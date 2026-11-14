@@ -3002,6 +3002,8 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
         const base = { traceId: 't', command: 'backupApp', startedAt: 1, completedAt: 2 }
         expect(traceArgTokens('{"instanceName":"kolibri","backupDiskId":"duration-empty-002"}')).toEqual(['kolibri', 'duration-empty-002'])
         expect(traceArgTokens('["a","b c"]')).toEqual(['a', 'b c'])
+        // engine#399: the derived display name is not a sent token
+        expect(traceArgTokens('{"instanceId":"kolibri-grade5a-001","backupDiskId":"duration-empty-002","instanceName":"Kolibri Grade 5A"}')).toEqual(['kolibri-grade5a-001', 'duration-empty-002'])
         expect(diagnoseBackupTrace({ ...base, args: '["kolibri","duration-empty-002"]', status: 'error', errorMessage: "backupApp: instance name 'kolibri' is ambiguous: a, b. Use the instance id." }, { instanceId: INST }))
             .toMatch(/non-unique name/)
         expect(diagnoseBackupTrace({ ...base, args: '["kolibri-grade5a-001","duration-empty-002"]', status: 'error', errorMessage: "Disk 'x' (duration-empty-002) is not docked to this engine." }, { instanceId: INST }))

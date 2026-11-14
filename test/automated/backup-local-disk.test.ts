@@ -173,7 +173,7 @@ describe('backupApp without a disk argument uses only a locally docked Backup Di
         const t = await runExplicit(`backupApp ${INST}`)
         expect(t.status).toBe('ok')
         expect(t.errorMessage).toBeNull()
-        expect(JSON.parse(t.args)).toEqual({ instanceName: INST, backupDiskId: null })
+        expect(JSON.parse(t.args)).toEqual({ instanceId: INST, backupDiskId: null, instanceName: INST_NAME })
         expect(vi.mocked(backupInstance)).toHaveBeenCalledOnce()
         expect((vi.mocked(backupInstance).mock.calls[0][2] as any).id).toBe('bk-local')
     })
@@ -186,7 +186,7 @@ describe('backupApp without a disk argument uses only a locally docked Backup Di
         expect(t.errorMessage).toBe(noLocalBackupDiskMessage(engineName))
         expect(t.errorMessage).toMatch(/^NOT_DOCKED: no Backup Disk docked on /)
         expect(t.errorMessage).not.toMatch(/Insufficient arguments/)
-        expect(JSON.parse(t.args)).toEqual({ instanceName: INST, backupDiskId: null })
+        expect(JSON.parse(t.args)).toEqual({ instanceId: INST, backupDiskId: null, instanceName: INST_NAME })
         expect(vi.mocked(backupInstance)).not.toHaveBeenCalled()
     })
 
@@ -195,7 +195,7 @@ describe('backupApp without a disk argument uses only a locally docked Backup Di
 
         const t = await runExplicit(`backupApp ${INST} bk-other-local`)
         expect(t.status).toBe('ok')
-        expect(JSON.parse(t.args)).toEqual({ instanceName: INST, backupDiskId: 'bk-other-local' })
+        expect(JSON.parse(t.args)).toEqual({ instanceId: INST, backupDiskId: 'bk-other-local', instanceName: INST_NAME })
         expect(vi.mocked(backupInstance)).toHaveBeenCalledOnce()
         expect((vi.mocked(backupInstance).mock.calls[0][2] as any).id).toBe('bk-other-local')
     })

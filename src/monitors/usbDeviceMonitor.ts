@@ -904,7 +904,7 @@ const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: 
         for (const instance of instancesOnDisk) {
             const cmdLogHandle = getCommandLogHandle()
             const traceId = crypto.randomUUID()
-            const traceCtx = { traceId, command: 'stopInstance', args: JSON.stringify({ instanceName: instance.name, diskId: disk.id, reason: 'disk-undocked' }) }
+            const traceCtx = { traceId, command: 'stopInstance', args: JSON.stringify({ instanceId: instance.id, instanceName: instance.name, diskId: disk.id, reason: 'disk-undocked' }) }
             if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: 'stopInstance', args: traceCtx.args, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
             try {
                 await runWithTrace(traceCtx, () => stopInstance(storeHandle, instance, disk, 'disk-undocked'))
