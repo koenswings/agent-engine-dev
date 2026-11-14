@@ -14,9 +14,15 @@
  *   3. Removing — only when move.verified was recorded: storedOn flips to the
  *                 target disk, then only the source folder is quarantined (helper
  *                 v4; never rm). removeInstance is not used, so the store row is kept.
- * Copy or verify failure deletes nothing (MOVE FAILED: … source kept). A failed
- * removal after a good copy is MOVED, source not removed: … Restart recovery
- * never removes the source (Operations.recoverInterruptedOperations): if not
+ * Copy or verify failure does not flip storedOn or touch the source folder
+ * (MOVE FAILED: … source kept). After the target folder exists, a pre-flip
+ * failure also has the target Engine stop any Checking container and quarantine
+ * the target folder (engine#388; never rm; storedOn stays on the source).
+ * SOURCE_CHANGED (source started or written to) keeps that code and a
+ * MOVE STOPPED: …; source kept text. Other pre-flip errors use SOURCE_KEPT
+ * (not MOVED). SOURCE_NOT_REMOVED / MOVED, source not removed: … is only used
+ * after storedOn has flipped and removeSource fails. Restart recovery never
+ * removes the source (Operations.recoverInterruptedOperations): if not
  * verified, only an unverified target folder is cleaned up; if verified, storedOn
  * is flipped if needed and a leftover source folder is not claimed.
  */
@@ -38,7 +44,7 @@ import { getEngineAddress } from './Network.js'
 import { fs } from 'zx'
 import {
     MOVE_CROSS_ENGINE_CAPABILITY, MOVE_STEPS, MOVE_STEP_INDEX, MoveError, MoveProgress, MoveResult,
-    MOVE_FAILURE_CODES, MoveRefusalCode, MoveVerify, VerifyCode, MoveFailureCode, moveFailedText, movedText, sourceNotRemovedText, sizesMatch,
+    MOVE_FAILURE_CODES, MoveRefusalCode, MoveVerify, VerifyCode, MoveFailureCode, moveFailedText, movedText, sourceNotRemovedText, sourceKeptText, withTargetCleanupText, sizesMatch,
 } from './MoveAppShapes.js'
 
 export interface MoveDeps {
@@ -49,11 +55,15 @@ export interface MoveDeps {
     copy: (storeHandle: DocHandle<Store>, instanceId: InstanceID, src: DiskID, tgt: DiskID, cause: OperationCause, opId: string) => Promise<InstanceID>
     requestVerify: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void
     requestStart: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void
+    /** Ask the target Engine to stop the Checking container and quarantine the target folder (engine#388). */
+    requestCleanup: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void
     /** True when instances/<id> already exists on the target disk (local folder or remote size). */
     targetFolderExists: (store: Store, disk: Disk, id: InstanceID) => Promise<boolean>
     startSource: (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => Promise<void>
     removeSource: (storeHandle: DocHandle<Store>, instanceId: InstanceID, engineId: string, sourceDiskId: DiskID) => Promise<{ quarantinePath: string }>
     verifyTimeoutMs: number
+    /** How long the source waits for the target to report move.targetCleanup. Does not change verify timing. */
+    cleanupTimeoutMs: number
     /** Fallback poll while waiting for Operation.move.verify; the source prefers the store change event (idea#498). */
     pollMs: number
     broadcast?: (msg: object) => void
@@ -154,6 +164,7 @@ const defaultDeps: MoveDeps = {
     },
     requestVerify: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
     requestStart: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
+    requestCleanup: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
     targetFolderExists: defaultTargetFolderExists,
     startSource: (storeHandle, instance, disk) => startInstance(storeHandle, instance, disk, 'post-move'),
     removeSource: async (storeHandle, instanceId, _engineId, sourceDiskId) => {
@@ -162,6 +173,7 @@ const defaultDeps: MoveDeps = {
         return quarantineInstanceOnDisk(disk, instanceId)
     },
     verifyTimeoutMs: 6 * 60 * 1000,
+    cleanupTimeoutMs: 6 * 60 * 1000,
     pollMs: 250,
 }
 
@@ -248,6 +260,35 @@ export const waitForMoveVerify = (
     if (already) finish(already)
 })
 
+/** Wait for Operation.move.targetCleanup after a pre-flip cleanup request (engine#388). */
+export const waitForTargetCleanup = (
+    storeHandle: DocHandle<Store>,
+    opId: string,
+    opts: { timeoutMs: number, pollMs: number },
+): Promise<{ status: 'quarantined' | 'failed', detail: string | null } | null> => new Promise(resolve => {
+    let settled = false
+    const read = (): { status: 'quarantined' | 'failed', detail: string | null } | null => {
+        const move = (storeHandle.doc().operationDB?.[opId] as any)?.move
+        const status = move?.targetCleanup
+        if (status !== 'quarantined' && status !== 'failed') return null
+        return { status, detail: move.targetCleanupDetail ?? null }
+    }
+    const finish = (v: { status: 'quarantined' | 'failed', detail: string | null } | null) => {
+        if (settled) return
+        settled = true
+        clearInterval(poll)
+        clearTimeout(timer)
+        try { storeHandle.off('change', onChange) } catch { /* typings */ }
+        resolve(v)
+    }
+    const onChange = () => { const v = read(); if (v) finish(v) }
+    const poll = setInterval(() => { const v = read(); if (v) finish(v) }, Math.max(1, opts.pollMs))
+    const timer = setTimeout(() => finish(null), opts.timeoutMs)
+    storeHandle.on('change', onChange)
+    const already = read()
+    if (already) finish(already)
+})
+
 export const moveAppCrossEngine = async (
     storeHandle: DocHandle<Store>,
     instanceName: InstanceName,
@@ -288,7 +329,7 @@ export const moveAppCrossEngine = async (
     const move: MoveProgress = {
         phase: 'copying', targetEngineId, sourceInstanceId: String(instance.id), targetInstanceId: null,
         expectedBytes: null, expectRunning, verify: null, verified: false, sourceRemoved: false,
-        quarantinePath: null, code: null, resultText: null,
+        quarantinePath: null, targetCleanup: null, targetCleanupDetail: null, code: null, resultText: null,
     }
     const opId = createOperation(storeHandle, 'moveApp', {
         instanceId: String(instance.id), sourceDiskId: String(sourceDisk.id), targetDiskId: String(targetDisk.id), crossEngine: 'true',
@@ -310,6 +351,39 @@ export const moveAppCrossEngine = async (
         finish(storeHandle, opId, r, true)
         return r
     }
+    let targetInstanceId: InstanceID | undefined
+    // engine#388: on a pre-flip failure, ask the target to stop any Checking
+    // container and quarantine its folder. Never runs after storedOn flips, and
+    // never points at a folder whose row already says it is stored on the target.
+    const cleanupTargetCopy = async (): Promise<'quarantined' | 'failed'> => {
+        const record = (status: 'quarantined' | 'failed', detail: string) => {
+            patchMove(storeHandle, opId, { targetCleanup: status, targetCleanupDetail: detail })
+            return status
+        }
+        const row = getInstance(storeHandle.doc(), instance.id)
+        if (row && String(row.storedOn) === String(targetDisk.id)) {
+            return record('failed', 'the instance is already stored on the target')
+        }
+        if (!targetInstanceId) {
+            return record('failed', 'no target copy to clean up')
+        }
+        try {
+            d.requestCleanup(storeHandle, targetEngineId, `cleanupMoveTarget ${opId} ${targetInstanceId} ${targetDisk.id}`)
+        } catch (e: any) {
+            return record('failed', e?.message ?? String(e))
+        }
+        const seen = await waitForTargetCleanup(storeHandle, opId, { timeoutMs: d.cleanupTimeoutMs, pollMs: d.pollMs })
+        if (!seen) return record('failed', `${targetName} did not confirm the target cleanup in time`)
+        return seen.status
+    }
+    const failAfterCleanup = async (code: MoveResult['code'], reason: string, targetId: string | null): Promise<MoveResult> => {
+        const cleanup = await cleanupTargetCopy()
+        await restartIfNeeded()
+        const r = result(code, withTargetCleanupText(moveFailedText(reason), cleanup, targetName), targetId)
+        log(`moveApp: ${r.text}`)
+        finish(storeHandle, opId, r, true)
+        return r
+    }
 
     // ── 1. Copying ─────────────────────────────────────────────────────────
     setPhase(storeHandle, opId, 'copying')
@@ -322,7 +396,6 @@ export const moveAppCrossEngine = async (
     // (idea#79 call 3): the copy stops it and keeps it stopped; the remove step
     // re-checks lastStarted, status and size against this baseline.
     const startedBaseline = Number(getInstance(storeHandle.doc(), instance.id)?.lastStarted ?? 0)
-    let targetInstanceId: InstanceID
     let baselineBytes: number
     try {
         targetInstanceId = await d.copy(storeHandle, instance.id, sourceDisk.id, targetDisk.id, cause, opId)
@@ -342,8 +415,8 @@ export const moveAppCrossEngine = async (
     }
     d.requestVerify(storeHandle, targetEngineId, `verifyMoveTarget ${opId} ${targetInstanceId} ${baselineBytes} ${expectRunning}`)
     const verdict = await waitForMoveVerify(storeHandle, opId, { timeoutMs: d.verifyTimeoutMs, pollMs: d.pollMs })
-    if (!verdict) { await restartIfNeeded(); return fail('VERIFY_TIMEOUT', `${targetName} did not confirm the copy in time`, String(targetInstanceId)) }
-    if (!verdict.ok) { await restartIfNeeded(); return fail(verdict.code ?? 'VERIFY_FAILED', `the copy on ${targetName} did not check out (${verdict.detail ?? 'no detail'})`, String(targetInstanceId)) }
+    if (!verdict) return failAfterCleanup('VERIFY_TIMEOUT', `${targetName} did not confirm the copy in time`, String(targetInstanceId))
+    if (!verdict.ok) return failAfterCleanup(verdict.code ?? 'VERIFY_FAILED', `the copy on ${targetName} did not check out (${verdict.detail ?? 'no detail'})`, String(targetInstanceId))
     // The one gate for removing the source: recorded before any removal step
     patchMove(storeHandle, opId, { verified: true })
 
@@ -374,11 +447,24 @@ export const moveAppCrossEngine = async (
         finish(storeHandle, opId, r, false)
         return r
     } catch (e: any) {
-        const changed = e instanceof MoveError && e.code === 'SOURCE_CHANGED'
+        const flipped = String(getInstance(storeHandle.doc(), instance.id)?.storedOn ?? '') === String(targetDisk.id)
         const why = e instanceof RemoveError ? `${e.code}: ${e.message}` : (e?.message ?? String(e))
-        const r = result(changed ? 'SOURCE_CHANGED' : 'SOURCE_NOT_REMOVED', sourceNotRemovedText(why), String(targetInstanceId))
+        // After the flip, only source removal failed: the app is on the target.
+        if (flipped) {
+            const r = result('SOURCE_NOT_REMOVED', sourceNotRemovedText(why), String(targetInstanceId))
+            log(`moveApp: ${r.text}`)
+            finish(storeHandle, opId, r, false)
+            return r
+        }
+        // Pre-flip: stop and quarantine the target copy; keep the source authoritative.
+        const cleanup = await cleanupTargetCopy()
+        await restartIfNeeded()
+        const changed = e instanceof MoveError && e.code === 'SOURCE_CHANGED'
+        const code = changed ? 'SOURCE_CHANGED' : 'SOURCE_KEPT'
+        const base = changed ? sourceKeptText(why) : moveFailedText(why)
+        const r = result(code, withTargetCleanupText(base, cleanup, targetName), String(targetInstanceId))
         log(`moveApp: ${r.text}`)
-        finish(storeHandle, opId, r, false)
+        finish(storeHandle, opId, r, !changed)
         return r
     }
 }
@@ -498,5 +584,60 @@ export const verifyMoveTarget = async (
     } finally {
         stopProgress(false)
         clearPortReadyProgress(instanceId)
+    }
+}
+
+// ── cleanupMoveTarget (runs on the TARGET Engine, engine#388) ────────────────
+
+export interface CleanupMoveTargetDeps {
+    localEngineId: () => Promise<string>
+    /** Compose-down and quarantine the folder on this disk; must not touch instanceDB. */
+    stopAndQuarantine: (disk: Disk, id: InstanceID) => Promise<{ quarantinePath: string }>
+}
+
+const defaultCleanupDeps: CleanupMoveTargetDeps = {
+    localEngineId: async () => String((await import('./Engine.js')).localEngineId),
+    stopAndQuarantine: (disk, id) => quarantineInstanceOnDisk(disk, id),
+}
+
+/**
+ * cleanupMoveTarget <opId> <instanceId> <targetDiskId>: stop the Checking
+ * container and quarantine the target instance folder. Writes the result into
+ * Operation.move.targetCleanup. Does not change the instance row (storedOn,
+ * lastBackup, status stay as they are). Refuses if the row already says this
+ * id is stored on the target disk, so a flipped move cannot quarantine the
+ * live copy. Only operates on a disk docked to this Engine.
+ */
+export const cleanupMoveTarget = async (
+    storeHandle: DocHandle<Store>, opId: string, instanceId: string, targetDiskId: string,
+    deps: Partial<CleanupMoveTargetDeps> = {},
+): Promise<{ status: 'quarantined' | 'failed', detail: string }> => {
+    const d = { ...defaultCleanupDeps, ...deps }
+    const write = (status: 'quarantined' | 'failed', detail: string) => {
+        storeHandle.change(doc => {
+            const op = doc.operationDB?.[opId] as any
+            if (!op?.move) return
+            op.move.targetCleanup = status
+            op.move.targetCleanupDetail = detail
+        })
+        return { status, detail }
+    }
+    const me = await d.localEngineId()
+    const disk = getDisk(storeHandle.doc(), targetDiskId as DiskID)
+    if (!disk || String(disk.dockedTo) !== me) {
+        return write('failed', 'the target disk is not docked to this Engine')
+    }
+    const row = getInstance(storeHandle.doc(), instanceId as InstanceID)
+    if (row && String(row.storedOn) === String(targetDiskId)) {
+        return write('failed', 'the instance is stored on the target; the copy was left in place')
+    }
+    try {
+        const { quarantinePath } = await d.stopAndQuarantine(disk, instanceId as InstanceID)
+        log(`cleanupMoveTarget: quarantined ${instanceId} on ${targetDiskId} at ${quarantinePath}`)
+        return write('quarantined', quarantinePath)
+    } catch (e: any) {
+        const detail = e?.message ?? String(e)
+        log(`cleanupMoveTarget: could not quarantine ${instanceId} on ${targetDiskId}: ${detail}`)
+        return write('failed', detail)
     }
 }

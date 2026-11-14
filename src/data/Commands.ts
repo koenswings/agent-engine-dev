@@ -544,6 +544,17 @@ const verifyMoveTargetWrapper = async (storeHandle: DocHandle<Store> | null, opI
     print(v.ok ? chalk.green(`Move copy ${instanceId} checks out`) : chalk.yellow(`Move copy ${instanceId} does not check out: ${v.detail}`))
 }
 
+/** cleanupMoveTarget <opId> <instanceId> <targetDiskId> (engine#388): sent Engine → Engine after a pre-flip move failure. */
+const cleanupMoveTargetWrapper = async (storeHandle: DocHandle<Store> | null, opId: string, instanceId: string, targetDiskId: string) => {
+    if (!storeHandle) throw new Error('Store is not available.')
+    const { cleanupMoveTarget } = await import('./MoveAppRemote.js')
+    const r = await cleanupMoveTarget(storeHandle, opId, instanceId, targetDiskId)
+    attachTraceResult(r)
+    print(r.status === 'quarantined'
+        ? chalk.green(`Move target copy ${instanceId} quarantined`)
+        : chalk.yellow(`Move target copy ${instanceId} was not quarantined: ${r.detail}`))
+}
+
 export type EjectTarget = DiskArgResult
 
 /**
@@ -666,6 +677,7 @@ export const commands: CommandDefinition[] = [
     { name: "copyApp", execute: copyAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "moveApp", execute: moveAppWrapper, args: [{ type: "string", name: "instanceName" }, { type: "string", name: "sourceDiskId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "verifyMoveTarget", execute: verifyMoveTargetWrapper, args: [{ type: "string", name: "opId" }, { type: "string", name: "instanceId" }, { type: "string", name: "expectedBytes" }, { type: "string", name: "expectRunning" }], scope: 'engine' },
+    { name: "cleanupMoveTarget", execute: cleanupMoveTargetWrapper, args: [{ type: "string", name: "opId" }, { type: "string", name: "instanceId" }, { type: "string", name: "targetDiskId" }], scope: 'engine' },
     { name: "ejectDisk", execute: ejectDiskWrapper, args: [{ type: "string", name: "diskId" }], scope: 'engine' },
     { name: "forgetDisk", execute: forgetDiskWrapper, args: [{ type: "string", name: "diskId" }, { type: "string", name: "options", variadic: true, optional: true }], scope: 'engine' },
     // backupApp / restoreApp (idea#168): the instance is an id or unique name, the disk
