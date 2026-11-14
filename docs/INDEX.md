@@ -55,8 +55,8 @@ deployment records, comparison, input archives, kit retro records, MORANGO proce
 → [docs/REPRODUCIBLE_BUILDS.md](REPRODUCIBLE_BUILDS.md)
 
 ## STORE_HISTORY_R86Q.md
-**Status:** Record (2026-10-13)  ·  **Maintained by:** Axle
-r86q diagnosis: why the shared store's history (heartbeats, metrics) made syncs slow, and the fixes (#192/#194, compaction).
+**Status:** Record (2026-10-13; addendum 2026-11-14)  ·  **Maintained by:** Axle
+r86q diagnosis: why the shared store's history (heartbeats, metrics) made syncs slow, and the fixes (#192/#194, compaction). Addendum: items 1–3 (ephemeral heartbeats and metrics, 7-day ops archive) and the dev-pool compaction are now in place on Engine main; the diagnosis itself is unchanged.
 → [docs/STORE_HISTORY_R86Q.md](STORE_HISTORY_R86Q.md)
 
 ## USB-STICKS.md

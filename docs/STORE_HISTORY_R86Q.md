@@ -44,3 +44,16 @@ Same pattern as the CommandLog (engine #183/#185: daily rotation).
 
 ## Not measured
 The per-burst apply cost on a Pi (3 store sessions on one walker thread each applying the same changes) was not measured; it needs a run on idea02.
+
+## Addendum (2026-11-14)
+
+Current status of the fixes listed above (engine#350, option a: a current-status addendum in place). The diagnosis itself is unchanged.
+
+1. Heartbeats out of the CRDT: **shipped** in engine #192 / #194 (`src/data/Liveness.ts`). An ephemeral `idea/hb` goes out every 10 s; `engineDB[self].lastRun` is stored at boot and hourly. The 7-day peer-stale rule uses `max(stored lastRun, live ping)`.
+2. Container metrics out of the shared doc: **shipped** in engine #194 and console #148. `dockerMetricsMonitor` broadcasts an ephemeral `idea/metrics` every 15 s; leftover stored `instance.metrics` is cleared once.
+3. Prune old Done/Failed `operationDB` entries: **shipped** in #194. Each Engine archives its own finished ops older than 7 days into the CommandLog and removes them from `operationDB` (`archiveOldOperations`, `OPERATION_ARCHIVE_AGE_MS`).
+4. One-time compaction / store epoch: **done for the dev pool** (3zoqd → 2VroE). Production and the kits keep their own stores and were not part of that switch. There is no automated weekly reset (Koen, 2026-10-13).
+
+CommandLog daily rotation (engine #183 / #185) also shipped, as noted above.
+
+Items 1–3 together are what this note expected would cut growth to roughly 3–6k changes/day. Measuring today's rate on the current pool store (2VroE) is not part of this addendum.
