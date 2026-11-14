@@ -9,7 +9,7 @@
  * Engine lock (engine.lock.json), the sanitise list, the verify checks and the
  * first-boot unit texts. The chroot orchestration is in engineRootfs.ts.
  */
-import { fs, path } from 'zx'
+import { fs, path, YAML } from 'zx'
 import crypto from 'crypto'
 
 // ── Arguments ───────────────────────────────────────────────────────────────
@@ -295,6 +295,20 @@ WantedBy=sysinit.target
 export const sshHostKeyUnitIsUnconditional = (unitText: string): boolean =>
     !/^\s*ConditionFirstBoot\s*=\s*yes\s*$/mi.test(unitText) && /ssh-keygen\s+-A/.test(unitText)
 
+/**
+ * idea#524: problems with the image's Engine config.yaml text. settings.skipHardwareId must be
+ * unset (any value, null included, is refused): the Engine id policy is open (idea#524), so an
+ * image leaves it to the default. Same rule as idea tools/engine-image/verify-sanitised.sh.
+ */
+export const imageConfigProblems = (text: string, file = 'config.yaml'): string[] => {
+    let doc: unknown
+    try { doc = YAML.parse(text) } catch (e) { return [`${file} is not valid YAML: ${e instanceof Error ? e.message : e}`] }
+    const settings = doc && typeof doc === 'object' ? (doc as Record<string, unknown>).settings : undefined
+    if (settings && typeof settings === 'object' && Object.prototype.hasOwnProperty.call(settings, 'skipHardwareId'))
+        return [`${file} sets settings.skipHardwareId; an image must leave it unset (idea#524)`]
+    return []
+}
+
 export const consolePathFromEngine = async (engineRoot: string): Promise<string> => {
     const cfg = path.join(engineRoot, 'config.yaml')
     if (await fs.pathExists(cfg)) {
@@ -459,6 +473,8 @@ export const IDENTITY_PATHS = [
     'home/pi/.ssh/idea_engine_ed25519',
     'home/pi/.ssh/idea_engine_ed25519.pub',
     'etc/idea/peer-owner',
+    // idea#524: sync-peers' copies of earlier peer files (the whole folder; other Pis' keys and host keys)
+    'etc/idea/.peer-quarantine',
     'root/.idea-build',
     'usr/sbin/policy-rc.d',
 ]
@@ -724,6 +740,9 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
     // 1. no identity
     for (const pat of IDENTITY_PATHS) for (const f of await globRel(c.root, pat)) p.push(`identity/runtime state present: /${path.relative(c.root, f)}`)
     for (const rel of ENGINE_RUNTIME_PATHS) if (await fs.pathExists(path.join(eng, rel))) p.push(`Engine runtime state present: ${c.enginePath}/${rel}`)
+    const cfgFile = path.join(eng, 'config.yaml')
+    if (await isSymlink(cfgFile)) p.push(`${c.enginePath}/config.yaml is a symlink`)
+    else if (await fs.pathExists(cfgFile)) p.push(...imageConfigProblems(await fs.readFile(cfgFile, 'utf8'), `${c.enginePath}/config.yaml`))
     const mid = R('etc/machine-id')
     if (!(await fs.pathExists(mid))) p.push('/etc/machine-id missing (must exist and be empty)')
     else if ((await fs.readFile(mid, 'utf8')).trim() !== '' ) p.push('/etc/machine-id is not empty')
