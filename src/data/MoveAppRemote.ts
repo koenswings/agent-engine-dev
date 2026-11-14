@@ -41,7 +41,9 @@ export interface MoveDeps {
     startSource: (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => Promise<void>
     removeSource: (storeHandle: DocHandle<Store>, instanceId: InstanceID, engineId: string) => Promise<{ quarantinePath: string }>
     verifyTimeoutMs: number
+    /** Fallback poll while waiting for Operation.move.verify; the source prefers the store change event (idea#498). */
     pollMs: number
+    broadcast?: (msg: object) => void
 }
 
 const defaultDeps: MoveDeps = {
@@ -62,7 +64,7 @@ const defaultDeps: MoveDeps = {
     startSource: (storeHandle, instance, disk) => startInstance(storeHandle, instance, disk, 'post-move'),
     removeSource: (storeHandle, instanceId, engineId) => removeInstance(storeHandle, String(instanceId), engineId),
     verifyTimeoutMs: 6 * 60 * 1000,
-    pollMs: 2000,
+    pollMs: 250,
 }
 
 /** Map a copyApp validate() refusal text to a refusal code. */
@@ -106,7 +108,39 @@ const finish = (storeHandle: DocHandle<Store>, opId: string, result: MoveResult,
     })
 }
 
-const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+export const MOVE_PROGRESS_TYPE = 'idea/progress' as const
+
+export interface MoveProgressMsg {
+    type: typeof MOVE_PROGRESS_TYPE
+    opId: string
+    step: string
+    bytesDone: number
+    bytesTotal: number
+}
+
+/** Wait for Operation.move.verify: Automerge change event first, pollMs (default 250) as fallback (idea#498). */
+export const waitForMoveVerify = (
+    storeHandle: DocHandle<Store>,
+    opId: string,
+    opts: { timeoutMs: number, pollMs: number },
+): Promise<MoveVerify | null> => new Promise(resolve => {
+    let settled = false
+    const read = (): MoveVerify | null => (storeHandle.doc().operationDB?.[opId] as any)?.move?.verify ?? null
+    const finish = (v: MoveVerify | null) => {
+        if (settled) return
+        settled = true
+        clearInterval(poll)
+        clearTimeout(timer)
+        try { storeHandle.off('change', onChange) } catch { /* typings */ }
+        resolve(v)
+    }
+    const onChange = () => { const v = read(); if (v) finish(v) }
+    const poll = setInterval(() => { const v = read(); if (v) finish(v) }, Math.max(1, opts.pollMs))
+    const timer = setTimeout(() => finish(null), opts.timeoutMs)
+    storeHandle.on('change', onChange)
+    const already = read()
+    if (already) finish(already)
+})
 
 export const moveAppCrossEngine = async (
     storeHandle: DocHandle<Store>,
@@ -168,6 +202,11 @@ export const moveAppCrossEngine = async (
 
     // ── 1. Copying ─────────────────────────────────────────────────────────
     setPhase(storeHandle, opId, 'copying')
+    // idea#498: ephemeral progress at the start of Copying so the Console is not
+    // blank for the 5–8 s before journaled copyApp steps (those are not stored
+    // on the moveApp operation; percent-only patches are dropped).
+    const emit = d.broadcast ?? ((msg: object) => { try { storeHandle.broadcast(msg as any) } catch { /* no peers */ } })
+    emit({ type: MOVE_PROGRESS_TYPE, opId, step: MOVE_STEPS[0], bytesDone: 0, bytesTotal: 0 })
     // The source must not be started or written to from here until it is removed
     // (idea#79 call 3): the copy stops it and keeps it stopped; the remove step
     // re-checks lastStarted, status and size against this baseline.
@@ -188,13 +227,7 @@ export const moveAppCrossEngine = async (
     // ── 2. Checking (on the target) ───────────────────────────────────────────
     setPhase(storeHandle, opId, 'checking')
     d.requestVerify(storeHandle, targetEngineId, `verifyMoveTarget ${opId} ${targetInstanceId} ${baselineBytes} ${expectRunning}`)
-    const deadline = Date.now() + d.verifyTimeoutMs
-    let verdict: MoveVerify | null = null
-    while (Date.now() < deadline) {
-        verdict = (storeHandle.doc().operationDB?.[opId] as any)?.move?.verify ?? null
-        if (verdict) break
-        await sleep(d.pollMs)
-    }
+    const verdict = await waitForMoveVerify(storeHandle, opId, { timeoutMs: d.verifyTimeoutMs, pollMs: d.pollMs })
     if (!verdict) { await restartIfNeeded(); return fail('VERIFY_TIMEOUT', `${targetName} did not confirm the copy in time`, String(targetInstanceId)) }
     if (!verdict.ok) { await restartIfNeeded(); return fail(verdict.code ?? 'VERIFY_FAILED', `the copy on ${targetName} did not check out (${verdict.detail ?? 'no detail'})`, String(targetInstanceId)) }
     // The one gate for removing the source: recorded before any removal step

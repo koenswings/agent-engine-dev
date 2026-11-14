@@ -603,7 +603,7 @@ const setupDemoWrapper = async (storeHandle: DocHandle<Store> | null, targetDisk
     if (!storeHandle) throw new Error("Store is not available. Please connect first.")
     const { setupDemo, parseAppsFlag } = await import('./DemoApps.js')
     const apps = parseAppsFlag(rest)
-    const result = await setupDemo(storeHandle, targetDiskId, apps)
+    const result = await setupDemo(storeHandle, targetDiskId, apps, undefined, {}, { explicitApps: rest.includes('--apps') })
     attachTraceResult(result)
     print(chalk.green(`setupDemo: ${result.code} (${result.apps.map(a => `${a.app} ${a.instanceId}`).join(', ')})`))
 }
