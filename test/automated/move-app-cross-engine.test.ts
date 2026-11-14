@@ -412,6 +412,16 @@ describe('verifyMoveTarget Checking idea/progress (idea#498 option 3)', () => {
             phase: 'stable', label: 'Checking it stays up: 10 of 10 s', stableElapsedMs: 10_000, stableTargetMs: 10_000,
         })
         expect(checkingProgressMessage(opId, { ...snap, stableReached: true }, t0 + 100).checking.phase).toBe('stable')
+        // stableTargetMs is always present and equals the real stableMs in use
+        const custom = { firstReadyAt: null as number | null, stableMs: 8_000 }
+        for (const m of [
+            checkingProgressMessage(opId, custom, t0),
+            checkingProgressMessage(opId, { firstReadyAt: t0, stableMs: 8_000 }, t0 + 1500),
+            checkingProgressMessage(opId, { firstReadyAt: t0, stableMs: 8_000, stableReached: true }, t0 + 100),
+        ]) {
+            expect(m.type).toBe('idea/progress')
+            expect(m.checking.stableTargetMs).toBe(8_000)
+        }
     })
 
     it('broadcasts that sequence from a fake prober; opId matches; no message after the verdict; nothing written to the doc', async () => {
@@ -453,7 +463,7 @@ describe('verifyMoveTarget Checking idea/progress (idea#498 option 3)', () => {
         expect(v.ok).toBe(true)
 
         expect(seen.length).toBeGreaterThan(0)
-        expect(seen.every((m: any) => m.type === 'idea/progress' && m.step === 'Checking' && m.opId === 'op-move' && m.bytesDone === 0 && m.bytesTotal === 0)).toBe(true)
+        expect(seen.every((m: any) => m.type === 'idea/progress' && m.step === 'Checking' && m.opId === 'op-move' && m.bytesDone === 0 && m.bytesTotal === 0 && m.checking.stableTargetMs === 10_000)).toBe(true)
         const phases = seen.map((m: any) => m.checking.phase)
         expect(phases[0]).toBe('starting')
         expect(seen[0].checking).toMatchObject({ label: 'Starting on new Engine', stableElapsedMs: 0, stableTargetMs: 10_000 })
@@ -481,5 +491,50 @@ describe('verifyMoveTarget Checking idea/progress (idea#498 option 3)', () => {
         expect(op.move.checking).toBeUndefined()
         expect(op.checking).toBeUndefined()
         expect((h.doc() as any).checking).toBeUndefined()
+    })
+
+    it('sends stable exactly once and no message after stable for that opId', async () => {
+        const h = makeStore()
+        const stableMs = 10_000
+        h.change(doc => {
+            (doc.instanceDB as any)[INST] = inst(INST, TGT_DISK, 'Starting')
+            doc.operationDB['op-move'] = {
+                id: 'op-move', kind: 'moveApp',
+                args: { instanceId: String(INST), sourceDiskId: String(SRC_DISK), targetDiskId: String(TGT_DISK), crossEngine: 'true' },
+                status: 'Running', currentStep: 1, totalSteps: 3, stepLabel: 'Checking',
+                move: {
+                    phase: 'checking', targetEngineId: String(TGT), sourceInstanceId: String(INST), targetInstanceId: String(INST),
+                    expectedBytes: BYTES, expectRunning: true, verify: null, verified: false, sourceRemoved: false,
+                    quarantinePath: null, code: null, resultText: null,
+                },
+            } as any
+        })
+        const seen: any[] = []
+        const verifyP = verifyMoveTarget(h, 'op-move', String(INST), String(BYTES), 'true', {
+            localEngineId: async () => String(TGT),
+            targetBytes: async () => BYTES,
+            timeoutMs: 4000,
+            pollMs: 25,
+            progressIntervalMs: 25,
+            broadcast: (m) => { seen.push(JSON.parse(JSON.stringify(m))) },
+        })
+        await sleep(40)
+        setPortReadyProgress(String(INST), { firstReadyAt: Date.now() - stableMs, stableMs, stableReached: true })
+        const deadline = Date.now() + 1000
+        while (Date.now() < deadline && !seen.some((m: any) => m.checking?.phase === 'stable')) await sleep(10)
+        expect(seen.filter((m: any) => m.checking?.phase === 'stable')).toHaveLength(1)
+        const afterStable = seen.length
+        // A later probe reset must not produce another message for this op.
+        setPortReadyProgress(String(INST), { firstReadyAt: null, stableMs })
+        await sleep(80)
+        expect(seen.length).toBe(afterStable)
+        h.change(d => { (d.instanceDB as any)[INST].status = 'Running' })
+        const v = await verifyP
+        expect(v.ok).toBe(true)
+        await sleep(80)
+        expect(seen.length).toBe(afterStable)
+        expect(seen.filter((m: any) => m.checking?.phase === 'stable')).toHaveLength(1)
+        expect(seen.every((m: any) => m.type === 'idea/progress' && m.opId === 'op-move' && m.checking.stableTargetMs === stableMs)).toBe(true)
+        expect((h.doc().operationDB as any)['op-move'].stepLabel).toBe('Checking')
     })
 })

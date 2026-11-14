@@ -318,17 +318,22 @@ export const verifyMoveTarget = async (
     const intervalMs = d.progressIntervalMs ?? CHECKING_PROGRESS_INTERVAL_MS
     let stopped = false
     let sentStable = false
+    let timer: ReturnType<typeof setInterval> | undefined
+    const stopTicks = () => {
+        stopped = true
+        if (timer !== undefined) clearInterval(timer)
+    }
     const tick = () => {
-        if (stopped) return
+        // After 'stable' is sent once, nothing more goes out for this op (Pixel / idea#498).
+        if (stopped || sentStable) return
         const msg = checkingProgressMessage(opId, getPortReadyProgress(instanceId))
-        if (msg.checking.phase === 'stable') {
-            if (sentStable) return
-            sentStable = true
-        }
+        if (msg.checking.phase === 'stable') sentStable = true
         emit(msg)
+        if (sentStable) stopTicks()
     }
     tick()
-    const timer = setInterval(tick, Math.max(1, intervalMs))
+    timer = setInterval(tick, Math.max(1, intervalMs))
+    if (sentStable) stopTicks()
     const stopProgress = (flushStable = false) => {
         if (flushStable && !sentStable) {
             const msg = checkingProgressMessage(opId, getPortReadyProgress(instanceId))
@@ -337,8 +342,7 @@ export const verifyMoveTarget = async (
                 if (!stopped) emit(msg)
             }
         }
-        stopped = true
-        clearInterval(timer)
+        stopTicks()
     }
     const write = (v: MoveVerify) => {
         stopProgress(v.ok === true)
