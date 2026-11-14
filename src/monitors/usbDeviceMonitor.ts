@@ -883,6 +883,7 @@ const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: 
                 dsk.filesConfig = null      // idea#131
                 dsk.sizeBytes = null
                 dsk.freeBytes = null
+                if (dsk.appBundles != null) dsk.appBundles = null   // idea#76 gap 1: unknown while undocked
             }
         })
         // Stop all instances of the disk and move them to the 'Undocked' state
@@ -909,6 +910,12 @@ const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: 
             })
             log(`Instance ${instance.id} has been moved to the 'Undocked' state`)
         }
+        // idea#76: hints that pointed at this disk, or that sit on its instances, are recomputed
+        try {
+            const { refreshUpdateAvailable } = await import('../data/UpdateApp.js')
+            const me = getLocalEngine(storeHandle.doc())?.id ?? disk.dockedTo
+            if (me) await refreshUpdateAvailable(storeHandle, String(me))
+        } catch (e) { log(`updateAvailable refresh failed on undock of ${disk.id}: ${(e as Error).message}`) }
         // Unmount after the instances are stopped (their containers keep files on
         // the disk open). Repeat umount until the folder is no longer a mount
         // point, then rmdir it; never rm -fr (idea#126).

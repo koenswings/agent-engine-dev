@@ -43,7 +43,7 @@ import type { Instance } from './Instance.js'
 import type { AppID, DiskID, InstanceID, Timestamp } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
 import { checkInstanceIdForDocker, composeProjectFor, COMPOSE_PROJECT_LABEL } from '../utils/instanceIds.js'
-import { diskMountRoot, appDataRoot, Disk, PreUpdateSnapshot, joinMountRoot } from './Disk.js'
+import { diskMountRoot, appDataRoot, Disk, PreUpdateSnapshot, AppBundleInfo, joinMountRoot } from './Disk.js'
 import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import {
     runAppData, snapshotArgs, restoreSnapshotArgs, snapshotsArgs, parseSnapshotResult, parseSnapshotsList,
@@ -53,6 +53,7 @@ import { createOperation, updateOperation } from './Operations.js'
 import { log } from '../utils/utils.js'
 import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
+    parseHealthCheck, healthBodyOk, estimateUpdateMinutes, fallbackUp, fallbackHealthTimeoutSeconds,
     HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange, backupIsDue,
 } from './UpdateAppPolicy.js'
 import { parseAppId } from './App.js'
@@ -113,6 +114,8 @@ export interface UpdateDeps {
     reread: (disk: Disk, id: InstanceID) => Promise<void>
     start: (inst: Instance, disk: Disk) => Promise<void>
     health: (id: InstanceID) => Promise<Omit<HealthSample, 'elapsedMs'>>
+    /** GET an x-app.healthCheck URL (idea#76); null when it does not answer */
+    probe: (url: string) => Promise<{ status: number, body: string } | null>
     broadcast: (msg: UpdateProgress) => void
     now: () => number
     sleep: (ms: number) => Promise<void>
@@ -186,6 +189,12 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
         const info = JSON.parse(await docker(['inspect', ...ids])) as any[]
         return aggregateHealth(info.map(c => ({ status: c?.State?.Status, health: c?.State?.Health?.Status, exitCode: c?.State?.ExitCode, restartCount: c?.RestartCount })))
     },
+    probe: async (url) => {
+        try {
+            const r = await fetch(url, { redirect: 'manual', signal: AbortSignal.timeout(10_000) })
+            return { status: r.status, body: await r.text() }
+        } catch { return null }
+    },
     broadcast: (msg) => { try { storeHandle.broadcast(msg) } catch { /* no peers */ } },
     now: () => Date.now(),
     sleep: (ms) => sleep(ms),
@@ -243,6 +252,12 @@ const findBundleDisk = async (store: Store, d: UpdateDeps, engineId: string, ins
         if (await fs.pathExists(path.join(dir, 'compose.yaml')) && !await isUnfinishedFetch(dir)) return { disk, dir }
     }
     return null
+}
+
+/** x-app of a compose file; {} when unreadable. */
+export const readXApp = async (composePath: string): Promise<Record<string, any>> => {
+    try { const x = YAML.parse(await fs.readFile(composePath, 'utf8'))?.['x-app']; return x && typeof x === 'object' ? x : {} }
+    catch { return {} }
 }
 
 /**
@@ -349,6 +364,7 @@ export const updateApp = async (
             allowMajor: !!opts.allowMajor,
             backupAgeMs,
             shortDisks,
+            updatesFrom: bundle ? (await readXApp(path.join(bundle.dir, 'compose.yaml'))).updatesFrom : undefined,
             backupPlanned: !!backupDisk,
         })
         if (refusal) throw refusal
@@ -423,17 +439,31 @@ export const updateApp = async (
             done.push('Start')
             // ── Health
             step = 'Health'; setStep('Health')
-            const timeoutS = await readHealthTimeout(composePath, parseAppId(newAppId).name)
+            const newX = await readXApp(composePath)
+            const hc = parseHealthCheck(newX.healthCheck)
+            // Declared healthCheck: agreed per-App timeout rule; fallback (main URL): healthTimeout, per-App default, else 300 s
+            const timeoutS = hc ? await readHealthTimeout(composePath, parseAppId(newAppId).name) : fallbackHealthTimeoutSeconds(parseAppId(newAppId).name, newX.healthTimeout)
             const t0 = d.now()
             for (;;) {
                 const elapsedMs = d.now() - t0
-                const v = healthGate({ ...(await d.health(inst.id)), elapsedMs }, timeoutS)
+                const sample = await d.health(inst.id)
+                // x-app.healthCheck (idea#351 §4.3): only once Docker says the containers are up
+                const ready = sample.state === 'healthy' || sample.state === 'none'
+                const base = `http://127.0.0.1:${(storeHandle.doc().instanceDB[inst.id] as Instance)?.port ?? inst.port}`
+                const bodyOk = !ready ? undefined
+                    : hc ? healthBodyOk(await d.probe(`${base}${hc.path}`), hc.expect)
+                    : fallbackUp(await d.probe(`${base}/`))
+                const v = healthGate({ ...sample, bodyOk, elapsedMs }, timeoutS)
                 progress('Health', Math.min(elapsedMs, timeoutS * 1000), timeoutS * 1000)
                 if (v.verdict === 'pass') break
                 if (v.verdict === 'fail') throw new Error(`health gate: ${v.why}`)
                 await d.sleep(d.pollMs)
             }
             done.push('Health')
+            storeHandle.change(doc => {
+                const i = doc.instanceDB[inst.id]
+                if (i) { i.previousAppId = fromAppId; i.updateAvailable = null }
+            })
             updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
             log(`updateApp: ${inst.id} ('${inst.name}') ${fromAppId} -> ${newAppId}; snapshot ${snap.path} (${snap.sizeBytes} bytes) kept`)
             return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes, snapshotExcludes: snapExcludes, preUpdateBackup }
@@ -543,42 +573,132 @@ export interface UpdateAvailableDeps {
     mountRoot: (disk: Disk) => Promise<string>
     listApps: (appsDir: string) => Promise<string[]>
     readSums: (bundleDir: string) => Promise<string | null>
+    /** x-app of a bundle (updatesFrom, healthTimeout, migrationNote) */
+    readXApp: (bundleDir: string) => Promise<Record<string, any>>
+    /** data bytes a snapshot of the instance would copy; null when unknown (estimatedMinutes then left out) */
+    dataBytes: (disk: Disk, id: InstanceID) => Promise<number | null>
 }
 const defaultAvailableDeps: UpdateAvailableDeps = {
     mountRoot: (disk) => diskMountRoot(disk),
     listApps: async (dir) => (await fs.pathExists(dir)) ? (await fs.readdir(dir)).filter(n => !n.startsWith('.')) : [],
     readSums: async (dir) => { try { return await fs.readFile(path.join(dir, 'SHA256SUMS'), 'utf8') } catch { return null } },
+    readXApp: (dir) => readXApp(path.join(dir, 'compose.yaml')),
+    dataBytes: async (disk, id) => {
+        try { const e = parseEstimate(await runAppData(estimateArgs(await appDataRoot(disk), String(id)))); return e.folderBytes + e.volumeBytes } catch { return null }
+    },
 }
 export const sumsLookUsable = (sums: string | null): boolean =>
     !!sums && sums.split('\n').some(l => /^[0-9a-f]{64} [ *]\.?\/?compose\.yaml$/.test(l.trim()))
+
+/** Bundle info for Disk.appBundles from a bundle folder (idea#76 gap 1). Only the fields with a valid value are set. */
+export const bundleInfo = (appId: string, sums: string | null, sizeBytes: number, xapp: Record<string, any>): AppBundleInfo => {
+    const b: AppBundleInfo = { appId: appId as AppID, version: parseAppId(appId).version, sumsListed: sumsLookUsable(sums), sizeBytes }
+    if (Array.isArray(xapp.updatesFrom)) b.updatesFrom = xapp.updatesFrom.map(Number).filter(n => Number.isFinite(n))
+    const t = Number(xapp.healthTimeout)
+    if (xapp.healthTimeout != null && Number.isFinite(t) && t > 0) b.healthTimeout = t
+    if (typeof xapp.migrationNote === 'string' && xapp.migrationNote.trim()) b.migrationNote = xapp.migrationNote.trim()
+    return b
+}
+
+export interface PublishBundlesDeps extends Pick<UpdateAvailableDeps, 'mountRoot' | 'listApps' | 'readSums' | 'readXApp'> {
+    dirBytes: (dir: string) => Promise<number>
+    isBundle: (dir: string) => Promise<boolean>
+}
+const defaultPublishDeps: PublishBundlesDeps = {
+    mountRoot: (disk) => diskMountRoot(disk),
+    listApps: defaultAvailableDeps.listApps,
+    readSums: defaultAvailableDeps.readSums,
+    readXApp: defaultAvailableDeps.readXApp,
+    dirBytes: async (dir) => (await import('./CopyMoveApp.js')).directoryBytes(dir),
+    isBundle: async (dir) => (await fs.pathExists(path.join(dir, 'compose.yaml'))) && !await isUnfinishedFetch(dir),
+}
+
+/**
+ * Write Disk.appBundles for a disk docked HERE (idea#76 gap 1, Lead option A): called on dock only.
+ * The store is written only when the list differs from what it holds (no timer, no rewrite when equal).
+ * A half-fetched bundle (no done marker) is not listed. Returns true when the store was written.
+ */
+export const publishAppBundles = async (storeHandle: DocHandle<Store>, disk: Disk, deps: Partial<PublishBundlesDeps> = {}): Promise<boolean> => {
+    const d = { ...defaultPublishDeps, ...deps }
+    let list: AppBundleInfo[]
+    try {
+        const apps = joinMountRoot(await d.mountRoot(disk), 'apps')
+        list = []
+        for (const appId of (await d.listApps(apps).catch(() => [] as string[])).sort()) {
+            const dir = joinMountRoot(apps, appId)
+            if (!await d.isBundle(dir).catch(() => false)) continue
+            list.push(bundleInfo(appId, await d.readSums(dir), await d.dirBytes(dir).catch(() => 0), await d.readXApp(dir).catch(() => ({}))))
+        }
+    } catch (e) { log(`publishAppBundles ${disk.id}: ${(e as Error).message}`); return false }
+    const cur = storeHandle.doc().diskDB[disk.id as DiskID]
+    if (!cur || JSON.stringify(cur.appBundles ?? null) === JSON.stringify(list)) return false
+    storeHandle.change(doc => {
+        const x = doc.diskDB[disk.id as DiskID]
+        if (x) x.appBundles = list.map(b => ({ ...b, ...(b.updatesFrom ? { updatesFrom: [...b.updatesFrom] } : {}) }))
+    })
+    return true
+}
+
+/** Rough LAN copy rate for the cross-Engine part of estimatedMinutes, until Atlas's measurement (idea#351 §10.2). */
+export const TRANSFER_BYTES_PER_MIN = 1024 ** 3
+
+/** Bundles on disks docked on OTHER Engines that may be offered: sumsListed and the source advertises updateAppFetch. */
+export const remoteBundles = (store: Store, engineId: string): { disk: Disk, appId: string, xapp: Record<string, any>, sizeBytes: number }[] =>
+    (Object.values(store.diskDB ?? {}) as Disk[]).flatMap(disk => {
+        if (!disk || !disk.dockedTo || !disk.device || String(disk.dockedTo) === engineId || !Array.isArray(disk.appBundles)) return []
+        const caps = (store.engineDB as any)?.[String(disk.dockedTo)]?.capabilities
+        if (!Array.isArray(caps) || !caps.includes('updateAppFetch')) return []
+        return disk.appBundles.filter(b => b && b.sumsListed).map(b => ({
+            disk, appId: String(b.appId), sizeBytes: Number(b.sizeBytes) || 0,
+            xapp: { updatesFrom: b.updatesFrom ? [...b.updatesFrom] : undefined, healthTimeout: b.healthTimeout, migrationNote: b.migrationNote },
+        }))
+    })
 
 export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engineId: string, deps: Partial<UpdateAvailableDeps> = {}): Promise<number> => {
     const d = { ...defaultAvailableDeps, ...deps }
     const store = storeHandle.doc()
     const docked = Object.values(store.diskDB ?? {}).filter(x => x && String(x.dockedTo) === engineId && x.device) as Disk[]
-    const bundles: { disk: Disk, appId: string }[] = []
+    const bundles: { disk: Disk, appId: string, xapp: Record<string, any>, sizeBytes?: number }[] = []
     for (const disk of docked) {
         let root: string
         try { root = await d.mountRoot(disk) } catch { continue }
         for (const appId of await d.listApps(joinMountRoot(root, 'apps')).catch(() => [] as string[])) {
-            if (sumsLookUsable(await d.readSums(joinMountRoot(root, 'apps', appId)))) bundles.push({ disk, appId })
+            const dir = joinMountRoot(root, 'apps', appId)
+            if (sumsLookUsable(await d.readSums(dir))) bundles.push({ disk, appId, xapp: await d.readXApp(dir).catch(() => ({})) })
         }
     }
+    // idea#76 gap 1: local bundles first, so a local copy wins a version tie over a remote one
+    bundles.push(...remoteBundles(store, engineId))
     const updates: Record<string, Instance['updateAvailable']> = {}
     for (const inst of Object.values(store.instanceDB ?? {}) as Instance[]) {
-        if (!inst || !docked.some(x => String(x.id) === String(inst.storedOn))) continue
-        let best: { disk: Disk, appId: string } | null = null
+        if (!inst) continue
+        if (!docked.some(x => String(x.id) === String(inst.storedOn))) {
+            // idea#76: an instance whose disk is docked nowhere has no hint; one docked on another Engine is that Engine's
+            const own = inst.storedOn ? store.diskDB[inst.storedOn as DiskID] : undefined
+            if (inst.updateAvailable && (!own || !own.dockedTo)) updates[String(inst.id)] = null
+            continue
+        }
+        let best: (typeof bundles)[number] | null = null
         for (const b of bundles) {
-            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true })) continue
+            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true, updatesFrom: b.xapp.updatesFrom })) continue
             const c = best ? compareVersions(parseAppId(b.appId).version, parseAppId(best.appId).version) : 1
             if (c !== null && (c > 0 || (c === 0 && String(b.disk.id) === String(inst.storedOn)))) best = b
         }
         if (!best) { updates[String(inst.id)] = null; continue }
         const from = parseAppId(String(inst.instanceOf)).version, to = parseAppId(best.appId).version
-        updates[String(inst.id)] = {
-            appId: best.appId as AppID, sourceDiskId: best.disk.id as DiskID, sourceEngineId: engineId as any,
+        const u: NonNullable<Instance['updateAvailable']> = {
+            appId: best.appId as AppID, sourceDiskId: best.disk.id as DiskID, sourceEngineId: String(best.disk.dockedTo) as any,
             fromVersion: from, toVersion: to, major: isMajorChange(from, to),
         }
+        // idea#76: estimatedMinutes (snapshot copy + health timeout) and the App's migrationNote
+        const disk = docked.find(x => String(x.id) === String(inst.storedOn))!
+        const bytes = await d.dataBytes(disk, inst.id).catch(() => null)
+        const remote = String(best.disk.dockedTo) !== engineId
+        if (remote) u.sizeBytes = best.sizeBytes ?? 0
+        if (bytes !== null) u.estimatedMinutes = estimateUpdateMinutes(bytes, healthTimeoutSeconds(parseAppId(best.appId).name, best.xapp.healthTimeout))
+            + (remote ? Math.ceil((best.sizeBytes ?? 0) / TRANSFER_BYTES_PER_MIN) : 0)
+        if (typeof best.xapp.migrationNote === 'string' && best.xapp.migrationNote.trim()) u.migrationNote = best.xapp.migrationNote.trim()
+        updates[String(inst.id)] = u
     }
     storeHandle.change(doc => {
         for (const [id, u] of Object.entries(updates)) {
@@ -589,6 +709,23 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
         }
     })
     return Object.values(updates).filter(Boolean).length
+}
+
+/**
+ * idea#76 gap 1: true when a store patch changes a disk's dockedTo or appBundles, so the cross-Engine
+ * hints must be recomputed (dock/undock on any Engine, or a source Engine republishing its list).
+ */
+export const patchTouchesBundles = (p: { path: (string | number)[] }): boolean =>
+    p.path[0] === 'diskDB' && (p.path[2] === 'dockedTo' || p.path[2] === 'appBundles' || p.path.length <= 2)
+
+let hintTimer: ReturnType<typeof setTimeout> | null = null
+/** Debounced refreshUpdateAvailable for store changes (one refresh per burst of patches). */
+export const scheduleHintRefresh = (storeHandle: DocHandle<Store>, engineId: string, delayMs = 2000): void => {
+    if (hintTimer) clearTimeout(hintTimer)
+    hintTimer = setTimeout(() => {
+        hintTimer = null
+        refreshUpdateAvailable(storeHandle, engineId).catch(e => log(`updateAvailable refresh after a disk change failed: ${(e as Error).message}`))
+    }, delayMs)
 }
 
 /**
