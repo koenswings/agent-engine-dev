@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '15'
+export const APP_DATA_HELPER_VERSION = '16'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -50,7 +50,10 @@ export const BORG_PATH = '/usr/bin/borg'
 
 const ROOT_TOKEN = /^(system|sd[a-z][1-9]|[a-z0-9][a-z0-9-]{0,63})$/
 const ID_TOKEN = /^[a-z0-9][a-z0-9-]{0,63}$/
-const ARCHIVE_TOKEN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z$/
+/** engine#401 (helper v16): an optional -hook / -stop / -cold mode suffix. */
+const ARCHIVE_TOKEN = /^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z(-(hook|stop|cold))?$/
+/** engine#401: the helper version that accepts a mode suffix on archive names. */
+export const ARCHIVE_MODE_HELPER_MIN = 16
 /** UTC stamp for .idea-verify/<id>-<stamp>/ (idea#446). No path separators. */
 const STAMP_TOKEN = /^[0-9]{8}T[0-9]{6,15}Z$/
 const APP_TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/

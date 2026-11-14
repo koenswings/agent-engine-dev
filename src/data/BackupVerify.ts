@@ -26,7 +26,8 @@ import {
     AppDataRunner, runAppData, helperAtLeast,
     borgListArgs, borgExtractVerifyArgs, quarantineBackupsArgs, verifyStampNow,
 } from '../utils/appDataHelper.js'
-import { parseBackupExcludeList, parseBackupVerifyLists } from '../utils/backupExclude.js'
+import { parseBackupExcludeList, parseBackupVerifyLists, parseBackupVerifyModeLists } from '../utils/backupExclude.js'
+import { parseArchiveName, type ArchiveMode } from '../utils/backupArchiveName.js'
 import { isBackupActive, runningBackupOnDisk, BACKUP_IN_PROGRESS, recordBackupStaleLocks, clearBackupStaleLock } from '../monitors/backupMonitor.js'
 
 /** idea#450: v9's 2-arg borg-list printed no archives list on real borg; require the fixed v10.
@@ -38,6 +39,8 @@ export const VERIFY_SPACE_MARGIN = 0.10
 
 export interface BackupArchiveInfo {
     name: string
+    /** engine#401: the backup mode from the name's suffix; null for an untagged (older) archive. */
+    mode?: ArchiveMode | null
     start?: string | null
     end?: string | null
     originalSize?: number | null
@@ -47,7 +50,8 @@ export interface BackupArchiveInfo {
 export interface BackupPathCheck {
     path: string
     expect: 'present' | 'absent'
-    source: 'exclude' | 'verify.present' | 'verify.absent'
+    /** engine#401 adds 'verify.<mode>.present' / 'verify.<mode>.absent' for a tagged archive. */
+    source: 'exclude' | 'verify.present' | 'verify.absent' | `verify.${ArchiveMode}.present` | `verify.${ArchiveMode}.absent`
     ok: boolean
 }
 
@@ -113,6 +117,7 @@ export const parseBorgListInventory = (json: string): BackupArchiveInfo[] => {
     if (!Array.isArray(archives)) throw new Error('borg-list JSON has no archives list')
     return archives.map((a: any) => ({
         name: String(a?.name ?? ''),
+        mode: parseArchiveName(String(a?.name ?? '')).mode,
         start: a?.start ?? a?.time ?? null,
         end: a?.end ?? null,
         originalSize: typeof a?.stats?.original_size === 'number' ? a.stats.original_size
@@ -134,8 +139,10 @@ export const newestArchive = (archives: BackupArchiveInfo[]): BackupArchiveInfo 
         withTime.sort((x, y) => y.t - x.t)
         return withTime[0].a
     }
-    // Engine archive names are ISO with : and . replaced by -, so lexicographic order is chronological.
-    return [...archives].sort((a, b) => a.name < b.name ? 1 : a.name > b.name ? -1 : 0)[0]
+    // Engine archive names are ISO with : and . replaced by -, so lexicographic order of the
+    // timestamp part is chronological (engine#401: a -hook/-stop/-cold suffix is ignored).
+    const ts = (a: BackupArchiveInfo) => parseArchiveName(a.name).timestamp
+    return [...archives].sort((a, b) => ts(a) < ts(b) ? 1 : ts(a) > ts(b) ? -1 : 0)[0]
 }
 
 /** Member paths from `borg list` (plain lines or --json-lines). */
@@ -250,6 +257,7 @@ const buildPathChecks = (
     members: string[],
     exclude: string[],
     verify: { present: string[]; absent: string[] },
+    modeVerify?: { mode: ArchiveMode, present: string[]; absent: string[] },
 ): BackupPathCheck[] => {
     const checks: BackupPathCheck[] = []
     for (const p of exclude) {
@@ -260,6 +268,14 @@ const buildPathChecks = (
     }
     for (const p of verify.absent) {
         checks.push({ path: p, expect: 'absent', source: 'verify.absent', ok: !pathsFoundInMembers(members, instanceId, p) })
+    }
+    if (modeVerify) {
+        for (const p of modeVerify.present) {
+            checks.push({ path: p, expect: 'present', source: `verify.${modeVerify.mode}.present`, ok: pathsFoundInMembers(members, instanceId, p) })
+        }
+        for (const p of modeVerify.absent) {
+            checks.push({ path: p, expect: 'absent', source: `verify.${modeVerify.mode}.absent`, ok: !pathsFoundInMembers(members, instanceId, p) })
+        }
     }
     return checks
 }
@@ -381,18 +397,24 @@ export const verifyBackup = async (
 
         let exclude: string[] = []
         let verify = { present: [] as string[], absent: [] as string[] }
+        // engine#401: a tagged archive also gets its mode's list; an untagged one only the flat lists
+        const mode = parseArchiveName(arch.name).mode
+        let modeVerify: { mode: ArchiveMode, present: string[], absent: string[] } | undefined
         try {
             const xapp = await readInstanceComposeXapp(storeHandle.doc(), instance.id)
             exclude = parseBackupExcludeList(xapp)
             verify = parseBackupVerifyLists(xapp)
+            const byMode = parseBackupVerifyModeLists(xapp)
+            if (mode && byMode[mode]) modeVerify = { mode, ...byMode[mode]! }
         } catch (e: any) {
             throw new Error(`verifyBackup: invalid x-app.backup on the instance compose (${e?.message ?? e})`)
         }
-        const checks = buildPathChecks(instance.id, checkMembers, exclude, verify)
+        const checks = buildPathChecks(instance.id, checkMembers, exclude, verify, modeVerify)
         const memberCap = (members.length ? members : scratchRels).slice(0, VERIFY_MEMBER_CAP)
         const result = {
             ok: checks.every(c => c.ok),
             archive: arch.name,
+            mode,
             scratchPath: usedPath,
             archiveOriginalBytes: arch.originalSize ?? null,
             archiveCompressedBytes: arch.compressedSize ?? null,

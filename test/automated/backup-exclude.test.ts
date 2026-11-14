@@ -207,7 +207,9 @@ describe('backupInstance honours x-app.backup.exclude (idea#443)', () => {
         const op = Object.values(h.doc()!.operationDB ?? {}).find((o: any) => o.kind === 'backupApp') as any
         expect(op?.status, op?.error).toBe('Done')
         const log = await calls()
-        expect(log.some(l => l === 'version' || l.startsWith('version '))).toBe(false)
+        // engine#401: the one helper version check now decides the archive-name mode suffix;
+        // a v7 helper still backs up, with today's untagged name (no exclude check, no refusal)
+        expect(log.filter(l => l === 'version' || l.startsWith('version '))).toHaveLength(1)
         expect(log.find(l => l.startsWith('borg-create '))).toMatch(new RegExp(`^borg-create ${backupDevice} ${INST} \\d{4}-\\d{2}-\\d{2}T[0-9-]+Z ${appDevice}$`))
     })
 })

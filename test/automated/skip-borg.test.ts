@@ -196,10 +196,13 @@ describe('backupInstance / restoreApp with testMode on', () => {
         const log = await calls()
         expect(backupOp?.status, JSON.stringify(backupOp)).toBe('Done')
         expect(log[0]).toBe(`borg-init ${backupDevice} ${INST}`)
-        expect(log[1]).toMatch(new RegExp(`^borg-create ${backupDevice} ${INST} \\d{4}-\\d{2}-\\d{2}T[0-9-]+Z ${appDevice}$`))
-        expect(log[2]).toBe(`borg-info ${backupDevice} ${INST}`)
-        expect(log[3]).toBe(`borg-extract ${backupDevice} ${INST} 2026-10-06T08-00-00-000Z 3 ${appDevice}`)
-        expect(log).toHaveLength(4)
+        // engine#401: one helper version check picks the archive-name mode suffix; this fake
+        // helper reports no version, so the name stays untagged
+        expect(log[1]).toBe('version')
+        expect(log[2]).toMatch(new RegExp(`^borg-create ${backupDevice} ${INST} \\d{4}-\\d{2}-\\d{2}T[0-9-]+Z ${appDevice}$`))
+        expect(log[3]).toBe(`borg-info ${backupDevice} ${INST}`)
+        expect(log[4]).toBe(`borg-extract ${backupDevice} ${INST} 2026-10-06T08-00-00-000Z 3 ${appDevice}`)
+        expect(log).toHaveLength(5)
     })
     it('a failed borg create keeps the .backup-in-progress lock (boot-resume) but blocks nothing: no running op, locks released, the next backup runs and removes it', async () => {
         // On-Pi triage idea04 2026-10-25: the real helper refused borg-create and the lock stayed.

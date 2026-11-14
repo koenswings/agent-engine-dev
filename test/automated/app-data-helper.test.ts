@@ -111,6 +111,15 @@ describe('helper argv builders', () => {
         expect(borgExtractVerifyArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261111T231806123Z')).toEqual(['borg-extract-verify', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261111T231806123Z'])
         expect(borgExtractVerifyArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261112T001825Z')).toEqual(['borg-extract-verify', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '20261112T001825Z'])
         expect(borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z')).toEqual(['borg-delete', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z'])
+        // engine#401: tagged archive names (helper v16) pass; anything else after the Z does not
+        for (const mode of ['hook', 'stop', 'cold']) {
+            const n = `2026-10-06T10-18-00-123Z-${mode}`
+            expect(borgCreateArgs('sdc1', 'inst-1', n, 'system')[3]).toBe(n)
+            expect(borgDeleteArgs('sdc1', 'inst-1', n)[3]).toBe(n)
+            expect(borgExtractArgs('sdc1', 'inst-1', n, 3, 'sdb1')[3]).toBe(n)
+        }
+        expect(() => borgCreateArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z-live', 'system')).toThrow(/archive name/)
+        expect(() => borgListArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z-hook;x')).toThrow(/archive name/)
         expect(borgDeleteArgs('sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', 3)).toEqual(['borg-delete', 'sdc1', 'inst-1', '2026-10-06T10-18-00-123Z', '3'])
         expect(borgCompactArgs('sdc1', 'inst-1')).toEqual(['borg-compact', 'sdc1', 'inst-1'])
         expect(quarantineBackupsArgs('sdc1')).toEqual(['quarantine-backups', 'sdc1'])
@@ -126,7 +135,7 @@ describe('helper argv builders', () => {
 
     it('refuse paths, option-looking tokens and bad archives/strips before anything runs', () => {
         for (const d of ['sdb3', 'sdb4', 'sdz9']) expect(sizeArgs(d, 'inst-1')).toEqual(['size', d, 'inst-1'])
-        expect(APP_DATA_HELPER_VERSION).toBe('15')
+        expect(APP_DATA_HELPER_VERSION).toBe('16')
         for (const d of ['sdb3', 'sdb9']) expect(() => eraseSlotArgs(d, '/tmp/x')).toThrow(/not a test slot name/)
         expect(() => sizeArgs('/disks/sdb1', 'x')).toThrow(/not a disk root/)
         expect(() => sizeArgs('..', 'x')).toThrow(/not a disk root/)

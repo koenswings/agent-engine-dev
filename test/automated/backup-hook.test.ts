@@ -671,6 +671,46 @@ describe('backupInstance method hook (idea#444)', () => {
         expect(hookCalls.map(c => c.which)).toEqual(['preHook', 'postHook'])
     })
 
+    // ── engine#401: the archive name carries the backup mode ─────────────────
+    const createdArchive = async () => (await calls()).find(l => l.startsWith('borg-create '))?.split(' ')[3] ?? ''
+
+    it('engine#401 helper v16: a hook backup is named <ts>-hook and recorded in op.args.archive', async () => {
+        process.env.FAKE_HELPER_VERSION = '16'
+        await writeCompose(hookBlock())
+        const h = await runBackup('Running')
+        const name = await createdArchive()
+        expect(name).toMatch(/^\d{4}-\d{2}-\d{2}T[0-9-]+Z-hook$/)
+        expect(opOf(h)?.args?.archive).toBe(name)
+    })
+
+    it('engine#401 helper v16: a HOOK_FALLBACK backup is named <ts>-stop', async () => {
+        process.env.FAKE_HELPER_VERSION = '16'
+        preOutcome = { code: 1, stderr: 'no dump' }
+        await writeCompose(hookBlock())
+        const h = await runBackup('Running')
+        expect(opOf(h)?.args?.hookResult).toBe('HOOK_FALLBACK')
+        expect(await createdArchive()).toMatch(/Z-stop$/)
+    })
+
+    it('engine#401 helper v16: a stopped hook instance is named <ts>-cold; method stop is <ts>-stop', async () => {
+        process.env.FAKE_HELPER_VERSION = '16'
+        await writeCompose(hookBlock())
+        await runBackup('Stopped')
+        expect(await createdArchive()).toMatch(/Z-cold$/)
+        await fs.remove(borgLog)
+        await writeCompose({ exclude: ['keys'] })
+        await runBackup('Running')
+        expect(await createdArchive()).toMatch(/Z-stop$/)
+    })
+
+    it('engine#401 an older helper (v8) gets today\'s untagged name', async () => {
+        await writeCompose(hookBlock())
+        const h = await runBackup('Running')
+        const name = await createdArchive()
+        expect(name).toMatch(/^\d{4}-\d{2}-\d{2}T[0-9-]+Z$/)
+        expect(opOf(h)?.args?.archive).toBe(name)
+    })
+
     // ── idea#448: the pre-update backup updateApp takes itself ────────────────
     const newBundleCompose = async (backup: Record<string, unknown>, services: Record<string, unknown> = { collector: {}, tailscale: {} }) => {
         const dir = `${DISKS_ROOT}/${appDevice}/apps/usage-dashboard-1.1`
