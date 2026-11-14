@@ -6,6 +6,7 @@ import { CommandLogStore, addTrace, closeTrace, getCommandLogHandle, takePending
 import { runWithTrace, flushTrace } from "./CommandLogger.js";
 import { print } from './utils.js';
 import { redactString } from './redact.js';
+import { setupDemoTraceApps } from '../data/DemoApps.js';
 
 
 /**
@@ -151,6 +152,11 @@ export const handleCommand = async (
             ? Object.fromEntries(command.args.map((a, i) =>
                 [a.name!, a.variadic ? stringArgs.slice(i) : stringArgs[i] ?? null]))
             : stringArgs
+    // setupDemo: COMMANDS.md documents args.apps as a comma-separated string, not the raw `--apps` tokens.
+    if (commandName === 'setupDemo' && !Array.isArray(namedArgs)) {
+        const rest = Array.isArray(namedArgs.apps) ? namedArgs.apps as string[] : []
+        namedArgs.apps = setupDemoTraceApps(rest)
+    }
     const argsJson = JSON.stringify(namedArgs);
     const traceCtx = { traceId, command: commandName, args: argsJson };
 

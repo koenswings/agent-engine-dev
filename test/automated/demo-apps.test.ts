@@ -11,13 +11,16 @@ import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import {
     setupDemo, removeDemo, DemoError, stepPlan, parseAppsList, parseAppsFlag,
-    demoKey, markDemoInterrupted, resetDemoHbForTests,
+    setupDemoTraceApps, demoKey, markDemoInterrupted, resetDemoHbForTests,
     isDemoAppsCapabilityOn, resetDemoAppsCapabilityForTests,
 } from '../../src/data/DemoApps.js'
 import { recoverInterruptedOperations } from '../../src/data/Operations.js'
 import { validate } from '../../src/data/CopyMoveApp.js'
 import { backupInstance } from '../../src/monitors/backupMonitor.js'
-import { resourceLock } from '../../src/utils/ResourceLock.js'
+import { resourceLock, instanceKey } from '../../src/utils/ResourceLock.js'
+import { commands } from '../../src/data/Commands.js'
+import { handleCommand } from '../../src/utils/commandUtils.js'
+import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { stampComposeInstanceIdentity } from '../../src/data/InstanceCopy.js'
 import type { InstanceID } from '../../src/data/CommonTypes.js'
 
@@ -121,6 +124,9 @@ describe('parseAppsList / parseAppsFlag', () => {
         expect(parseAppsList('kolibri,nextcloud')).toEqual(['kolibri', 'nextcloud'])
         expect(parseAppsFlag(['--apps', 'kolibri'])).toEqual(['kolibri'])
         expect(parseAppsFlag([])).toEqual(['kolibri', 'nextcloud'])
+        expect(setupDemoTraceApps(['--apps', 'kolibri'])).toBe('kolibri')
+        expect(setupDemoTraceApps([])).toBe('kolibri,nextcloud')
+        expect(setupDemoTraceApps(['--apps', 'kolibri,nextcloud'])).toBe('kolibri,nextcloud')
         expect(() => parseAppsList('kiwix')).toThrow(DemoError)
         expect(() => parseAppsList('kiwix')).toThrow(/UNKNOWN_APP/)
     })
@@ -380,5 +386,105 @@ describe('setupDemo default skips NO_SOURCE (engine#369 follow-up)', () => {
         expect(await codeOf(setupDemo(h, 'd1', ['kolibri', 'nextcloud'], ME, deps(), { explicitApps: true }))).toMatch(/^NO_SOURCE: /)
         expect(Object.keys(h.doc().operationDB ?? {})).toHaveLength(0)
         expect(h.doc().instanceDB['inst-k' as any]).toBeUndefined()
+    })
+})
+
+const newLog = (): DocHandle<CommandLogStore> =>
+    new Repo({ network: [], storage: undefined }).create<CommandLogStore>({ traces: {}, recentTraceIds: [] })
+const lastTrace = (log: DocHandle<CommandLogStore>): CommandTrace | undefined => {
+    const ids = log.doc()!.recentTraceIds
+    return ids.length ? log.doc()!.traces[ids[ids.length - 1]] : undefined
+}
+
+const realRemoveDeps = () => {
+    const { remove: _drop, ...rest } = deps({
+        removeInstanceDeps: {
+            helperProblem: async () => null,
+            instanceDir: async (_d: unknown, id: string) => path.join(tmp, 'instances', String(id)),
+            composeDown: async () => {},
+            removeProjectContainers: async () => {},
+            listVolumes: async () => [] as string[],
+            quarantine: async (_d: unknown, id: string) => path.join(tmp, '.idea-quarantine', `${id}-stamp`),
+            quarantineSnapshot: async () => '',
+            refreshSnapshots: async () => {},
+            pruneNetworks: async () => {},
+        },
+    })
+    return rest
+}
+
+describe('setupDemo command trace apps and packVersion (engine#369 follow-up)', () => {
+    it("command trace stores apps as the comma string 'kolibri', not the raw --apps tokens", async () => {
+        const log = newLog()
+        await log.whenReady()
+        await handleCommand(commands, h, 'engine', 'setupDemo d1 --apps kolibri', log)
+        const args = JSON.parse(lastTrace(log)!.args)
+        expect(args).toEqual({ targetDiskId: 'd1', apps: 'kolibri' })
+        expect(typeof args.apps).toBe('string')
+        await handleCommand(commands, h, 'engine', 'setupDemo d1', log)
+        expect(JSON.parse(lastTrace(log)!.args)).toEqual({ targetDiskId: 'd1', apps: 'kolibri,nextcloud' })
+    })
+
+    it("packVersion stays null during download and is set to the real version at verify, never 'github'", async () => {
+        const payload = path.join(tmp, 'payload')
+        await writeValidPack(payload, 4)
+        const tar = path.join(tmp, 'idea-demo-kolibri-v4.tar')
+        const { $ } = await import('zx')
+        await $`tar -cf ${tar} -C ${payload} pack.json CREDITS.txt`
+        const digest = sha(await fs.readFile(tar))
+        await fs.outputFile(path.join(tmp, 'apps', 'kolibri-1.2-0.19.5', 'app.yaml'), appYaml(digest, (await fs.stat(tar)).size, 3))
+        let duringDownload: { packVersion: unknown, downloadStatus: unknown } | null = null
+        const r = await setupDemo(h, 'd1', ['kolibri'], ME, deps({
+            hasInternet: async () => true,
+            download: async (url: string, dest: string, onProgress?: Function) => {
+                downloads.push(url)
+                const op = Object.values(h.doc().operationDB)[0] as any
+                const app = op.demo.apps[0]
+                duringDownload = {
+                    packVersion: app.packVersion,
+                    downloadStatus: app.steps.find((s: any) => s.id === 'download')?.status,
+                }
+                onProgress?.(10, 100)
+                await fs.copy(tar, dest)
+            },
+        }))
+        expect(r.code).toBe('DEMO_READY')
+        expect(duringDownload).toEqual({ packVersion: null, downloadStatus: 'running' })
+        expect(r.apps[0].packVersion).toBe('4')
+        const op = Object.values(h.doc().operationDB)[0] as any
+        expect(op.demo.apps[0].packVersion).toBe('4')
+        expect(op.demo.apps[0].source).toBe('github')
+        expect(op.demo.apps[0].packVersion).not.toBe('github')
+    })
+})
+
+describe('removeDemo uses the real removeInstance lock check (engine#369 follow-up)', () => {
+    it('removes the instance end-to-end while removeDemo holds the instance lock, and ends DEMO_REMOVED', async () => {
+        h.change(doc => {
+            doc.instanceDB['demo-k' as any] = { id: 'demo-k', name: 'Kolibri Demo', storedOn: 'd1', instanceOf: 'kolibri-1.2-0.19.5', status: 'Stopped', port: 50001, demo: true } as any
+        })
+        const r = await removeDemo(h, ['demo-k'], ME, realRemoveDeps())
+        expect(r.code).toBe('DEMO_REMOVED')
+        expect(r.removed[0].instanceId).toBe('demo-k')
+        expect(h.doc().instanceDB['demo-k' as any]).toBeUndefined()
+        const op = Object.values(h.doc().operationDB)[0] as any
+        expect(op.kind).toBe('removeDemo')
+        expect(op.status).toBe('Done')
+        expect(op.demo.code).toBe('DEMO_REMOVED')
+        expect(resourceLock.isLocked(instanceKey('demo-k'))).toBe(false)
+    })
+
+    it('BUSY when a different op holds the instance lock; the instance is left in place', async () => {
+        h.change(doc => {
+            doc.instanceDB['demo-k' as any] = { id: 'demo-k', name: 'Kolibri Demo', storedOn: 'd1', instanceOf: 'kolibri-1.2-0.19.5', status: 'Stopped', port: 50001, demo: true } as any
+        })
+        expect(resourceLock.acquire(instanceKey('demo-k'), 'backupApp')).toBe(true)
+        try {
+            expect(await codeOf(removeDemo(h, ['demo-k'], ME, realRemoveDeps()))).toMatch(/^BUSY: /)
+            expect(Object.keys(h.doc().operationDB ?? {})).toHaveLength(0)
+            expect(h.doc().instanceDB['demo-k' as any]).toBeTruthy()
+        } finally {
+            resourceLock.release(instanceKey('demo-k'))
+        }
     })
 })

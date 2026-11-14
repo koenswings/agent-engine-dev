@@ -34,6 +34,7 @@ import {
     spaceNeededBytes, verifyExtractedPack, verifyTarSha256,
     DownloadFn,
 } from './DemoPack.js'
+import type { RemoveDeps } from './RemoveInstance.js'
 
 export type DemoStepId = 'install' | 'download' | 'verify' | 'seed' | 'start' | 'ready' | 'classwork' | 'stop' | 'remove'
 export type DemoStepStatus = 'pending' | 'running' | 'done' | 'skipped' | 'failed'
@@ -218,6 +219,12 @@ export const parseAppsList = (raw: string | undefined | null, fallback: DemoAppN
     return out
 }
 
+/** Trace `args.apps` for setupDemo: a comma-separated string, never the raw `--apps` tokens (COMMANDS.md). */
+export const setupDemoTraceApps = (rest: string[]): string => {
+    try { return parseAppsFlag(rest).join(',') }
+    catch { return rest.filter(t => t !== '--apps' && t !== '--').join(',') }
+}
+
 /** Parse the optional `--apps` tokens from a variadic rest list. */
 export const parseAppsFlag = (rest: string[]): DemoAppName[] => {
     if (!rest.length) return [...DEMO_APP_NAMES]
@@ -358,9 +365,11 @@ export interface SetupDemoDeps {
     sleep: (ms: number) => Promise<void>
     /** Injected python3 check for tests; production uses checkDemoAppsCapability's default. */
     checkDemoApps?: () => boolean
+    /** Passed through to the real removeInstance when `remove` is not overridden (tests). */
+    removeInstanceDeps?: Partial<RemoveDeps>
 }
 
-const defaultDeps = (storeHandle: DocHandle<Store>): SetupDemoDeps => ({
+const defaultDeps = (storeHandle: DocHandle<Store>, over: Partial<SetupDemoDeps> = {}): SetupDemoDeps => ({
     mountRoot: (disk) => diskMountRoot(disk),
     hasInternet,
     availableBytes,
@@ -380,7 +389,10 @@ const defaultDeps = (storeHandle: DocHandle<Store>): SetupDemoDeps => ({
     },
     start: async (inst, disk) => (await import('./Instance.js')).startInstance(storeHandle, inst, disk),
     stop: async (inst, disk) => (await import('./Instance.js')).stopInstance(storeHandle, inst, disk),
-    remove: async (instanceArg, engineId) => (await import('./RemoveInstance.js')).removeInstance(storeHandle, instanceArg, engineId),
+    remove: async (instanceArg, engineId) => (await import('./RemoveInstance.js')).removeInstance(storeHandle, instanceArg, engineId, {
+        alreadyLocked: true,
+        ...(over.removeInstanceDeps ?? {}),
+    }),
     runHook: async ({ hookPath, step, cwd, env, timeoutSec }) => {
         try {
             const out = await $({ cwd, env: { ...process.env, ...env }, timeout: timeoutSec * 1000, nothrow: true })`bash ${hookPath} ${step}`
@@ -410,7 +422,7 @@ export const setupDemo = async (
     deps: Partial<SetupDemoDeps> = {},
     opts: { explicitApps?: boolean } = {},
 ): Promise<{ code: 'DEMO_READY', apps: { app: DemoAppName, instanceId: string, name: string, port: number, source: string | null, packVersion: string | null }[], skipped: string }> => {
-    const d: SetupDemoDeps = { ...defaultDeps(storeHandle), ...deps }
+    const d: SetupDemoDeps = { ...defaultDeps(storeHandle, deps), ...deps }
     const store = storeHandle.doc()
     const eng = localEngine(store, engineId)
     if (!apps.length) apps = [...DEMO_APP_NAMES]
@@ -529,7 +541,7 @@ export const setupDemo = async (
         instanceId: dockedDemoInstances(store, eng, p.app).find(i => String(i.storedOn) === String(disk.id))?.id ?? null,
         steps: stepPlan(p.bundle?.spec ?? null).map(id => ({ id, status: 'pending' as DemoStepStatus })),
         source: p.source,
-        packVersion: p.local ? String(p.local.packVersion) : (p.bundle?.spec.pack ? 'github' : null),
+        packVersion: null,  // set at verify, never a source name such as 'github'
         code: null,
         detail: null,
     }))
@@ -643,7 +655,7 @@ export const setupDemo = async (
                         fail('DOWNLOAD_FAILED', (e as Error).message, app, 'download')
                     }
                 } else {
-                    bump('download', 'skipped', { source, packVersion: String(pack.packVersion), bytesTotal: pack.bytes })
+                    bump('download', 'skipped', { source, bytesTotal: pack.bytes })
                 }
                 if (source) {
                     const cur = (storeHandle.doc().operationDB[opId] as any).demo as DemoProgress
@@ -790,7 +802,7 @@ export const removeDemo = async (
     engineId?: string,
     deps: Partial<SetupDemoDeps> = {},
 ): Promise<{ code: 'DEMO_REMOVED', removed: { instanceId: string, quarantinePath: string, keptVolumes: string[] }[] }> => {
-    const d: SetupDemoDeps = { ...defaultDeps(storeHandle), ...deps }
+    const d: SetupDemoDeps = { ...defaultDeps(storeHandle, deps), ...deps }
     const store = storeHandle.doc()
     const eng = localEngine(store, engineId)
 
