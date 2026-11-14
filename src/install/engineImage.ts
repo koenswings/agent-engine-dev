@@ -330,7 +330,7 @@ export const writeBootSshTrigger = async (boot: string): Promise<string> => {
 /**
  * Kernel arguments the image appends to <boot>/cmdline.txt (koenswings/idea#518). The Raspberry Pi firmware passes
  * cgroup_disable=memory; cgroup_enable=memory overrides it so Docker has memory accounting (docker stats and the
- * Engine's idea/metrics memUsageBytes/memLimitBytes read 0 without it). The idea repo's kernel-cmdline.sh appends
+ * Engine's idea/metrics memUsageBytes/memLimitBytes would otherwise be unknown (null; idea#518 follow-up) without it). The idea repo's kernel-cmdline.sh appends
  * the same token; both appends are idempotent.
  */
 export const KERNEL_CMDLINE_FLAGS = ['cgroup_enable=memory'] as const

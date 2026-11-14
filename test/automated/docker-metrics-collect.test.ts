@@ -161,4 +161,53 @@ describe('collectMetrics exact compose-project attribution (idea#492)', () => {
         expect(msg.instances[LIVE].cpuPercent).toBe(11)
         expect(msg.instances[DOTTED].cpuPercent).toBe(22)
     })
+
+    it('memUsageBytes is null, not 0, when docker reports 0B/0B or there is no memory data (idea#518)', async () => {
+        const C1 = `${A}-app-1`
+        const C2 = `${A}-app-2`
+        const ps = `${C1}\t${A}\n${C2}\t${A}\n${LIVE_C}\t${LIVE}\n${AB_C}\t${AB}\n`
+        await writeFakeDocker(ps, {
+            [C1]: statsLine(C1, '1.00%', '0B / 0B', '0.00%'),
+            [C2]: statsLine(C2, '2.00%', '0B / 0B', '0.00%'),
+            [LIVE_C]: statsLine(LIVE_C, '11.00%', '', '0.00%'),
+            [AB_C]: statsLine(AB_C, '3.00%', '0B /', '0.00%'),
+        })
+        const { metrics } = await collectMetrics([A, LIVE, AB])
+
+        // Two containers, both 0B/0B (no memory cgroup): stay null after the merge, not 0
+        expect(metrics.get(A)?.cpuPercent).toBe(3)
+        expect(metrics.get(A)?.memUsageBytes).toBeNull()
+        expect(metrics.get(A)?.memLimitBytes).toBeNull()
+        expect(metrics.get(A)?.memPercent).toBeNull()
+        expect(metrics.get(A)?.netRxBytes).toBe(2000) // two containers, 1.00kB each
+        expect(metrics.get(A)?.netTxBytes).toBe(4000)
+
+        // Empty MemUsage (no data)
+        expect(metrics.get(LIVE)?.memUsageBytes).toBeNull()
+        expect(metrics.get(LIVE)?.memLimitBytes).toBeNull()
+        expect(metrics.get(LIVE)?.cpuPercent).toBe(11)
+
+        // Usage 0B and no parseable limit (no data)
+        expect(metrics.get(AB)?.memUsageBytes).toBeNull()
+        expect(metrics.get(AB)?.memLimitBytes).toBeNull()
+        expect(metrics.get(AB)?.memPercent).toBeNull()
+    })
+
+    it('real memory values stay numbers, including a real 0 usage when a limit is present (idea#518)', async () => {
+        const C1 = `${A}-app-1`
+        const C2 = `${A}-app-2`
+        const ps = `${C1}\t${A}\n${C2}\t${A}\n${LIVE_C}\t${LIVE}\n`
+        await writeFakeDocker(ps, {
+            [C1]: statsLine(C1, '1.00%', '128MiB / 1GiB', '12.50%'),
+            [C2]: statsLine(C2, '2.00%', '128MiB / 1GiB', '12.50%'),
+            [LIVE_C]: statsLine(LIVE_C, '11.00%', '0B / 1GiB', '0.00%'),
+        })
+        const { metrics } = await collectMetrics([A, LIVE])
+        expect(metrics.get(A)?.memUsageBytes).toBe(2 * 128 * 1024 ** 2)
+        expect(metrics.get(A)?.memLimitBytes).toBe(1024 ** 3) // first container; limits are not summed
+        expect(metrics.get(A)?.memPercent).toBe(12.5)
+        expect(metrics.get(LIVE)?.memUsageBytes).toBe(0)
+        expect(metrics.get(LIVE)?.memLimitBytes).toBe(1024 ** 3)
+        expect(metrics.get(LIVE)?.memPercent).toBe(0)
+    })
 })
