@@ -1358,9 +1358,28 @@ export const versionDirName = (ref: string): string => {
 export const appCloneArgs = (gitAccount: string, appName: string, ref: string, dest: string): string[] =>
   ['clone', '--branch', ref, '--', `https://github.com/${gitAccount}/app-${appName}`, dest]
 
+/**
+ * idea#473: re-read x-app from the instance compose.yaml and update the store
+ * record through createOrUpdateInstance (no direct instanceOf edit). After a
+ * manual restore-snapshot the files can be an older version while the store
+ * still names the newer app; startInstance uses this so they agree again.
+ * If compose cannot be read, the existing record is kept and start continues.
+ */
+export const refreshInstanceFromCompose = async (
+  storeHandle: DocHandle<Store>,
+  instance: Instance,
+  disk: Disk,
+): Promise<Instance> => {
+  const updated = await createOrUpdateInstance(storeHandle, instance.id, disk)
+  return storeHandle.doc()?.instanceDB?.[instance.id] ?? updated ?? instance
+}
+
 /** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
 export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> =>
-  trackInFlight(String(disk.id), `startInstance ${instance.id}`, startInstanceTracked(storeHandle, instance, disk, cause))
+  trackInFlight(String(disk.id), `startInstance ${instance.id}`, (async () => {
+    const inst = await refreshInstanceFromCompose(storeHandle, instance, disk)
+    return startInstanceTracked(storeHandle, inst, disk, cause)
+  })())
 
 const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   const store: Store = storeHandle.doc()
