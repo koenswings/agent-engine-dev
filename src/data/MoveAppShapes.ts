@@ -2,14 +2,19 @@
  * MoveAppShapes.ts — the cross-Engine moveApp contract (idea#79). See SHAPES.md
  * at the repo root of PR "moveApp across Engines" for the Console-facing summary.
  *
- * A cross-Engine move is a copy followed by a delete:
+ * A cross-Engine move keeps the same instance id (engine#381): the app moves,
+ * it is not copied. The target folder is instances/<same id>; there is no second
+ * instanceDB row, and lastBackup / Backup Disk links stay on that id.
  *   1. copying  — the existing cross-Engine copyApp path (ensure-dirs, receive-app,
  *                 send/receive, receive-files, receive-service on the peer helper)
- *   2. checking — the target Engine verifies the copy (registered on its disk,
- *                 instance data size matches, healthy when the source was running)
- *                 and records the verdict in this operation
- *   3. removing — only after a recorded, complete verify: the source is removed with
- *                 the safe removeInstance (helper v4 quarantine, never rm)
+ *                 with an internal dstId equal to the source id (not on the CLI)
+ *   2. checking — the target Engine verifies the folder on operation.args.targetDiskId
+ *                 (not storedOn: the source stays authoritative until after verify),
+ *                 instance data size matches, and the port-ready registry is stable
+ *                 when the source was running; the verdict is recorded here
+ *   3. removing — only after a recorded, complete verify: storedOn flips to the
+ *                 target disk, then only the source folder is quarantined (helper v4,
+ *                 never rm). removeInstance is not used, so the store row is kept.
  */
 
 /** Engine capability: this Engine can move an App to a disk on another Engine. */
@@ -38,6 +43,7 @@ export const MOVE_REFUSAL_CODES = [
     'HELPER_OUTDATED',    // this Engine's idea-app-data helper is older than v4
     'BUSY',               // the instance or target disk is locked by another operation
     'INVALID',            // other validation refusal (same disk, external links, ...)
+    'TARGET_EXISTS',      // the same id is already on the target disk / Engine (engine#381)
 ] as const
 export const MOVE_FAILURE_CODES = [
     'COPY_FAILED',        // the copy failed
@@ -80,7 +86,7 @@ export interface MoveProgress {
     phase: MovePhase
     targetEngineId: string
     sourceInstanceId: string
-    /** the instance id on the target (a fresh id, set once copying registered it) */
+    /** equal to the source id, set once the target folder is in place (engine#381) */
     targetInstanceId: string | null
     /** source instance data bytes measured before the copy */
     expectedBytes: number | null
@@ -90,7 +96,7 @@ export interface MoveProgress {
     /** true only after verify.ok was recorded — the one gate for removing the source */
     verified: boolean
     sourceRemoved: boolean
-    /** where removeInstance quarantined the source folder */
+    /** where the source folder was quarantined (the instance record is kept) */
     quarantinePath: string | null
     code: MoveCode | null
     /** final text: MOVED to …, MOVE FAILED: … source kept, MOVED, source not removed: … */

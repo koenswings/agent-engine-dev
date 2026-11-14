@@ -239,6 +239,33 @@ describe('copyApp', () => {
         expect(capturedId).not.toBe(INSTANCE_ID)
     })
 
+    it('with dstId equal to the source id: keeps that id and does not register a second row', async () => {
+        const { handle } = await makeHandle()
+        const lastBackup = handle.doc().instanceDB[INSTANCE_ID]?.lastBackup
+        const { processInstance } = await import('../../src/data/Disk.js')
+        const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
+        const { startInstance } = await import('../../src/data/Instance.js')
+        const dst = await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID, 'console-command', { dstId: INSTANCE_ID, keepName: true })
+        expect(dst).toBe(INSTANCE_ID)
+        expect(vi.mocked(processInstance)).not.toHaveBeenCalled()
+        expect(vi.mocked(rsyncInstanceData).mock.calls[0][0]).toMatchObject({ dstId: INSTANCE_ID, srcId: INSTANCE_ID })
+        expect(handle.doc().instanceDB[INSTANCE_ID]?.lastBackup).toBe(lastBackup)
+        expect(handle.doc().instanceDB[INSTANCE_ID]?.storedOn).toBe(SOURCE_DISK_ID)
+        // start of the target is deferred to the move; a local preserve-id copy must not start either
+        expect(vi.mocked(startInstance)).not.toHaveBeenCalled()
+    })
+
+    it('a failed preserve-id copy removes only the target folder, even though instanceDB[id] still exists as the source', async () => {
+        const { handle } = await makeHandle()
+        const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
+        const helper = await import('../../src/utils/appDataHelper.js')
+        vi.mocked(rsyncInstanceData).mockRejectedValueOnce(new Error('rsync cancelled (SIGTERM)'))
+        await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID, 'console-command', { dstId: INSTANCE_ID, keepName: true, rethrow: false })
+        expect(vi.mocked(helper.deleteInstanceData).mock.calls).toEqual([['idea-test-2', INSTANCE_ID]])
+        expect(handle.doc().instanceDB[INSTANCE_ID]).toBeDefined()
+        expect(handle.doc().instanceDB[INSTANCE_ID]?.storedOn).toBe(SOURCE_DISK_ID)
+    })
+
     it('stops and restarts the source instance when it is Running', async () => {
         const { handle } = await makeHandle('Running')
         const { stopInstance, startInstance } = await import('../../src/data/Instance.js')

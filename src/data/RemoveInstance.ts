@@ -135,6 +135,19 @@ const defaultDeps: RemoveDeps = {
     pruneNetworks: async (id) => { await pruneUnusedInstanceNetworks(String(id), REMOVAL) },
 }
 
+/**
+ * Compose-down and quarantine the instance folder on `disk` without deleting
+ * the instanceDB row (engine#381: source of a same-id cross-Engine move).
+ */
+export const quarantineInstanceOnDisk = async (disk: Disk, instanceId: InstanceID): Promise<{ quarantinePath: string }> => {
+    const dir = await defaultDeps.instanceDir(disk, instanceId)
+    await defaultDeps.composeDown(dir, instanceId)
+    await defaultDeps.removeProjectContainers(instanceId)
+    const quarantinePath = await defaultDeps.quarantine(disk, instanceId)
+    try { await defaultDeps.pruneNetworks(instanceId) } catch { /* best effort */ }
+    return { quarantinePath }
+}
+
 const RUNNING_STATES = new Set(['Running', 'Starting'])
 const BACKUP_KINDS = new Set(['backupApp', 'restoreApp'])
 const MOVE_KINDS = new Set(['moveApp', 'copyApp'])
