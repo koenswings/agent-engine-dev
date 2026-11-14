@@ -27,6 +27,7 @@ import { addBackupLink, removeBackupLink } from "./BackupLinks.js";
 import { setBackupMode } from './BackupModeCommand.js'
 import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
+import { pickLocalBackupDisk, localBackupDisks, localEngineName, noLocalBackupDiskMessage } from './LocalBackupDisk.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
@@ -304,7 +305,9 @@ export { resolveInstanceArg } from './InstanceArg.js'
 /**
  * backupApp <instanceIdOrName> <backupDiskIdOrName> (idea#168 r29@97). The
  * instance goes through resolveInstanceArg, the disk through resolveDiskArg:
- * an id, or a unique name (a disk name with a warning).
+ * an id, or a unique name (a disk name with a warning). With no disk argument,
+ * only a Backup Disk docked on this Engine is used, preferring the instance's
+ * linked disk (engine#394).
  */
 const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, backupDiskId?: string) => {
     // Refusals throw so the command-log trace closes as error (idea#122).
@@ -312,17 +315,18 @@ const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceAr
     const store = storeHandle.doc()
     const instance = resolveInstanceArg(store, instanceArg, 'backupApp')
     const instanceName = instance.name
+    const engineId = getLocalEngine(store)?.id
 
-    // Find backup disk: by id or unique name, or first linked docked Backup Disk
+    // Find backup disk: by id or unique name, or a Backup Disk docked on this
+    // Engine (prefer the instance's linked disk). Never a disk docked elsewhere.
     let backupDisk = backupDiskId
-        ? resolveDiskArg(store, getLocalEngine(store)?.id, backupDiskId, 'backupApp')
-        : Object.values(store.diskDB).find(d =>
-            d.device != null &&
-            d.diskTypes?.includes('backup') &&
-            d.backupConfig?.links.includes(instance.id)
-          )
+        ? resolveDiskArg(store, engineId, backupDiskId, 'backupApp')
+        : pickLocalBackupDisk(store, engineId, instance.id)
 
     if (!backupDisk) {
+        if (!backupDiskId && localBackupDisks(store, engineId).length === 0) {
+            throw new Error(noLocalBackupDiskMessage(localEngineName(store)))
+        }
         throw new Error(`No docked Backup Disk found linked to instance '${instanceName}'.`)
     }
     print(chalk.blue(`Backing up instance '${instanceName}' to disk '${backupDisk.name}' (${backupDisk.id})...`))
