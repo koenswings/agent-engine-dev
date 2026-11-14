@@ -721,7 +721,7 @@ export const commands: CommandDefinition[] = [
     { name: "initialiseDisk", execute: async (storeHandle: DocHandle<Store> | null, candidateId: string, role?: string) => {
         if (!storeHandle) throw new Error('Store is not available.')
         await initialiseDisk(storeHandle, candidateId, role ?? 'empty')
-    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "role", optional: true }], scope: 'engine' },
+    }, args: [{ type: "string", name: "candidateId" }, { type: "string", name: "role" }], scope: 'engine' },
 
     { name: "cancelOperation", execute: async (storeHandle: DocHandle<Store> | null, opId: string) => {
         if (!storeHandle) throw new Error('Store is not available.')
