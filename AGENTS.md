@@ -61,6 +61,13 @@ live Engine (idea#105):
 - Each run gets a private temp folder: `IDEA_WATCH_DIR` (replaces `/dev/engine`)
   and `IDEA_DISKS_ROOT` (replaces `/disks`). `test/harness/diskSim.ts` refuses to
   load without them. Nothing in the tests touches `/dev/engine`, `/disks` or `/disks/old`.
+- In `testMode`, startup reconcile does not publish dock, undock, or instance
+  state for devices outside `IDEA_WATCH_DIR` (engine#362); those records and
+  their processes are left alone. A testMode Engine, or any Engine with
+  `IDEA_WATCH_DIR` set, refuses to start if `store-url.txt` is a known fleet
+  store (dev pool 2VroE, kit 3Vvv, production 6f8m, retired 4GQm — full IDs in
+  `KNOWN_FLEET_STORE_IDS`). Use a scratch store-url. `store-template.json` is
+  not those IDs and must not be modified.
 - `script/test-run.sh` also writes a test-local system META and sets
   `IDEA_SYSTEM_META` to it, so `pnpm test:full` on the Grok Bot box does not
   depend on `/META.yaml` on the host. `src/data/Meta.ts` `systemMetaPath()`

@@ -21,6 +21,50 @@ import { log } from '../utils/utils.js'
  */
 export const FLEET_STORE_URL = 'automerge:3Vvvigx8bKcuwKALqMVz85GhDqrk'
 
+/**
+ * Known live or retired fleet store document IDs (engine#362). Full IDs:
+ *   - 2VroEUvDkmYsDAwE5oG9YeFNadWH  dev pool (fleet-state, deploy-engine-pi)
+ *   - 3Vvvigx8bKcuwKALqMVz85GhDqrk  kit store (FLEET_STORE_URL, store-url.txt)
+ *   - 6f8m5KxzARv9xwv4Lw18LgVUJzu  production (fleet-state, deploy-engine-pi)
+ *   - 4GQmEZehPDfryGDxkFo9XixbvmAC  retired previous default (idea#452); not the
+ *     store-template.json document ID (the template is a content snapshot
+ *     imported under whatever ID is in store-url.txt).
+ * A testMode or IDEA_WATCH_DIR Engine must not open these: startup reconcile
+ * used to publish undock of real disks into the shared store (idea03, 13 Nov 2026).
+ */
+export const KNOWN_FLEET_STORE_IDS: readonly string[] = [
+    '2VroEUvDkmYsDAwE5oG9YeFNadWH',
+    '3Vvvigx8bKcuwKALqMVz85GhDqrk',
+    '6f8m5KxzARv9xwv4Lw18LgVUJzu',
+    '4GQmEZehPDfryGDxkFo9XixbvmAC',
+]
+
+export const isKnownFleetStoreId = (idOrUrl: string): boolean =>
+    KNOWN_FLEET_STORE_IDS.includes(storeDocIdFromUrl(idOrUrl))
+
+/**
+ * Refuse to start a test/fixture Engine on a known fleet store (engine#362).
+ * Call after the store URL is known and before the Automerge server opens it.
+ * `testMode` / `watchDirSet` must be passed explicitly (official tests set
+ * IDEA_WATCH_DIR globally).
+ */
+export const refuseFleetStoreInIsolatedMode = (
+    storeDocId: string,
+    opts: { testMode: boolean, watchDirSet: boolean },
+): void => {
+    if (!opts.testMode && !opts.watchDirSet) return
+    if (!isKnownFleetStoreId(storeDocId)) return
+    const id = storeDocIdFromUrl(storeDocId)
+    const why = opts.testMode && opts.watchDirSet
+        ? 'testMode is on and IDEA_WATCH_DIR is set'
+        : opts.testMode ? 'testMode is on' : 'IDEA_WATCH_DIR is set'
+    throw new Error(
+        `Refusing to start: ${why}, but the configured store is a known fleet store automerge:${id}. ` +
+        `A test or fixture Engine must use an isolated store, not the dev pool (2VroE), kit (3Vvv), ` +
+        `production (6f8m), or retired (4GQm) store. Point store-identity/store-url.txt ` +
+        `(or settings.storeIdentityFolder) at a scratch document. (engine#362)`)
+}
+
 export interface StoreIdentityPaths {
     urlPath: string
     templatePath: string
