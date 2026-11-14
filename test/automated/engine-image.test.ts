@@ -14,6 +14,7 @@ import {
     PI_LOGIN_SHELL, USERCONFIG_UNIT, RENAME_USER_SSHD_DROPIN, shadowPasswordIsLocked, passwdShellOf, shadowHashOf, unitMasked, piLoginProblems,
     OPERATOR_KEYS_DIR, OPERATOR_KEYS_FILE, OPERATOR_KEYS_ASSET, LOGIN_SSHD_DROPIN, LOGIN_SSHD_ASSET, PEER_SSHD_DROPIN_PATH, REQUIRED_OPERATOR_KEY_FPS,
     publicKeyFingerprint, operatorKeysProblems, sshdEffectiveConfig,
+    KERNEL_CMDLINE_FLAGS, kernelCmdlineProblems, appendKernelCmdlineFlags, writeKernelCmdlineFlags,
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, engineCloneCommand, consoleCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
 import { pinNpmTools, writeReport, LOCKED_FILE_SPECS } from '../../src/install/engineImageCli.js'
@@ -24,6 +25,7 @@ const ENGINE = '/home/pi/idea/agents/agent-engine-dev'
 const COMMIT = 'a'.repeat(40)
 const sha = (s: string) => crypto.createHash('sha256').update(s).digest('hex')
 const DIGEST = 'b'.repeat(64)
+const STOCK_CMDLINE = 'console=serial0,115200 console=tty1 root=PARTUUID=abcd1234-02 rootfstype=ext4 fsck.repair=yes rootwait'
 
 const LR_SHA = crypto.createHash('sha256').update('lr').digest('hex')
 const lock = (over: Partial<EngineLock> = {}): EngineLock => ({
@@ -128,6 +130,7 @@ const goodRootfs = async (root: string) => {
         await fs.writeFile(R(`etc/systemd/system/${dir}/${u}`), '')
     }
     await fs.ensureDir(R('boot/firmware')); await fs.writeFile(R('boot/firmware/ssh'), '')
+    await fs.writeFile(R('boot/firmware/cmdline.txt'), `${STOCK_CMDLINE} cgroup_enable=memory\n`)
     await fs.ensureDir(R(DEFAULT_CONSOLE_PATH.slice(1))); await fs.writeFile(R(`${DEFAULT_CONSOLE_PATH.slice(1)}/index.html`), '<!doctype html>')
     await fs.writeFile(R('etc/machine-id'), ''); await fs.writeFile(R('etc/hostname'), GENERIC_HOSTNAME + '\n')
     await fs.writeFile(R('etc/hosts'), '127.0.0.1\tlocalhost\n127.0.1.1\traspberrypi\n')
@@ -833,5 +836,46 @@ describe('no dev files in the image (sparse Engine clone, secret scan)', () => {
         expect(await fs.pathExists(path.join(dest, 'src/c.ts'))).toBe(true)
         expect(await fs.pathExists(path.join(dest, 'test'))).toBe(false)
         expect($('git status --porcelain', dest)).toBe('')
+    })
+})
+
+describe('kernel cmdline: memory cgroup (koenswings/idea#518)', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const CL = () => path.join(root, 'boot/firmware/cmdline.txt')
+    const problemsOf = async () => (await verifyRootfsChecks({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas })).find(x => x.name === 'kernel-cmdline')!.problems
+    it('flags are cgroup_enable=memory', () => { expect([...KERNEL_CMDLINE_FLAGS]).toEqual(['cgroup_enable=memory']) })
+    it('appends to the single line, keeps it one line, never twice', () => {
+        const once = appendKernelCmdlineFlags(STOCK_CMDLINE)
+        expect(once).toBe(`${STOCK_CMDLINE} cgroup_enable=memory\n`)
+        expect(appendKernelCmdlineFlags(once)).toBe(once)
+        expect(appendKernelCmdlineFlags(STOCK_CMDLINE + '  \n')).toBe(once)
+        expect(appendKernelCmdlineFlags(`${STOCK_CMDLINE} xcgroup_enable=memory`)).toBe(`${STOCK_CMDLINE} xcgroup_enable=memory cgroup_enable=memory\n`)
+        expect(() => appendKernelCmdlineFlags(`${STOCK_CMDLINE}\nmore`)).toThrow(/one non-empty line/)
+        expect(() => appendKernelCmdlineFlags('')).toThrow()
+        expect(() => appendKernelCmdlineFlags(STOCK_CMDLINE, ['a b'])).toThrow(/bad kernel flag/)
+    })
+    it('kernelCmdlineProblems: none for one line with the flag once; reports missing, duplicate, two lines', () => {
+        expect(kernelCmdlineProblems(`${STOCK_CMDLINE} cgroup_enable=memory\n`)).toEqual([])
+        expect(kernelCmdlineProblems(STOCK_CMDLINE).join()).toContain('0 times')
+        expect(kernelCmdlineProblems(`${STOCK_CMDLINE} cgroup_enable=memory cgroup_enable=memory`).join()).toContain('2 times')
+        expect(kernelCmdlineProblems(`${STOCK_CMDLINE}\ncgroup_enable=memory\n`).join()).toContain('2 lines')
+    })
+    it('writeKernelCmdlineFlags appends once on the bootfs and is idempotent', async () => {
+        await fs.writeFile(CL(), STOCK_CMDLINE)
+        expect(await writeKernelCmdlineFlags(path.join(root, 'boot/firmware'))).toContain('appended cgroup_enable=memory')
+        expect(await fs.readFile(CL(), 'utf8')).toBe(`${STOCK_CMDLINE} cgroup_enable=memory\n`)
+        expect(await writeKernelCmdlineFlags(path.join(root, 'boot/firmware'))).toContain('already present')
+        expect(await fs.readFile(CL(), 'utf8')).toBe(`${STOCK_CMDLINE} cgroup_enable=memory\n`)
+        await fs.remove(CL())
+        expect(await writeKernelCmdlineFlags(path.join(root, 'boot/firmware'))).toContain('missing')
+    })
+    it('verify kernel-cmdline: clean passes; missing flag, duplicate, two lines and missing file fail', async () => {
+        expect(await problemsOf()).toEqual([])
+        await fs.writeFile(CL(), STOCK_CMDLINE + '\n'); expect((await problemsOf()).join()).toContain('cgroup_enable=memory 0 times')
+        await fs.writeFile(CL(), `${STOCK_CMDLINE} cgroup_enable=memory cgroup_enable=memory\n`); expect((await problemsOf()).join()).toContain('2 times')
+        await fs.writeFile(CL(), `${STOCK_CMDLINE}\ncgroup_enable=memory\n`); expect((await problemsOf()).join()).toContain('2 lines')
+        await fs.remove(CL()); expect((await problemsOf()).join()).toContain('missing')
     })
 })
