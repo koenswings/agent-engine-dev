@@ -159,6 +159,46 @@ describe('backupApp without a disk argument uses only a locally docked Backup Di
         expect(remote.errorMessage).toContain('not docked to this engine')
         expect(vi.mocked(backupInstance)).not.toHaveBeenCalled()
     })
+
+    it('the registry marks backupDiskId optional, so a one-arg dispatch reaches the wrapper', () => {
+        const diskArg = backupApp().args.find(a => a.name === 'backupDiskId')
+        expect(diskArg).toMatchObject({ type: 'string', name: 'backupDiskId', optional: true })
+        expect(diskArg?.variadic).not.toBe(true)
+    })
+
+    it('dispatching backupApp <instanceId> with no disk passes validation and picks a local disk', async () => {
+        addDisk(h, 'bk-remote', { name: 'Remote Backups', device: 'sdb1', dockedTo: OTHER, links: [INST] })
+        addDisk(h, 'bk-local', { name: 'Local Backups', device: 'sdc1', dockedTo: LOCAL, links: [INST] })
+
+        const t = await runExplicit(`backupApp ${INST}`)
+        expect(t.status).toBe('ok')
+        expect(t.errorMessage).toBeNull()
+        expect(JSON.parse(t.args)).toEqual({ instanceName: INST, backupDiskId: null })
+        expect(vi.mocked(backupInstance)).toHaveBeenCalledOnce()
+        expect((vi.mocked(backupInstance).mock.calls[0][2] as any).id).toBe('bk-local')
+    })
+
+    it("dispatching backupApp <instanceId> with no local disk reaches the wrapper and throws NOT_DOCKED", async () => {
+        addDisk(h, 'bk-remote', { name: 'Remote Backups', device: 'sdb1', dockedTo: OTHER, links: [INST] })
+
+        const t = await runExplicit(`backupApp ${INST}`)
+        expect(t.status).toBe('error')
+        expect(t.errorMessage).toBe(noLocalBackupDiskMessage(engineName))
+        expect(t.errorMessage).toMatch(/^NOT_DOCKED: no Backup Disk docked on /)
+        expect(t.errorMessage).not.toMatch(/Insufficient arguments/)
+        expect(JSON.parse(t.args)).toEqual({ instanceName: INST, backupDiskId: null })
+        expect(vi.mocked(backupInstance)).not.toHaveBeenCalled()
+    })
+
+    it('the explicit two-arg dispatch still works and records backupDiskId as a string', async () => {
+        addDisk(h, 'bk-other-local', { name: 'Other Local', device: 'sdd1', dockedTo: LOCAL, links: [] })
+
+        const t = await runExplicit(`backupApp ${INST} bk-other-local`)
+        expect(t.status).toBe('ok')
+        expect(JSON.parse(t.args)).toEqual({ instanceName: INST, backupDiskId: 'bk-other-local' })
+        expect(vi.mocked(backupInstance)).toHaveBeenCalledOnce()
+        expect((vi.mocked(backupInstance).mock.calls[0][2] as any).id).toBe('bk-other-local')
+    })
 })
 
 describe('backupInstance refuses a Backup Disk not docked on this Engine (engine#394)', () => {
