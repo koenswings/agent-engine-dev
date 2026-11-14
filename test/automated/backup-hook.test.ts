@@ -647,7 +647,7 @@ describe('backupInstance method hook (idea#444)', () => {
         expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/${INST}`)).toBe(false)
     })
 
-    it('idea#403 stopped instance with method hook: hooks skipped, backed up cold (no hookExclude), not HOOK_FALLBACK', async () => {
+    it('idea#403 stopped instance with method hook: hooks skipped, backed up cold (only exclude; hookExclude paths stay IN the archive), not HOOK_FALLBACK', async () => {
         await writeCompose(listBlock())
         const h = await runBackup('Stopped')
         const op = opOf(h)
@@ -658,6 +658,8 @@ describe('backupInstance method hook (idea#444)', () => {
         expect(startCount).toBe(0)
         const create = (await calls()).find(l => l.startsWith('borg-create '))
         expect(create).toMatch(/ data\/keys data\/tailscale data\/tailscale-run data\/backup\/daily$/)
+        // no hook copies were made, so the live dbs that hookExclude lists must be packed (e.g. Kolibri)
+        expect(create).not.toMatch(/usage\.sqlite/)
         expect(h.doc()!.instanceDB[INST].lastBackup).not.toBeNull()
         expect(lastResultOf(h)).toMatchObject({ method: 'hook', result: 'OK' })
     })
