@@ -11,7 +11,7 @@ import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { localEngineId } from '../../src/data/Engine.js'
 import { InstanceID, DiskID, DiskName, EngineID, Timestamp, AppID } from '../../src/data/CommonTypes.js'
-import { moveAppCrossEngine, verifyMoveTarget, MoveDeps, refusalCode, moveCommandOutcome } from '../../src/data/MoveAppRemote.js'
+import { moveAppCrossEngine, verifyMoveTarget, MoveDeps, refusalCode, moveCommandOutcome, MOVE_PROGRESS_TYPE } from '../../src/data/MoveAppRemote.js'
 import { MoveError, MOVE_CODES, MOVE_FAILURE_CODES, MOVE_REFUSAL_CODES, MOVE_DONE_CODES, MOVE_CROSS_ENGINE_CAPABILITY, moveFailedText, sourceNotRemovedText, sizesMatch } from '../../src/data/MoveAppShapes.js'
 import { recoverInterruptedOperations } from '../../src/data/Operations.js'
 import { RemoveError } from '../../src/data/RemoveInstance.js'
@@ -342,5 +342,47 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(MOVE_CODES).toEqual([...MOVE_REFUSAL_CODES, ...MOVE_FAILURE_CODES, ...MOVE_DONE_CODES])
         expect(new Set(MOVE_CODES).size).toBe(MOVE_CODES.length)
         expect(MOVE_CODES).toEqual(expect.arrayContaining(['VERIFY_SIZE', 'VERIFY_NOT_RUNNING', 'VERIFY_NOT_FOUND', 'VERIFY_TIMEOUT']))
+    })
+
+    it('the source picks up the verify result on the store change, without waiting for the 2 s poll (idea#498)', async () => {
+        const h = makeStore()
+        const { deps } = twoEngines(h, { verifyReply: false })
+        deps.pollMs = 2000
+        deps.verifyTimeoutMs = 3000
+        deps.requestVerify = (sh, engineId, command) => {
+            expect(engineId).toBe(String(TGT))
+            const [, opId] = command.split(' ')
+            setTimeout(() => {
+                sh.change(doc => {
+                    const op = doc.operationDB?.[opId] as any
+                    if (op?.move) op.move.verify = { ok: true, code: null, bytes: BYTES, detail: null, at: Date.now() }
+                })
+            }, 40)
+        }
+        const t0 = Date.now()
+        const r = await moveAppCrossEngine(h, 'my-kolibri' as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        const elapsed = Date.now() - t0
+        expect(r.code).toBe('MOVED')
+        expect(elapsed).toBeLessThan(1500)
+        expect(theOp(h).move.verify.ok).toBe(true)
+    })
+
+    it('emits idea/progress for Copying at the start, before the copy work (idea#498)', async () => {
+        const h = makeStore()
+        const seen: object[] = []
+        const { deps } = twoEngines(h)
+        deps.broadcast = (m: object) => { seen.push(m) }
+        const inner = deps.copy!
+        let atCopyStart: object[] = []
+        deps.copy = async (...args: Parameters<typeof inner>) => {
+            atCopyStart = [...seen]
+            return inner(...args)
+        }
+        const r = await moveAppCrossEngine(h, 'my-kolibri' as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        expect(r.code).toBe('MOVED')
+        const msg = atCopyStart.find((m: any) => m.type === MOVE_PROGRESS_TYPE && m.step === 'Copying') as any
+        expect(msg).toMatchObject({ type: 'idea/progress', step: 'Copying', bytesDone: 0, bytesTotal: 0 })
+        expect(typeof msg.opId).toBe('string')
+        expect(msg.opId.length).toBeGreaterThan(0)
     })
 })
