@@ -121,7 +121,13 @@ The bootfs `ssh` trigger is present at flash time; `sshswitch.service` enables s
 `passwd -S pi` shows L (key-only; password auth is off). systemd writes a machine-id. `idea-engine-firstboot`
 (`script/build_image_assets/idea-engine-firstboot`) loads the preloaded images (sha256 and image id checked), creates
 the docker networks, installs pm2-logrotate from the preloaded tarball and, as pi, starts the Engine with
-`pm2.config.cjs` and `pm2 save`; `pm2-pi.service` resurrects it on later boots. The Engine creates `/META.yaml` itself
+`pm2.config.cjs` and `pm2 save`; `pm2-pi.service` resurrects it on later boots. Sanitise has already removed
+`store-data`, so first boot starts with an empty store-data and the git-tracked `store-identity/` (including
+`store-url.txt`). The engine#391 store-identity guard lets that start: empty store-data takes the normal create
+path, which imports `store-template.json` under the shipped store-url document. A pre-seeded `store-data` is not
+part of the image; if one is added, it must already contain that document, or the Engine refuses with
+`STORE_IDENTITY_MISMATCH`. The first-boot unit and `pm2.config.cjs` must not set `--allow-new-store` or
+`IDEA_ALLOW_NEW_STORE`. The Engine creates `/META.yaml` itself
 at its first start (`ensureSystemMeta`: root drive serial, else a UUID); a `/META.yaml` without a diskId also gets a
 UUID (`diskIdWithoutHardware`), never `ENGINE_undefined`.
 
