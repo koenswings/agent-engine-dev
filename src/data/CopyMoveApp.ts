@@ -655,7 +655,7 @@ export const moveApp = async (
             }
         }
 
-        // 6. Register on target disk (storedOn + status set here; instance starts).
+        // 6. Register on target disk (storedOn set here). A previously running instance is started just below (idea#474).
         //    This MUST succeed before we touch the source record — if cancelled before
         //    this point the source record is untouched and the operator can retry cleanly.
         setMoveStep(5)
@@ -673,6 +673,19 @@ export const moveApp = async (
         log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
         await processInstance(storeHandle, targetDisk, instance.id)
         partialTarget = false
+
+        // idea#474: processInstance does not auto-start a just-stopped instance
+        // (shouldAutoStart skips status Stopped). If it was running before the
+        // move, start it on the target — running in, running out. Do this
+        // before the source folder is removed, so a failed start can still
+        // leave the source data in place.
+        if (wasRunning) {
+            const moved = getInstance(storeHandle.doc(), instance.id)
+            if (moved) {
+                log(`moveApp: starting moved instance '${instanceName}' on '${targetDisk.name}'`)
+                await startInstance(storeHandle, moved, targetDisk, 'post-move')
+            }
+        }
 
         // 8. Remove source instance directory
         setMoveStep(6)
@@ -736,8 +749,10 @@ export const moveApp = async (
             }
         }
 
-        // On failure, try to restart the source instance if we stopped it
-        if (wasRunning) {
+        // On failure, restart the source only if we stopped it and it is still
+        // registered there (idea#474: after a successful register, a later
+        // start-on-target failure must not start the old source project).
+        if (wasRunning && stillOnSource) {
             try {
                 const freshStore = storeHandle.doc()
                 const freshInstance = getInstance(freshStore, instance.id)

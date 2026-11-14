@@ -374,6 +374,42 @@ describe('moveApp', () => {
         )
     })
 
+    it('a Running instance is started on the target after register (idea#474: running in, running out)', async () => {
+        const { handle } = await makeHandle('Running')
+        const { processInstance } = await import('../../src/data/Disk.js')
+        const { stopInstance, startInstance } = await import('../../src/data/Instance.js')
+        const order: string[] = []
+        composeDownAtMock.mockImplementation(async () => { order.push('down') })
+        vi.mocked(processInstance).mockImplementationOnce(async (handle: any, disk: any, instanceId: any) => {
+            order.push('process')
+            handle.change((doc: any) => {
+                const inst = doc.instanceDB[instanceId]
+                if (inst) { inst.storedOn = disk.id; inst.status = 'Stopped' }
+            })
+            return undefined as any
+        })
+        vi.mocked(startInstance).mockImplementation(async () => { order.push('start') })
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(vi.mocked(stopInstance)).toHaveBeenCalledOnce()
+        expect(vi.mocked(startInstance)).toHaveBeenCalledOnce()
+        expect(vi.mocked(startInstance)).toHaveBeenCalledWith(
+            handle,
+            expect.objectContaining({ id: INSTANCE_ID }),
+            expect.objectContaining({ id: TARGET_DISK_ID }),
+            'post-move',
+        )
+        expect(order).toEqual(['down', 'process', 'start'])
+        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Done')
+    })
+
+    it('a Stopped instance is not started on the target (idea#474)', async () => {
+        const { handle } = await makeHandle('Stopped')
+        const { stopInstance, startInstance } = await import('../../src/data/Instance.js')
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(vi.mocked(stopInstance)).not.toHaveBeenCalled()
+        expect(vi.mocked(startInstance)).not.toHaveBeenCalled()
+    })
+
     it('takes down the source compose project (no -v) after a successful copy and before processInstance (idea#468)', async () => {
         const { handle } = await makeHandle()
         const { processInstance } = await import('../../src/data/Disk.js')
