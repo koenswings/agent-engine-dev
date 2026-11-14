@@ -55,7 +55,9 @@ const main = async () => {
         for (const [id, e] of Object.entries<any>(doc.engineDB ?? {})) {
             engineDB[id] = {
                 hostname: e?.hostname ?? null, lastRun: e?.lastRun ?? null, lastBooted: e?.lastBooted ?? null,
-                version: e?.version ?? null, commands: [...(e?.commands ?? [])],
+                version: e?.version ?? null, lanAddress: e?.lanAddress ?? null,
+                lanAddresses: [...(e?.lanAddresses ?? [])],
+                commands: [...(e?.commands ?? [])],
                 peerAccess: e?.peerAccess == null ? (e?.peerAccess === null ? null : undefined)
                     : { sshKey: e.peerAccess.sshKey, hostKey: e.peerAccess.hostKey, publishedAt: e.peerAccess.publishedAt, authorized: [...(e.peerAccess.authorized ?? [])] },
             }
