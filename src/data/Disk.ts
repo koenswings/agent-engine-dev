@@ -4,7 +4,7 @@ import { $, YAML, chalk, fs, os } from 'zx';
 import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
 import { App, appTitleFromXapp, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
-import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance, applyDemoFlag } from './Instance.js'
+import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance, applyDemoFlag, applyBackupMethod } from './Instance.js'
 import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
@@ -668,6 +668,7 @@ export const upsertSystemInstanceRecord = (storeHandle: DocHandle<Store>, disk: 
                 metrics: null,
             }
             applyDemoFlag(newInst, compose)
+            applyBackupMethod(newInst, compose)
             doc.instanceDB[instanceId] = newInst
             instance = newInst
         } else {
@@ -683,6 +684,7 @@ export const upsertSystemInstanceRecord = (storeHandle: DocHandle<Store>, disk: 
                 stored.status = 'Docked' as Status
             }
             applyDemoFlag(stored, compose)
+            applyBackupMethod(stored, compose)
             instance = stored
         }
     })

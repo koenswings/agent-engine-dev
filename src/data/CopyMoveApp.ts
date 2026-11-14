@@ -25,7 +25,7 @@ import {
 } from './CommonTypes.js'
 import { Store, getDisk, getInstance, getInstancesOfDisk } from './Store.js'
 import { Disk, processInstance, diskMountRoot, diskFsRoot, appDataRoot } from './Disk.js'
-import { stopInstance, startInstance } from './Instance.js'
+import { stopInstance, startInstance, applyBackupMethod } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
 import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
@@ -527,6 +527,7 @@ export const copyApp = async (
                     stepLabel: null,
                     metrics: null,
                 }
+                applyBackupMethod(newInst, compose)   // idea#403
                 doc.instanceDB[newInstanceId] = newInst
             })
             // Tell the remote engine to start this instance, by id (idea#168)
