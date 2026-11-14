@@ -44,6 +44,7 @@ export const backupLifecycle = {
 }
 import { BackupMode, BackupMethodUsed, DiskID, DiskName, InstanceID, Timestamp, OperationCause, Operation } from '../data/CommonTypes.js'
 import { Store, getInstance, getDisks, findDiskByName, getLocalEngine } from '../data/Store.js'
+import { isDockedOnEngine, localEngineName, noLocalBackupDiskMessage } from '../data/LocalBackupDisk.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
 import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
@@ -260,8 +261,12 @@ export const backupInstance = async (
         }
 
         const appDisk = store.diskDB[instance.storedOn]
-        if (!appDisk || !appDisk.device) {
+        const localId = getLocalEngine(store)?.id ?? localEngineId
+        if (!isDockedOnEngine(appDisk, localId)) {
             throw new Error(`App Disk for instance ${instanceId} is not docked`)
+        }
+        if (!isDockedOnEngine(backupDisk, localId)) {
+            throw new Error(noLocalBackupDiskMessage(localEngineName(store)))
         }
 
         const backupDevice = backupDisk.device!

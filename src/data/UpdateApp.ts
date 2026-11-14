@@ -39,6 +39,7 @@
 import { DocHandle } from '@automerge/automerge-repo'
 import { $, fs, path, YAML, sleep } from 'zx'
 import type { Store } from './Store.js'
+import { pickLocalBackupDisk } from './LocalBackupDisk.js'
 import type { Instance } from './Instance.js'
 import type { AppID, DiskID, InstanceID, Timestamp } from './CommonTypes.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
@@ -390,9 +391,7 @@ export const writePreUpdateGate = (
 }
 
 export const linkedBackupDisk = (store: Store, engineId: string, inst: Instance): Disk | null =>
-    (Object.values(store.diskDB ?? {}).find(x =>
-        x && x.device && String(x.dockedTo) === engineId && x.diskTypes?.includes('backup') &&
-        (x.backupConfig?.links ?? []).some(l => String(l) === String(inst.id))) as Disk | undefined) ?? null
+    pickLocalBackupDisk(store, engineId, inst.id) ?? null
 
 const readHealthTimeout = async (composePath: string, appName: string): Promise<number> => {
     try { return healthTimeoutSeconds(appName, YAML.parse(await fs.readFile(composePath, 'utf8'))?.['x-app']?.healthTimeout) }
