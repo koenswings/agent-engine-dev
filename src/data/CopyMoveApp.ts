@@ -38,6 +38,7 @@ import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
 import { lookupInstanceArg, describeInstanceCandidates } from './InstanceArg.js'
 import { checkInstanceIdForDocker } from '../utils/instanceIds.js'
+import { MoveError, moveFailedText } from './MoveAppShapes.js'
 import { findExternalLinks, externalLinksMessage, uniqueCopyName, preparedCopyFiles, instanceDirLooksLikeKolibri } from './InstanceCopy.js'
 import type { MoveResult } from './MoveAppShapes.js'
 import { composeDownAt, pruneUnusedInstanceNetworks } from '../utils/instanceNetworks.js'
@@ -764,6 +765,11 @@ export const moveApp = async (
                 console.error(chalk.red(`moveApp: failed to restart source instance: ${restartErr.message}`))
             }
         }
+        // idea#475: rethrow so the command trace ends as error (not ok) with a
+        // leading result code in the same style as a cross-Engine move.
+        if (e instanceof MoveError) throw e
+        const reason = e?.message ?? String(e)
+        throw new MoveError('COPY_FAILED', moveFailedText(reason))
     } finally {
         resourceLock.releaseAll(moveLockKeys)
         endUsageSkip('move')
