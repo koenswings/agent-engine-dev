@@ -544,7 +544,7 @@ const verifyMoveTargetWrapper = async (storeHandle: DocHandle<Store> | null, opI
     print(v.ok ? chalk.green(`Move copy ${instanceId} checks out`) : chalk.yellow(`Move copy ${instanceId} does not check out: ${v.detail}`))
 }
 
-/** cleanupMoveTarget <opId> <instanceId> <targetDiskId> (engine#388): sent Engine → Engine after a pre-flip move failure. */
+/** cleanupMoveTarget <opId> <instanceId> <targetDiskId> (engine#388): sent Engine → Engine after a pre-flip move failure. The target refuses a late or duplicate cleanup unless this op is the latest moveApp for the instance and is in a terminal non-success state. */
 const cleanupMoveTargetWrapper = async (storeHandle: DocHandle<Store> | null, opId: string, instanceId: string, targetDiskId: string) => {
     if (!storeHandle) throw new Error('Store is not available.')
     const { cleanupMoveTarget } = await import('./MoveAppRemote.js')
