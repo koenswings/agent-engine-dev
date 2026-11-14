@@ -17,7 +17,7 @@ import { startAutomergeServer } from './repo.js'
 import { enableMulticastDNSEngineMonitor } from './monitors/mdnsMonitor.js'
 import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
 import { createServerStore } from './data/Store.js'
-import { prepareStoreIdentity, storeIdentityPaths } from './data/StoreIdentity.js'
+import { prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
 import { startBackupScheduler } from './monitors/backupScheduler.js'
@@ -94,6 +94,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Read BEFORE the Automerge server starts: the Repo's peerId carries the store
     // tag, so the Engine only ever peers with Engines of this store (StoreScope.ts).
     const { storeDocId, restored, fallback } = await prepareStoreIdentity(storeIdentity)
+    // engine#362: a test/fixture Engine must not open a known fleet store
+    refuseFleetStoreInIsolatedMode(storeDocId, {
+        testMode: config.settings.testMode,
+        watchDirSet: !!process.env.IDEA_WATCH_DIR,
+    })
     if (restored) print(chalk.yellow(`store-url.txt was missing: restored the fleet store URL`))
     if (fallback) print(chalk.bgRed.white(`store-url.txt was restored by the Engine (store-identity/store-url.restored): peer access fails closed until Ops confirms the store`))
     log(`Using document ID: ${storeDocId}`)
