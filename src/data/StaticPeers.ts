@@ -28,6 +28,10 @@
  *     .local), a loopback address, or an address of a local interface.
  *   - A failed attempt (DNS failure, connectEngine error) is retried with backoff:
  *     5 s, 10 s, 20 s, ... capped at 5 min; reset after a success.
+ *   - engineId (engine#377): the store Engine whose hostname matches the entry, else the
+ *     one whose lanAddress / lanAddresses holds the resolved IP (staticPeerEngineId), so
+ *     an entry given as an IP gets the real id too; else a 'static:<host>' placeholder,
+ *     replaced on a later check once the store has a matching record.
  *   - A live connection is checked every 10 s. If it is gone (removed from
  *     network.connections, e.g. dropped by the mDNS path), it is dialled again,
  *     with the same backoff on failure. The check also resets the connection's
@@ -93,6 +97,34 @@ export const isSelfPeer = (host: string, address: string): boolean => {
     return Object.values(os.networkInterfaces()).some(list => (list ?? []).some(i => i.address === address))
 }
 
+/** The Engine record fields staticPeerEngineId reads. */
+export interface EngineAddressRecord {
+    id: string
+    hostname?: string | null
+    lanAddress?: string | null
+    lanAddresses?: string[] | null
+}
+
+/**
+ * engine#377: the store Engine a static peer is, by hostname OR address. `host` is the
+ * configured entry (hostname or IPv4), `address` the IPv4 it resolved to (the
+ * connection key's IP).
+ *   1. a record whose hostname matches `host` (with or without .local), as before;
+ *   2. else exactly one record whose lanAddress is `address` (or `host` when it is an IPv4);
+ *   3. else exactly one record whose lanAddresses contains it.
+ * Several records on one address (e.g. a stale record after a DHCP change) match none,
+ * so the placeholder stays rather than naming the wrong Engine. undefined: no match.
+ */
+export const staticPeerEngineId = (engines: EngineAddressRecord[], host: string, address: string): string | undefined => {
+    const byName = engines.find(e => e.hostname && shortName(String(e.hostname)) === shortName(host))
+    if (byName) return String(byName.id)
+    const addrs = new Set([address, ...(HOST_IS_IPV4(host) ? [host] : [])].filter(Boolean))
+    const unique = (list: EngineAddressRecord[]) => list.length === 1 ? String(list[0].id) : undefined
+    const byLan = engines.filter(e => !!e.lanAddress && addrs.has(String(e.lanAddress)))
+    if (byLan.length) return unique(byLan)
+    return unique(engines.filter(e => Array.isArray(e.lanAddresses) && e.lanAddresses.some(a => addrs.has(String(a)))))
+}
+
 export interface StaticPeerDeps {
     resolve: (host: string) => Promise<string>
     connect: (address: IPAddress, hostname: Hostname, engineId: EngineID, port: PortNumber) => Promise<unknown>
@@ -141,10 +173,8 @@ export const startStaticPeers = (repo: Repo, storeHandle: DocHandle<Store>, opts
         timers.add(t)
     }
 
-    const engineIdFor = (host: string): EngineID => {
-        const engine = Object.values(storeHandle.doc()?.engineDB ?? {}).find(e => shortName(String(e.hostname)) === shortName(host))
-        return (engine?.id ?? `static:${host}`) as EngineID
-    }
+    const engineIdFor = (host: string, address: string): EngineID =>
+        (staticPeerEngineId(Object.values(storeHandle.doc()?.engineDB ?? {}) as EngineAddressRecord[], host, address) ?? `static:${host}`) as EngineID
 
     const supervise = (peer: StaticPeer) => {
         let failures = 0
@@ -159,12 +189,12 @@ export const startStaticPeers = (repo: Repo, storeHandle: DocHandle<Store>, opts
                 const existing = network.connections[key as IPAddress]
                 if (existing) {
                     existing.missedDiscoveryCount = 0
-                    if (String(existing.engineId).startsWith('static:')) existing.engineId = engineIdFor(peer.host)
+                    if (String(existing.engineId).startsWith('static:')) existing.engineId = engineIdFor(peer.host, address)
                 } else {
                     // Store-scoped peering: a static peer goes through the same handshake store
                     // check as an mDNS peer (connectEngine); a refused one is backed off there.
                     if (!((refusedPeers.get(key)?.until ?? 0) > Date.now())) deps.log(`Static peer ${peer.host}:${peer.port}: connecting to ${key}`)
-                    await deps.connect(address as IPAddress, shortName(peer.host) as Hostname, engineIdFor(peer.host), peer.port)
+                    await deps.connect(address as IPAddress, shortName(peer.host) as Hostname, engineIdFor(peer.host, address), peer.port)
                 }
                 failures = 0
                 schedule(attempt, check)
