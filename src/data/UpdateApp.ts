@@ -518,7 +518,8 @@ export const updateApp = async (
                 if (/HOOK_FAILED: /.test(m)) throw new UpdateAppError('HOOK_FAILED', `${m.replace(/^.*?HOOK_FAILED: /, '')} (the current version's backup hook); nothing was stopped or changed, and the update does not fall back to a stop-mode backup`)
                 throw new UpdateAppError('BACKUP_FAILED', `the pre-update backup to ${backupDisk!.name} failed: ${m}`)
             }
-            preUpdateBackup = { backupDiskId: String(backupDisk!.id), method: instanceStopped ? 'stop' : 'hook', duringStop: instanceStopped }
+            // idea#403: method none copies nothing; the result says so instead of 'stop'
+            preUpdateBackup = { backupDiskId: String(backupDisk!.id), method: live?.method === 'none' ? 'none' : (instanceStopped ? 'stop' : 'hook'), duringStop: instanceStopped }
             log(`updateApp: ${inst.id}: pre-update backup to ${backupDisk!.id} done (${instanceStopped ? 'inside the snapshot stop' : 'hook, no stop'})`)
         }
         try {
