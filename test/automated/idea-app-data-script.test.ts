@@ -139,7 +139,7 @@ describe('idea-app-data: argument checks', () => {
             refused(await sb.run(['size', 'sdb1', id]), /instance id '.*' does not match/)
         }
         await sb.addDisk('sdc1', { backup: true })
-        for (const archive of ['latest', '2026-10-06', '../2026-10-06T10-00-00-000Z', '-2026-10-06T10-00-00Z', '2026-10-06T10:00:00Z']) {
+        for (const archive of ['latest', '2026-10-06', '../2026-10-06T10-00-00-000Z', '-2026-10-06T10-00-00Z', '2026-10-06T10:00:00Z', '2026-10-06T10-00-00-000Z-live', '2026-10-06T10-00-00-000Z-', '2026-10-06T10-00-00-000Z-hook-x']) {
             refused(await sb.run(['borg-create', 'sdc1', 'inst1', archive, 'sdb1']), /archive name '.*' does not match/)
         }
         for (const stamp of ['../etc', '2026-11-12T001825Z', '-20261112T001825Z', '20261112T00:18:25Z', '20261112T001825Z/../x', 'latest']) {
@@ -949,6 +949,13 @@ describe('idea-app-data: borg', () => {
         expect((await sb.run(['borg-create', 'sdc1', 'inst1', '2026-10-06T11-00-00-000Z', 'sdb1'])).exitCode).toBe(0)
         const [plain] = await sb.calls('borg')
         expect(plain.argv).toEqual(['create', '--numeric-ids', '--', `${repo}::2026-10-06T11-00-00-000Z`, src])
+        // engine#401 (v16): a backup-mode suffix is accepted
+        for (const mode of ['hook', 'stop', 'cold']) {
+            await fs.remove(path.join(sb.tmp, 'calls', 'borg.log'))
+            expect((await sb.run(['borg-create', 'sdc1', 'inst1', `2026-10-06T12-00-00-000Z-${mode}`, 'sdb1'])).exitCode, mode).toBe(0)
+            const [tagged] = await sb.calls('borg')
+            expect(tagged.argv).toEqual(['create', '--numeric-ids', '--', `${repo}::2026-10-06T12-00-00-000Z-${mode}`, src])
+        }
     })
 
     it('borg-create refuses exclude paths that escape the instance folder or look like options (idea#443)', async () => {
@@ -1482,10 +1489,10 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v14', async () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('14')
+    it('helper and Engine speak v16', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('16')
         const r = await sb.run(['version'])
-        expect(r.stdout.trim()).toBe('idea-app-data 14')
+        expect(r.stdout.trim()).toBe('idea-app-data 16')
     })
 
     it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {

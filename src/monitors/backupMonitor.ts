@@ -22,9 +22,10 @@ import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot, backupOrphanLinks, syncBackupOrphanLinks } from '../data/Disk.js'
-import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast } from '../utils/appDataHelper.js'
+import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast, ARCHIVE_MODE_HELPER_MIN } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, parseBackupHookExcludeList, mergeBackupExcludeLists, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
 import { backupCleanupRunner, backupDiskFullError, cleanupIsEnabled } from '../utils/backupCleanup.js'
+import { backupArchiveName, type ArchiveMode } from '../utils/backupArchiveName.js'
 import { parseBackupSpec, assertHookServicesExist, backupHookRunner, defaultBackupSpec, type BackupHookDecl } from '../utils/backupMethod.js'
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
@@ -462,10 +463,16 @@ export const backupInstance = async (
             return failures
         }
 
-        const runBorgCreate = async (excludes: string[]): Promise<void> => {
+        // engine#401: the archive name carries the backup mode (-hook / -stop / -cold) when
+        // the helper accepts it (v16); an older helper gets today's untagged name.
+        const tagArchives = skipBorg() || !(await helperAtLeast(ARCHIVE_MODE_HELPER_MIN, 'a backup-mode archive name'))
+        if (!tagArchives) log(`Backup of ${instanceId}: app-data helper older than v${ARCHIVE_MODE_HELPER_MIN}; the archive name gets no mode suffix`)
+        let archiveName: string | null = null
+
+        const runBorgCreate = async (excludes: string[], mode: ArchiveMode): Promise<void> => {
             setBackupStep(2, BACKUP_STEPS[2])
             borgStarted = true
-            const archiveName = new Date().toISOString().replace(/[:.]/g, '-')
+            archiveName = backupArchiveName(new Date(), tagArchives ? mode : null)
             if (!skipBorg()) {
                 log(`Running borg create for instance ${instanceId}${excludes.length ? ` (${excludes.length} exclude(s))` : ''}`)
                 await runAppData(borgCreateArgs(backupDevice, instanceId, archiveName, await appDataRoot(appDisk as Disk), excludes))
@@ -497,20 +504,20 @@ export const backupInstance = async (
             // updateApp stopped the instance for its Snapshot: Borg only, the hook dump is not
             // needed (the live files are quiet), so hookExclude does not apply.
             hookResult = 'stop'
-            await runBorgCreate(backupExcludes)
+            await runBorgCreate(backupExcludes, 'stop')
         } else if (backupSpec.method === 'hook' && !instanceUp) {
             // idea#403: the instance is not running: skip the hooks and back up cold. No dump
             // was made, so hookExclude does not apply. Not HOOK_FALLBACK (nothing failed).
             hookResult = 'cold'
             log(`Instance ${instanceId} is not running (${instance.status}): hooks skipped, backing up cold`)
-            await runBorgCreate(backupExcludes)
+            await runBorgCreate(backupExcludes, 'cold')
         } else if (backupSpec.method === 'hook') {
             setBackupStep(1, 'Running pre-backup hook')
             const preFailure = await runPreHooks()
             if (!preFailure) {
                 hookResult = 'hook'
                 try {
-                    await runBorgCreate(mergeBackupExcludeLists(backupExcludes, hookExcludes))
+                    await runBorgCreate(mergeBackupExcludeLists(backupExcludes, hookExcludes), 'hook')
                 } catch (borgErr) {
                     setBackupStep(3, 'Running post-backup hook')
                     const postFailures = await runPostHooks()
@@ -531,10 +538,10 @@ export const backupInstance = async (
                 }
                 hookResult = 'HOOK_FALLBACK'
                 log(`HOOK_FALLBACK: ${preFailure}; falling back to a short stop`)
-                await stopThenStartAround(() => runBorgCreate(backupExcludes))
+                await stopThenStartAround(() => runBorgCreate(backupExcludes, 'stop'))
             }
         } else {
-            await stopThenStartAround(() => runBorgCreate(backupExcludes))
+            await stopThenStartAround(() => runBorgCreate(backupExcludes, 'stop'))
         }
 
         // 6. Update store: set lastBackup on the instance
@@ -568,6 +575,7 @@ export const backupInstance = async (
             const op = doc.operationDB?.[opId]
             if (!op) return
             op.args.hookResult = hookResult
+            if (archiveName) op.args.archive = archiveName   // engine#401
             if (hookWarning) op.args.warning = hookWarning
             if (cleanupWarning) op.args.cleanup = cleanupWarning as string
         })

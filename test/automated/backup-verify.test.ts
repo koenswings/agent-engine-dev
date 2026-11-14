@@ -21,7 +21,8 @@ import {
     memberMatchesPath, pathsFoundInMembers, newestArchive, BACKUP_VERIFY_HELPER_MIN,
     parseScratchBytes,
 } from '../../src/data/BackupVerify.js'
-import { parseBackupVerifyLists, parseBackupExcludeList } from '../../src/utils/backupExclude.js'
+import { parseBackupVerifyLists, parseBackupExcludeList, parseBackupVerifyModeLists } from '../../src/utils/backupExclude.js'
+import { parseArchiveName, backupArchiveName } from '../../src/utils/backupArchiveName.js'
 import { resourceLock, diskKey, instanceKey } from '../../src/utils/ResourceLock.js'
 import { APP_DATA_HELPER_VERSION, borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
@@ -106,6 +107,47 @@ const addInstance = (h: DocHandle<Store>, diskId: string, status: 'Stopped' | 'R
     })
 }
 
+describe('archive mode in the name (engine#401)', () => {
+    it('backupArchiveName tags the mode; parseArchiveName reads tagged and untagged names', () => {
+        const at = new Date('2026-11-14T21:45:01.234Z')
+        expect(backupArchiveName(at, null)).toBe('2026-11-14T21-45-01-234Z')
+        expect(backupArchiveName(at, 'hook')).toBe('2026-11-14T21-45-01-234Z-hook')
+        expect(backupArchiveName(at, 'stop')).toBe('2026-11-14T21-45-01-234Z-stop')
+        expect(backupArchiveName(at, 'cold')).toBe('2026-11-14T21-45-01-234Z-cold')
+        expect(parseArchiveName('2026-11-14T21-45-01-234Z')).toEqual({ timestamp: '2026-11-14T21-45-01-234Z', mode: null })
+        expect(parseArchiveName('2026-11-14T21-45-01-234Z-cold')).toEqual({ timestamp: '2026-11-14T21-45-01-234Z', mode: 'cold' })
+        expect(parseArchiveName('not-an-engine-archive')).toEqual({ timestamp: 'not-an-engine-archive', mode: null })
+        expect(parseArchiveName('2026-11-14T21-45-01-234Z-live').mode).toBeNull()
+    })
+
+    it('inventory carries the mode (null for untagged) and newestArchive ignores the suffix', () => {
+        const archives = parseBorgListInventory(JSON.stringify({
+            archives: [{ name: OLDER }, { name: '2026-11-12T01-00-00-000Z-stop' }, { name: '2026-11-11T23-18-06-123Z-hook' }],
+        }))
+        expect(archives.map(a => a.mode)).toEqual([null, 'stop', 'hook'])
+        expect(newestArchive(archives).name).toBe('2026-11-12T01-00-00-000Z-stop')
+        expect(newestArchive([{ name: '2026-11-12T01-00-00-000Z' }, { name: '2026-11-11T23-00-00-000Z-hook' }]).name).toBe('2026-11-12T01-00-00-000Z')
+    })
+
+    it('parseBackupVerifyModeLists reads verify.hook / stop / cold next to the flat lists; fails closed on a bad block', () => {
+        const xapp = { backup: { verify: {
+            present: ['.env'],
+            hook: { present: ['data/backup/db.sqlite3'] },
+            stop: { absent: ['data/backup/db.sqlite3'] },
+        } } }
+        expect(parseBackupVerifyLists(xapp)).toEqual({ present: ['.env'], absent: [] })
+        expect(parseBackupVerifyModeLists(xapp)).toEqual({
+            hook: { present: ['data/backup/db.sqlite3'], absent: [] },
+            stop: { present: [], absent: ['data/backup/db.sqlite3'] },
+        })
+        expect(parseBackupVerifyModeLists(undefined)).toEqual({})
+        expect(parseBackupVerifyModeLists({ backup: { verify: { present: ['x'] } } })).toEqual({})
+        expect(() => parseBackupVerifyModeLists({ backup: { verify: { hook: ['x'] } } })).toThrow(/verify\.hook is not a mapping/)
+        expect(() => parseBackupVerifyModeLists({ backup: { verify: { cold: { present: 'x' } } } })).toThrow(/verify\.cold\.present must be a list/)
+        expect(() => parseBackupVerifyModeLists({ backup: { verify: { hook: { present: ['../etc'] } } } })).toThrow()
+    })
+})
+
 describe('parse helpers (idea#446)', () => {
     it('parses borg inventory JSON and picks the newest archive', () => {
         const archives = parseBorgListInventory(JSON.stringify({
@@ -158,9 +200,9 @@ describe('parse helpers (idea#446)', () => {
         expect(parseScratchBytes('scratchBytes=9007199254740992\n')).toBeNull() // > MAX_SAFE_INTEGER
     })
 
-    it('registers the four commands and the backupVerify capability; Engine speaks helper v14 (idea#396), verify min stays v10', () => {
+    it('registers the four commands and the backupVerify capability; Engine speaks helper v16 (engine#401), verify min stays v10', () => {
         expect(BACKUP_VERIFY_HELPER_MIN).toBe(10)
-        expect(APP_DATA_HELPER_VERSION).toBe('14')
+        expect(APP_DATA_HELPER_VERSION).toBe('16')
         expect(ENGINE_CAPABILITIES).toContain('backupVerify')
         for (const name of ['listBackup', 'verifyBackup', 'clearBackupLock', 'removeBackupRole']) {
             expect(commands.find(c => c.name === name), name).toBeTruthy()
@@ -178,14 +220,15 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         path: process.env.PATH, log: process.env.FAKE_BORG_LOG, ver: process.env.FAKE_HELPER_VERSION,
     }
 
-    const inventory = (original = 1000, compressed = 400) => JSON.stringify({
+    const inventory = (original = 1000, compressed = 400, newest = ARCHIVE) => JSON.stringify({
         archives: [
             { name: OLDER, start: '2026-11-10T10:00:00.000000', stats: { original_size: 10, compressed_size: 4 } },
-            { name: ARCHIVE, start: '2026-11-11T23:18:06.123000', stats: { original_size: original, compressed_size: compressed } },
+            { name: newest, start: '2026-11-11T23:18:06.123000', stats: { original_size: original, compressed_size: compressed } },
         ],
     })
 
-    const seedRepo = async (opts?: { members?: string[]; extract?: Record<string, string>; compose?: any }) => {
+    const seedRepo = async (opts?: { members?: string[]; extract?: Record<string, string>; compose?: any; archive?: string }) => {
+        const A = opts?.archive ?? ARCHIVE
         const instDir = `${DISKS_ROOT}/${appDevice}/instances/${INST}`
         await fs.ensureDir(`${instDir}/data`)
         await fs.ensureDir(`${DISKS_ROOT}/${backupDevice}/backups/${INST}`)
@@ -193,16 +236,16 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/BACKUP.yaml`, `mode: on-demand\nlinks:\n  - instanceId: ${INST}\n    lastBackup: 0\n`)
         await fs.ensureDir(`${DISKS_ROOT}/${backupDevice}/apps`)
         await fs.ensureDir(`${DISKS_ROOT}/${backupDevice}/.idea-inventory`)
-        await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/.idea-inventory/${INST}.json`, inventory())
+        await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/.idea-inventory/${INST}.json`, inventory(1000, 400, A))
         const members = opts?.members ?? [
             `disks/${backupDevice}/instances/${INST}/compose.yaml`,
             `disks/${backupDevice}/instances/${INST}/data/hello.txt`,
             `disks/${backupDevice}/instances/${INST}/.env`,
         ]
         await fs.ensureDir(`${DISKS_ROOT}/${backupDevice}/.idea-members/${INST}`)
-        await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/.idea-members/${INST}/${ARCHIVE}`, members.join('\n') + '\n')
+        await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/.idea-members/${INST}/${A}`, members.join('\n') + '\n')
         const extract = opts?.extract ?? { 'compose.yaml': 'services: {}\n', 'data/hello.txt': 'hi\n', '.env': 'X=1\n' }
-        const src = `${DISKS_ROOT}/${backupDevice}/.idea-verify-src/${INST}/${ARCHIVE}`
+        const src = `${DISKS_ROOT}/${backupDevice}/.idea-verify-src/${INST}/${A}`
         for (const [rel, body] of Object.entries(extract)) {
             await fs.ensureDir(path.join(src, path.dirname(rel)))
             await fs.writeFile(path.join(src, rel), body)
@@ -337,6 +380,91 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         const log = await calls()
         expect(log.some(l => l.startsWith('borg-extract '))).toBe(false)
         expect(log.some(l => l.startsWith(`borg-extract-verify ${backupDevice} ${INST} ${ARCHIVE} `))).toBe(true)
+    })
+
+    // ── engine#401: per-mode verify lists ─────────────────────────────────────
+    const modeCompose = {
+        'x-app': { name: 'kolibri', backup: { exclude: ['keys'], verify: {
+            present: ['.env'],
+            hook: { present: ['data/backup/db.sqlite3'] },
+            stop: { absent: ['data/backup/db.sqlite3'] },
+        } } },
+        services: {},
+    }
+    const membersWith = (extra: string[]) => [
+        `disks/${backupDevice}/instances/${INST}/compose.yaml`,
+        `disks/${backupDevice}/instances/${INST}/.env`,
+        ...extra.map(e => `disks/${backupDevice}/instances/${INST}/${e}`),
+    ]
+
+    it('engine#401 a -hook archive without the db copy fails its verify.hook list; the stop list does not apply', async () => {
+        const A = '2026-11-11T23-18-06-123Z-hook'
+        await seedRepo({ archive: A, compose: modeCompose, members: membersWith([]) })
+        const { h } = await storeWithDisks()
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.archive).toBe(A)
+        expect(result.mode).toBe('hook')
+        expect(result.ok).toBe(false)
+        expect(result.checks).toEqual(expect.arrayContaining([
+            expect.objectContaining({ path: '.env', source: 'verify.present', ok: true }),
+            expect.objectContaining({ path: 'data/backup/db.sqlite3', expect: 'present', source: 'verify.hook.present', ok: false }),
+        ]))
+        expect(result.checks.some((c: any) => c.source.startsWith('verify.stop'))).toBe(false)
+    })
+
+    it('engine#401 a -hook archive with the db copy passes', async () => {
+        const A = '2026-11-11T23-18-06-123Z-hook'
+        await seedRepo({ archive: A, compose: modeCompose, members: membersWith(['data/backup/db.sqlite3']) })
+        const { h } = await storeWithDisks()
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.ok).toBe(true)
+        expect(result.checks).toEqual(expect.arrayContaining([
+            expect.objectContaining({ path: 'data/backup/db.sqlite3', source: 'verify.hook.present', ok: true }),
+        ]))
+    })
+
+    it('engine#401 a -stop archive uses verify.stop (no db copy expected)', async () => {
+        const A = '2026-11-11T23-18-06-123Z-stop'
+        await seedRepo({ archive: A, compose: modeCompose, members: membersWith([]) })
+        const { h } = await storeWithDisks()
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.mode).toBe('stop')
+        expect(result.ok).toBe(true)
+        expect(result.checks).toEqual(expect.arrayContaining([
+            expect.objectContaining({ path: 'data/backup/db.sqlite3', expect: 'absent', source: 'verify.stop.absent', ok: true }),
+        ]))
+    })
+
+    it('engine#401 a -cold archive with no verify.cold block gets the flat lists only', async () => {
+        await seedRepo({ archive: '2026-11-11T23-18-06-123Z-cold', compose: modeCompose, members: membersWith([]) })
+        const { h } = await storeWithDisks()
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.mode).toBe('cold')
+        expect(result.ok).toBe(true)
+        expect(result.checks.map((c: any) => c.source).sort()).toEqual(['exclude', 'verify.present'])
+    })
+
+    it('engine#401 an untagged (older) archive verifies exactly as before: flat lists only, mode null', async () => {
+        await seedRepo({ compose: modeCompose, members: membersWith([]) })
+        const { h } = await storeWithDisks()
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.archive).toBe(ARCHIVE)
+        expect(result.mode).toBeNull()
+        expect(result.ok).toBe(true)
+        expect(result.checks.map((c: any) => c.source).sort()).toEqual(['exclude', 'verify.present'])
+    })
+
+    it('engine#401 listBackup reports each archive\'s mode and accepts a tagged archive name', async () => {
+        const A = '2026-11-11T23-18-06-123Z-hook'
+        await seedRepo({ archive: A })
+        const { h } = await storeWithDisks()
+        const listed = await listBackup(h, INST, 'ver-bd', A) as any
+        expect(listed.archives).toEqual(expect.arrayContaining([
+            expect.objectContaining({ name: A, mode: 'hook' }),
+            expect.objectContaining({ name: OLDER, mode: null }),
+        ]))
+        expect(listed.archive).toBe(A)
+        expect(listed.memberCount).toBe(3)
     })
 
     it('verifyBackup uses the helper scratchBytes count, even when it differs from a local walk', async () => {
