@@ -102,6 +102,10 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
     `ssh-no-password` fails if `10-idea-login.conf` is missing, or the effective `PasswordAuthentication` or
     `KbdInteractiveAuthentication` (or its alias `ChallengeResponseAuthentication`) is not `no`, or a `Match` block
     turns either back on.
+    `kernel-cmdline` (koenswings/idea#518) fails unless `<boot>/cmdline.txt` is exactly one line carrying
+    `cgroup_enable=memory` exactly once. The sanitise step appends it (`KERNEL_CMDLINE_FLAGS`; same line, idempotent),
+    because the Raspberry Pi firmware passes `cgroup_disable=memory` and Docker then has no memory accounting
+    (`docker stats` 0B, `idea/metrics` memUsageBytes 0). Post-boot check: `memory` in `/sys/fs/cgroup/cgroup.controllers`.
 
 `engine-build.json`: `{engine_commit, engine_version, lock_sha256, verify: {passed, failed}}` (failed = the problems).
 

@@ -315,6 +315,51 @@ export const writeBootSshTrigger = async (boot: string): Promise<string> => {
     if (!(await fs.pathExists(f)) && !(await fs.pathExists(path.join(boot, 'ssh.txt')))) await fs.writeFile(f, '')
     return f
 }
+/**
+ * Kernel arguments the image appends to <boot>/cmdline.txt (koenswings/idea#518). The Raspberry Pi firmware passes
+ * cgroup_disable=memory; cgroup_enable=memory overrides it so Docker has memory accounting (docker stats and the
+ * Engine's idea/metrics memUsageBytes/memLimitBytes read 0 without it). The idea repo's kernel-cmdline.sh appends
+ * the same token; both appends are idempotent.
+ */
+export const KERNEL_CMDLINE_FLAGS = ['cgroup_enable=memory'] as const
+
+/** Problems with a cmdline.txt text: must be exactly one line carrying each flag exactly once (none = ok). */
+export const kernelCmdlineProblems = (text: string, flags: readonly string[] = KERNEL_CMDLINE_FLAGS): string[] => {
+    const p: string[] = []
+    const lines = text.replace(/\n$/, '').split('\n')
+    if (text.trim() === '') p.push('cmdline.txt is empty')
+    else if (lines.length !== 1) p.push(`cmdline.txt has ${lines.length} lines, must be exactly one`)
+    const toks = text.split(/\s+/).filter(Boolean)
+    for (const f of flags) {
+        const n = toks.filter(t => t === f).length
+        if (n !== 1) p.push(`cmdline.txt carries ${f} ${n} times, must be exactly once`)
+    }
+    return p
+}
+
+/** cmdline.txt text with each missing flag appended to its single line (never a new line, never twice). */
+export const appendKernelCmdlineFlags = (text: string, flags: readonly string[] = KERNEL_CMDLINE_FLAGS): string => {
+    const lines = text.replace(/\n$/, '').split('\n')
+    if (lines.length !== 1 || text.trim() === '') throw new Error(`cmdline.txt must be exactly one non-empty line (has ${lines.length})`)
+    let line = lines[0].trimEnd()
+    for (const f of flags) {
+        if (/\s/.test(f) || !f) throw new Error(`bad kernel flag '${f}'`)
+        if (!line.split(/\s+/).includes(f)) line += ` ${f}`
+    }
+    return line + '\n'
+}
+
+/** Appends KERNEL_CMDLINE_FLAGS to <boot>/cmdline.txt; returns a short note. A missing cmdline.txt is left to verify. */
+export const writeKernelCmdlineFlags = async (boot: string, flags: readonly string[] = KERNEL_CMDLINE_FLAGS): Promise<string> => {
+    const f = path.join(boot, 'cmdline.txt')
+    if (!(await fs.pathExists(f))) return `${f} missing (not changed; verify will fail)`
+    if ((await fs.lstat(f)).isSymbolicLink()) throw new Error(`${f} is a symlink (refusing)`)
+    const before = await fs.readFile(f, 'utf8'), after = appendKernelCmdlineFlags(before, flags)
+    if (after === before || after.trimEnd() === before.trimEnd()) return `${f}: ${flags.join(' ')} already present`
+    await fs.writeFile(f, after)
+    return `${f}: appended ${flags.filter(x => !before.split(/\s+/).includes(x)).join(' ')}`
+}
+
 /** In the image (idea tools/engine-image/INTERFACE.md) */
 export const IMAGE_LOCK_PATH = '/etc/idea/engine.lock'
 export const IMAGE_VERSION_PATH = '/etc/idea/engine-version'
@@ -638,7 +683,7 @@ export const piLoginProblems = async (root: string): Promise<string[]> => {
 
 /** Every check a built rootfs must pass. Returns problems; empty = OK. Read-only. */
 /** verify's checks, in order; the report counts how many passed (VERIFY_CHECKS.length in all). */
-export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image', 'ssh-first-boot', 'console-ui', 'pi-login', 'operator-keys', 'ssh-no-password'] as const
+export const VERIFY_CHECKS = ['identity', 'store-identity', 'engine-tree', 'pm2-as-pi', 'enabled-units', 'locked-files', 'permissions', 'npm-tools', 'docker-preload', 'packages', 'no-dev-files', 'lock-in-image', 'ssh-first-boot', 'console-ui', 'pi-login', 'operator-keys', 'ssh-no-password', 'kernel-cmdline'] as const
 export interface VerifyCheckResult { name: string, problems: string[] }
 
 export const verifyRootfs = async (c: VerifyContext): Promise<string[]> => (await verifyRootfsChecks(c)).flatMap(x => x.problems)
@@ -832,6 +877,15 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
         if (!kb.length || kb.some(x => x.value.toLowerCase() !== 'no')) p.push(`KbdInteractiveAuthentication is ${kb.length ? kb.map(x => `${x.value} (${x.file})`).join(', ') : 'unset (sshd default yes)'}; must be no`)
         for (const m of sshd.inMatch) if (['passwordauthentication', 'kbdinteractiveauthentication', 'challengeresponseauthentication'].includes(m.keyword) && m.value.toLowerCase() !== 'no')
             p.push(`${m.file}: a Match block sets ${m.keyword} ${m.value}`)
+    }
+    check('kernel-cmdline')
+    // 17. memory cgroup on (koenswings/idea#518): <boot>/cmdline.txt is one line with cgroup_enable=memory exactly once
+    const kboot = c.boot ?? (await fs.pathExists(R('boot/firmware')) ? R('boot/firmware') : undefined)
+    if (kboot) {
+        const cl = path.join(kboot, 'cmdline.txt')
+        if (!(await fs.pathExists(cl))) p.push(`${cl} missing (kernel arguments: ${KERNEL_CMDLINE_FLAGS.join(' ')})`)
+        else if ((await fs.lstat(cl)).isSymbolicLink()) p.push(`${cl} must not be a symlink`)
+        else p.push(...kernelCmdlineProblems(await fs.readFile(cl, 'utf8')))
     }
     return results
 }
