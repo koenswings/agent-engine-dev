@@ -214,3 +214,91 @@ describe('peer-verify.sh: lint', () => {
         expect(r.exitCode, r.stdout).toBe(0)
     })
 })
+
+
+describe('peer-verify.sh: Engine pins, golden peer and a copy outside the repo', () => {
+    const fleet = {
+        idea01: { role: 'golden', status: 'idle', version: 'engine main@6b44c8a3e9fdcc2360c06d37dc865336b4416acd, console main@4272c4fb717d1c9412f429f71aa40ec5ac650ee1' },
+        idea03: { role: 'spare', status: 'idle', version: 'engine main@4522d7ff9a2652a44e2135ed279e55302b2b90a7, console main@6f314a0ab264b8b5d5e20ec6b355e45fa7518717' },
+        idea04: { role: 'spare', status: 'idle', version: 'engine deploy/x@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa, console main@bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb' },
+    }
+
+    const printPins = async (args: string[], env: Record<string, string> = {}) =>
+        run(['--print-pins', ...args], env)
+
+    it('help text describes the pin, golden peer and tag:idea EXPECTED-BLOCKED behaviour', async () => {
+        const r = await run(['--help'])
+        expect(r.code, r.out).toBe(0)
+        expect(r.out).toMatch(/--required-commit/)
+        expect(r.out).toMatch(/--fleet-state/)
+        expect(r.out).toMatch(/role golden/)
+        expect(r.out).toMatch(/EXPECTED-BLOCKED/)
+        expect(r.out).toMatch(/tag:idea/)
+        expect(r.out).toMatch(/lanAddress/)
+        expect(r.out).toMatch(/PV_REPO_DIR/)
+    })
+
+    it('prints default pin 4522d7f and golden idea01 when no fleet-state is given', async () => {
+        const r = await printPins(['idea03', 'idea04'])
+        expect(r.code, r.out).toBe(0)
+        expect(r.out).toMatch(/FLEET_SOURCE=none/)
+        expect(r.out).toMatch(/GOLDEN_NAME=idea01/)
+        expect(r.out).toMatch(/DEFAULT_ENGINE_PIN=4522d7ff9a2652a44e2135ed279e55302b2b90a7/)
+        expect(r.out).toMatch(/PIN idea03=4522d7ff9a2652a44e2135ed279e55302b2b90a7/)
+        expect(r.out).toMatch(/PIN idea04=4522d7ff9a2652a44e2135ed279e55302b2b90a7/)
+    })
+
+    it('reads each Pi\'s engine pin and the golden role from --fleet-state', async () => {
+        const f = path.join(tmp, 'fleet-state.json')
+        await fs.writeFile(f, JSON.stringify(fleet))
+        const r = await printPins(['idea03', 'idea04'], { PV_FLEET_STATE: f })
+        expect(r.code, r.out).toBe(0)
+        expect(r.out).toMatch(new RegExp(`FLEET_SOURCE=${f}`))
+        expect(r.out).toMatch(/GOLDEN_NAME=idea01/)
+        expect(r.out).toMatch(/PIN idea03=4522d7ff9a2652a44e2135ed279e55302b2b90a7/)
+        expect(r.out).toMatch(/PIN idea04=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/)
+    })
+
+    it('--required-commit overrides the fleet-state pins on every given Pi', async () => {
+        const f = path.join(tmp, 'fleet-state.json')
+        await fs.writeFile(f, JSON.stringify(fleet))
+        const r = await printPins(['--required-commit', 'deadbeefcafebabe', '--fleet-state', f, 'idea03', 'idea04'])
+        expect(r.code, r.out).toBe(0)
+        expect(r.out).toMatch(/GOLDEN_NAME=idea01/)
+        expect(r.out).toMatch(/PIN idea03=deadbeefcafebabe/)
+        expect(r.out).toMatch(/PIN idea04=deadbeefcafebabe/)
+    })
+
+    it('refuses a bad --required-commit and a missing --fleet-state file', async () => {
+        const bad = await run(['--print-pins', '--required-commit', 'not-a-sha', 'idea03', 'idea04'])
+        expect(bad.code, bad.out).toBe(2)
+        expect(bad.out).toMatch(/REFUSED: --required-commit needs a 7/)
+        const missing = await run(['--print-pins', '--fleet-state', path.join(tmp, 'no-such.json'), 'idea03', 'idea04'])
+        expect(missing.code, missing.out).toBe(2)
+        expect(missing.out).toMatch(/REFUSED: fleet-state file not found/)
+    })
+
+    it('works as a copy outside the repo; PV_REPO_DIR points at the checkout', async () => {
+        const copy = path.join(tmp, 'peer-verify.sh')
+        await fs.copy(SCRIPT, copy)
+        const runCopy = async (env: Record<string, string> = {}) => {
+            $.verbose = false
+            const r = await $({
+                env: { ...process.env, PV_EVIDENCE_ROOT: path.join(tmp, 'evidence'), PV_SSH: '/bin/false', PV_STORE: '/bin/false', ...env },
+                nothrow: true,
+            })`bash ${copy} --print-pins idea03 idea04`
+            return { code: r.exitCode, out: r.stdout + r.stderr }
+        }
+        const without = await runCopy()
+        expect(without.code, without.out).toBe(0)
+        expect(without.out).toMatch(/REPO_HAS_ASSETS=0/)
+        expect(without.out).toMatch(/GOLDEN_NAME=idea01/)
+        expect(without.out).toMatch(/PIN idea03=4522d7ff9a2652a44e2135ed279e55302b2b90a7/)
+
+        const repo = path.resolve('.')
+        const withRepo = await runCopy({ PV_REPO_DIR: repo })
+        expect(withRepo.code, withRepo.out).toBe(0)
+        expect(withRepo.out).toMatch(/REPO_HAS_ASSETS=1/)
+        expect(withRepo.out).toMatch(new RegExp(`REPO_DIR=${repo}`))
+    })
+})
