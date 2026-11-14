@@ -46,14 +46,14 @@ export const MOVE_REFUSAL_CODES = [
     'TARGET_EXISTS',      // the same id is already on the target disk / Engine (engine#381)
 ] as const
 export const MOVE_FAILURE_CODES = [
-    'COPY_FAILED',        // the copy failed
+    'COPY_FAILED',        // the copy did not finish (no target cleanup)
     'VERIFY_NOT_FOUND',   // the copy is not registered, or not on a disk docked to the target
     'VERIFY_NOT_RUNNING', // the source was running but the copy did not reach Running
     'VERIFY_SIZE',        // the copy's instance data size does not match
     'VERIFY_TIMEOUT',     // the target did not report a verdict in time
     'VERIFY_FAILED',      // fallback only: the target could not check (e.g. sizing error) or sent no code
     'INTERRUPTED',        // the Engine restarted before verify was recorded
-    'SOURCE_KEPT',        // pre-flip failure that is not SOURCE_CHANGED (engine#388): source kept, not moved
+    'SOURCE_KEPT',        // pre-flip failure that is not SOURCE_CHANGED (engine#388), including a failed size measurement after a finished copy: source kept, not moved
 ] as const
 export const MOVE_DONE_CODES = [
     'MOVED',              // copied, verified, source quarantined
