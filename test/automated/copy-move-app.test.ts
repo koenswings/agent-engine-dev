@@ -225,6 +225,10 @@ describe('copyApp', () => {
         expect(ops[0].status).toBe('Done')
         expect(ops[0].progressPercent).toBe(100)
         expect(ops[0].error).toBeNull()
+        expect(ops[0].args).toMatchObject({
+            instanceId: INSTANCE_ID, sourceDiskId: SOURCE_DISK_ID, targetDiskId: TARGET_DISK_ID,
+            instanceName: 'my-kolibri',
+        })
     })
 
     it('assigns a new InstanceID (not the original) for the copy', async () => {
@@ -375,6 +379,11 @@ describe('moveApp', () => {
         const ops = Object.values(handle.doc().operationDB)
         expect(ops[0].kind).toBe('moveApp')
         expect(ops[0].status).toBe('Done')
+        expect(ops[0].args).toMatchObject({
+            instanceId: INSTANCE_ID, sourceDiskId: SOURCE_DISK_ID, targetDiskId: TARGET_DISK_ID,
+            instanceName: 'my-kolibri',
+        })
+        expect(ops[0].args.crossEngine).toBeUndefined()
     })
 
     it('retains the original InstanceID', async () => {

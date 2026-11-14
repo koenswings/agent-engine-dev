@@ -24,6 +24,22 @@ import { peerRsyncShell, peerTarget } from './peerSsh.js'
 
 export interface RsyncProgress {
     progressPercent: number
+    /** Bytes reported by rsync --info=progress2 for this transfer, when parsed. */
+    bytesDone?: number
+}
+
+/** Parse the last rsync --info=progress2 update in `text` (lines may use CR). */
+export const parseRsyncProgress2 = (text: string): RsyncProgress | null => {
+    const re = /([\d,]+)\s+(\d{1,3})%/g
+    let last: RsyncProgress | null = null
+    let m: RegExpExecArray | null
+    while ((m = re.exec(text)) !== null) {
+        const bytesDone = parseInt(m[1].replace(/,/g, ''), 10)
+        const progressPercent = parseInt(m[2], 10)
+        if (!Number.isFinite(bytesDone) || !Number.isFinite(progressPercent)) continue
+        last = { progressPercent, bytesDone }
+    }
+    return last
 }
 
 export type RsyncProgressCallback = (progress: RsyncProgress) => void
@@ -54,14 +70,8 @@ const runRsyncProcess = (
         proc.stdout?.on('data', (chunk: Buffer) => {
             const text = chunk.toString()
             // progress2 lines look like: "  1,234,567  42%    1.23MB/s    0:00:05"
-            // We scan for the percentage value.
-            const matches = text.match(/\s(\d{1,3})%/)
-            if (matches && onProgress) {
-                const pct = parseInt(matches[1], 10)
-                if (!isNaN(pct)) {
-                    onProgress({ progressPercent: pct })
-                }
-            }
+            const parsed = parseRsyncProgress2(text)
+            if (parsed && onProgress) onProgress(parsed)
         })
 
         proc.stderr?.on('data', (chunk: Buffer) => {

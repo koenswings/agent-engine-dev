@@ -163,6 +163,9 @@ export const cleanupUnverifiedMoveTarget = async (storeHandle: DocHandle<Store>,
  */
 export const CLEANUP_TIMEOUT_MS = 60 * 1000
 
+/** Default copyApp hooks ephemeral byte progress registered by moveAppCrossEngine (per opId). */
+const copyByteProgressByOp = new Map<string, (p: CopyByteProgress, force?: boolean) => void>()
+
 const defaultDeps: MoveDeps = {
     localEngineId: async () => String((await import('./Engine.js')).localEngineId),
     validate: async (store, name, src, tgt) => {
@@ -173,8 +176,10 @@ const defaultDeps: MoveDeps = {
     sourceBytes: async (disk, id) => instanceDataBytes(await appDataRoot(disk), String(id)),
     copy: async (storeHandle, instanceId, src, tgt, cause, opId) => {
         const { copyApp } = await import('./CopyMoveApp.js')
+        const onByteProgress = copyByteProgressByOp.get(opId)
         const id = await copyApp(storeHandle, instanceId as unknown as InstanceName, src, tgt, cause, {
             journalOpId: opId, keepName: true, rethrow: true, keepSourceStopped: true, dstId: instanceId,
+            onByteProgress: onByteProgress ? (p) => onByteProgress(p) : undefined,
         })
         if (!id) throw new Error('the copy did not finish')
         return id
@@ -187,7 +192,9 @@ const defaultDeps: MoveDeps = {
     removeSource: async (storeHandle, instanceId, _engineId, sourceDiskId) => {
         const disk = getDisk(storeHandle.doc(), sourceDiskId)
         if (!disk) throw new RemoveError('NOT_FOUND', `source disk '${sourceDiskId}' not found`)
-        return quarantineInstanceOnDisk(disk, instanceId)
+        // The copy already stopped the source and SOURCE_CHANGED re-checks it;
+        // compose down -t 0 avoids waiting out a stop timeout on a stopped container.
+        return quarantineInstanceOnDisk(disk, instanceId, { composeTimeoutSec: 0 })
     },
     verifyTimeoutMs: 6 * 60 * 1000,
     cleanupTimeoutMs: CLEANUP_TIMEOUT_MS,
@@ -237,6 +244,28 @@ const finish = (storeHandle: DocHandle<Store>, opId: string, result: MoveResult,
 }
 
 export const MOVE_PROGRESS_TYPE = 'idea/progress' as const
+/** Copying idea/progress is throttled to about once a second (engine#387). */
+export const COPY_PROGRESS_INTERVAL_MS = 1_000
+
+export type CopyByteProgress = { bytesDone: number, bytesTotal: number }
+
+/** Emit Copying idea/progress at most once per interval, plus the first and a forced last. */
+export const throttledCopyProgress = (
+    emit: (msg: object) => void,
+    opId: string,
+    intervalMs: number = COPY_PROGRESS_INTERVAL_MS,
+    now: () => number = Date.now,
+): ((p: CopyByteProgress, force?: boolean) => void) => {
+    let lastAt = 0
+    return (p, force = false) => {
+        const t = now()
+        const complete = p.bytesTotal > 0 && p.bytesDone >= p.bytesTotal
+        if (!force && !complete && lastAt !== 0 && t - lastAt < intervalMs) return
+        lastAt = t
+        emit({ type: MOVE_PROGRESS_TYPE, opId, step: 'Copying', bytesDone: p.bytesDone, bytesTotal: p.bytesTotal })
+    }
+}
+
 
 export interface MoveProgressMsg {
     type: typeof MOVE_PROGRESS_TYPE
@@ -350,6 +379,7 @@ export const moveAppCrossEngine = async (
     }
     const opId = createOperation(storeHandle, 'moveApp', {
         instanceId: String(instance.id), sourceDiskId: String(sourceDisk.id), targetDiskId: String(targetDisk.id), crossEngine: 'true',
+        instanceName: String(instance.name),
     }, cause, { type: 'instance', id: String(instance.id) })
     storeHandle.change(doc => { const op = doc.operationDB?.[opId] as any; if (op) op.move = { ...move } })
 
@@ -413,6 +443,8 @@ export const moveAppCrossEngine = async (
     // on the moveApp operation; percent-only patches are dropped).
     const emit = d.broadcast ?? ((msg: object) => { try { storeHandle.broadcast(msg as any) } catch { /* no peers */ } })
     emit({ type: MOVE_PROGRESS_TYPE, opId, step: MOVE_STEPS[0], bytesDone: 0, bytesTotal: 0 })
+    const emitCopyBytes = throttledCopyProgress(emit, opId)
+    copyByteProgressByOp.set(opId, emitCopyBytes)
     // The source must not be started or written to from here until it is removed
     // (idea#79 call 3): the copy stops it and keeps it stopped; the remove step
     // re-checks lastStarted, status and size against this baseline.
@@ -423,6 +455,8 @@ export const moveAppCrossEngine = async (
     } catch (e: any) {
         await restartIfNeeded()
         return fail('COPY_FAILED', `the copy to ${targetName} failed (${e?.message ?? e})`, null)
+    } finally {
+        copyByteProgressByOp.delete(opId)
     }
     try {
         patchMove(storeHandle, opId, { targetInstanceId: String(targetInstanceId) })
@@ -447,6 +481,12 @@ export const moveAppCrossEngine = async (
 
     // ── 3. Removing the old copy (quarantine, never rm) ─────────────────────
     setPhase(storeHandle, opId, 'removing')
+    const removeStarted = Date.now()
+    const removeTimed = async <T>(step: string, fn: () => Promise<T>): Promise<T> => {
+        const t0 = Date.now()
+        try { return await fn() }
+        finally { log(`moveApp remove: ${step} ${Date.now() - t0}ms (since step start ${Date.now() - removeStarted}ms)`) }
+    }
     try {
         const verifiedNow = (storeHandle.doc().operationDB?.[opId] as any)?.move?.verified === true
         if (!verifiedNow) throw new Error('verify was not recorded')
@@ -455,21 +495,27 @@ export const moveAppCrossEngine = async (
         if (src.status === 'Running' || src.status === 'Starting' || Number(src.lastStarted ?? 0) !== startedBaseline) {
             throw new MoveError('SOURCE_CHANGED', `the source was started during the move (status ${src.status}); it may hold newer data than the copy`)
         }
-        const nowBytes = await d.sourceBytes(sourceDisk, instance.id)
+        const nowBytes = await removeTimed('sourceBytes', () => d.sourceBytes(sourceDisk, instance.id))
         if (nowBytes !== baselineBytes) {
             throw new MoveError('SOURCE_CHANGED', `the source was written to during the move (${baselineBytes} → ${nowBytes} bytes); it may hold newer data than the copy`)
         }
         // Flip storedOn only after verify and SOURCE_CHANGED checks; then quarantine
         // the source folder (not the store row). The target adopts port/status after.
+        const flipAt = Date.now()
         flipStoredOnAfterVerify(storeHandle, String(instance.id), String(targetDisk.id))
-        const removed = await d.removeSource(storeHandle, instance.id, engineId, sourceDisk.id)
+        log(`moveApp remove: flipStoredOn ${Date.now() - flipAt}ms (since step start ${Date.now() - removeStarted}ms)`)
+        const removed = await removeTimed('removeSource', () => d.removeSource(storeHandle, instance.id, engineId, sourceDisk.id))
         patchMove(storeHandle, opId, { sourceRemoved: true, quarantinePath: removed.quarantinePath })
         if (expectRunning) {
+            const startAt = Date.now()
             d.requestStart(storeHandle, targetEngineId, `startInstance ${targetInstanceId} ${targetDisk.id} --cause post-move`)
+            log(`moveApp remove: requestStart ${Date.now() - startAt}ms (since step start ${Date.now() - removeStarted}ms)`)
         }
         const r = result('MOVED', movedText(targetName), String(targetInstanceId), removed.quarantinePath)
         log(`moveApp: ${r.text}; the old copy is quarantined at ${removed.quarantinePath}`)
+        const finishAt = Date.now()
         finish(storeHandle, opId, r, false)
+        log(`moveApp remove: finish ${Date.now() - finishAt}ms (since step start ${Date.now() - removeStarted}ms)`)
         return r
     } catch (e: any) {
         const flipped = String(getInstance(storeHandle.doc(), instance.id)?.storedOn ?? '') === String(targetDisk.id)

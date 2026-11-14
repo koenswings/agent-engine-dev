@@ -149,6 +149,9 @@ describe('removeInstance with a legacy dotted id (idea#479)', () => {
             await composeDownAt(tmp, DOTTED as any, run, { allowLegacyDotted: true })
             expect(ran).toEqual([['compose', '-p', DOTTED_PROJECT, '-f', path.join(tmp, 'compose.yaml'), 'down']])
             ran.length = 0
+            await composeDownAt(tmp, DOTTED as any, run, { allowLegacyDotted: true, timeoutSec: 0 })
+            expect(ran).toEqual([['compose', '-p', DOTTED_PROJECT, '-f', path.join(tmp, 'compose.yaml'), 'down', '-t', '0']])
+            ran.length = 0
             await expect(composeDownAt(tmp, DOTTED as any, run)).rejects.toThrow(/^INVALID_INSTANCE_ID/)
             await expect(composeDownAt(tmp, 'Bad;id' as any, run, { allowLegacyDotted: true })).rejects.toThrow(/^INVALID_INSTANCE_ID/)
             expect(ran).toEqual([])

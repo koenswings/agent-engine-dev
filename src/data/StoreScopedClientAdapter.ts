@@ -23,6 +23,7 @@ import { cbor, Message, PeerId, PeerMetadata } from '@automerge/automerge-repo'
 import { parseRefusalMessage, peerVerdict, PeerVerdict } from './StoreScope.js'
 import { WsLiveness, wsDeadMs, wsPingMs } from './WsLiveness.js'
 import { log } from '../utils/utils.js'
+import { createEphemeralSendDedupe } from '../utils/ephemeralDedupe.js'
 
 export interface ClientRefusal {
     url: string
@@ -151,11 +152,13 @@ export class StoreScopedWebSocketClientAdapter extends WebSocketClientAdapter {
         return (super.emit as any)(event, ...args)
     }
 
+    #ephemeralDedupe = createEphemeralSendDedupe()
+
     override send(message: Message): void {
         if (this.refusal) return
         if (message.type !== 'join' && !this.#admitted) return
         const out = guardOutgoing(message, this.#docGuard)
-        if (out) super.send(out)
+        if (out && this.#ephemeralDedupe.shouldSend(out)) super.send(out)
     }
 
     /** Idempotent: removeNetworkAdapter calls it again after a refusal already closed the socket. */
