@@ -40,7 +40,7 @@ export type DemoStepStatus = 'pending' | 'running' | 'done' | 'skipped' | 'faile
 export type DemoCode =
     | 'UNKNOWN_APP' | 'NOT_FOUND' | 'NOT_DOCKED' | 'NOT_LOCAL' | 'SYSTEM_DISK' | 'NOT_APP_DISK'
     | 'DEMO_EXISTS' | 'DEMO_AMBIGUOUS' | 'NO_SOURCE' | 'PACK_OUTDATED' | 'NO_SPACE' | 'BUSY'
-    | 'NOT_DEMO' | 'HELPER_OUTDATED' | 'DOWNLOAD_FAILED' | 'CHECKSUM_MISMATCH' | 'INSTALL_FAILED'
+    | 'NOT_DEMO' | 'HELPER_OUTDATED' | 'DOWNLOAD_FAILED' | 'CHECKSUM_MISMATCH' | 'INVALID_PACK' | 'INSTALL_FAILED'
     | 'HOOK_MISSING' | 'HOOK_FAILED' | 'START_FAILED' | 'NOT_READY' | 'DOCK_CHANGED' | 'INTERRUPTED'
     | 'REMOVE_FAILED' | 'DEMO_READY' | 'DEMO_REMOVED'
 
@@ -108,7 +108,7 @@ export const demoKey = (engineId: string): string => `demo:${engineId}`
 
 // ── Capability (implemented in Engine.ts so engineCapabilities has no cycle) ──
 
-import { isDemoAppsCapabilityOn } from './Engine.js'
+import { isDemoAppsCapabilityOn, checkDemoAppsCapability } from './Engine.js'
 export { DEMO_APPS_CAPABILITY, checkDemoAppsCapability, resetDemoAppsCapabilityForTests, isDemoAppsCapabilityOn } from './Engine.js'
 
 // ── Heartbeat fields (ephemeral; never stored) ────────────────────────────────
@@ -347,6 +347,8 @@ export interface SetupDemoDeps {
     broadcast: (msg: DemoProgressMsg) => void
     now: () => number
     sleep: (ms: number) => Promise<void>
+    /** Injected python3 check for tests; production uses checkDemoAppsCapability's default. */
+    checkDemoApps?: () => boolean
 }
 
 const defaultDeps = (storeHandle: DocHandle<Store>): SetupDemoDeps => ({
@@ -432,7 +434,11 @@ export const setupDemo = async (
         if (demos.length >= 2) throw new DemoError('DEMO_AMBIGUOUS', `two or more ${app} demo instances are docked on this Engine`)
     }
 
-    if (isDemoAppsCapabilityOn() === false) {
+    // Steve on PR #374: if the boot-time check has not run yet, run it on demand. Never proceed blind.
+    if (isDemoAppsCapabilityOn() === null) {
+        checkDemoAppsCapability(d.checkDemoApps)
+    }
+    if (isDemoAppsCapabilityOn() !== true) {
         throw new DemoError('HELPER_OUTDATED', 'python3 is not on PATH; setupDemo is not available on this Engine')
     }
 

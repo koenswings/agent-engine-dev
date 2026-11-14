@@ -12,6 +12,7 @@ import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import {
     setupDemo, removeDemo, DemoError, stepPlan, parseAppsList, parseAppsFlag,
     demoKey, markDemoInterrupted, resetDemoHbForTests,
+    isDemoAppsCapabilityOn, resetDemoAppsCapabilityForTests,
 } from '../../src/data/DemoApps.js'
 import { recoverInterruptedOperations } from '../../src/data/Operations.js'
 import { validate } from '../../src/data/CopyMoveApp.js'
@@ -97,6 +98,7 @@ const deps = (over: Record<string, unknown> = {}) => ({
     broadcast: (m: any) => { broadcasts.push(m) },
     now: () => Date.now(),
     sleep: async () => {},
+    checkDemoApps: () => true,
     ...over,
 })
 
@@ -112,7 +114,7 @@ beforeEach(async () => {
     await fs.outputFile(path.join(bundle, 'compose.yaml'), 'services:\n  web:\n    image: x\n')
     await seedStore()
 })
-afterEach(async () => { releaseLocks(); await fs.remove(tmp) })
+afterEach(async () => { releaseLocks(); resetDemoAppsCapabilityForTests(); resetDemoHbForTests(); await fs.remove(tmp) })
 
 describe('parseAppsList / parseAppsFlag', () => {
     it('parses a comma string and the --apps flag', () => {
@@ -289,6 +291,26 @@ describe('removeDemo and other refusals', () => {
         expect(op.args).toEqual({ instanceIds: 'demo-k' })
         expect(op.status).toBe('Done')
         expect(h.doc().instanceDB['demo-k' as any]).toBeUndefined()
+    })
+})
+
+describe('setupDemo on-demand capability check (PR #374)', () => {
+    it('runs the check when it has not run, then refuses HELPER_OUTDATED if python3 is missing', async () => {
+        resetDemoAppsCapabilityForTests()
+        expect(isDemoAppsCapabilityOn()).toBeNull()
+        const msg = await codeOf(setupDemo(h, 'd1', ['kolibri'], ME, deps({ checkDemoApps: () => false })))
+        expect(msg).toMatch(/^HELPER_OUTDATED: /)
+        expect(isDemoAppsCapabilityOn()).toBe(false)
+        expect(Object.keys(h.doc().operationDB ?? {})).toHaveLength(0)
+    })
+
+    it('runs the check when it has not run, then proceeds when python3 is present', async () => {
+        resetDemoAppsCapabilityForTests()
+        expect(isDemoAppsCapabilityOn()).toBeNull()
+        await writeValidPack(path.join(tmp, 'IDEA-DEMO', 'kolibri'), 4)
+        const r = await setupDemo(h, 'd1', ['kolibri'], ME, deps({ checkDemoApps: () => true }))
+        expect(r.code).toBe('DEMO_READY')
+        expect(isDemoAppsCapabilityOn()).toBe(true)
     })
 })
 

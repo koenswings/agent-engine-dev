@@ -86,7 +86,7 @@ export interface LocatedPack {
 }
 
 export class PackVerifyError extends Error {
-    constructor(public code: 'PACK_OUTDATED' | 'CHECKSUM_MISMATCH' | 'NO_SOURCE', text: string) {
+    constructor(public code: 'PACK_OUTDATED' | 'CHECKSUM_MISMATCH' | 'INVALID_PACK' | 'NO_SOURCE', text: string) {
         super(`${code}: ${text}`)
         this.name = 'PackVerifyError'
     }
@@ -104,60 +104,60 @@ const asPosInt = (v: unknown): number | null =>
 const asNonEmpty = (v: unknown): string | null =>
     typeof v === 'string' && v.trim().length > 0 ? v.trim() : null
 
-/** Parse and type-check pack.json. Throws PackVerifyError('CHECKSUM_MISMATCH', ...) on a bad document. */
+/** Parse and type-check pack.json. Throws PackVerifyError('INVALID_PACK', ...) on a bad document. */
 export const parsePackJson = (raw: string, expectedApp?: DemoAppName): PackJson => {
     let v: any
     try { v = JSON.parse(raw) } catch (e) {
-        throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json does not parse: ${(e as Error).message}`)
+        throw new PackVerifyError('INVALID_PACK', `pack.json does not parse: ${(e as Error).message}`)
     }
     if (!v || typeof v !== 'object' || Array.isArray(v)) {
-        throw new PackVerifyError('CHECKSUM_MISMATCH', 'pack.json must be an object')
+        throw new PackVerifyError('INVALID_PACK', 'pack.json must be an object')
     }
     if (v.schemaVersion !== PACK_SCHEMA_VERSION) {
-        throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json schemaVersion must be ${PACK_SCHEMA_VERSION} (got ${String(v.schemaVersion)})`)
+        throw new PackVerifyError('INVALID_PACK', `pack.json schemaVersion must be ${PACK_SCHEMA_VERSION} (got ${String(v.schemaVersion)})`)
     }
     const packVersion = asPosInt(v.packVersion)
-    if (packVersion === null) throw new PackVerifyError('CHECKSUM_MISMATCH', 'pack.json packVersion must be a non-negative integer')
+    if (packVersion === null) throw new PackVerifyError('INVALID_PACK', 'pack.json packVersion must be a non-negative integer')
     const app = asApp(v.app)
-    if (!app) throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json app must be "kolibri" or "nextcloud" (got ${JSON.stringify(v.app)})`)
+    if (!app) throw new PackVerifyError('INVALID_PACK', `pack.json app must be "kolibri" or "nextcloud" (got ${JSON.stringify(v.app)})`)
     if (expectedApp && app !== expectedApp) {
-        throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json app is '${app}', expected '${expectedApp}'`)
+        throw new PackVerifyError('INVALID_PACK', `pack.json app is '${app}', expected '${expectedApp}'`)
     }
     const minAppVersion = asNonEmpty(v.minAppVersion)
-    if (!minAppVersion) throw new PackVerifyError('CHECKSUM_MISMATCH', 'pack.json minAppVersion is required')
+    if (!minAppVersion) throw new PackVerifyError('INVALID_PACK', 'pack.json minAppVersion is required')
     const bytes = asPosInt(v.bytes)
-    if (bytes === null) throw new PackVerifyError('CHECKSUM_MISMATCH', 'pack.json bytes must be a non-negative integer')
+    if (bytes === null) throw new PackVerifyError('INVALID_PACK', 'pack.json bytes must be a non-negative integer')
     const credits = asNonEmpty(v.credits)
-    if (!credits) throw new PackVerifyError('CHECKSUM_MISMATCH', 'pack.json credits is required')
+    if (!credits) throw new PackVerifyError('INVALID_PACK', 'pack.json credits is required')
     if (!SAFE_REL.test(credits) || credits.includes('..')) {
-        throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json credits path is not a safe relative path: ${credits}`)
+        throw new PackVerifyError('INVALID_PACK', `pack.json credits path is not a safe relative path: ${credits}`)
     }
     if (v.licence !== undefined && v.licence !== null) {
         const lic = asNonEmpty(v.licence)
-        if (!lic || !SAFE_REL.test(lic)) throw new PackVerifyError('CHECKSUM_MISMATCH', 'pack.json licence must be a safe relative path when set')
+        if (!lic || !SAFE_REL.test(lic)) throw new PackVerifyError('INVALID_PACK', 'pack.json licence must be a safe relative path when set')
     }
-    if (!Array.isArray(v.hooks)) throw new PackVerifyError('CHECKSUM_MISMATCH', 'pack.json hooks must be an array')
+    if (!Array.isArray(v.hooks)) throw new PackVerifyError('INVALID_PACK', 'pack.json hooks must be an array')
     const hooks: PackHookDecl[] = v.hooks.map((h: any, i: number) => {
-        if (!h || typeof h !== 'object') throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json hooks[${i}] is invalid`)
+        if (!h || typeof h !== 'object') throw new PackVerifyError('INVALID_PACK', `pack.json hooks[${i}] is invalid`)
         const id = asNonEmpty(h.id)
-        if (!id) throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json hooks[${i}].id is required`)
+        if (!id) throw new PackVerifyError('INVALID_PACK', `pack.json hooks[${i}].id is required`)
         if (h.needs !== 'stopped' && h.needs !== 'running') {
-            throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json hooks[${i}].needs must be "stopped" or "running"`)
+            throw new PackVerifyError('INVALID_PACK', `pack.json hooks[${i}].needs must be "stopped" or "running"`)
         }
         return { id, needs: h.needs }
     })
-    if (!Array.isArray(v.files)) throw new PackVerifyError('CHECKSUM_MISMATCH', 'pack.json files must be an array')
+    if (!Array.isArray(v.files)) throw new PackVerifyError('INVALID_PACK', 'pack.json files must be an array')
     const files: PackFile[] = v.files.map((f: any, i: number) => {
-        if (!f || typeof f !== 'object') throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json files[${i}] is invalid`)
+        if (!f || typeof f !== 'object') throw new PackVerifyError('INVALID_PACK', `pack.json files[${i}] is invalid`)
         const p = asNonEmpty(f.path)
         const sha = typeof f.sha256 === 'string' ? f.sha256.toLowerCase() : ''
         const fb = asPosInt(f.bytes)
         if (!p || !SAFE_REL.test(p) || p.includes('..') || p.startsWith('/')) {
-            throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json files[${i}].path is not a safe relative path`)
+            throw new PackVerifyError('INVALID_PACK', `pack.json files[${i}].path is not a safe relative path`)
         }
-        if (p === 'pack.json') throw new PackVerifyError('CHECKSUM_MISMATCH', 'pack.json must not list itself in files')
-        if (!SHA_RE.test(sha)) throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json files[${i}].sha256 must be 64 lowercase hex`)
-        if (fb === null) throw new PackVerifyError('CHECKSUM_MISMATCH', `pack.json files[${i}].bytes must be a non-negative integer`)
+        if (p === 'pack.json') throw new PackVerifyError('INVALID_PACK', 'pack.json must not list itself in files')
+        if (!SHA_RE.test(sha)) throw new PackVerifyError('INVALID_PACK', `pack.json files[${i}].sha256 must be 64 lowercase hex`)
+        if (fb === null) throw new PackVerifyError('INVALID_PACK', `pack.json files[${i}].bytes must be a non-negative integer`)
         return { path: p, sha256: sha, bytes: fb }
     })
     const out: PackJson = { schemaVersion: 1, packVersion, app, minAppVersion, bytes, credits, hooks, files }
@@ -203,7 +203,7 @@ export const verifyExtractedPack = async (
     opts: { minVersion?: number, appVersion?: string } = {},
 ): Promise<PackJson> => {
     const packPath = path.join(root, 'pack.json')
-    if (!await fs.pathExists(packPath)) throw new PackVerifyError('CHECKSUM_MISMATCH', `no pack.json in ${root}`)
+    if (!await fs.pathExists(packPath)) throw new PackVerifyError('INVALID_PACK', `no pack.json in ${root}`)
     const pack = parsePackJson(await fs.readFile(packPath, 'utf8'), expectedApp)
     if (opts.minVersion !== undefined && pack.packVersion < opts.minVersion) {
         throw new PackVerifyError('PACK_OUTDATED', `packVersion ${pack.packVersion} is below minVersion ${opts.minVersion}`)
@@ -222,23 +222,23 @@ export const verifyExtractedPack = async (
     }
     const listed = new Set(pack.files.map(f => f.path))
     if (!listed.has(pack.credits)) {
-        throw new PackVerifyError('CHECKSUM_MISMATCH', `credits file '${pack.credits}' is not in pack.json files`)
+        throw new PackVerifyError('INVALID_PACK', `credits file '${pack.credits}' is not in pack.json files`)
     }
     if (pack.licence && !listed.has(pack.licence)) {
-        throw new PackVerifyError('CHECKSUM_MISMATCH', `licence file '${pack.licence}' is not in pack.json files`)
+        throw new PackVerifyError('INVALID_PACK', `licence file '${pack.licence}' is not in pack.json files`)
     }
     for (const f of pack.files) {
         const full = path.join(root, f.path)
-        if (!await fs.pathExists(full)) throw new PackVerifyError('CHECKSUM_MISMATCH', `missing pack file ${f.path}`)
+        if (!await fs.pathExists(full)) throw new PackVerifyError('INVALID_PACK', `missing pack file ${f.path}`)
         const st = await fs.stat(full)
-        if (!st.isFile()) throw new PackVerifyError('CHECKSUM_MISMATCH', `pack path ${f.path} is not a file`)
-        if (st.size !== f.bytes) throw new PackVerifyError('CHECKSUM_MISMATCH', `${f.path} is ${st.size} bytes, pack.json says ${f.bytes}`)
+        if (!st.isFile()) throw new PackVerifyError('INVALID_PACK', `pack path ${f.path} is not a file`)
+        if (st.size !== f.bytes) throw new PackVerifyError('INVALID_PACK', `${f.path} is ${st.size} bytes, pack.json says ${f.bytes}`)
         const sha = await sha256File(full)
         if (sha !== f.sha256) throw new PackVerifyError('CHECKSUM_MISMATCH', `${f.path} sha256 is ${sha}, pack.json says ${f.sha256}`)
     }
     const creditsPath = path.join(root, pack.credits)
     const creditsText = await fs.readFile(creditsPath, 'utf8')
-    if (!creditsText.trim()) throw new PackVerifyError('CHECKSUM_MISMATCH', `credits file '${pack.credits}' is empty`)
+    if (!creditsText.trim()) throw new PackVerifyError('INVALID_PACK', `credits file '${pack.credits}' is empty`)
     const present = await listFilesRec(root)
     for (const rel of present) {
         if (rel === 'pack.json') continue
@@ -261,7 +261,7 @@ export const extractPackTar = async (tarPath: string, destDir: string): Promise<
         const m = line.replace(/\/$/, '')
         if (!m) continue
         if (m.startsWith('/') || m.split('/').includes('..')) {
-            throw new PackVerifyError('CHECKSUM_MISMATCH', `tar member has an unsafe path: ${m}`)
+            throw new PackVerifyError('INVALID_PACK', `tar member has an unsafe path: ${m}`)
         }
     }
     await execFile('tar', ['-xf', tarPath, '-C', destDir])

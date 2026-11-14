@@ -30,16 +30,23 @@ const packDoc = (over: Record<string, unknown> = {}) => ({
 })
 
 describe('parsePackJson', () => {
-    it('accepts a schema v1 pack and rejects a bad document', () => {
+    it('accepts a schema v1 pack and rejects a bad document as INVALID_PACK', () => {
         const p = parsePackJson(JSON.stringify(packDoc()), 'kolibri')
         expect(p.packVersion).toBe(4)
         expect(p.app).toBe('kolibri')
         expect(p.credits).toBe('CREDITS.txt')
-        expect(() => parsePackJson('{')).toThrow(PackVerifyError)
-        expect(() => parsePackJson(JSON.stringify(packDoc({ schemaVersion: 2 })))).toThrow(/schemaVersion/)
-        expect(() => parsePackJson(JSON.stringify(packDoc({ app: 'kiwix' })))).toThrow(/kolibri/)
-        expect(() => parsePackJson(JSON.stringify(packDoc({ files: [{ path: 'pack.json', sha256: sha('x'), bytes: 1 }] })))).toThrow(/must not list itself/)
-        expect(() => parsePackJson(JSON.stringify(packDoc({ credits: '../etc/passwd' })))).toThrow(/safe relative path/)
+        const bad = (raw: string, re: RegExp) => {
+            try { parsePackJson(raw); throw new Error('expected throw') } catch (e) {
+                expect(e).toBeInstanceOf(PackVerifyError)
+                expect((e as PackVerifyError).code).toBe('INVALID_PACK')
+                expect((e as Error).message).toMatch(re)
+            }
+        }
+        bad('{', /INVALID_PACK/)
+        bad(JSON.stringify(packDoc({ schemaVersion: 2 })), /schemaVersion/)
+        bad(JSON.stringify(packDoc({ app: 'kiwix' })), /kolibri/)
+        bad(JSON.stringify(packDoc({ files: [{ path: 'pack.json', sha256: sha('x'), bytes: 1 }] })), /must not list itself/)
+        bad(JSON.stringify(packDoc({ credits: '../etc/passwd' })), /safe relative path/)
     })
 })
 
@@ -66,12 +73,12 @@ describe('verifyExtractedPack', () => {
         await expect(verifyExtractedPack(oldRoot, 'kolibri', { minVersion: 3 })).rejects.toThrow(/PACK_OUTDATED/)
     })
 
-    it('refuses an empty credits file', async () => {
+    it('INVALID_PACK when the credits file is empty', async () => {
         const root = path.join(tmp, 'empty-credits')
         await fs.outputFile(path.join(root, 'CREDITS.txt'), '   \n')
         const files = [{ path: 'CREDITS.txt', sha256: sha('   \n'), bytes: Buffer.byteLength('   \n') }]
         await fs.outputFile(path.join(root, 'pack.json'), JSON.stringify(packDoc({ files, bytes: Buffer.byteLength('   \n') })))
-        await expect(verifyExtractedPack(root, 'kolibri')).rejects.toThrow(/credits file/)
+        await expect(verifyExtractedPack(root, 'kolibri')).rejects.toMatchObject({ code: 'INVALID_PACK', message: expect.stringMatching(/^INVALID_PACK: .*credits file/) })
     })
 })
 
@@ -85,10 +92,22 @@ describe('verifyTarSha256 and extractPackTar', () => {
         await $`tar -cf ${tar} -C ${root} pack.json CREDITS.txt`
         const digest = await sha256File(tar)
         await verifyTarSha256(tar, digest)
-        await expect(verifyTarSha256(tar, '0'.repeat(64))).rejects.toThrow(/CHECKSUM_MISMATCH/)
+        await expect(verifyTarSha256(tar, '0'.repeat(64))).rejects.toMatchObject({ code: 'CHECKSUM_MISMATCH' })
         const dest = path.join(tmp, 'extracted')
         await extractPackTar(tar, dest)
         expect(await fs.pathExists(path.join(dest, 'pack.json'))).toBe(true)
+    })
+
+    it('INVALID_PACK when a tar member has an unsafe path', async () => {
+        const unsafe = path.join(tmp, 'unsafe.tar')
+        const py = path.join(tmp, 'mk-unsafe-tar.py')
+        await fs.outputFile(py, `import tarfile\nt = tarfile.open(${JSON.stringify(unsafe)}, "w")\ni = tarfile.TarInfo("../evil")\ni.size = 0\nt.addfile(i)\nt.close()\n`)
+        const { $ } = await import('zx')
+        await $`python3 ${py}`
+        await expect(extractPackTar(unsafe, path.join(tmp, 'unsafe-out'))).rejects.toMatchObject({
+            code: 'INVALID_PACK',
+            message: expect.stringMatching(/^INVALID_PACK: .*unsafe path/),
+        })
     })
 })
 
