@@ -1,4 +1,5 @@
 import { $, chalk, os, YAML, fs, path, sleep } from 'zx';
+import { execFileSync } from 'node:child_process';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
@@ -159,12 +160,19 @@ export interface EraseInProgress {
  *   backupLinks: addBackupLink, removeBackupLink (idea#451).
  *   scheduledBackups: the daily scheduled Backup Disk mode (tick, BACKUP.yaml schedule,
  *     Disk/Instance schedule fields) and setBackupMode (idea#400).
+ *   demoApps:     setupDemo / removeDemo (engine#369); advertised only when
+ *               python3 is on PATH, checked once at startup (same pattern as
+ *               backupCleanup / flashCard). The Console counts it only when
+ *               capabilitiesBootedAt === lastBooted.
  *   backupCleanup: fullness-driven Backup Disk cleanup (idea#401 / idea#400 §3.1);
  *               advertised only when the app-data root helper is at
  *               BACKUP_CLEANUP_HELPER_MIN (v10, idea#450) or newer, checked once
  *               at startup (same pattern as flashCard). An older, missing, failing
  *               or timed-out helper leaves it out; runtime cleanup still records
  *               HELPER_OUTDATED and the backup still runs.
+ *   preUpdateQuarantine: 24 h cleanup of a pre-update snapshot (idea#396);
+ *               advertised only when the app-data helper is at v14 or newer,
+ *               checked once at startup (same pattern as backupCleanup).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
@@ -179,6 +187,9 @@ const flashHelperInstalled = (): boolean => { try { fs.accessSync(FLASH_HELPER_P
 
 /** idea#400 §3.1: advertised only when the app-data helper is at BACKUP_CLEANUP_HELPER_MIN or newer */
 export const BACKUP_CLEANUP_CAPABILITY = 'backupCleanup'
+
+/** engine#369: advertised when python3 is on PATH (demo hook). See checkDemoAppsCapability. */
+export const DEMO_APPS_CAPABILITY = 'demoApps'
 const BACKUP_CLEANUP_HELPER_CHECK_MS = 5_000
 /** Cached result of the one startup version check; null = not yet checked (omit the capability). */
 let backupCleanupHelperOk: boolean | null = null
@@ -224,14 +235,74 @@ export const checkBackupCleanupCapability = async (
 /** Test seam: drop the cached startup check so later cases start from "not checked". */
 export const resetBackupCleanupCapabilityForTests = (): void => { backupCleanupHelperOk = null }
 
+/** idea#396: advertised only when the app-data helper is at v14 or newer */
+export const PRE_UPDATE_QUARANTINE_CAPABILITY = 'preUpdateQuarantine'
+const PRE_UPDATE_QUARANTINE_HELPER_MIN = 14
+const PRE_UPDATE_QUARANTINE_HELPER_CHECK_MS = 5_000
+let preUpdateQuarantineHelperOk: boolean | null = null
+
+/**
+ * Once at startup, decide whether to advertise `preUpdateQuarantine`. Never throws:
+ * an older, missing, failing or timed-out helper leaves the capability out.
+ */
+export const checkPreUpdateQuarantineCapability = async (
+  run?: AppDataRunner,
+  timeoutMs: number = PRE_UPDATE_QUARANTINE_HELPER_CHECK_MS,
+): Promise<boolean> => {
+  try {
+    const outdated = await withTimeout(
+      helperAtLeast(PRE_UPDATE_QUARANTINE_HELPER_MIN, 'preUpdateQuarantine', run),
+      timeoutMs,
+    )
+    preUpdateQuarantineHelperOk = outdated === null
+  } catch {
+    preUpdateQuarantineHelperOk = false
+  }
+  if (preUpdateQuarantineHelperOk) {
+    log(`preUpdateQuarantine capability advertised (app-data helper v${PRE_UPDATE_QUARANTINE_HELPER_MIN}+)`)
+  } else {
+    log(`preUpdateQuarantine capability omitted (app-data helper older than v${PRE_UPDATE_QUARANTINE_HELPER_MIN}, missing, error or timeout)`)
+  }
+  return preUpdateQuarantineHelperOk
+}
+
+/** Test seam: drop the cached startup check so later cases start from "not checked". */
+export const resetPreUpdateQuarantineCapabilityForTests = (): void => { preUpdateQuarantineHelperOk = null }
+
 /** The capability list written at this startup */
+let demoAppsPythonOk: boolean | null = null
+
+const python3OnPath = (): boolean => {
+  try {
+    execFileSync('python3', ['-c', 'import sys'], { timeout: 3000, stdio: 'ignore' })
+    return true
+  } catch { return false }
+}
+
+/** Once at startup, before createOrUpdateEngine: advertise demoApps when python3 is on PATH. */
+export const checkDemoAppsCapability = (which: () => boolean = python3OnPath): boolean => {
+  try { demoAppsPythonOk = which() } catch { demoAppsPythonOk = false }
+  if (demoAppsPythonOk) log('demoApps capability advertised (python3 on PATH)')
+  else log('demoApps capability omitted (python3 not on PATH)')
+  return demoAppsPythonOk === true
+}
+
+export const resetDemoAppsCapabilityForTests = (): void => { demoAppsPythonOk = null }
+
+/** null until checkDemoAppsCapability runs; then true/false. */
+export const isDemoAppsCapabilityOn = (): boolean | null => demoAppsPythonOk
+
 export const engineCapabilities = (
   helperInstalled: boolean = flashHelperInstalled(),
   cleanupHelperOk: boolean = backupCleanupHelperOk === true,
+  quarantineHelperOk: boolean = preUpdateQuarantineHelperOk === true,
+  demoAppsOk: boolean = demoAppsPythonOk === true,
 ): string[] => {
   const caps = [...ENGINE_CAPABILITIES]
   if (helperInstalled) caps.push(FLASH_CARD_CAPABILITY)
   if (cleanupHelperOk) caps.push(BACKUP_CLEANUP_CAPABILITY)
+  if (quarantineHelperOk) caps.push(PRE_UPDATE_QUARANTINE_CAPABILITY)
+  if (demoAppsOk) caps.push(DEMO_APPS_CAPABILITY)
   return caps
 }
 

@@ -158,6 +158,23 @@ export const setComposeInstanceName = (composeText: string, name: string): strin
 }
 
 /**
+ * engine#369: restamp x-app.instanceName and x-app.demo from the old instance.
+ * demo: true writes the flag; otherwise the key is deleted so a bundle cannot
+ * invent a demo (or drop one).
+ */
+export const stampComposeInstanceIdentity = (
+    composeText: string,
+    fields: { instanceName: string, demo?: true },
+): string => {
+    const doc = parseDocument(composeText)
+    if (doc.errors.length > 0) throw new Error(`compose.yaml does not parse: ${doc.errors[0].message}`)
+    doc.setIn(['x-app', 'instanceName'], fields.instanceName)
+    if (fields.demo === true) doc.setIn(['x-app', 'demo'], true)
+    else doc.deleteIn(['x-app', 'demo'])
+    return doc.toString()
+}
+
+/**
  * The copy's rewritten files, built from the SOURCE instance folder (so the
  * same content serves a local and a cross-engine target). A file that does not
  * exist in the source is omitted.

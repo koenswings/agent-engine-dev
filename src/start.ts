@@ -8,7 +8,7 @@ import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
 import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
-import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
@@ -21,6 +21,7 @@ import { prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPath
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
 import { startBackupScheduler } from './monitors/backupScheduler.js'
+import { startPreUpdateQuarantine } from './monitors/preUpdateQuarantine.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
 import { ensureEngineStateDir, setFilesMountStore } from './data/FilesMount.js'
@@ -127,10 +128,13 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // backupCleanup capability: one helper version check, never fatal (idea#400 §3.1).
     // Must run before createOrUpdateEngine writes Engine.capabilities.
     await checkBackupCleanupCapability()
+    await checkPreUpdateQuarantineCapability()
+    checkDemoAppsCapability()
 
     // Create or update the local engine object
     const engine = await createOrUpdateEngine(storeHandle, localEngineId)
     await storeHandle.whenReady()
+    await import('./data/DemoApps.js').then(m => m.refreshDemoHb(storeHandle, String(localEngineId))).catch(e => log(`demo hb: ${e}`))
     const store = storeHandle.doc()
 
     // Remove any phantom engine entries and orphan disks that accumulated
@@ -299,6 +303,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // idea#400: scheduled Backup Disks run from a 60 s tick inside the Engine (never host cron)
     const scheduler = startBackupScheduler(storeHandle)
     startLiveness(storeHandle, String(localEngineId), { clockStatus: () => scheduler.clockStatus() })
+    startPreUpdateQuarantine(storeHandle)
     // The heartbeat timer still repairs this Engine's peerAccess, expires stale
     // peers and archives old operations; it no longer writes to the store itself
 

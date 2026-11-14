@@ -4,7 +4,7 @@ import { $, YAML, chalk, fs, os } from 'zx';
 import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
 import { App, appTitleFromXapp, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
-import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance } from './Instance.js'
+import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance, applyDemoFlag } from './Instance.js'
 import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
@@ -410,6 +410,14 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
     } catch (e: any) {
         log(`Could not read the size of disk ${disk.id}: ${e.message ?? e}`)
     }
+    try {
+        const { getLocalEngine } = await import('./Store.js')
+        const { refreshDemoHb } = await import('./DemoApps.js')
+        const eng = getLocalEngine(storeHandle.doc())
+        if (eng) await refreshDemoHb(storeHandle, String(eng.id))
+    } catch (e: any) {
+        log(`demo hb after processDisk: ${e.message ?? e}`)
+    }
 }
 
 /**
@@ -659,6 +667,7 @@ export const upsertSystemInstanceRecord = (storeHandle: DocHandle<Store>, disk: 
                 stepLabel: null,
                 metrics: null,
             }
+            applyDemoFlag(newInst, compose)
             doc.instanceDB[instanceId] = newInst
             instance = newInst
         } else {
@@ -673,6 +682,7 @@ export const upsertSystemInstanceRecord = (storeHandle: DocHandle<Store>, disk: 
             if (stored.status === 'Missing' || stored.status === 'Undocked' || stored.status === 'Error') {
                 stored.status = 'Docked' as Status
             }
+            applyDemoFlag(stored, compose)
             instance = stored
         }
     })
@@ -810,6 +820,12 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
         if (disk.dockedTo) await refreshUpdateAvailable(storeHandle, String(disk.dockedTo))
     } catch (e) {
         log(`updateAvailable refresh failed on dock of ${disk.id}: ${(e as Error).message}`)
+    }
+    try {
+        const { scanPreUpdateQuarantine } = await import('../monitors/preUpdateQuarantine.js')
+        await scanPreUpdateQuarantine(storeHandle, {}, String(disk.id))
+    } catch (e) {
+        log(`preUpdateQuarantine on dock of ${disk.id}: ${(e as Error).message}`)
     }
 
     // Trigger backups on any docked Backup Disk linked to instances on this App Disk

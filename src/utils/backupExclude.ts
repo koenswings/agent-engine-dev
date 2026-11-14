@@ -159,3 +159,87 @@ export const parseBackupVerifyLists = (xapp: unknown): { present: string[]; abse
     return { present: parse('present'), absent: parse('absent') }
 }
 
+
+
+// ── idea#396: snapshot / estimate excludes (helper v14) ──────────────────────
+
+/** Helper v14: at most this many snapshot/estimate excludes after de-duplication. */
+export const SNAPSHOT_EXCLUDE_MAX = 32
+/** Helper v14: at most this many characters per token after trimming. */
+export const SNAPSHOT_EXCLUDE_MAX_LEN = 256
+
+export const snapshotExcludeError = (raw: string, why: string, source = 'exclude'): Error =>
+    new Error(`${raw}: ${why}`)
+
+/** True when a normalised token is legal for helper v14 snapshot / estimate. */
+export const isSnapshotExcludePath = (rel: string): boolean =>
+    rel === 'data' || rel.startsWith('data/')
+
+/**
+ * Validate one raw token for snapshot / estimate: trim-length, v8 normalisation,
+ * and `data` / `data/<rel>` only. Does not follow symlinks (the helper does that
+ * at call time). Throws with an INVALID_EXCLUDE: prefix.
+ */
+export const normalizeSnapshotExclude = (raw: unknown, source = 'exclude'): string => {
+    if (typeof raw !== 'string') throw new Error(`${source} entries must be strings`)
+    const trimmed = raw.trim()
+    if (trimmed.length > SNAPSHOT_EXCLUDE_MAX_LEN) {
+        throw snapshotExcludeError(trimmed.length > 64 ? `${trimmed.slice(0, 64)}…` : trimmed, `longer than ${SNAPSHOT_EXCLUDE_MAX_LEN} characters`, source)
+    }
+    let rel: string
+    try {
+        rel = normalizeBackupExclude(raw, 'exclude')
+    } catch (e) {
+        const msg = (e as Error).message.replace(/^x-app\.backup\.exclude entry '.*?' is not allowed: /, '')
+        throw snapshotExcludeError(String(raw), msg.replace(/^x-app\.backup\.exclude entries must be strings$/, 'must be a string'), source)
+    }
+    if (!isSnapshotExcludePath(rel)) {
+        throw snapshotExcludeError(String(raw), 'must be data or a path under data/', source)
+    }
+    return rel
+}
+
+/**
+ * Normalise, de-duplicate (first occurrence kept) and bound a list of snapshot /
+ * estimate exclude tokens. Throws INVALID_EXCLUDE when any token is illegal or
+ * the list has more than SNAPSHOT_EXCLUDE_MAX unique entries.
+ */
+export const parseSnapshotExcludeTokens = (tokens: unknown[], source = 'exclude'): string[] => {
+    const out: string[] = []
+    const seen = new Set<string>()
+    for (const item of tokens) {
+        const n = normalizeSnapshotExclude(item, source)
+        if (seen.has(n)) continue
+        seen.add(n)
+        out.push(n)
+        if (out.length > SNAPSHOT_EXCLUDE_MAX) {
+            throw snapshotExcludeError(String(item), `list has more than ${SNAPSHOT_EXCLUDE_MAX} entries`, source)
+        }
+    }
+    return out
+}
+
+/**
+ * Read top-level `x-app.snapshotExclude` (idea#396). Missing or empty → `[]`.
+ * A present but malformed list throws (fail closed). Independent of
+ * `x-app.backup.exclude`; Borg path rules are unchanged.
+ */
+export const parseSnapshotExcludeList = (xapp: unknown): string[] => {
+    if (xapp === undefined || xapp === null) return []
+    if (typeof xapp !== 'object' || Array.isArray(xapp)) {
+        throw new Error('x-app is not a mapping')
+    }
+    const ex = (xapp as { snapshotExclude?: unknown }).snapshotExclude
+    if (ex === undefined || ex === null) return []
+    if (!Array.isArray(ex)) throw new Error('x-app.snapshotExclude must be a list of paths')
+    return parseSnapshotExcludeTokens(ex, 'x-app.snapshotExclude')
+}
+
+/**
+ * Re-check an already-normalised list against v14 snapshot rules (data / data/…,
+ * at most 32 unique entries). Used after merging live.backup.exclude ∪
+ * new.backup.exclude ∪ live.snapshotExclude, because backup.exclude may still
+ * contain Borg-legal paths that v14 snapshot / estimate refuse.
+ */
+export const assertSnapshotExcludeList = (tokens: string[], source = 'exclude'): string[] =>
+    parseSnapshotExcludeTokens(tokens, source)

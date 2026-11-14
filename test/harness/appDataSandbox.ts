@@ -168,6 +168,12 @@ if [[ -z "$target" || "$target" == -- ]]; then
 fi
 echo "Filesystem 1024-blocks Used Available Capacity Mounted on"
 echo "/dev/fake 99999999 1 \${FAKE_DF_AVAIL_KB:-99999998} 1% /"`)
+    // date: the real /usr/bin/date, except that FAKE_DATE_UTC_STAMP replaces the output of
+    // exactly `date -u +%Y%m%dT%H%M%SZ` (the quarantine stamps), so a test can make a
+    // destination collide (idea#396 quarantine-snapshot).
+    await fake('date', `
+if [[ -n "\${FAKE_DATE_UTC_STAMP:-}" && "$#" -eq 2 && "$1" == -u && "$2" == '+%Y%m%dT%H%M%SZ' ]]; then echo "$FAKE_DATE_UTC_STAMP"; exit 0; fi
+exec /usr/bin/date "$@"`)
     // runuser -u <user> -- <cmd…>: record, then run <cmd…> as the test user
     await fake('runuser', `${RECORD('runuser', callsDir)}
 while [[ $# -gt 0 && "$1" != -- ]]; do shift; done
@@ -244,7 +250,7 @@ exit \${FAKE_SYSTEMCTL_EXIT:-0}`)
         if (!re.test(text)) throw new Error(`idea-app-data has no ${name}= line`)
         text = text.replace(re, `${name}=${value}`)
     }
-    for (const tool of ['rsync', 'rrsync', 'findmnt', 'logger', 'getent', 'df', 'runuser', 'umount', 'mount', 'losetup', 'docker']) setConst(tool.toUpperCase(), path.join(bin, tool))
+    for (const tool of ['rsync', 'rrsync', 'findmnt', 'logger', 'getent', 'df', 'runuser', 'umount', 'mount', 'losetup', 'docker', 'date']) setConst(tool.toUpperCase(), path.join(bin, tool))
     setConst('SSHD', path.join(bin, 'sshd'))
     setConst('SYSTEMCTL', path.join(bin, 'systemctl'))
     setConst('VOLUMES_DIR', path.join(tmp, 'volumes'))

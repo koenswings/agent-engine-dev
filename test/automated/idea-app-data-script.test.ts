@@ -108,7 +108,7 @@ describe('idea-app-data: argument checks', () => {
 
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
-            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['estimate', 2],
+            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['quarantine-snapshot', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0], ['install-usage-key', 3],
         ]
@@ -123,6 +123,7 @@ describe('idea-app-data: argument checks', () => {
         refused(await sb.run(['borg-create', 'x', 'x', 'x']), /borg-create takes at least 4 argument/)
         refused(await sb.run(['snapshot', 'x']), /snapshot takes at least 2 argument/)
         refused(await sb.run(['restore-snapshot', 'x']), /restore-snapshot takes at least 2 argument/)
+        refused(await sb.run(['estimate', 'x']), /estimate takes at least 2 argument/)
         refused(await sb.run(['borg-delete', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
         refused(await sb.run(['borg-delete', 'x', 'x', 'x', 'x', 'x']), /borg-delete takes 3 or 4 argument/)
         refused(await sb.run(['borg-list', 'x']), /borg-list takes 2 or 3 argument/)
@@ -1466,4 +1467,307 @@ describe('idea-app-data: logging and cancellation', () => {
         expect(Date.now() - t0).toBeLessThan(10_000)
         expect(await sb.journalText()).toMatch(/sub=copy \(cancelled by SIGTERM\) .* exit=143 /)
     }, 20_000)
+})
+
+describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#396)', () => {
+    const snap = (root: string, id: string) => path.join(root, '.pre-update', id)
+    const duKb = (p: string) => Number(spawnSync('du', ['-sk', '-x', '--', p], { encoding: 'utf8' }).stdout.split(/\s/)[0])
+    /** a Kolibri-like instance: 3 MB of content under data/kolibri/content, plus a db */
+    const kolibri = async (root: string, id = 'inst1') => {
+        const inst = await sb.addInstance(root, id)
+        await fs.ensureDir(path.join(inst, 'data', 'kolibri', 'content', 'storage'))
+        await fs.writeFile(path.join(inst, 'data', 'kolibri', 'content', 'storage', 'video.mp4'), Buffer.alloc(3 * 1024 * 1024, 1))
+        await fs.writeFile(path.join(inst, 'data', 'kolibri', 'db.sqlite3'), Buffer.alloc(64 * 1024, 2))
+        return inst
+    }
+    const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
+
+    it('helper and Engine speak v14', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('14')
+        const r = await sb.run(['version'])
+        expect(r.stdout.trim()).toBe('idea-app-data 14')
+    })
+
+    it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {
+        const root = await sb.addDisk('sdb1')
+        const inst = await kolibri(root)
+        const env = { FAKE_DF_AVAIL_KB: '777777' }
+        const full = await sb.run(['estimate', 'sdb1', 'inst1'], env)
+        expect(full.exitCode, full.stderr).toBe(0)
+        expect(full.stdout).toMatch(/^\d+ \d+ 777777\n$/)
+        const [f] = full.stdout.trim().split(' ').map(Number)
+        expect(f).toBe(duKb(inst))
+        const contentKb = duKb(path.join(inst, 'data', 'kolibri', 'content'))
+        expect(contentKb).toBeGreaterThanOrEqual(3072)
+
+        const net = await sb.run(['estimate', 'sdb1', 'inst1', 'data/kolibri/content'], env)
+        expect(net.exitCode, net.stderr).toBe(0)
+        expect(net.stdout).toMatch(/^\d+ \d+ 777777\n$/)             // exactly one line on stdout
+        expect(Number(net.stdout.split(' ')[0])).toBe(f - contentKb)
+        expect(net.stderr).toContain(`exclude data/kolibri/content ${contentKb} KB`)
+
+        // nested excludes are not counted twice: data covers data/kolibri/content
+        const nested = await sb.run(['estimate', 'sdb1', 'inst1', 'data/kolibri/content', 'data'], env)
+        expect(nested.exitCode, nested.stderr).toBe(0)
+        expect(Number(nested.stdout.split(' ')[0])).toBe(f - duKb(path.join(inst, 'data')))
+        expect(nested.stderr).not.toContain('exclude data/kolibri/content')
+
+        // a missing path counts 0; a bare name is data/<name>; duplicates count once
+        const miss = await sb.run(['estimate', 'sdb1', 'inst1', 'data/not-there', 'not-there', './data/not-there/'], env)
+        expect(miss.exitCode, miss.stderr).toBe(0)
+        expect(Number(miss.stdout.split(' ')[0])).toBe(f)
+        expect(miss.stderr.match(/exclude data\/not-there 0 KB/g)).toHaveLength(1)
+
+        // read-only: nothing written, no lock taken
+        expect(await fs.pathExists(path.join(root, '.pre-update'))).toBe(false)
+        expect(await fs.pathExists(path.join(root, '.idea-quarantine'))).toBe(false)
+        expect(await fs.pathExists(lockFile('sdb1', 'inst1'))).toBe(false)
+    })
+
+    it('snapshot: NO_SPACE uses the same net size; the excluded path is left out and recorded', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await kolibri(root)
+        const contentKb = duKb(path.join(inst, 'data', 'kolibri', 'content'))
+        const instKb = duKb(inst)
+        const est = await sb.run(['estimate', 'sdb1', 'inst1', 'data/kolibri/content'])
+        const netKb = Number(est.stdout.split(' ')[0])
+        expect(netKb).toBe(instKb - contentKb)
+        // free space between the net need and the full need (margin floor 1 GiB)
+        const avail = String(netKb + 1048576 + Math.floor(contentKb / 2))
+        const ns = await sb.run(['snapshot', 'sdb1', 'inst1'], { FAKE_DF_AVAIL_KB: avail })
+        expect(ns.exitCode, ns.stderr).toBe(3)
+        expect(ns.stderr).toMatch(new RegExp(`^NO_SPACE: snapshot needs \\d+ bytes \\(${instKb} KB folder \\+ 0 KB volumes \\+ 1048576 KB margin; 0 KB excluded\\), free \\d+ bytes`, 'm'))
+        expect(await fs.pathExists(path.join(root, '.pre-update'))).toBe(false)
+        const tight = await sb.run(['snapshot', 'sdb1', 'inst1', 'data/kolibri/content'], { FAKE_DF_AVAIL_KB: '1000' })
+        expect(tight.exitCode).toBe(3)
+        expect(tight.stderr).toMatch(new RegExp(`\\(${netKb} KB folder \\+ 0 KB volumes \\+ 1048576 KB margin; ${contentKb} KB excluded\\)`))
+        const ok = await sb.run(['snapshot', 'sdb1', 'inst1', 'data/kolibri/content'], { FAKE_DF_AVAIL_KB: avail })
+        expect(ok.exitCode, ok.stderr).toBe(0)
+        const d = path.join(snap(root, 'inst1'), 'data')
+        expect(await fs.pathExists(path.join(d, 'data', 'kolibri', 'content'))).toBe(false)
+        expect((await fs.readFile(path.join(d, 'data', 'kolibri', 'db.sqlite3'))).length).toBe(64 * 1024)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'EXCLUDE'), 'utf8')).toBe('data/kolibri/content\n')
+        const journal = await fs.readFile(path.join(snap(root, 'inst1'), 'JOURNAL'), 'utf8')
+        expect(journal).toMatch(new RegExp(`need_kb=${netKb} excluded_kb=${contentKb} volumes=0 old=none excludes=1\\nexclude data/kolibri/content\\n`))
+        expect(await fs.pathExists(path.join(snap(root, 'inst1'), 'COMPLETE'))).toBe(true)
+    })
+
+    it('refuses every bad exclude on snapshot and estimate before anything is locked or written', async () => {
+        const root = await sb.addDisk('sdb1')
+        const inst = await kolibri(root)
+        await fs.symlink(sb.tmp, path.join(inst, 'data', 'out'))                       // leaves the instance
+        await fs.symlink('../compose.yaml', path.join(inst, 'data', 'up'))             // inside the instance, outside data/
+        await fs.symlink('../.env', path.join(inst, 'data', 'envlink'))
+        await fs.symlink('loop2', path.join(inst, 'data', 'loop1'))
+        await fs.symlink('loop1', path.join(inst, 'data', 'loop2'))
+        const many = Array.from({ length: 33 }, (_, i) => `data/p${i}`)
+        const cases: [string[], RegExp][] = [
+            [['../etc'], /'\.\.' component/],
+            [['data/../compose.yaml'], /'\.\.' component/],
+            [['data/kolibri/../x'], /'\.\.' component/],
+            [['/etc/shadow'], /absolute path/],
+            [['/data'], /absolute path/],
+            [['data/*'], /glob/],
+            [['data/k?'], /glob/],
+            [['data/[a]'], /glob/],
+            [['--delete'], /looks like an option/],
+            [[''], /empty/],
+            [['   '], /empty/],
+            [['.env'], /must be data or a path under data\//],
+            [['volumes/db'], /must be data or a path under data\//],
+            [['instances/x'], /must be data or a path under data\//],
+            [['data/out'], /points outside the instance folder/],
+            [['data/out/missing/deeper'], /points outside the instance's data folder/],
+            [['data/up'], /points outside the instance's data folder/],
+            [['data/envlink'], /points outside the instance's data folder/],
+            [['data/loop1'], /cannot be resolved/],
+            [['data/' + 'x'.repeat(252)], /longer than 256 characters/],
+            [many, /exclude list has more than 32 entries/],
+        ]
+        for (const sub of ['estimate', 'snapshot']) {
+            for (const [ex, re] of cases) {
+                refused(await sb.run([sub, 'sdb1', 'inst1', 'data/kolibri/content', ...ex]), re)
+            }
+        }
+        expect(await fs.pathExists(path.join(root, '.pre-update'))).toBe(false)
+        expect(await fs.pathExists(path.join(root, '.idea-quarantine'))).toBe(false)
+        expect(await fs.pathExists(lockFile('sdb1', 'inst1'))).toBe(false)
+        expect(await sb.calls('rsync')).toHaveLength(0)
+        expect(await fs.pathExists(path.join(inst, 'data', 'kolibri', 'content', 'storage', 'video.mp4'))).toBe(true)
+    })
+
+    it('accepts the limits exactly: 32 entries, 256 characters, data itself, a symlink that stays in data/', async () => {
+        const root = await sb.addDisk('sdb1')
+        await kolibri(root)
+        const env = { FAKE_DF_AVAIL_KB: '99999999' }
+        const k32 = Array.from({ length: 32 }, (_, i) => `data/p${i}`)
+        expect((await sb.run(['estimate', 'sdb1', 'inst1', ...k32], env)).exitCode).toBe(0)
+        // duplicates do not count towards the 32
+        expect((await sb.run(['estimate', 'sdb1', 'inst1', ...k32, ...k32, 'p0'], env)).exitCode).toBe(0)
+        const long = 'data/' + 'x'.repeat(251)
+        expect(long.length).toBe(256)
+        expect((await sb.run(['estimate', 'sdb1', 'inst1', `  ${long}  `], env)).exitCode).toBe(0)
+        // the sandbox instance has data/link-inside -> sessions/s1 (inside data/)
+        expect((await sb.run(['estimate', 'sdb1', 'inst1', 'data/link-inside', 'data', 'content'], env)).exitCode).toBe(0)
+        const r = await sb.run(['snapshot', 'sdb1', 'inst1', 'data', 'data/kolibri/content'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(await fs.readFile(path.join(snap(root, 'inst1'), 'EXCLUDE'), 'utf8')).toBe('data\ndata/kolibri/content\n')
+    })
+
+    it('restore-snapshot keeps the v9 rules: a recorded EXCLUDE outside data/ still restores', async () => {
+        sb = await sandbox({ realRsync: true })
+        const root = await sb.addDisk('sdb1')
+        const inst = await kolibri(root)
+        expect((await sb.run(['snapshot', 'sdb1', 'inst1', 'data/kolibri/content'])).exitCode).toBe(0)
+        await fs.writeFile(path.join(snap(root, 'inst1'), 'EXCLUDE'), 'data/kolibri/content\n.env\n')   // as a v9-v13 snapshot could hold
+        await fs.writeFile(path.join(inst, '.env'), 'port=9999\n')
+        await fs.writeFile(path.join(inst, 'data', 'kolibri', 'db.sqlite3'), 'migrated')
+        const r = await sb.run(['restore-snapshot', 'sdb1', 'inst1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(await fs.readFile(path.join(inst, '.env'), 'utf8')).toBe('port=9999\n')
+        expect((await fs.readFile(path.join(inst, 'data', 'kolibri', 'db.sqlite3'))).length).toBe(64 * 1024)
+        expect(await fs.pathExists(path.join(inst, 'data', 'kolibri', 'content', 'storage', 'video.mp4'))).toBe(true)
+    })
+})
+
+describe('idea-app-data v14: quarantine-snapshot (idea#396)', () => {
+    const snap = (root: string, id: string) => path.join(root, '.pre-update', id)
+    const makeSnap = async (root: string, id: string, complete = true) => {
+        const d = snap(root, id)
+        await fs.ensureDir(path.join(d, 'data', 'data'))
+        await fs.chmod(path.join(root, '.pre-update'), 0o700)
+        await fs.writeFile(path.join(d, 'data', 'data', 'db'), 'snap-db')
+        await fs.writeFile(path.join(d, 'JOURNAL'), 'snapshot started\n')
+        if (complete) await fs.writeFile(path.join(d, 'COMPLETE'), 'complete x kb=1\n')
+        return d
+    }
+
+    it('moves .pre-update/<id> to .idea-quarantine/<id>-pre-update-<UTC stamp> (0700, same inode) and prints the path', async () => {
+        const root = await sb.addDisk('sdb1')
+        await sb.addInstance(root, 'inst1')
+        const d = await makeSnap(root, 'inst1')
+        const ino = (await fs.stat(d)).ino
+        const r = await sb.run(['quarantine-snapshot', 'sdb1', 'inst1'], { FAKE_DOCKER_PS: 'running1' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        const lines = r.stdout.trim().split('\n')
+        expect(lines).toHaveLength(1)
+        const dest = lines[0]
+        expect(path.dirname(dest)).toBe(path.join(root, '.idea-quarantine'))
+        expect(path.basename(dest)).toMatch(/^inst1-pre-update-\d{8}T\d{6}Z$/)
+        expect((await fs.stat(dest)).ino).toBe(ino)
+        expect((await fs.stat(dest)).mode & 0o777).toBe(0o700)
+        expect((await fs.stat(path.join(root, '.idea-quarantine'))).mode & 0o777).toBe(0o700)
+        expect(await fs.readFile(path.join(dest, 'data', 'data', 'db'), 'utf8')).toBe('snap-db')
+        expect(await fs.pathExists(path.join(dest, 'COMPLETE'))).toBe(true)
+        expect(await fs.pathExists(d)).toBe(false)
+        expect(await fs.pathExists(path.join(root, '.pre-update'))).toBe(true)          // only <id> moves
+        expect(await fs.pathExists(path.join(root, 'instances', 'inst1'))).toBe(true)   // the instance is untouched
+        expect(await sb.calls('docker')).toHaveLength(0)                                 // containers are never asked or stopped
+        expect(await sb.journalText()).toMatch(/quarantine-snapshot: .*\.pre-update\/inst1 -> .*inst1-pre-update-\d{8}T\d{6}Z \(complete\)/)
+    })
+
+    it('a missing snapshot (or no .pre-update at all) is exit 0 with nothing on stdout; a second call is a no-op', async () => {
+        const root = await sb.addDisk('sdb1')
+        const none = await sb.run(['quarantine-snapshot', 'sdb1', 'inst1'])
+        expect(none.exitCode, none.stderr).toBe(0)
+        expect(none.stdout).toBe('')
+        expect(none.stderr).toMatch(/ok: .*\.pre-update\/inst1 does not exist; nothing to quarantine/)
+        expect(await fs.pathExists(path.join(root, '.idea-quarantine'))).toBe(false)
+        await makeSnap(root, 'inst1')
+        const first = await sb.run(['quarantine-snapshot', 'sdb1', 'inst1'])
+        expect(first.exitCode, first.stderr).toBe(0)
+        const again = await sb.run(['quarantine-snapshot', 'sdb1', 'inst1'])
+        expect(again.exitCode, again.stderr).toBe(0)
+        expect(again.stdout).toBe('')
+        expect(again.stderr).toMatch(/nothing to quarantine/)
+        expect(await fs.readdir(path.join(root, '.idea-quarantine'))).toEqual([path.basename(first.stdout.trim())])
+    })
+
+    it('an incomplete snapshot is moved too (journalled as incomplete); system root works', async () => {
+        await sb.addInstance(sb.sys, 'inst1')
+        await makeSnap(sb.sys, 'inst1', false)
+        const r = await sb.run(['quarantine-snapshot', 'system', 'inst1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(path.dirname(r.stdout.trim())).toBe(path.join(sb.sys, '.idea-quarantine'))
+        expect(await fs.pathExists(path.join(r.stdout.trim(), 'JOURNAL'))).toBe(true)
+        expect(await fs.pathExists(snap(sb.sys, 'inst1'))).toBe(false)
+        expect(await sb.journalText()).toMatch(/quarantine-snapshot: .* \(incomplete\)/)
+    })
+
+    it('refuses an existing destination and never overwrites it; the snapshot stays put', async () => {
+        const root = await sb.addDisk('sdb1')
+        const d = await makeSnap(root, 'inst1')
+        const stamp = '20261114T120000Z'
+        const taken = path.join(root, '.idea-quarantine', `inst1-pre-update-${stamp}`)
+        await fs.ensureDir(taken)
+        await fs.chmod(path.join(root, '.idea-quarantine'), 0o700)
+        await fs.writeFile(path.join(taken, 'older'), 'keep')
+        refused(await sb.run(['quarantine-snapshot', 'sdb1', 'inst1'], { FAKE_DATE_UTC_STAMP: stamp }), /inst1-pre-update-20261114T120000Z already exists/)
+        expect(await fs.readdir(taken)).toEqual(['older'])
+        expect(await fs.readFile(path.join(d, 'data', 'data', 'db'), 'utf8')).toBe('snap-db')
+        // a later stamp goes through
+        const r = await sb.run(['quarantine-snapshot', 'sdb1', 'inst1'], { FAKE_DATE_UTC_STAMP: '20261114T120001Z' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(path.basename(r.stdout.trim())).toBe('inst1-pre-update-20261114T120001Z')
+    })
+
+    it('refuses symlinks at .pre-update, .pre-update/<id> and .idea-quarantine, and a snapshot that is not a folder', async () => {
+        const root = await sb.addDisk('sdb1')
+        const victim = path.join(sb.tmp, 'victim-qs')
+        await fs.ensureDir(path.join(victim, 'data')); await fs.writeFile(path.join(victim, 'COMPLETE'), 'x')
+        await fs.ensureDir(path.join(root, '.pre-update'))
+        await fs.symlink(victim, snap(root, 'inst1'))
+        refused(await sb.run(['quarantine-snapshot', 'sdb1', 'inst1']), /symlink/)
+        expect(await fs.pathExists(path.join(victim, 'COMPLETE'))).toBe(true)
+        await fs.writeFile(snap(root, 'inst2'), 'not a folder')
+        refused(await sb.run(['quarantine-snapshot', 'sdb1', 'inst2']), /is not a folder/)
+
+        const root2 = await sb.addDisk('sdc1')
+        await makeSnap(root2, 'inst1')
+        const qVictim = path.join(sb.tmp, 'victim-q-dir')
+        await fs.ensureDir(qVictim)
+        await fs.symlink(qVictim, path.join(root2, '.idea-quarantine'))
+        refused(await sb.run(['quarantine-snapshot', 'sdc1', 'inst1']), /\.idea-quarantine is a symlink/)
+        expect(await fs.readdir(qVictim)).toEqual([])
+        expect(await fs.pathExists(snap(root2, 'inst1'))).toBe(true)
+
+        const root3 = await sb.addDisk('sdd1')
+        const pVictim = path.join(sb.tmp, 'victim-p-dir')
+        await fs.ensureDir(path.join(pVictim, 'inst1'))
+        await fs.symlink(pVictim, path.join(root3, '.pre-update'))
+        refused(await sb.run(['quarantine-snapshot', 'sdd1', 'inst1']), /\.pre-update is a symlink/)
+        expect(await fs.pathExists(path.join(pVictim, 'inst1'))).toBe(true)
+    })
+
+    it('validates root and id like snapshot (strict id; a legacy dotted id is refused) and waits for the instance lock', async () => {
+        const root = await sb.addDisk('sdb1')
+        for (const id of ['..', '-rf', 'a/b', 'Inst', 'nextcloud-x.backup-20261027-181633', '.hidden', 'x'.repeat(65)]) {
+            refused(await sb.run(['quarantine-snapshot', 'sdb1', id]), /instance id '.*' does not match/)
+        }
+        refused(await sb.run(['quarantine-snapshot', '/disks/sdb1', 'inst1']), /root '.*' is not sd\[a-z\]\[1-9\]|unknown root/)
+        refused(await sb.run(['quarantine-snapshot', 'sdb1']), /quarantine-snapshot takes exactly 2 argument/)
+        refused(await sb.run(['quarantine-snapshot', 'sdb1', 'inst1', 'data']), /quarantine-snapshot takes exactly 2 argument/)
+        const d = await makeSnap(root, 'inst1')
+        await fs.ensureDir(sb.lockDir)
+        await fs.chmod(sb.lockDir, 0o700)
+        const holder = spawn('flock', [path.join(sb.lockDir, 'inst.sdb1.inst1.lock'), 'sleep', '5'])
+        await new Promise(r => setTimeout(r, 300))
+        try {
+            refused(await sb.run(['quarantine-snapshot', 'sdb1', 'inst1']), /busy: another idea-app-data run still holds inst\.sdb1\.inst1/)
+        } finally {
+            holder.kill('SIGKILL')
+        }
+        expect(await fs.pathExists(d)).toBe(true)
+    })
+
+    it('has no code path that removes anything, and takes no exclude or option argument', async () => {
+        const body = await fs.readFile(HELPER_SOURCE, 'utf8')
+        const block = body.slice(body.indexOf('    quarantine-snapshot)'), body.indexOf('    borg-init)'))
+        expect(block.length).toBeGreaterThan(100)
+        expect(block).not.toMatch(/\$RM|\$RMDIR|rm -|\$CP|\$RSYNC|\$TAR|\$DOCKER|containers_stopped/)
+        expect(block).toContain('$MV -T -- "./$3" "$QDEST"')
+        expect(block).toContain('need 2 $(($# - 1)) "<root> <id>"')
+        expect(block).toContain('check_id "$3"')
+    })
 })

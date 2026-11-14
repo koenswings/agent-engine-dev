@@ -47,6 +47,7 @@ import { recordBackupResult } from '../data/BackupResults.js'
 import { resourceLock } from '../utils/ResourceLock.js'
 import { readBuildInfo } from '../utils/buildInfo.js'
 import { defaultReadBootId, defaultReadNtpSynced, defaultReadUptimeS } from '../usage/sampler.js'
+import { bindEngineClockTrusted } from '../utils/engineClockStatus.js'
 import {
     BackupDue, ClockJumpState, DEFAULT_BACKUP_TIME, ClockSample, ClockTrust, SkippedRun,
     advanceClockJumpState, advanceUptimeCounter, decideBackupDue, detectClockJump, effectiveSchedule,
@@ -351,9 +352,14 @@ export class BackupScheduler {
             log(`Backup scheduler: disk ${diskId} is no longer docked here in scheduled mode; ${instanceId} not run`)
             return null
         }
-        if (!getInstance(store, instanceId as InstanceID)) {
+        const inst = getInstance(store, instanceId as InstanceID)
+        if (!inst) {
             log(`Backup scheduler: linked instance ${instanceId} is not in the store; skipped (orphanLinks)`)
             syncBackupOrphanLinks(this.storeHandle, diskId as DiskID)
+            return null
+        }
+        if ((inst as any).demo === true) {
+            log(`Backup scheduler: ${instanceId} is a demo instance — skipped (engine#369)`)
             return null
         }
         const lockFile = `${disksRoot()}/${disk.device}/backups/${instanceId}/${BACKUP_IN_PROGRESS}`
@@ -437,7 +443,14 @@ export const startBackupScheduler = (storeHandle: DocHandle<Store>): BackupSched
     if (!engineScheduler) {
         engineScheduler = new BackupScheduler(storeHandle)
         engineScheduler.start()
+        bindEngineClockTrusted(() => engineScheduler!.clockStatus().clockTrusted)
         log(`Backup scheduler started (${SCHEDULER_TICK_MS / 1000} s tick, in the Engine; idea#400)`)
     }
     return engineScheduler
 }
+
+/** The running scheduler, if startBackupScheduler has run (idea#396 clock trust). */
+export const getBackupScheduler = (): BackupScheduler | null => engineScheduler
+
+/** Test seam: drop the process-wide scheduler. */
+export const resetBackupSchedulerForTests = (): void => { engineScheduler = null }

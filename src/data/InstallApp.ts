@@ -25,11 +25,11 @@ import { Store, getDisk, getLocalEngine } from './Store.js'
 import { resolveDiskArg } from './DiskArg.js'
 import { buildInstance, versionDirName } from './Instance.js'
 import { parseAppId } from './App.js'
-import { AppID, AppName, DiskID, DiskName, InstanceName, Version } from './CommonTypes.js'
+import { AppID, AppName, DiskID, DiskName, InstanceID, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { Disk, diskMountRoot } from './Disk.js'
 import { App, createOrUpdateApp } from './App.js'
-import { assertNoExternalLinks, setComposeInstanceName } from './InstanceCopy.js'
+import { assertNoExternalLinks, setComposeInstanceName, stampComposeInstanceIdentity } from './InstanceCopy.js'
 import { splitArgs } from '../utils/commandUtils.js'
 import { assertSameDockAfterWait, dockIdentityOf, trackInFlight } from './InstanceInFlight.js'
 
@@ -143,8 +143,8 @@ export const installAppFromDisk = async (
     sourceDisk: Disk,
     targetDisk: Disk,
     instanceName: InstanceName,
-    opts: { fresh?: boolean } = {}
-): Promise<void> => {
+    opts: { fresh?: boolean, start?: boolean, demo?: boolean } = {}
+): Promise<InstanceID> => {
     const sourceDevice = sourceDisk.device
     const targetDevice = targetDisk.device
     // #170: the copies below can take minutes; an eject/erase/re-dock meanwhile must not get a store record
@@ -226,15 +226,26 @@ export const installAppFromDisk = async (
     const composeFile = `${instanceDir}/compose.yaml`
     if (await fs.pathExists(composeFile)) {
         const text = await fs.readFile(composeFile, 'utf8')
-        await fs.writeFile(composeFile, setComposeInstanceName(text, String(instanceName)))
+        if (opts.demo) {
+            await fs.writeFile(composeFile, stampComposeInstanceIdentity(text, { instanceName: String(instanceName), demo: true }))
+        } else {
+            await fs.writeFile(composeFile, setComposeInstanceName(text, String(instanceName)))
+        }
     }
 
-    // processInstance registers the new instance in the store and starts it
+    // processInstance registers the new instance in the store and starts it.
+    // setupDemo (engine#369) asks for no-start and x-app.demo already written.
     recheck('before registering the instance')
-    const { processInstance } = await import('./Disk.js')
-    await processInstance(storeHandle, targetDisk, instanceId as any)
+    if (opts.start === false) {
+        const { createOrUpdateInstance } = await import('./Instance.js')
+        await createOrUpdateInstance(storeHandle, instanceId as InstanceID, targetDisk)
+    } else {
+        const { processInstance } = await import('./Disk.js')
+        await processInstance(storeHandle, targetDisk, instanceId as any)
+    }
 
     log(chalk.green(`installApp: installed '${appId}' as instance '${instanceName}' on disk '${targetDisk.name}'`))
+    return instanceId as InstanceID
 }
 
 // ── Source router ─────────────────────────────────────────────────────────────
@@ -246,6 +257,10 @@ export interface InstallAppOptions {
     instanceName?: InstanceName  // --name flag; defaults to appId
     fresh?: boolean              // --fresh flag; local route starts from the bundle, no source instance data
     gitAccount?: string          // for GitHub path; defaults to 'koenswings'
+    /** engine#369 internal: register but do not start (CLI default is to start). */
+    start?: boolean
+    /** engine#369 internal: write x-app.demo: true before registration (CLI never sets this). */
+    demo?: boolean
 }
 
 /**
@@ -276,7 +291,7 @@ const findDockedDiskWithApp = async (store: Store, appId: AppID, excludeDiskId?:
 export const installApp = async (
     storeHandle: DocHandle<Store>,
     opts: InstallAppOptions
-): Promise<void> => {
+): Promise<InstanceID> => {
     const target = resolveDiskArg(storeHandle.doc(), getLocalEngine(storeHandle.doc())?.id, opts.targetDiskId, 'installApp')
     return trackInFlight(String(target.id), `installApp ${opts.appId}`, installAppRouted(storeHandle, opts))
 }
@@ -284,7 +299,7 @@ export const installApp = async (
 const installAppRouted = async (
     storeHandle: DocHandle<Store>,
     opts: InstallAppOptions
-): Promise<void> => {
+): Promise<InstanceID> => {
     // `<name>@<ref>` (Kid, #221): the ref goes to git as given; disks use the folder-safe id
     const refAppId = opts.appId
     opts = { ...opts, appId: diskAppId(opts.appId) }
@@ -305,8 +320,7 @@ const installAppRouted = async (
         const sourceDisk = resolveDiskArg(store, engineId, opts.sourceDiskId, 'installApp --source')
         if (await diskHasAppBundle(sourceDisk as Disk, opts.appId)) {
             log(chalk.blue(`installApp: local path — source '${sourceDisk.name}' (${sourceDisk.id})`))
-            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName, { fresh: opts.fresh })
-            return
+            return await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName, { fresh: opts.fresh, start: opts.start, demo: opts.demo })
         }
         log(chalk.yellow(
             `installApp: --source '${sourceDisk.name}' (${sourceDisk.id}) has no apps/${opts.appId} — ` +
@@ -335,10 +349,23 @@ const installAppRouted = async (
         // #170: the build can take minutes; never register on a dock that changed meanwhile
         assertSameDockAfterWait(storeHandle.doc(), String(targetDisk.id), targetDock, `installApp '${opts.appId}' on '${targetDisk.name}' (GitHub build)`)
         await createOrUpdateApp(storeHandle, opts.appId, targetDisk as Disk)
-        const { processInstance } = await import('./Disk.js')
-        await processInstance(storeHandle, targetDisk as Disk, instanceId)
+        if (opts.demo || opts.start === false) {
+            const { diskMountRoot } = await import('./Disk.js')
+            const composeFile = `${await diskMountRoot(targetDisk as Disk)}/instances/${instanceId}/compose.yaml`
+            if (await fs.pathExists(composeFile)) {
+                const text = await fs.readFile(composeFile, 'utf8')
+                await fs.writeFile(composeFile, stampComposeInstanceIdentity(text, { instanceName: String(instanceName), demo: opts.demo ? true : undefined }))
+            }
+        }
+        if (opts.start === false) {
+            const { createOrUpdateInstance } = await import('./Instance.js')
+            await createOrUpdateInstance(storeHandle, instanceId as InstanceID, targetDisk as Disk)
+        } else {
+            const { processInstance } = await import('./Disk.js')
+            await processInstance(storeHandle, targetDisk as Disk, instanceId)
+        }
         log(chalk.green(`installApp: installed '${opts.appId}' as instance '${instanceName}' on disk '${targetDisk.name}' (GitHub)`))
-        return
+        return instanceId as InstanceID
     }
 
     // Route 3: offline — appDB pointer only if bundle still on that disk; else scan docked disks
@@ -349,16 +376,14 @@ const installAppRouted = async (
         const sourceDisk = getDisk(store, sourceDiskId)
         if (sourceDisk?.device && await diskHasAppBundle(sourceDisk as Disk, opts.appId)) {
             log(chalk.blue(`installApp: auto-selected source disk '${sourceDisk.name}'`))
-            await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName, { fresh: opts.fresh })
-            return
+            return await installAppFromDisk(storeHandle, opts.appId, sourceDisk as Disk, targetDisk as Disk, instanceName, { fresh: opts.fresh, start: opts.start, demo: opts.demo })
         }
     }
 
     const alt = await findDockedDiskWithApp(store, opts.appId, String(targetDisk.id))
     if (alt) {
         log(chalk.blue(`installApp: found apps/${opts.appId} on docked disk '${alt.name}' (${alt.id})`))
-        await installAppFromDisk(storeHandle, opts.appId, alt, targetDisk as Disk, instanceName, { fresh: opts.fresh })
-        return
+        return await installAppFromDisk(storeHandle, opts.appId, alt, targetDisk as Disk, instanceName, { fresh: opts.fresh, start: opts.start, demo: opts.demo })
     }
 
     // No local source found
