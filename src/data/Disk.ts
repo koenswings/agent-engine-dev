@@ -936,10 +936,18 @@ export const dropInstancesWithoutFiles = async (storeHandle: DocHandle<Store>, d
 }
 
 export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): void => {
+    const current = getInstance(storeHandle.doc(), instanceId)
+    // engine#381: after a keep-id move flips storedOn, a leftover folder (or a
+    // missing folder) on this disk must not mark the instance Missing.
+    if (current?.storedOn && String(current.storedOn) !== String(disk.id)) {
+        log(`Instance ${instanceId} is stored on ${current.storedOn}, not ${disk.id} — not marking Missing`)
+        return
+    }
     log(`Instance ${instanceId} no longer found on disk ${disk.id}`)
     storeHandle.change(doc => {
         const instance = getInstance(doc, instanceId)
         if (instance) {
+            if (instance.storedOn && String(instance.storedOn) !== String(disk.id)) return
             // Mark as Missing — the instance directory is no longer on this disk (deleted or moved).
             // We preserve the instanceDB entry so that:
             //   1. Instance history is not lost.

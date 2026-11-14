@@ -341,6 +341,14 @@ export const recoverInterruptedOperations = async (
         // removes the source; only a recorded verify means the copy is good.
         if (op.kind === 'moveApp' && op.move) {
             const verified = op.move.verified === true
+            const { cleanupUnverifiedMoveTarget, flipStoredOnAfterVerify } = await import('./MoveAppRemote.js')
+            if (!verified) {
+                await cleanupUnverifiedMoveTarget(storeHandle, op as any)
+            } else {
+                const id = String(op.move.sourceInstanceId ?? op.args?.instanceId ?? '')
+                const tgt = String(op.args?.targetDiskId ?? '')
+                if (id && tgt) flipStoredOnAfterVerify(storeHandle, id, tgt)
+            }
             const text = verified
                 ? 'MOVED, source not removed: the Engine restarted before the old copy was removed'
                 : 'MOVE FAILED: the Engine restarted during the move; source kept'

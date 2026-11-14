@@ -11,7 +11,8 @@ import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { localEngineId } from '../../src/data/Engine.js'
 import { InstanceID, DiskID, DiskName, EngineID, Timestamp, AppID } from '../../src/data/CommonTypes.js'
-import { moveAppCrossEngine, verifyMoveTarget, MoveDeps, refusalCode, moveCommandOutcome, MOVE_PROGRESS_TYPE } from '../../src/data/MoveAppRemote.js'
+import { moveAppCrossEngine, verifyMoveTarget, MoveDeps, refusalCode, moveCommandOutcome, MOVE_PROGRESS_TYPE, isInFlightKeepIdMove } from '../../src/data/MoveAppRemote.js'
+import { removeInstance as dropInstanceFromDisk } from '../../src/data/Disk.js'
 import { checkingProgressMessage, setPortReadyProgress, resetPortReadyProgressForTests } from '../../src/data/PortReadyProgress.js'
 import { MoveError, MOVE_CODES, MOVE_FAILURE_CODES, MOVE_REFUSAL_CODES, MOVE_DONE_CODES, MOVE_CROSS_ENGINE_CAPABILITY, moveFailedText, sourceNotRemovedText, sizesMatch } from '../../src/data/MoveAppShapes.js'
 import { recoverInterruptedOperations } from '../../src/data/Operations.js'
@@ -27,7 +28,7 @@ const BYTES = 50 * 1024 * 1024
 
 const inst = (id: InstanceID, storedOn: DiskID, status: string) => ({
     id, instanceOf: 'kolibri-1.0' as AppID, name: 'my-kolibri' as any, status: status as any, port: 3000 as any,
-    serviceImages: [], created: 0 as Timestamp, lastBackup: null, lastStarted: 0 as Timestamp, statusCondition: null,
+    serviceImages: [], created: 0 as Timestamp, lastBackup: 1_700_000_000_000 as Timestamp, lastStarted: 0 as Timestamp, statusCondition: null,
     storedOn, currentStep: null, totalSteps: null, stepLabel: null, metrics: null, portZip: null,
 })
 const disk = (id: DiskID, dockedTo: string) => ({
@@ -49,31 +50,35 @@ const makeStore = (opts: { status?: string, targetCaps?: string[] } = {}): DocHa
     } as any)
 }
 
-/** Two-Engine wiring: copy registers the new instance on the TARGET disk; verify runs as TARGET. */
-const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes?: number, copyFails?: string, verifyReply?: boolean, removeFails?: boolean, sourceBytesSeq?: number[], duringVerify?: (sh: DocHandle<Store>) => void } = {}) => {
-    const removeSource = vi.fn(async (sh: DocHandle<Store>, id: InstanceID) => {
+/** Two-Engine wiring: copy keeps the same id and does not flip storedOn; verify runs as TARGET. */
+const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes?: number, copyFails?: string, verifyReply?: boolean, removeFails?: boolean, sourceBytesSeq?: number[], duringVerify?: (sh: DocHandle<Store>) => void, folderExists?: boolean } = {}) => {
+    const removeSource = vi.fn(async (_sh: DocHandle<Store>, id: InstanceID) => {
         if (o.removeFails) throw new RemoveError('QUARANTINE_FAILED', 'cannot quarantine /disks/sda1/instances/inst-src: busy; the store is unchanged')
-        sh.change(d => { delete d.instanceDB[id] })
+        // engine#381: quarantine the source folder only; never delete instanceDB[id]
         return { quarantinePath: `/disks/sda1/.idea-quarantine/${id}` }
     })
     const startSource = vi.fn(async (sh: DocHandle<Store>, i: any) => { sh.change(d => { (d.instanceDB as any)[i.id].status = 'Running' }) })
+    const requestStart = vi.fn()
     const deps: Partial<MoveDeps> = {
         localEngineId: async () => SRC,
         validate: async (store) => ({ instance: store.instanceDB[INST] as any, sourceDisk: store.diskDB[SRC_DISK] as any, targetDisk: store.diskDB[TGT_DISK] as any }),
         helperProblem: async () => null,
         sourceBytes: async () => (o.sourceBytesSeq?.shift() ?? BYTES),
+        targetFolderExists: async () => o.folderExists === true,
         copy: async (sh) => {
-            // like copyApp with keepSourceStopped: the source is stopped for the copy and stays stopped
+            // like copyApp with keepSourceStopped + dstId: source stopped, same id, storedOn unchanged
             sh.change(d => { (d.instanceDB as any)[INST].status = 'Stopped' })
             if (o.copyFails) throw new Error(o.copyFails)
-            sh.change(d => { (d.instanceDB as any)[NEW] = inst(NEW, TGT_DISK, o.targetStatus ?? 'Running') })
-            return NEW
+            return INST
         },
+        requestStart: requestStart as any,
         requestVerify: (sh, engineId, command) => {
             expect(engineId).toBe(String(TGT))
             o.duringVerify?.(sh)
             if (o.verifyReply === false) return
             const [, opId, id, bytes, running] = command.split(' ')
+            const healthy = running === 'true' && (!o.targetStatus || o.targetStatus === 'Running')
+            if (healthy) setPortReadyProgress(id, { firstReadyAt: Date.now() - 10_000, stableMs: 10_000, stableReached: true })
             void verifyMoveTarget(sh, opId, id, bytes, running, { localEngineId: async () => String(TGT), targetBytes: async () => o.targetBytes ?? BYTES, timeoutMs: 50, pollMs: 5 })
         },
         startSource: startSource as any,
@@ -81,11 +86,13 @@ const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes
         verifyTimeoutMs: 300,
         pollMs: 5,
     }
-    return { deps, removeSource, startSource }
+    return { deps, removeSource, startSource, requestStart }
 }
 const theOp = (h: DocHandle<Store>) => Object.values(h.doc().operationDB)[0] as any
 
 describe('moveApp across Engines (idea#79)', () => {
+    afterEach(() => { resetPortReadyProgressForTests() })
+
     it('success: copies, verifies on the target, quarantines (never deletes) the source', async () => {
         const h = makeStore()
         const { deps, removeSource } = twoEngines(h)
@@ -94,13 +101,14 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(r.text).toBe('MOVED to idea04')
         expect(r.quarantinePath).toContain('.idea-quarantine')
         expect(removeSource).toHaveBeenCalledTimes(1)
-        expect(h.doc().instanceDB[INST]).toBeUndefined()
-        expect(h.doc().instanceDB[NEW]?.storedOn).toBe(TGT_DISK)
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
+        expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
+        expect(h.doc().instanceDB[NEW]).toBeUndefined()
         const op = theOp(h)
         expect(op.kind).toBe('moveApp')
         expect(op.status).toBe('Done')
         expect(op.error).toBeNull()
-        expect(op.move).toMatchObject({ phase: 'done', verified: true, sourceRemoved: true, code: 'MOVED', targetInstanceId: NEW, expectedBytes: BYTES })
+        expect(op.move).toMatchObject({ phase: 'done', verified: true, sourceRemoved: true, code: 'MOVED', targetInstanceId: INST, expectedBytes: BYTES })
         expect(op.move.verify.ok).toBe(true)
     })
 
@@ -121,7 +129,7 @@ describe('moveApp across Engines (idea#79)', () => {
         const { deps, removeSource } = twoEngines(h, { targetStatus: 'Error' })
         const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)
         expect(r.code).toBe('VERIFY_NOT_RUNNING')
-        expect(r.text).toContain('failed to start')
+        expect(r.text).toMatch(/did not start|failed to start/)
         expect(removeSource).not.toHaveBeenCalled()
     })
 
@@ -199,9 +207,9 @@ describe('moveApp across Engines (idea#79)', () => {
         const h = makeStore()
         h.change(d => {
             (d.operationDB as any)['op-v'] = {
-                id: 'op-v', kind: 'moveApp', args: {}, cause: 'console-command', subject: null, engineId: localEngineId, status: 'Running',
+                id: 'op-v', kind: 'moveApp', args: { instanceId: INST, sourceDiskId: SRC_DISK, targetDiskId: TGT_DISK, crossEngine: 'true' }, cause: 'console-command', subject: null, engineId: localEngineId, status: 'Running',
                 progressPercent: 90, currentStep: 2, totalSteps: 3, stepLabel: 'Removing the old copy', startedAt: 0, completedAt: null, error: null,
-                move: { phase: 'removing', targetEngineId: TGT, sourceInstanceId: INST, targetInstanceId: NEW, expectedBytes: BYTES, expectRunning: false,
+                move: { phase: 'removing', targetEngineId: TGT, sourceInstanceId: INST, targetInstanceId: INST, expectedBytes: BYTES, expectRunning: false,
                     verify: { ok: true, bytes: BYTES, detail: null, at: 1 }, verified: true, sourceRemoved: false, quarantinePath: null, code: null, resultText: null },
             }
         })
@@ -210,6 +218,8 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(op.status).toBe('Done')
         expect(op.error).toBe('MOVED, source not removed: the Engine restarted before the old copy was removed')
         expect(op.move.code).toBe('SOURCE_NOT_REMOVED')
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
+        expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
     })
 
     it('removal fails after a good copy: MOVED, source not removed', async () => {
@@ -221,6 +231,7 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(theOp(h).status).toBe('Done')
         expect(theOp(h).move).toMatchObject({ verified: true, sourceRemoved: false })
         expect(h.doc().instanceDB[INST]).toBeDefined()
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
     })
 
     it('source started during the move: SOURCE_CHANGED, MOVED, source not removed, nothing quarantined', async () => {
@@ -276,6 +287,7 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(sourceNotRemovedText('y')).toBe('MOVED, source not removed: y')
         expect(refusalCode("Instance name 'a' is ambiguous: …")).toBe('AMBIGUOUS')
         expect(refusalCode("Source disk 'x' is docked to a remote engine. Copy/move must be initiated from that engine.")).toBe('SOURCE_REMOTE')
+        expect(refusalCode(`instance ${INST} already exists on idea04`)).toBe('TARGET_EXISTS')
         expect(sizesMatch(BYTES, BYTES + 1000)).toBe(true)
         expect(sizesMatch(BYTES, BYTES / 2)).toBe(false)
     })
@@ -302,11 +314,18 @@ describe('moveApp across Engines (idea#79)', () => {
         ['SOURCE_CHANGED', { sourceBytesSeq: [BYTES, BYTES * 2] }, () => {}, 'SOURCE_CHANGED'],
         ['HELPER_OUTDATED (refusal)', {}, (_h, d) => { d.helperProblem = async () => 'needs helper v4' }, 'HELPER_OUTDATED'],
         ['TARGET_UNREACHABLE (refusal)', {}, (_h, d) => { d.validate = async () => `Target engine '${TGT}' is not currently reachable (not in network connections).` }, 'TARGET_UNREACHABLE'],
+        ['TARGET_EXISTS (refusal)', { folderExists: true }, () => {}, 'TARGET_EXISTS'],
     ]
     it.each(scenarios)('%s: code on op.move.code and trace errorCode/result.code', async (_n, o, tweak, code) => {
         const h = makeStore(o.status ? { status: o.status } : undefined)
         const { deps } = twoEngines(h, o)
-        if (o.copyNotRegistered) deps.copy = async (sh) => { sh.change(d => { (d.instanceDB as any)[INST].status = 'Stopped' }); return NEW }
+        if (o.copyNotRegistered) deps.copy = async (sh) => {
+            sh.change(d => {
+                (d.instanceDB as any)[INST].status = 'Stopped'
+                ;(d.diskDB as any)[TGT_DISK].dockedTo = null
+            })
+            return INST
+        }
         tweak(h, deps)
         const t = await viaTrace(h, deps)
         const result = JSON.parse(t.result)
@@ -339,10 +358,91 @@ describe('moveApp across Engines (idea#79)', () => {
         } finally { resourceLock.release(instanceKey(INST)) }
     })
 
+    it('keeps the instance id and lastBackup; no second instanceDB row', async () => {
+        const h = makeStore()
+        const { deps } = twoEngines(h)
+        const r = await moveAppCrossEngine(h, 'my-kolibri' as any, SRC_DISK, TGT_DISK, 'console-command', deps)
+        expect(r.code).toBe('MOVED')
+        expect(r.targetInstanceId).toBe(String(INST))
+        expect(Object.keys(h.doc().instanceDB)).toEqual([INST])
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
+        expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
+        expect(h.doc().instanceDB[INST]?.name).toBe('my-kolibri')
+    })
+
+    it('TARGET_EXISTS: a leftover folder on the target is refused before anything happens', async () => {
+        const h = makeStore()
+        const { deps } = twoEngines(h, { folderExists: true })
+        const copy = vi.fn(deps.copy!)
+        deps.copy = copy
+        await expect(moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)).rejects.toMatchObject({
+            code: 'TARGET_EXISTS',
+        })
+        await expect(moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)).rejects.toThrow(/already exists on disk-tgt; source kept/)
+        expect(copy).not.toHaveBeenCalled()
+        expect(Object.keys(h.doc().operationDB)).toHaveLength(0)
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+    })
+
+    it('TARGET_EXISTS: storedOn already names a disk on the target Engine', async () => {
+        const h = makeStore()
+        h.change(d => { (d.instanceDB as any)[INST].storedOn = TGT_DISK })
+        const { deps } = twoEngines(h)
+        const copy = vi.fn(deps.copy!)
+        deps.copy = copy
+        await expect(moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', deps)).rejects.toMatchObject({
+            code: 'TARGET_EXISTS',
+        })
+        expect(copy).not.toHaveBeenCalled()
+        expect(Object.keys(h.doc().operationDB)).toHaveLength(0)
+    })
+
+    it('an interrupted (unverified) move leaves the source intact and authoritative', async () => {
+        const h = makeStore()
+        h.change(d => {
+            (d.operationDB as any)['op-m'] = {
+                id: 'op-m', kind: 'moveApp', args: { instanceId: INST, sourceDiskId: SRC_DISK, targetDiskId: TGT_DISK, crossEngine: 'true' },
+                cause: 'console-command', subject: { type: 'instance', id: INST }, engineId: localEngineId, status: 'Running',
+                progressPercent: 40, currentStep: 0, totalSteps: 3, stepLabel: 'Copying', startedAt: 0, completedAt: null, error: null,
+                move: { phase: 'checking', targetEngineId: TGT, sourceInstanceId: INST, targetInstanceId: INST, expectedBytes: BYTES, expectRunning: true,
+                    verify: null, verified: false, sourceRemoved: false, quarantinePath: null, code: null, resultText: null },
+            }
+        })
+        await recoverInterruptedOperations(h, {})
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(h.doc().instanceDB[INST]?.lastBackup).toBe(1_700_000_000_000)
+        expect((h.doc().operationDB['op-m'] as any).move.code).toBe('INTERRUPTED')
+    })
+
+    it('dock scan must not mark Missing when storedOn is already another disk', () => {
+        const h = makeStore()
+        h.change(d => { (d.instanceDB as any)[INST].storedOn = TGT_DISK; (d.instanceDB as any)[INST].status = 'Running' })
+        dropInstanceFromDisk(h, h.doc().diskDB[SRC_DISK] as any, INST)
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
+        expect(h.doc().instanceDB[INST]?.status).toBe('Running')
+    })
+
+    it('isInFlightKeepIdMove is true only for an unverified move to that target disk', () => {
+        const h = makeStore()
+        expect(isInFlightKeepIdMove(h.doc(), INST, TGT_DISK)).toBe(false)
+        h.change(d => {
+            (d.operationDB as any)['op-m'] = {
+                id: 'op-m', kind: 'moveApp',
+                args: { instanceId: INST, sourceDiskId: SRC_DISK, targetDiskId: TGT_DISK, crossEngine: 'true' },
+                status: 'Running',
+                move: { phase: 'checking', sourceInstanceId: INST, targetInstanceId: INST, verified: false, sourceRemoved: false },
+            } as any
+        })
+        expect(isInFlightKeepIdMove(h.doc(), INST, TGT_DISK)).toBe(true)
+        expect(isInFlightKeepIdMove(h.doc(), INST, SRC_DISK)).toBe(false)
+        h.change(d => { (d.operationDB['op-m'] as any).move.verified = true })
+        expect(isInFlightKeepIdMove(h.doc(), INST, TGT_DISK)).toBe(false)
+    })
+
     it('MOVE_CODES is the single list: refusals + failures + done, no duplicates', () => {
         expect(MOVE_CODES).toEqual([...MOVE_REFUSAL_CODES, ...MOVE_FAILURE_CODES, ...MOVE_DONE_CODES])
         expect(new Set(MOVE_CODES).size).toBe(MOVE_CODES.length)
-        expect(MOVE_CODES).toEqual(expect.arrayContaining(['VERIFY_SIZE', 'VERIFY_NOT_RUNNING', 'VERIFY_NOT_FOUND', 'VERIFY_TIMEOUT']))
+        expect(MOVE_CODES).toEqual(expect.arrayContaining(['VERIFY_SIZE', 'VERIFY_NOT_RUNNING', 'VERIFY_NOT_FOUND', 'VERIFY_TIMEOUT', 'TARGET_EXISTS']))
     })
 
     it('the source picks up the verify result on the store change, without waiting for the 2 s poll (idea#498)', async () => {

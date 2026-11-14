@@ -186,7 +186,7 @@ export const validate = async (
     return { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot }
 }
 
-/** Options for copyApp when it runs as the copy step of a cross-Engine move (idea#79). */
+/** Options for copyApp when it runs as the copy step of a cross-Engine move (idea#79, engine#381). */
 export interface CopyAppOptions {
     /** write progress into this (moveApp) operation instead of creating a copyApp one */
     journalOpId?: string
@@ -196,16 +196,26 @@ export interface CopyAppOptions {
     rethrow?: boolean
     /** a move keeps the source stopped after a good copy (it restarts it itself on failure) */
     keepSourceStopped?: boolean
+    /**
+     * Internal only (not on the CLI). Cross-Engine moveApp passes the source id so
+     * the target folder is instances/<same id> and no second instanceDB row is written.
+     * A plain copyApp omits this and still mints a fresh id.
+     */
+    dstId?: InstanceID
 }
 
 // ── copyApp ───────────────────────────────────────────────────────────────────
 
 /**
  * Copy an app instance from sourceDisk to targetDisk.
- * The copy receives a fresh InstanceID — it is a brand new instance — and its
+ * A plain copyApp receives a fresh InstanceID — it is a brand new instance — and its
  * own name (`<name>-2`, `<name>-3`, …) and port (idea#168 r35).
+ * When called as the copy step of a cross-Engine move with dstId set to the source
+ * id (engine#381), the target folder uses that same id: no second instanceDB row,
+ * lastBackup is kept, and Kolibri morango is not rebound. storedOn is not flipped
+ * here; the move flips it only after verify.
  * The original keeps running: it is stopped during the file copy and restarted
- * before the copy starts, so it keeps its port.
+ * before the copy starts, so it keeps its port (unless keepSourceStopped).
  */
 export const copyApp = async (
     storeHandle: DocHandle<Store>,
@@ -239,7 +249,8 @@ export const copyApp = async (
     let copyError: Error | null = null
     beginUsageSkip('move')
 
-    const newInstanceId = uuid() as InstanceID
+    const newInstanceId = (opts.dstId ?? uuid()) as InstanceID
+    const preserveId = Boolean(opts.dstId) && String(opts.dstId) === String(instance.id)
     let wasRunning = false
     let sourceRestarted = false
     // idea#168 r36: the folder this copy creates on the target disk. A failed copy
@@ -379,7 +390,7 @@ export const copyApp = async (
         const kolibriCopy = peer
             ? await instanceDirLooksLikeKolibri(instanceSrc)
             : await instanceDirLooksLikeKolibri(instanceDest)
-        if (kolibriCopy) {
+        if (kolibriCopy && !preserveId) {
             // Flat marker at instance root (receive-files / put-files place basenames).
             // Peer: receive-files through the gate. Local: put-files as root (app-data policy).
             const tmp = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-kolibri-rebind-'))
@@ -440,7 +451,12 @@ export const copyApp = async (
         // it while the original is down for the snapshot.
         if (wasRunning && !opts.keepSourceStopped) await restartSource('before the copy starts')
 
-        if (isCrossEngine) {
+        if (preserveId) {
+            // engine#381: the existing instanceDB row stays the source of truth
+            // until moveApp flips storedOn after verify. Do not start the target
+            // here (the move starts it on the target disk during Checking).
+            log(`copyApp: kept instance id ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id}); storedOn is unchanged until verify`)
+        } else if (isCrossEngine) {
             // Cross-engine: create instance record in shared store (as Docked),
             // then tell the remote engine to start it via sendCommand.
             log(`copyApp: registering new instance ${newInstanceId} on remote disk '${targetDisk.name}' (${targetDisk.id})`)
@@ -498,10 +514,12 @@ export const copyApp = async (
             })
         }
         console.error(chalk.red(`copyApp: failed — ${e.message ?? e}`))
-        // Remove the partial copy unless it was already registered (fresh id, so the
-        // folder holds only what this op wrote). As root through the app-data helper
-        // (idea#168): the copy holds files owned by root, 999 and www-data.
-        if (createdInstanceDest && !storeHandle.doc()?.instanceDB?.[newInstanceId]) {
+        // Remove the partial copy unless a *new* id was already registered (fresh
+        // id, so the folder holds only what this op wrote). When preserveId, the
+        // existing instanceDB[id] is the source row — still delete only the target
+        // folder, never the source, never the store row (engine#381).
+        const registeredFresh = !preserveId && storeHandle.doc()?.instanceDB?.[newInstanceId]
+        if (createdInstanceDest && !registeredFresh) {
             try {
                 if (peer) await deleteRemoteInstanceData(peer.host, peer.engineId, targetRoot, newInstanceId)
                 else await deleteInstanceData(targetRoot, newInstanceId)

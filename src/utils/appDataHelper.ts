@@ -231,6 +231,9 @@ export const remoteHelperRsyncPath = (args: string[]): string => remoteHelperCom
 export const remoteDeleteSshArgs = (host: string, peerEngineId: string, root: string, id: string): string[] =>
     peerSshArgv(host, peerEngineId, remoteHelperCommand(deleteArgs(root, id)))
 
+export const remoteSizeSshArgs = (host: string, peerEngineId: string, root: string, id: string): string[] =>
+    peerSshArgv(host, peerEngineId, remoteHelperCommand(sizeArgs(root, id)))
+
 /** The ssh argv that creates apps/, instances/ and services/ on the peer's target disk (idea#80). */
 export const remoteEnsureDirsSshArgs = (host: string, peerEngineId: string, root: string): string[] =>
     peerSshArgv(host, peerEngineId, remoteHelperCommand(ensureDirsArgs(root)))
@@ -293,6 +296,17 @@ export const putInstanceFiles = async (
 /** Removes an instance folder on a peer Engine: ssh pi@host sudo -n idea-app-data delete <root> <id> (through its gate). */
 export const deleteRemoteInstanceData = async (host: string, peerEngineId: string, root: string, id: string): Promise<void> => {
     await $`${remoteDeleteSshArgs(host, peerEngineId, root, id)}`
+}
+
+/** True when `idea-app-data size` on the peer succeeds (the instance folder exists). */
+export const remoteInstanceFolderExists = async (host: string, peerEngineId: string, root: string, id: string): Promise<boolean> => {
+    try {
+        const out = String((await $`${remoteSizeSshArgs(host, peerEngineId, root, id)}`).stdout ?? '').trim()
+        const last = out.split('\n').pop() ?? out
+        return /^[0-9]+$/.test(last)
+    } catch {
+        return false
+    }
 }
 
 /** Creates apps/, instances/ and services/ on a peer's disk (through its gate). */

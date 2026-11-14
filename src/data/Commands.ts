@@ -228,14 +228,26 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
         : 'console-command'
     const store = storeHandle.doc()
     const instance = resolveInstanceArg(store, instanceName, 'startInstance', diskName)
+    const requested = (getDisk(store, diskName as unknown as DiskID) ?? findDiskByName(store, diskName))
+    // engine#381: during a keep-id cross-Engine move, start the folder on the
+    // command's target disk (not storedOn, which still names the source) and
+    // do not write Running/lastStarted onto the shared row until after verify.
+    let deferStoreStatus = false
+    if (requested && String(requested.dockedTo) === String(localEngineId)) {
+        const { isInFlightKeepIdMove } = await import('./MoveAppRemote.js')
+        deferStoreStatus = isInFlightKeepIdMove(store, String(instance.id), String(requested.id))
+    }
     // Look up disk by ID from instance.storedOn — same fix as stopInstanceWrapper.
     // findDiskByName uses getDisks() which filters dockedTo != null and misses
     // disks that appear undocked in the CRDT but are physically still attached.
-    const disk = (instance.storedOn ? getDisk(store, instance.storedOn) : undefined) ?? findDiskByName(store, diskName)
+    // An in-flight keep-id move is the exception: prefer the requested disk.
+    const disk = (deferStoreStatus ? requested : undefined)
+        ?? (instance.storedOn ? getDisk(store, instance.storedOn) : undefined)
+        ?? findDiskByName(store, diskName)
     if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
     // #239 (Steve): await the start too, so a stopInstance queued behind it cannot run mid-start
     // and the start trace closes only once the start is done.
-    await startInstance(storeHandle, instance, disk, cause)
+    await startInstance(storeHandle, instance, disk, cause, deferStoreStatus ? { deferStoreStatus: true } : {})
 }
 
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {

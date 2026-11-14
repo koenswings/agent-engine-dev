@@ -1,25 +1,30 @@
 /**
- * MoveAppRemote.ts — moveApp to a disk on another Engine (idea#79).
+ * MoveAppRemote.ts — moveApp to a disk on another Engine (idea#79, engine#381).
  *
- * A move is a copy followed by a delete, in one moveApp operation:
- *   1. Copying  — the existing cross-Engine copyApp path, journaled into this op.
- *   2. Checking — the target Engine runs verifyMoveTarget: the copy is registered
- *                 on a disk docked to it, its instance data size matches, and it
- *                 starts healthy when the source was running. The verdict is
- *                 written into Operation.move.verify. While it waits, the target
- *                 broadcasts ephemeral idea/progress Checking messages about once
- *                 a second (never stored; idea#498 option 3).
- *   3. Removing — only when move.verified was recorded: removeInstance (helper v4
- *                 quarantine; never rm) on the source.
+ * A move keeps the same instance id (and its Backup Disk link). In one moveApp op:
+ *   1. Copying  — the existing cross-Engine copyApp path with an internal dstId
+ *                 equal to the source id (not on the CLI), journaled into this op.
+ *                 No second instanceDB row; storedOn stays on the source until verify.
+ *   2. Checking — the target Engine runs verifyMoveTarget against the folder on
+ *                 operation.args.targetDiskId (not storedOn). Size must match, and
+ *                 when the source was running the port-ready registry must reach
+ *                 stable. The verdict is written into Operation.move.verify.
+ *                 While it waits, the target broadcasts ephemeral idea/progress
+ *                 Checking messages about once a second (never stored; idea#498 option 3).
+ *   3. Removing — only when move.verified was recorded: storedOn flips to the
+ *                 target disk, then only the source folder is quarantined (helper
+ *                 v4; never rm). removeInstance is not used, so the store row is kept.
  * Copy or verify failure deletes nothing (MOVE FAILED: … source kept). A failed
  * removal after a good copy is MOVED, source not removed: … Restart recovery
- * never removes the source (Operations.recoverInterruptedOperations).
+ * never removes the source (Operations.recoverInterruptedOperations): if not
+ * verified, only an unverified target folder is cleaned up; if verified, storedOn
+ * is flipped if needed and a leftover source folder is not claimed.
  */
 
 import { DocHandle } from '@automerge/automerge-repo'
 import { log } from '../utils/utils.js'
 import { Store, getDisk, getInstance, getEngine } from './Store.js'
-import { Disk, appDataRoot } from './Disk.js'
+import { Disk, appDataRoot, diskMountRoot } from './Disk.js'
 import { Instance, startInstance } from './Instance.js'
 import { CHECKING_PROGRESS_INTERVAL_MS, checkingProgressMessage, clearPortReadyProgress, getPortReadyProgress } from './PortReadyProgress.js'
 import { InstanceID, InstanceName, DiskID, EngineID, OperationCause, Timestamp, Command } from './CommonTypes.js'
@@ -27,8 +32,10 @@ import { createOperation, updateOperation } from './Operations.js'
 import { attachTraceResult } from './SummariseDisk.js'
 import { sendCommand } from '../utils/commandUtils.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
-import { instanceDataBytes, helperAtLeast } from '../utils/appDataHelper.js'
-import { REMOVE_HELPER_MIN, RemoveError, removeInstance } from './RemoveInstance.js'
+import { instanceDataBytes, helperAtLeast, deleteInstanceData, deleteRemoteInstanceData, remoteInstanceFolderExists } from '../utils/appDataHelper.js'
+import { REMOVE_HELPER_MIN, RemoveError, quarantineInstanceOnDisk } from './RemoveInstance.js'
+import { getEngineAddress } from './Network.js'
+import { fs } from 'zx'
 import {
     MOVE_CROSS_ENGINE_CAPABILITY, MOVE_STEPS, MOVE_STEP_INDEX, MoveError, MoveProgress, MoveResult,
     MOVE_FAILURE_CODES, MoveRefusalCode, MoveVerify, VerifyCode, MoveFailureCode, moveFailedText, movedText, sourceNotRemovedText, sizesMatch,
@@ -41,12 +48,92 @@ export interface MoveDeps {
     sourceBytes: (disk: Disk, id: InstanceID) => Promise<number>
     copy: (storeHandle: DocHandle<Store>, instanceId: InstanceID, src: DiskID, tgt: DiskID, cause: OperationCause, opId: string) => Promise<InstanceID>
     requestVerify: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void
+    requestStart: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void
+    /** True when instances/<id> already exists on the target disk (local folder or remote size). */
+    targetFolderExists: (store: Store, disk: Disk, id: InstanceID) => Promise<boolean>
     startSource: (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => Promise<void>
-    removeSource: (storeHandle: DocHandle<Store>, instanceId: InstanceID, engineId: string) => Promise<{ quarantinePath: string }>
+    removeSource: (storeHandle: DocHandle<Store>, instanceId: InstanceID, engineId: string, sourceDiskId: DiskID) => Promise<{ quarantinePath: string }>
     verifyTimeoutMs: number
     /** Fallback poll while waiting for Operation.move.verify; the source prefers the store change event (idea#498). */
     pollMs: number
     broadcast?: (msg: object) => void
+}
+
+
+/** True when a keep-id move to `diskId` is in flight for `instanceId` (storedOn still names the source). */
+export const isInFlightKeepIdMove = (store: Store, instanceId: string, diskId: string): boolean => {
+    for (const op of Object.values(store.operationDB ?? {})) {
+        if (!op || op.kind !== 'moveApp' || !op.move) continue
+        if (op.move.verified === true || op.move.sourceRemoved === true) continue
+        if (op.status === 'Done' || op.status === 'Failed') continue
+        if (String(op.args?.targetDiskId ?? '') !== String(diskId)) continue
+        const src = String(op.move.sourceInstanceId ?? op.args?.instanceId ?? '')
+        const tgt = String(op.move.targetInstanceId ?? '')
+        if (src === String(instanceId) || (tgt && tgt === String(instanceId))) return true
+    }
+    return false
+}
+
+const occupyingTarget = (store: Store, instanceId: InstanceID, targetDisk: Disk, targetEngineId: string): string | null => {
+    const row = getInstance(store, instanceId)
+    if (!row?.storedOn) return null
+    if (String(row.storedOn) === String(targetDisk.id)) return String(targetDisk.name ?? targetDisk.id)
+    const on = getDisk(store, row.storedOn as DiskID)
+    if (on && String(on.dockedTo) === String(targetEngineId)) return String(on.name ?? on.id)
+    return null
+}
+
+export const defaultTargetFolderExists = async (_store: Store, disk: Disk, id: InstanceID): Promise<boolean> => {
+    const { localEngineId } = await import('./Engine.js')
+    const root = await appDataRoot(disk)
+    if (String(disk.dockedTo) === String(localEngineId)) {
+        try {
+            const mount = await diskMountRoot(disk)
+            if (await fs.pathExists(`${mount}/instances/${id}`)) return true
+        } catch { /* fall through */ }
+        return false
+    }
+    try {
+        const host = getEngineAddress(disk.dockedTo as EngineID)
+        if (!host) return false
+        return await remoteInstanceFolderExists(host, String(disk.dockedTo), root, String(id))
+    } catch {
+        return false
+    }
+}
+
+/** After a recorded verify, flip storedOn to the target (if not already) and clear the source Engine's port. */
+export const flipStoredOnAfterVerify = (storeHandle: DocHandle<Store>, instanceId: string, targetDiskId: string): void => {
+    storeHandle.change(doc => {
+        const inst = doc.instanceDB[instanceId as InstanceID]
+        if (!inst) return
+        inst.storedOn = targetDiskId as DiskID
+        inst.port = 0 as any
+        inst.portZip = null
+        inst.metrics = null
+    })
+}
+
+/** Best-effort: delete only an unverified target folder. Never touches the source or instanceDB. */
+export const cleanupUnverifiedMoveTarget = async (storeHandle: DocHandle<Store>, op: { args?: Record<string, string>, move?: { targetInstanceId?: string | null, sourceInstanceId?: string } }): Promise<void> => {
+    const id = String(op.move?.targetInstanceId ?? op.move?.sourceInstanceId ?? op.args?.instanceId ?? '')
+    const tgt = String(op.args?.targetDiskId ?? '')
+    if (!id || !tgt) return
+    const disk = getDisk(storeHandle.doc(), tgt as DiskID)
+    if (!disk) return
+    const root = await appDataRoot(disk)
+    const { localEngineId } = await import('./Engine.js')
+    try {
+        if (String(disk.dockedTo) === String(localEngineId)) {
+            await deleteInstanceData(root, id)
+        } else if (disk.dockedTo) {
+            const host = getEngineAddress(disk.dockedTo as EngineID)
+            if (host) await deleteRemoteInstanceData(host, String(disk.dockedTo), root, id)
+        }
+        log(`moveApp recovery: removed unverified target folder ${id} on ${tgt}`)
+    } catch (e: any) {
+        log(`moveApp recovery: could not remove unverified target folder ${id} on ${tgt}: ${e?.message ?? e}`)
+    }
 }
 
 const defaultDeps: MoveDeps = {
@@ -59,13 +146,21 @@ const defaultDeps: MoveDeps = {
     sourceBytes: async (disk, id) => instanceDataBytes(await appDataRoot(disk), String(id)),
     copy: async (storeHandle, instanceId, src, tgt, cause, opId) => {
         const { copyApp } = await import('./CopyMoveApp.js')
-        const id = await copyApp(storeHandle, instanceId as unknown as InstanceName, src, tgt, cause, { journalOpId: opId, keepName: true, rethrow: true, keepSourceStopped: true })
+        const id = await copyApp(storeHandle, instanceId as unknown as InstanceName, src, tgt, cause, {
+            journalOpId: opId, keepName: true, rethrow: true, keepSourceStopped: true, dstId: instanceId,
+        })
         if (!id) throw new Error('the copy did not finish')
         return id
     },
     requestVerify: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
+    requestStart: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
+    targetFolderExists: defaultTargetFolderExists,
     startSource: (storeHandle, instance, disk) => startInstance(storeHandle, instance, disk, 'post-move'),
-    removeSource: (storeHandle, instanceId, engineId) => removeInstance(storeHandle, String(instanceId), engineId),
+    removeSource: async (storeHandle, instanceId, _engineId, sourceDiskId) => {
+        const disk = getDisk(storeHandle.doc(), sourceDiskId)
+        if (!disk) throw new RemoveError('NOT_FOUND', `source disk '${sourceDiskId}' not found`)
+        return quarantineInstanceOnDisk(disk, instanceId)
+    },
     verifyTimeoutMs: 6 * 60 * 1000,
     pollMs: 250,
 }
@@ -77,6 +172,7 @@ export const refusalCode = (text: string): MoveRefusalCode => {
     if (/docked to a remote engine/i.test(text)) return 'SOURCE_REMOTE'
     if (/not currently reachable/i.test(text)) return 'TARGET_UNREACHABLE'
     if (/key|peer access|accepted/i.test(text)) return 'PEER_ACCESS'
+    if (/already exists/i.test(text)) return 'TARGET_EXISTS'
     return 'INVALID'
 }
 
@@ -182,6 +278,11 @@ export const moveAppCrossEngine = async (
     if (resourceLock.isLocked(instanceKey(instance.id)) || resourceLock.isLocked(diskKey(targetDisk.id))) {
         refuse('BUSY', `another operation is running on '${instance.name}' or the target disk; retry when it completes`)
     }
+    const alreadyOn = occupyingTarget(storeHandle.doc(), instance.id, targetDisk, targetEngineId)
+    if (alreadyOn) refuse('TARGET_EXISTS', `instance ${instance.id} already exists on ${alreadyOn}`)
+    if (await d.targetFolderExists(storeHandle.doc(), targetDisk, instance.id)) {
+        refuse('TARGET_EXISTS', `instance ${instance.id} already exists on ${targetDisk.name}`)
+    }
 
     const expectRunning = instance.status === 'Running' || instance.status === 'Starting'
     const move: MoveProgress = {
@@ -236,6 +337,9 @@ export const moveAppCrossEngine = async (
 
     // ── 2. Checking (on the target) ───────────────────────────────────────────
     setPhase(storeHandle, opId, 'checking')
+    if (expectRunning) {
+        d.requestStart(storeHandle, targetEngineId, `startInstance ${targetInstanceId} ${targetDisk.id} --cause cross-engine-cmd`)
+    }
     d.requestVerify(storeHandle, targetEngineId, `verifyMoveTarget ${opId} ${targetInstanceId} ${baselineBytes} ${expectRunning}`)
     const verdict = await waitForMoveVerify(storeHandle, opId, { timeoutMs: d.verifyTimeoutMs, pollMs: d.pollMs })
     if (!verdict) { await restartIfNeeded(); return fail('VERIFY_TIMEOUT', `${targetName} did not confirm the copy in time`, String(targetInstanceId)) }
@@ -257,8 +361,14 @@ export const moveAppCrossEngine = async (
         if (nowBytes !== baselineBytes) {
             throw new MoveError('SOURCE_CHANGED', `the source was written to during the move (${baselineBytes} → ${nowBytes} bytes); it may hold newer data than the copy`)
         }
-        const removed = await d.removeSource(storeHandle, instance.id, engineId)
+        // Flip storedOn only after verify and SOURCE_CHANGED checks; then quarantine
+        // the source folder (not the store row). The target adopts port/status after.
+        flipStoredOnAfterVerify(storeHandle, String(instance.id), String(targetDisk.id))
+        const removed = await d.removeSource(storeHandle, instance.id, engineId, sourceDisk.id)
         patchMove(storeHandle, opId, { sourceRemoved: true, quarantinePath: removed.quarantinePath })
+        if (expectRunning) {
+            d.requestStart(storeHandle, targetEngineId, `startInstance ${targetInstanceId} ${targetDisk.id} --cause post-move`)
+        }
         const r = result('MOVED', movedText(targetName), String(targetInstanceId), removed.quarantinePath)
         log(`moveApp: ${r.text}; the old copy is quarantined at ${removed.quarantinePath}`)
         finish(storeHandle, opId, r, false)
@@ -354,20 +464,30 @@ export const verifyMoveTarget = async (
         const deadline = Date.now() + d.timeoutMs
         let inst = getInstance(storeHandle.doc(), instanceId as InstanceID)
         const wantRunning = expectRunning === 'true'
-        // Wait for the record (and, when the source ran, a healthy start)
+        // Judge the folder on the operation's target disk, not storedOn (engine#381:
+        // the source stays authoritative until after this verdict is recorded).
+        const targetDiskId = (storeHandle.doc().operationDB?.[opId] as any)?.args?.targetDiskId
+        const disk = getDisk(storeHandle.doc(), targetDiskId as DiskID)
+        if (!disk || String(disk.dockedTo) !== me) return bad('VERIFY_NOT_FOUND', 'the copy is not on a disk docked to this Engine')
+        // Wait: when the source ran, for a stable port-ready on the target (not
+        // inst.status — a deferred start must not write Running onto the shared row).
         while (Date.now() < deadline) {
             inst = getInstance(storeHandle.doc(), instanceId as InstanceID)
-            if (inst && inst.status === 'Error') break
-            if (inst && (!wantRunning || inst.status === 'Running')) break
+            if (wantRunning) {
+                if (getPortReadyProgress(instanceId)?.stableReached) break
+                if (inst?.status === 'Error') break
+            } else {
+                break
+            }
             await new Promise(r => setTimeout(r, d.pollMs))
         }
         if (!inst) return bad('VERIFY_NOT_FOUND', 'the copy is not registered')
-        const disk = getDisk(storeHandle.doc(), inst.storedOn as DiskID)
-        if (!disk || String(disk.dockedTo) !== me) return bad('VERIFY_NOT_FOUND', 'the copy is not on a disk docked to this Engine')
-        if (inst.status === 'Error') return bad('VERIFY_NOT_RUNNING', 'the copy failed to start')
-        if (wantRunning && inst.status !== 'Running') return bad('VERIFY_NOT_RUNNING', `the copy did not start (status ${inst.status})`)
+        if (wantRunning && !getPortReadyProgress(instanceId)?.stableReached) {
+            if (inst.status === 'Error') return bad('VERIFY_NOT_RUNNING', 'the copy failed to start')
+            return bad('VERIFY_NOT_RUNNING', `the copy did not start (status ${inst.status})`)
+        }
         let bytes: number
-        try { bytes = await d.targetBytes(disk, inst.id) } catch (e: any) { return bad('VERIFY_FAILED', `cannot size the copy (${e?.message ?? e})`) }
+        try { bytes = await d.targetBytes(disk, instanceId as InstanceID) } catch (e: any) { return bad('VERIFY_FAILED', `cannot size the copy (${e?.message ?? e})`) }
         const expected = Number(expectedBytes)
         if (!Number.isFinite(expected) || !sizesMatch(expected, bytes)) {
             const v = write({ ok: false, code: 'VERIFY_SIZE', bytes, detail: `size ${bytes} bytes, expected ${expectedBytes}`, at: Date.now() })
