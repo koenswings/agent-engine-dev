@@ -175,7 +175,7 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
     if (a.mode === 'write-lock') {
         const lock = await buildLock(repo, E, a.images, a.cache, a.pm2Env, consoleRepo)
         await fs.writeFile(a.lock!, serialiseLock(lock))
-        console.log(`lock written: ${a.lock} (${lock.engineCommit})`)
+        console.info(`lock written: ${a.lock} (${lock.engineCommit})`)
         return 0
     }
     const root = a.rootfs!
@@ -187,14 +187,14 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
         const problems = checks.flatMap(x => x.problems)
         problems.forEach(p => console.error(`verify: ${p}`))
         await writeReport(a.report, lock, await fs.readFile(a.lock!, 'utf8'), problems, checks.filter(x => !x.problems.length).length)
-        console.log(problems.length ? `verify FAILED (${problems.length})` : 'verify OK')
+        console.info(problems.length ? `verify FAILED (${problems.length})` : 'verify OK')
         return problems.length ? 1 : 0
     }
     // rootfs build
     if (!a.dryRun) {
         const hostProblem = rootfsHostProblem(os.arch(), await fs.pathExists(QEMU_AARCH64_STATIC))
         if (hostProblem) throw new UsageError(hostProblem)
-        if (os.arch() !== 'arm64') console.log(`--root build on ${os.arch()} via ${QEMU_AARCH64_STATIC}`)
+        if (os.arch() !== 'arm64') console.info(`--root build on ${os.arch()} via ${QEMU_AARCH64_STATIC}`)
         if (process.getuid?.() !== 0) throw new UsageError('--root builds run as root')
     }
     if ((await piUidOf(root)) === undefined) throw new UsageError(`${root}/etc/passwd has no pi user`)
@@ -205,7 +205,7 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
     let cache = a.cache
     if (!cache && !a.dryRun) {
         cache = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-engine-inputs-'))
-        console.log(`no --cache: fetching the pinned inputs for ${lock.engineCommit} into ${cache} (archive-engine-inputs.sh, checksummed)`)
+        console.info(`no --cache: fetching the pinned inputs for ${lock.engineCommit} into ${cache} (archive-engine-inputs.sh, checksummed)`)
         await $({ cwd: repo, stdio: 'inherit' })`bash script/archive-engine-inputs.sh ${lock.engineCommit} ${cache} ${lock.dockerImages.map(i => i.ref)}`
     }
     if (cache) lock = await pinNpmTools(lock, cache)
@@ -232,10 +232,10 @@ export const runImageMode = async (a: ImageArgs, repo: string): Promise<number> 
     } catch (e) {
         problems = [`build step failed: ${e instanceof Error ? e.message : e}`]
     }
-    if (a.dryRun) log.forEach(l => console.log(l))
+    if (a.dryRun) log.forEach(l => console.info(l))
     problems.forEach(p => console.error(`verify: ${p}`))
     await writeReport(a.report, lock, finalLock, problems, passed)
-    console.log(`verify: ${passed}/${VERIFY_CHECKS.length} checks passed`)
-    console.log(problems.length ? `engine offline build FAILED (${problems.length})` : `engine offline build OK (${lock.engineCommit})`)
+    console.info(`verify: ${passed}/${VERIFY_CHECKS.length} checks passed`)
+    console.info(problems.length ? `engine offline build FAILED (${problems.length})` : `engine offline build OK (${lock.engineCommit})`)
     return problems.length ? 1 : 0
 }
