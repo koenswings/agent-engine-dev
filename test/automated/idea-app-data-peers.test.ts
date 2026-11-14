@@ -1,9 +1,12 @@
 /**
  * idea-app-data-peers.test.ts — the helper's peer side (per-Pi Engine keys, helper v2)
  *
- *   - sync-peers: stdin full set, strict line checks, the restrict,command=gate
- *     prefix written by the helper, atomic swap of the root-owned authorized_keys
- *     and known_hosts, no-op when unchanged, the 256 cap, empty set empties both
+ *   - sync-peers <engineId> <storeDocId> (v15, engine#376): stdin full set, strict
+ *     line checks, the restrict,command=gate prefix written by the helper, atomic swap
+ *     of the root-owned authorized_keys and known_hosts, no-op when unchanged, the 256
+ *     cap; owner stamp (PEER_OWNER_MISMATCH), never empties (PEER_SHRINK_TO_EMPTY),
+ *     quarantine copy before every changing swap
+ *   - clear-peers (v15, Ops only): the only way to empty the files
  *   - peer-receive: a NEW instance folder only, recorded in the root-owned ledger;
  *     the free-space floor on every receive
  *   - peer-delete / peer-receive-files: only for a folder that SAME peer's receive
@@ -27,7 +30,14 @@ const refused = (r: { exitCode: number | null, stderr: string }, re: RegExp) => 
     expect(r.stderr).toMatch(/^refused: /m)
     expect(r.stderr).toMatch(re)
 }
-const sync = (lines: string[] | string) => sb.run(['sync-peers'], { FAKE_STDIN: Array.isArray(lines) ? lines.map(l => l + '\n').join('') : lines })
+const ME = 'ENGINE_me'
+const DOC = '2VroEUvDkmYsDAwE5oG9YeFNadWH'
+const OTHER_DOC = '4uXisoLatedStore1111abcdefg'
+const stdin = (lines: string[] | string) => Array.isArray(lines) ? lines.map(l => l + '\n').join('') : lines
+const sync = (lines: string[] | string, id = ME, doc = DOC) => sb.run(['sync-peers', id, doc], { FAKE_STDIN: stdin(lines) })
+const clear = (id = ME, doc = DOC) => sb.run(['clear-peers', id, doc])
+const quarantined = async () => (await fs.pathExists(sb.peerQuarantineDir)) ? (await fs.readdir(sb.peerQuarantineDir)).sort() : []
+const QNOTE = /; previous files copied to (\S+\/\.peer-quarantine\/[0-9]{8}T[0-9]+Z)$/
 const authLines = async () => (await fs.readFile(sb.peerAuthFile, 'utf8')).split('\n').filter(l => l && !l.startsWith('#'))
 const knownLines = async () => (await fs.readFile(sb.peerKnownHosts, 'utf8')).split('\n').filter(l => l && !l.startsWith('#'))
 const SERVER = ['--server', '-logDtpre.iLsfxCIvu', '--numeric-ids', '.', '.']
@@ -36,7 +46,9 @@ describe('idea-app-data sync-peers', () => {
     it('writes one restricted line per peer (prefix added by the helper) and pins each host key by Engine id', async () => {
         const r = await sync([peerLine('ENGINE_a'), peerLine('ENGINE_b')])
         expect(r.exitCode, r.stderr).toBe(0)
-        expect(r.stdout.trim()).toBe('sync-peers: 2 peer(s); authorized_keys updated; known_hosts updated')
+        expect(r.stdout.trim()).toBe(`sync-peers: 2 peer(s); authorized_keys updated; known_hosts updated; owner ${ME} ${DOC} recorded`)
+        expect(await fs.readFile(sb.peerOwner, 'utf8')).toBe(`${ME} ${DOC}\n`)
+        expect(await quarantined()).toEqual([])   // nothing to copy on a fresh Pi
         expect(await authLines()).toEqual([
             `restrict,command="/usr/local/sbin/idea-peer-gate ENGINE_a" ${testKey('ENGINE_a-ssh')} idea-peer:ENGINE_a`,
             `restrict,command="/usr/local/sbin/idea-peer-gate ENGINE_b" ${testKey('ENGINE_b-ssh')} idea-peer:ENGINE_b`,
@@ -47,7 +59,7 @@ describe('idea-app-data sync-peers', () => {
             expect(st.mode & 0o777).toBe(0o644)
             expect(st.uid).toBe(process.getuid!())   // the sandbox's "root"
         }
-        expect(await sb.journalText()).toMatch(/sync-peers: 2 peer\(s\); authorized_keys updated; known_hosts updated; peers=\[ENGINE_a ENGINE_b \]/)
+        expect(await sb.journalText()).toMatch(new RegExp(`sync-peers: 2 peer\\(s\\); authorized_keys updated; known_hosts updated; peers=\\[ENGINE_a ENGINE_b \\]; caller=${ME} ${DOC}; owner ${ME} ${DOC} recorded`))
     })
 
     it('is a no-op when the set is unchanged (same inode, no temp files left); a changed set is swapped in by rename', async () => {
@@ -56,21 +68,110 @@ describe('idea-app-data sync-peers', () => {
         const again = await sync([peerLine('ENGINE_a')])
         expect(again.stdout.trim()).toBe('sync-peers: 1 peer(s); authorized_keys unchanged; known_hosts unchanged')
         expect((await fs.stat(sb.peerAuthFile)).ino).toBe(ino)
+        expect(await quarantined()).toEqual([])   // unchanged: no copy
         const changed = await sync([peerLine('ENGINE_a', 'rotated')])
-        expect(changed.stdout.trim()).toBe('sync-peers: 1 peer(s); authorized_keys updated; known_hosts updated')
+        expect(changed.stdout.trim()).toMatch(/^sync-peers: 1 peer\(s\); authorized_keys updated; known_hosts updated; previous files copied to /)
+        expect(await quarantined()).toHaveLength(1)
         expect((await fs.stat(sb.peerAuthFile)).ino).not.toBe(ino)
         expect((await authLines())[0]).toContain(testKey('rotated-ssh'))
         expect((await fs.readdir(sb.peerAuthDir)).filter(f => f.startsWith('.'))).toEqual([])
-        expect((await fs.readdir(path.dirname(sb.peerKnownHosts))).filter(f => f.startsWith('.'))).toEqual([])
+        expect((await fs.readdir(path.dirname(sb.peerKnownHosts))).filter(f => f.startsWith('.') && f !== '.peer-quarantine')).toEqual([])
     })
 
-    it('the empty set empties both files (store reset / fail-closed)', async () => {
+    it('PEER_SHRINK_TO_EMPTY: an empty set never empties the files (engine#376); nothing changes, no copy is made', async () => {
         await sync([peerLine('ENGINE_a'), peerLine('ENGINE_b')])
+        const auth = await fs.readFile(sb.peerAuthFile, 'utf8')
+        const kh = await fs.readFile(sb.peerKnownHosts, 'utf8')
+        const ino = (await fs.stat(sb.peerAuthFile)).ino
+        const r = await sync('')
+        refused(r, new RegExp(`PEER_SHRINK_TO_EMPTY: the peer set on stdin is empty, but \\S+ holds 2 peer key\\(s\\) and \\S+ 2 host key\\(s\\); sync-peers never empties them, nothing was changed\\. ` +
+            `Only Ops empties them, by hand: idea-app-data clear-peers ${ME} ${DOC} \\(engine#376\\)`))
+        expect(await fs.readFile(sb.peerAuthFile, 'utf8')).toBe(auth)
+        expect(await fs.readFile(sb.peerKnownHosts, 'utf8')).toBe(kh)
+        expect((await fs.stat(sb.peerAuthFile)).ino).toBe(ino)
+        expect(await quarantined()).toEqual([])
+        expect(await sb.journalText()).toMatch(/refused=.*PEER_SHRINK_TO_EMPTY/)
+        // a known_hosts line alone also counts
+        await fs.writeFile(sb.peerAuthFile, '# only comments\n')
+        refused(await sync(''), /PEER_SHRINK_TO_EMPTY: .* holds 0 peer key\(s\) and \S+ 2 host key\(s\)/)
+    })
+
+    it('an empty set over empty or missing files is fine (fresh Pi): header-only files, owner recorded', async () => {
         const r = await sync('')
         expect(r.exitCode, r.stderr).toBe(0)
-        expect(r.stdout.trim()).toBe('sync-peers: 0 peer(s); authorized_keys updated; known_hosts updated')
+        expect(r.stdout.trim()).toBe(`sync-peers: 0 peer(s); authorized_keys updated; known_hosts updated; owner ${ME} ${DOC} recorded`)
         expect(await authLines()).toEqual([])
         expect(await knownLines()).toEqual([])
+    })
+
+    it('a smaller, non-empty set is allowed (stale peers expire), with a copy of the previous files made BEFORE the swap', async () => {
+        await sync([peerLine('ENGINE_a'), peerLine('ENGINE_b')])
+        const auth = await fs.readFile(sb.peerAuthFile, 'utf8')
+        const kh = await fs.readFile(sb.peerKnownHosts, 'utf8')
+        const r = await sync([peerLine('ENGINE_b')])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const m = r.stdout.trim().match(QNOTE)
+        expect(m, r.stdout).toBeTruthy()
+        const q = m![1]
+        expect(path.dirname(q)).toBe(sb.peerQuarantineDir)
+        expect(await fs.readFile(path.join(q, 'idea_authorized_keys-pi'), 'utf8')).toBe(auth)
+        expect(await fs.readFile(path.join(q, 'peer_known_hosts'), 'utf8')).toBe(kh)
+        expect((await fs.stat(sb.peerQuarantineDir)).mode & 0o777).toBe(0o700)
+        expect((await fs.stat(q)).mode & 0o777).toBe(0o700)
+        expect((await authLines()).map(l => l.split(' ').at(-1))).toEqual(['idea-peer:ENGINE_b'])
+        // copies are never deleted: a second change adds a second folder
+        await sync([peerLine('ENGINE_b'), peerLine('ENGINE_c')])
+        expect(await quarantined()).toHaveLength(2)
+        expect(await sb.journalText()).toMatch(/sync-peers: 1 peer\(s\); .*previous files copied to \S+\.peer-quarantine/)
+    })
+
+    it('PEER_OWNER_MISMATCH: another Engine id or another store is refused and nothing changes (engine#376)', async () => {
+        await sync([peerLine('ENGINE_a'), peerLine('ENGINE_b')])
+        const auth = await fs.readFile(sb.peerAuthFile, 'utf8')
+        const owner = await fs.readFile(sb.peerOwner, 'utf8')
+        for (const [id, doc] of [[ME, OTHER_DOC], ['ENGINE_second', DOC], ['ENGINE_second', OTHER_DOC]]) {
+            refused(await sync([peerLine('ENGINE_x')], id, doc), new RegExp(
+                `PEER_OWNER_MISMATCH: the peer files on this Pi belong to Engine ${ME} in store ${DOC} \\(\\S+peer-owner\\), not to Engine ${id} in store ${doc}; nothing was changed\\. ` +
+                `After a store change Ops moves \\S+peer-owner aside by hand \\(engine#376\\)`))
+            refused(await sync('', id, doc), /PEER_OWNER_MISMATCH/)   // the owner check comes before the shrink check
+        }
+        expect(await fs.readFile(sb.peerAuthFile, 'utf8')).toBe(auth)
+        expect(await fs.readFile(sb.peerOwner, 'utf8')).toBe(owner)
+        expect(await quarantined()).toEqual([])
+        expect(await sb.journalText()).toMatch(/refused=.*PEER_OWNER_MISMATCH/)
+    })
+
+    it('ownership changes only by hand: once Ops moves peer-owner aside, the next sync-peers records the new owner', async () => {
+        await sync([peerLine('ENGINE_a')])
+        refused(await sync([peerLine('ENGINE_a')], ME, OTHER_DOC), /PEER_OWNER_MISMATCH/)
+        await fs.move(sb.peerOwner, path.join(sb.tmp, 'peer-owner.aside'))
+        const r = await sync([peerLine('ENGINE_a')], ME, OTHER_DOC)
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout.trim()).toBe(`sync-peers: 1 peer(s); authorized_keys unchanged; known_hosts unchanged; owner ${ME} ${OTHER_DOC} recorded`)
+        expect(await fs.readFile(sb.peerOwner, 'utf8')).toBe(`${ME} ${OTHER_DOC}\n`)
+    })
+
+    it('refuses an owner file that is a symlink, group/other writable or not one owner line', async () => {
+        await sync([peerLine('ENGINE_a')])
+        await fs.chmod(sb.peerOwner, 0o666)
+        refused(await sync([peerLine('ENGINE_a')]), /peer owner file \S+ \(mode 0666\) must not be group or other writable/)
+        await fs.chmod(sb.peerOwner, 0o644)
+        await fs.writeFile(sb.peerOwner, `${ME}\n`)
+        refused(await sync([peerLine('ENGINE_a')]), /peer owner file \S+ is not one '<engineId> <storeDocId>' line; Ops must fix it by hand/)
+        await fs.writeFile(sb.peerOwner, `${ME} ${DOC} extra\n`)
+        refused(await sync([peerLine('ENGINE_a')]), /is not one '<engineId> <storeDocId>' line/)
+        await fs.remove(sb.peerOwner)
+        await fs.symlink(path.join(sb.tmp, 'elsewhere'), sb.peerOwner)
+        refused(await sync([peerLine('ENGINE_a')]), /peer owner file \S+ is a symlink/)
+    })
+
+    it('checks the caller\'s Engine id and store document id', async () => {
+        refused(await sync([peerLine('ENGINE_a')], ME, `automerge:${DOC}`), /store document id .* does not match/)
+        refused(await sync([peerLine('ENGINE_a')], ME, '../etc/x'), /store document id .* does not match/)
+        refused(await sync([peerLine('ENGINE_a')], ME, 'short'), /store document id .* does not match/)
+        refused(await sync([peerLine('ENGINE_a')], ME, '2VroEUvDkmYsDAwE5oG9YeFNad0O'), /store document id .* does not match/)   // 0 and O are not base58
+        refused(await sync([peerLine('ENGINE_a')], '-ENGINE', DOC), /Engine id '-ENGINE' does not match/)
+        expect(await fs.pathExists(sb.peerOwner)).toBe(false)
     })
 
     it('refuses anything but exact lines, and leaves the files as they were', async () => {
@@ -95,7 +196,8 @@ describe('idea-app-data sync-peers', () => {
         for (const line of bad) refused(await sync(line + '\n'), /peer line 1 is not '<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>'/)
         refused(await sync([peerLine('ENGINE_b'), peerLine('ENGINE_b', 'other')]), /Engine ENGINE_b is listed twice/)
         refused(await sync([peerLine('ENGINE_b', 'same'), peerLine('ENGINE_c', 'same')]), /the key of Engine ENGINE_c is listed for another Engine too/)
-        refused(await sb.run(['sync-peers', 'ENGINE_b'], { FAKE_STDIN: '' }), /sync-peers takes exactly 0 argument/)
+        refused(await sb.run(['sync-peers'], { FAKE_STDIN: stdin([peerLine('ENGINE_b')]) }), /sync-peers takes exactly 2 argument/)
+        refused(await sb.run(['sync-peers', ME], { FAKE_STDIN: stdin([peerLine('ENGINE_b')]) }), /sync-peers takes exactly 2 argument/)
         expect(await fs.readFile(sb.peerAuthFile, 'utf8')).toBe(before)
     })
 
@@ -127,6 +229,40 @@ describe('idea-app-data sync-peers', () => {
         await fs.remove(sb.peerAuthDir)
         await fs.symlink(sb.tmp, sb.peerAuthDir)
         refused(await sync([peerLine('ENGINE_a')]), /authorized keys folder .* is missing or a symlink/)
+    })
+})
+
+describe('idea-app-data clear-peers (v15, engine#376: Ops only, the only way to empty the peer files)', () => {
+    it('empties both files after a copy to .peer-quarantine, journaled; sync-peers works again afterwards', async () => {
+        await sync([peerLine('ENGINE_a'), peerLine('ENGINE_b')])
+        const auth = await fs.readFile(sb.peerAuthFile, 'utf8')
+        const kh = await fs.readFile(sb.peerKnownHosts, 'utf8')
+        const r = await clear()
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout.trim()).toMatch(/^clear-peers: removed 2 peer key\(s\) and 2 host key\(s\); authorized_keys updated; known_hosts updated; previous files copied to /)
+        const q = r.stdout.trim().match(QNOTE)![1]
+        expect(await fs.readFile(path.join(q, 'idea_authorized_keys-pi'), 'utf8')).toBe(auth)
+        expect(await fs.readFile(path.join(q, 'peer_known_hosts'), 'utf8')).toBe(kh)
+        expect(await authLines()).toEqual([])
+        expect(await knownLines()).toEqual([])
+        expect(await fs.readFile(sb.peerOwner, 'utf8')).toBe(`${ME} ${DOC}\n`)   // owner unchanged
+        expect(await sb.journalText()).toMatch(new RegExp(`clear-peers: by \\S+ for Engine ${ME} store ${DOC}: removed 2 peer key\\(s\\) and 2 host key\\(s\\)`))
+        const again = await clear()
+        expect(again.stdout.trim()).toBe('clear-peers: removed 0 peer key(s) and 0 host key(s); authorized_keys unchanged; known_hosts unchanged')
+        const back = await sync([peerLine('ENGINE_a')])
+        expect(back.exitCode, back.stderr).toBe(0)
+        expect(await authLines()).toHaveLength(1)
+    })
+
+    it('checks the owner and its arguments like sync-peers', async () => {
+        await sync([peerLine('ENGINE_a')])
+        const auth = await fs.readFile(sb.peerAuthFile, 'utf8')
+        refused(await clear('ENGINE_second', DOC), /PEER_OWNER_MISMATCH/)
+        refused(await clear(ME, OTHER_DOC), /PEER_OWNER_MISMATCH/)
+        refused(await sb.run(['clear-peers']), /clear-peers takes exactly 2 argument/)
+        refused(await clear(ME, 'automerge:x'), /store document id .* does not match/)
+        expect(await fs.readFile(sb.peerAuthFile, 'utf8')).toBe(auth)
+        expect(await quarantined()).toEqual([])
     })
 })
 

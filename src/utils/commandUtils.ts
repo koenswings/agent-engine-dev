@@ -7,6 +7,7 @@ import { runWithTrace, flushTrace } from "./CommandLogger.js";
 import { print } from './utils.js';
 import { redactString } from './redact.js';
 import { setupDemoTraceApps } from '../data/DemoApps.js';
+import { lookupInstanceArg } from '../data/InstanceArg.js';
 
 
 /**
@@ -145,7 +146,8 @@ export const handleCommand = async (
     const traceId = crypto.randomUUID();
     // Build a named args object when the CommandDefinition has arg names defined,
     // otherwise fall back to a positional array. The Console filters traces by
-    // args['instanceName'] or args['instanceId'], so named args are required.
+    // args['instanceId'] (or, before engine#399, args['instanceName']), so named
+    // args are required.
     // A variadic last arg is recorded as an array of all its tokens.
     const namedArgs: Record<string, string | string[] | null> | string[] =
         command.args.every(a => a.name)
@@ -157,6 +159,7 @@ export const handleCommand = async (
         const rest = Array.isArray(namedArgs.apps) ? namedArgs.apps as string[] : []
         namedArgs.apps = setupDemoTraceApps(rest)
     }
+    if (!Array.isArray(namedArgs)) addTraceInstanceIdentity(storeHandle, namedArgs)
     const argsJson = JSON.stringify(namedArgs);
     const traceCtx = { traceId, command: commandName, args: argsJson };
 
@@ -192,6 +195,38 @@ export const handleCommand = async (
     }
 }
 
+
+/**
+ * engine#399: a named `instanceId` trace arg is the instance id, and `instanceName`
+ * its display name. The registry arg holds what the sender typed (an id, or a name
+ * that resolves id-first, idea#168); when it resolves (InstanceArg.ts, with the
+ * command's disk arg for a shared name), `instanceId` becomes the resolved id and
+ * `instanceName` the instance's name at the time the command starts. When it does
+ * not resolve (not found, ambiguous, no store), `instanceId` keeps the raw argument
+ * and `instanceName` is null, so a refusal still carries what was sent.
+ */
+export const addTraceInstanceIdentity = (
+    storeHandle: DocHandle<Store> | null,
+    namedArgs: Record<string, string | string[] | null>
+): void => {
+    const raw = namedArgs.instanceId
+    if (typeof raw !== 'string' || raw === '') return
+    let name: string | null = null
+    try {
+        const store = storeHandle?.doc()
+        if (store) {
+            const diskArg = [namedArgs.diskId, namedArgs.sourceDiskId].find((d): d is string => typeof d === 'string' && d !== '')
+            const found = lookupInstanceArg(store, raw, diskArg)
+            if (found.ok) {
+                namedArgs.instanceId = String(found.instance.id)
+                name = found.instance.name != null ? String(found.instance.name) : null
+            }
+        }
+    } catch {
+        // A trace never fails a command: keep the raw argument.
+    }
+    namedArgs.instanceName = name
+}
 
 /**
  * A dependency-free utility to add a command to a specific engine's command array in the store.

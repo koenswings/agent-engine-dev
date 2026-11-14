@@ -78,7 +78,7 @@ describe('idea-app-data: the source script (idea#168)', () => {
         // Every external command is a $VAR set to an absolute path
         for (const m of text.matchAll(/^([A-Z_]+)=(\/\S+)$/gm)) {
             if (['PATH', 'DISKS_DIR', 'ROOTS_FILE', 'LOCK_DIR', 'ROOT_HOME', 'HELPER_PATH',
-                'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_GATE', 'LEDGER_DIR', 'VOLUMES_DIR',
+                'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_OWNER', 'PEER_QUARANTINE_DIR', 'PEER_GATE', 'LEDGER_DIR', 'VOLUMES_DIR',
                 'USAGE_AUTH_DIR', 'USAGE_EXPORT', 'USAGE_EXPORT_CMD', 'USAGE_EXPORT_SRC', 'PEER_SSHD_DROPIN'].includes(m[1])) continue
             expect(m[2], m[1]).toMatch(/^\/usr\/(s?bin)\/[a-z0-9.]+$/)
         }
@@ -110,7 +110,7 @@ describe('idea-app-data: argument checks', () => {
         const cases: [string, number][] = [
             ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['quarantine-snapshot', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1],
-            ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 0], ['install-usage-key', 3],
+            ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 2], ['clear-peers', 2], ['install-usage-key', 3],
         ]
         for (const [sub, n] of cases) {
             for (const count of [n - 1, n + 1]) {
@@ -1482,10 +1482,10 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v14', async () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('14')
+    it('helper and Engine speak v15 (v14 verbs unchanged; v15 adds the engine#376 peer-file guards)', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('15')
         const r = await sb.run(['version'])
-        expect(r.stdout.trim()).toBe('idea-app-data 14')
+        expect(r.stdout.trim()).toBe('idea-app-data 15')
     })
 
     it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {

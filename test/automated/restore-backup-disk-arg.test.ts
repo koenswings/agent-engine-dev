@@ -114,7 +114,8 @@ describe('restoreApp / backupApp resolve their disk and instance args (idea#168 
             const t = await run(`${cmd} nextcloud "${SPACED}"`)
             expect(t.status).toBe('ok')
             expect((target().mock.calls[0][2] as any).id).toBe('d-spaced')
-            expect(JSON.parse(t.args)).toEqual({ instanceName: 'nextcloud', backupDiskId: SPACED })
+            // engine#399: the resolved id under instanceId, the display name under instanceName
+            expect(JSON.parse(t.args)).toEqual({ instanceId: 'inst-nc', backupDiskId: SPACED, instanceName: 'nextcloud' })
         })
 
         it(`${cmd} refuses an ambiguous disk name, listing the ids`, async () => {

@@ -520,7 +520,7 @@ const sendCommand = (cmd: string): number => {
 const instanceStatus = (id: string): string | null => store().instanceDB?.[id]?.status ?? null
 const runningStartTrace = (instanceId: string, name: string, t0: number): boolean =>
     (Object.values((logHandle.doc() as any)?.traces ?? {}) as any[]).some(t => t.command === 'startInstance' && t.startedAt >= t0 - 2000
-        && t.status === 'running' && (() => { try { const a = JSON.parse(t.args); return [instanceId, name].includes(a.instanceName ?? a.instanceId) } catch { return false } })())
+        && t.status === 'running' && (() => { try { const a = JSON.parse(t.args); return [instanceId, name].includes(a.instanceId ?? a.instanceName) } catch { return false } })())
 
 const inflightPull = async (parts: Part[], nonExt4: { dev: string, fstype: string, uuid: string }[]) => {
     write(`== in-flight start pull-out (${INFLIGHT_START})`)

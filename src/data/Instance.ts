@@ -120,7 +120,7 @@ const addStandaloneStartTrace = (
   addTrace(handle, {
     traceId,
     command: START_INSTANCE_COMMAND,
-    args: JSON.stringify({ instanceName: instance.name, instanceId: instance.id, diskId: disk.id, cause }),
+    args: JSON.stringify({ instanceId: instance.id, instanceName: instance.name, diskId: disk.id, cause }),
     startedAt: pendingWarnings[0]?.timestamp ?? Date.now(),
     completedAt: null,
     status: 'running',
@@ -140,7 +140,7 @@ const addStandaloneStartTrace = (
  *   closeTrace never turns an 'error' trace back into 'ok', so the caller's
  *   own closing call cannot hide the failure.
  * - Otherwise: a completed `startInstance` trace with status 'error' is added,
- *   with args { instanceName, instanceId, diskId, cause } and the pending
+ *   with args { instanceId, instanceName, diskId, cause } and the pending
  *   warnings as 'warn' log lines.
  *
  * Never throws: recording the failure must not break the caller.

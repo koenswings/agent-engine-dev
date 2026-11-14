@@ -901,7 +901,7 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     const traceCtx = {
         traceId,
         command: 'startInstance',
-        args: JSON.stringify({ instanceName: instance.name, diskId: disk.id }),
+        args: JSON.stringify({ instanceId: instance.id, instanceName: instance.name, diskId: disk.id }),
     }
     if (cmdLogHandle) {
         addTrace(cmdLogHandle, {
