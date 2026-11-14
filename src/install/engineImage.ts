@@ -304,6 +304,18 @@ export const consolePathFromEngine = async (engineRoot: string): Promise<string>
     return DEFAULT_CONSOLE_PATH
 }
 
+/**
+ * The image's boot partition for verify: the explicit --boot dir if it exists, else <root>/boot/firmware
+ * (bookworm/trixie), else <root>/boot (older layouts). undefined = no bootfs found (the checks that need it fail).
+ */
+export const bootDirOf = async (root: string, boot?: string): Promise<string | undefined> => {
+    if (boot) return (await fs.pathExists(boot)) ? boot : undefined
+    for (const rel of ['boot/firmware', 'boot']) if (await fs.pathExists(path.join(root, rel))) return path.join(root, rel)
+    return undefined
+}
+const noBootfsProblem = (root: string, boot?: string) =>
+    boot ? `bootfs ${boot} not found` : `no bootfs found (neither ${path.join(root, 'boot/firmware')} nor ${path.join(root, 'boot')})`
+
 export const bootSshTriggerPresent = async (boot: string): Promise<boolean> => {
     for (const n of BOOT_SSH_NAMES) if (await fs.pathExists(path.join(boot, n))) return true
     return false
@@ -333,6 +345,13 @@ export const kernelCmdlineProblems = (text: string, flags: readonly string[] = K
     for (const f of flags) {
         const n = toks.filter(t => t === f).length
         if (n !== 1) p.push(`cmdline.txt carries ${f} ${n} times, must be exactly once`)
+        // the kernel applies cgroup_enable/cgroup_disable in order: a cgroup_disable=<x> AFTER cgroup_enable=<x> wins
+        // (one before it, as the Raspberry Pi firmware prepends, is overridden and fine)
+        const m = /^cgroup_enable=(.+)$/.exec(f)
+        if (m && n >= 1) {
+            const last = toks.lastIndexOf(f), off = `cgroup_disable=${m[1]}`
+            if (toks.slice(last + 1).includes(off)) p.push(`cmdline.txt has ${off} after ${f} (the later one wins: ${m[1]} cgroup off)`)
+        }
     }
     return p
 }
@@ -818,8 +837,9 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
     if (!(await fs.pathExists(hostKeysSrc))) p.push(`${SSH_HOSTKEYS_UNIT} is missing (needed because ConditionFirstBoot does not fire on an empty machine-id)`)
     else if (!sshHostKeyUnitIsUnconditional(await fs.readFile(hostKeysSrc, 'utf8'))) p.push(`${SSH_HOSTKEYS_UNIT} must run ssh-keygen -A without ConditionFirstBoot=yes`)
     else if (!(await unitEnabled(c.root, SSH_HOSTKEYS_UNIT))) p.push(`unit ${SSH_HOSTKEYS_UNIT} is not enabled`)
-    const boot = c.boot ?? (await fs.pathExists(R('boot/firmware')) ? R('boot/firmware') : await fs.pathExists(R('boot')) ? R('boot') : undefined)
-    if (boot && !(await bootSshTriggerPresent(boot))) p.push(`bootfs has no ssh or ssh.txt trigger under ${boot} (sshswitch will not enable ssh)`)
+    const boot = await bootDirOf(c.root, c.boot)
+    if (!boot) p.push(noBootfsProblem(c.root, c.boot))
+    else if (!(await bootSshTriggerPresent(boot))) p.push(`bootfs has no ssh or ssh.txt trigger under ${boot} (sshswitch will not enable ssh)`)
     check('console-ui')
     // 13. Console production build is present at consolePath (Engine answers 503 otherwise)
     const consolePath = await consolePathFromEngine(eng)
@@ -880,8 +900,9 @@ export const verifyRootfsChecks = async (c: VerifyContext): Promise<VerifyCheckR
     }
     check('kernel-cmdline')
     // 17. memory cgroup on (koenswings/idea#518): <boot>/cmdline.txt is one line with cgroup_enable=memory exactly once
-    const kboot = c.boot ?? (await fs.pathExists(R('boot/firmware')) ? R('boot/firmware') : undefined)
-    if (kboot) {
+    const kboot = await bootDirOf(c.root, c.boot)
+    if (!kboot) p.push(noBootfsProblem(c.root, c.boot))
+    else {
         const cl = path.join(kboot, 'cmdline.txt')
         if (!(await fs.pathExists(cl))) p.push(`${cl} missing (kernel arguments: ${KERNEL_CMDLINE_FLAGS.join(' ')})`)
         else if ((await fs.lstat(cl)).isSymbolicLink()) p.push(`${cl} must not be a symlink`)

@@ -14,7 +14,7 @@ import {
     PI_LOGIN_SHELL, USERCONFIG_UNIT, RENAME_USER_SSHD_DROPIN, shadowPasswordIsLocked, passwdShellOf, shadowHashOf, unitMasked, piLoginProblems,
     OPERATOR_KEYS_DIR, OPERATOR_KEYS_FILE, OPERATOR_KEYS_ASSET, LOGIN_SSHD_DROPIN, LOGIN_SSHD_ASSET, PEER_SSHD_DROPIN_PATH, REQUIRED_OPERATOR_KEY_FPS,
     publicKeyFingerprint, operatorKeysProblems, sshdEffectiveConfig,
-    KERNEL_CMDLINE_FLAGS, kernelCmdlineProblems, appendKernelCmdlineFlags, writeKernelCmdlineFlags,
+    KERNEL_CMDLINE_FLAGS, kernelCmdlineProblems, appendKernelCmdlineFlags, writeKernelCmdlineFlags, bootDirOf,
 } from '../../src/install/engineImage.js'
 import { rootfsSteps, runRootfsBuild, engineCloneCommand, consoleCloneCommand, Runner, Installers, SHIMS, quoteTemplate } from '../../src/install/engineRootfs.js'
 import { pinNpmTools, writeReport, LOCKED_FILE_SPECS } from '../../src/install/engineImageCli.js'
@@ -877,5 +877,43 @@ describe('kernel cmdline: memory cgroup (koenswings/idea#518)', () => {
         await fs.writeFile(CL(), `${STOCK_CMDLINE} cgroup_enable=memory cgroup_enable=memory\n`); expect((await problemsOf()).join()).toContain('2 times')
         await fs.writeFile(CL(), `${STOCK_CMDLINE}\ncgroup_enable=memory\n`); expect((await problemsOf()).join()).toContain('2 lines')
         await fs.remove(CL()); expect((await problemsOf()).join()).toContain('missing')
+    })
+})
+
+describe('bootfs lookup + cmdline order (engine#384 review nits, koenswings/idea#518)', () => {
+    let root: string
+    beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'rootfs-')); await goodRootfs(root) })
+    afterEach(async () => { await fs.remove(root) })
+    const R = (rel: string) => path.join(root, rel)
+    const checks = async (boot?: string) => Object.fromEntries((await verifyRootfsChecks({ root, enginePath: ENGINE, lock: lock(), storeIdentity: storeShas, boot })).map(x => [x.name, x.problems.join('; ')]))
+    it('bootDirOf: boot/firmware first, then /boot, an explicit dir only if it exists, else undefined', async () => {
+        expect(await bootDirOf(root)).toBe(R('boot/firmware'))
+        expect(await bootDirOf(root, R('boot/firmware'))).toBe(R('boot/firmware'))
+        expect(await bootDirOf(root, R('nope'))).toBeUndefined()
+        await fs.remove(R('boot/firmware')); expect(await bootDirOf(root)).toBe(R('boot'))
+        await fs.remove(R('boot')); expect(await bootDirOf(root)).toBeUndefined()
+    })
+    it('ssh-first-boot and kernel-cmdline share the lookup: both pass with a /boot-only layout', async () => {
+        await fs.move(R('boot/firmware'), R('boot-fw')); await fs.remove(R('boot')); await fs.move(R('boot-fw'), R('boot'))
+        const c = await checks()
+        expect(c['ssh-first-boot']).toBe('')
+        expect(c['kernel-cmdline']).toBe('')
+    })
+    it('no bootfs fails both checks (no silent pass)', async () => {
+        await fs.remove(R('boot'))
+        const c = await checks()
+        expect(c['ssh-first-boot']).toContain('no bootfs found')
+        expect(c['kernel-cmdline']).toContain('no bootfs found')
+        const e = await checks(R('missing-boot'))
+        expect(e['ssh-first-boot']).toContain('not found')
+        expect(e['kernel-cmdline']).toContain('not found')
+    })
+    it('cgroup_disable=memory before cgroup_enable=memory is fine, after it fails', async () => {
+        expect(kernelCmdlineProblems(`cgroup_disable=memory ${STOCK_CMDLINE} cgroup_enable=memory\n`)).toEqual([])
+        expect(kernelCmdlineProblems(`${STOCK_CMDLINE} cgroup_enable=memory cgroup_disable=memory\n`).join()).toContain('cgroup_disable=memory after cgroup_enable=memory')
+        const CL = R('boot/firmware/cmdline.txt')
+        await fs.writeFile(CL, `cgroup_disable=memory ${STOCK_CMDLINE} cgroup_enable=memory\n`); expect((await checks())['kernel-cmdline']).toBe('')
+        await fs.writeFile(CL, `${STOCK_CMDLINE} cgroup_enable=memory cgroup_disable=memory\n`); expect((await checks())['kernel-cmdline']).toContain('after cgroup_enable=memory')
+        await fs.writeFile(CL, `${STOCK_CMDLINE} cgroup_enable=memory cgroup_disable=cpuset\n`); expect((await checks())['kernel-cmdline']).toBe('')
     })
 })
