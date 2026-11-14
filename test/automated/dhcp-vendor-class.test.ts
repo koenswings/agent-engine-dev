@@ -5,11 +5,11 @@
  * Runs the real helper script against temp copies of the config files.
  */
 import { describe, it, expect, beforeEach } from 'vitest'
-import { execFileSync } from 'child_process'
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, chmodSync, existsSync } from 'fs'
+import { execFileSync, execSync } from 'child_process'
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, readdirSync, statSync, chmodSync, existsSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, resolve } from 'path'
-import { installDhcpVendorClass, DHCP_VENDOR_CLASS_HELPER, DHCP_VENDOR_CLASS } from '../../src/data/Engine.js'
+import { installDhcpVendorClass, dhcpVendorClassNmChanged, DHCP_VENDOR_CLASS_HELPER, DHCP_VENDOR_CLASS } from '../../src/data/Engine.js'
 
 const HELPER = resolve(process.cwd(), 'script/build_image_assets/idea-dhcp-vendor-class')
 // Raspberry Pi OS stock /etc/dhcpcd.conf (abridged; same shape as idea04's copy)
@@ -137,19 +137,46 @@ describe('idea-dhcp-vendor-class: both clients present (idea04 has NM active plu
 })
 
 describe('installDhcpVendorClass (build-engine step)', () => {
-    it('installs and runs the helper, then only reloads NM config (no restart, no link change)', async () => {
+    const INSTALL = `if ! cmp -s /home/pi/engine/script/build_image_assets/idea-dhcp-vendor-class ${DHCP_VENDOR_CLASS_HELPER}; then sudo install -o root -g root -m 0755 /home/pi/engine/script/build_image_assets/idea-dhcp-vendor-class ${DHCP_VENDOR_CLASS_HELPER}; fi`
+    const RELOAD = 'if systemctl is-active --quiet NetworkManager; then sudo nmcli general reload conf; fi'
+    const recording = (helperOut: string) => {
         const cmds: string[] = []
         const exec = async (strings: TemplateStringsArray, ...vals: unknown[]) => {
-            cmds.push(strings.reduce((a, s, i) => a + s + (i < vals.length ? String(vals[i]) : ''), ''))
-            return { stdout: '' }
+            const cmd = strings.reduce((a, s, i) => a + s + (i < vals.length ? String(vals[i]) : ''), '')
+            cmds.push(cmd)
+            return { stdout: cmd === `sudo ${DHCP_VENDOR_CLASS_HELPER}` ? helperOut : '' }
         }
+        return { cmds, exec }
+    }
+    it('installs the helper only when it differs, runs it, then only reloads NM config when the drop-in changed (no restart, no link change)', async () => {
+        const { cmds, exec } = recording('nm changed\ndhcpcd absent\n')
         await installDhcpVendorClass(exec, '/home/pi/engine')
         expect(DHCP_VENDOR_CLASS).toBe('idea-engine')
-        expect(cmds).toEqual([
-            `sudo install -o root -g root -m 0755 /home/pi/engine/script/build_image_assets/idea-dhcp-vendor-class ${DHCP_VENDOR_CLASS_HELPER}`,
-            `sudo ${DHCP_VENDOR_CLASS_HELPER}`,
-            'if systemctl is-active --quiet NetworkManager; then sudo nmcli general reload conf; fi',
-        ])
+        expect(cmds).toEqual([INSTALL, `sudo ${DHCP_VENDOR_CLASS_HELPER}`, RELOAD])
         for (const c of cmds) expect(c).not.toMatch(/restart|connection (up|down)|device (disconnect|reapply)|dhcpcd -[nk]/)
+    })
+    it('idea#284: nothing differs (nm unchanged): no NetworkManager reload', async () => {
+        for (const out of ['nm unchanged\ndhcpcd unchanged\n', 'nm absent\ndhcpcd changed backup=/etc/dhcpcd.conf.idea-bak-x\n', '']) {
+            const { cmds, exec } = recording(out)
+            await installDhcpVendorClass(exec, '/home/pi/engine')
+            expect(cmds).toEqual([INSTALL, `sudo ${DHCP_VENDOR_CLASS_HELPER}`])
+        }
+    })
+    it('idea#284: a changed NM drop-in with a backup still reloads', () => {
+        expect(dhcpVendorClassNmChanged('nm changed backup=/etc/NetworkManager/conf.d/90-idea-dhcp-vendor-class.conf.idea-bak-x\ndhcpcd absent\n')).toBe(true)
+        expect(dhcpVendorClassNmChanged('nm unchanged\ndhcpcd changed backup=x\n')).toBe(false)
+        expect(dhcpVendorClassNmChanged('nm absent\n')).toBe(false)
+    })
+    it('idea#284: the install step copies the helper only when its content differs (cmp -s, real files)', () => {
+        const dir = mkdtempSync(join(tmpdir(), 'dhcp-cmp-'))
+        try {
+            const src = join(dir, 'src'), dst = join(dir, 'dst')
+            writeFileSync(src, 'v2\n'); writeFileSync(dst, 'v2\n')
+            const cmd = (s: string, d: string) => `if ! cmp -s ${s} ${d}; then cp ${s} ${d}; echo copied; fi`
+            expect(execSync(cmd(src, dst), { encoding: 'utf8' })).toBe('')
+            writeFileSync(src, 'v3\n')
+            expect(execSync(cmd(src, dst), { encoding: 'utf8' })).toBe('copied\n')
+            expect(execSync(cmd(src, join(dir, 'missing')), { encoding: 'utf8' })).toBe('copied\n')
+        } finally { rmSync(dir, { recursive: true, force: true }) }
     })
 })
