@@ -109,6 +109,13 @@ export interface RemoveDeps {
     refreshSnapshots: (disk: Disk) => Promise<void>
     /** idea#468: prune unused compose-project networks for this instance, locally. */
     pruneNetworks: (id: InstanceID) => Promise<void>
+    /**
+     * Internal callers only (removeDemo): reuse the instance lock the caller
+     * already holds. The CLI / other commands must not set this. The lock is
+     * reused only when it is already held by `removeDemo`; a different holder
+     * still refuses BUSY. This function does not release a reused lock.
+     */
+    alreadyLocked?: boolean
 }
 
 const defaultDeps: RemoveDeps = {
@@ -168,11 +175,15 @@ export const removeInstance = async (
     if (helper) throw new RemoveError('HELPER_OUTDATED', helper)
 
     const key = instanceKey(inst.id)
-    if (!resourceLock.acquire(key, 'removeInstance')) {
-        const kind = resourceLock.getLockInfo(key)?.kind ?? ''
-        if (BACKUP_KINDS.has(kind)) throw new RemoveError('BUSY_BACKUP', `instance '${inst.name}' is being backed up or restored; retry when it completes`)
-        if (MOVE_KINDS.has(kind)) throw new RemoveError('BUSY_MOVE', `instance '${inst.name}' is being copied or moved; retry when it completes`)
-        throw new RemoveError('BUSY', `instance '${inst.name}' is busy (${kind || 'another operation'}); retry when it completes`)
+    const held = resourceLock.getLockInfo(key)
+    const reused = d.alreadyLocked === true && held?.kind === 'removeDemo'
+    if (!reused) {
+        if (!resourceLock.acquire(key, 'removeInstance')) {
+            const kind = resourceLock.getLockInfo(key)?.kind ?? ''
+            if (BACKUP_KINDS.has(kind)) throw new RemoveError('BUSY_BACKUP', `instance '${inst.name}' is being backed up or restored; retry when it completes`)
+            if (MOVE_KINDS.has(kind)) throw new RemoveError('BUSY_MOVE', `instance '${inst.name}' is being copied or moved; retry when it completes`)
+            throw new RemoveError('BUSY', `instance '${inst.name}' is busy (${kind || 'another operation'}); retry when it completes`)
+        }
     }
     try {
         const disk = store.diskDB[inst.storedOn!] as Disk
@@ -232,6 +243,6 @@ export const removeInstance = async (
         }
         return { instanceId: inst.id, name: String(inst.name), quarantinePath, keptVolumes }
     } finally {
-        resourceLock.release(key)
+        if (!reused) resourceLock.release(key)
     }
 }
