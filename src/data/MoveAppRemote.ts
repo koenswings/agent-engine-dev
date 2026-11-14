@@ -379,6 +379,7 @@ export const moveAppCrossEngine = async (
     }
     const opId = createOperation(storeHandle, 'moveApp', {
         instanceId: String(instance.id), sourceDiskId: String(sourceDisk.id), targetDiskId: String(targetDisk.id), crossEngine: 'true',
+        instanceName: String(instance.name),
     }, cause, { type: 'instance', id: String(instance.id) })
     storeHandle.change(doc => { const op = doc.operationDB?.[opId] as any; if (op) op.move = { ...move } })
 

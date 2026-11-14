@@ -273,6 +273,7 @@ export const copyApp = async (
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
+        instanceName: String(instance.name),
     }, cause, { type: 'instance', id: instance.id })
     let copyError: Error | null = null
     beginUsageSkip('move')
@@ -623,6 +624,7 @@ export const moveApp = async (
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
+        instanceName: String(instance.name),
     }, cause, { type: 'instance', id: instance.id })
     beginUsageSkip('move')
 

@@ -127,6 +127,10 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(op.kind).toBe('moveApp')
         expect(op.status).toBe('Done')
         expect(op.error).toBeNull()
+        expect(op.args).toMatchObject({
+            instanceId: String(INST), sourceDiskId: String(SRC_DISK), targetDiskId: String(TGT_DISK),
+            crossEngine: 'true', instanceName: 'my-kolibri',
+        })
         expect(op.move).toMatchObject({ phase: 'done', verified: true, sourceRemoved: true, code: 'MOVED', targetInstanceId: INST, expectedBytes: BYTES, targetCleanup: null })
         expect(op.move.verify.ok).toBe(true)
     })
