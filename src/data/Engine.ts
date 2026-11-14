@@ -170,6 +170,9 @@ export interface EraseInProgress {
  *               at startup (same pattern as flashCard). An older, missing, failing
  *               or timed-out helper leaves it out; runtime cleanup still records
  *               HELPER_OUTDATED and the backup still runs.
+ *   preUpdateQuarantine: 24 h cleanup of a pre-update snapshot (idea#396);
+ *               advertised only when the app-data helper is at v14 or newer,
+ *               checked once at startup (same pattern as backupCleanup).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
@@ -232,6 +235,40 @@ export const checkBackupCleanupCapability = async (
 /** Test seam: drop the cached startup check so later cases start from "not checked". */
 export const resetBackupCleanupCapabilityForTests = (): void => { backupCleanupHelperOk = null }
 
+/** idea#396: advertised only when the app-data helper is at v14 or newer */
+export const PRE_UPDATE_QUARANTINE_CAPABILITY = 'preUpdateQuarantine'
+const PRE_UPDATE_QUARANTINE_HELPER_MIN = 14
+const PRE_UPDATE_QUARANTINE_HELPER_CHECK_MS = 5_000
+let preUpdateQuarantineHelperOk: boolean | null = null
+
+/**
+ * Once at startup, decide whether to advertise `preUpdateQuarantine`. Never throws:
+ * an older, missing, failing or timed-out helper leaves the capability out.
+ */
+export const checkPreUpdateQuarantineCapability = async (
+  run?: AppDataRunner,
+  timeoutMs: number = PRE_UPDATE_QUARANTINE_HELPER_CHECK_MS,
+): Promise<boolean> => {
+  try {
+    const outdated = await withTimeout(
+      helperAtLeast(PRE_UPDATE_QUARANTINE_HELPER_MIN, 'preUpdateQuarantine', run),
+      timeoutMs,
+    )
+    preUpdateQuarantineHelperOk = outdated === null
+  } catch {
+    preUpdateQuarantineHelperOk = false
+  }
+  if (preUpdateQuarantineHelperOk) {
+    log(`preUpdateQuarantine capability advertised (app-data helper v${PRE_UPDATE_QUARANTINE_HELPER_MIN}+)`)
+  } else {
+    log(`preUpdateQuarantine capability omitted (app-data helper older than v${PRE_UPDATE_QUARANTINE_HELPER_MIN}, missing, error or timeout)`)
+  }
+  return preUpdateQuarantineHelperOk
+}
+
+/** Test seam: drop the cached startup check so later cases start from "not checked". */
+export const resetPreUpdateQuarantineCapabilityForTests = (): void => { preUpdateQuarantineHelperOk = null }
+
 /** The capability list written at this startup */
 let demoAppsPythonOk: boolean | null = null
 
@@ -258,11 +295,13 @@ export const isDemoAppsCapabilityOn = (): boolean | null => demoAppsPythonOk
 export const engineCapabilities = (
   helperInstalled: boolean = flashHelperInstalled(),
   cleanupHelperOk: boolean = backupCleanupHelperOk === true,
+  quarantineHelperOk: boolean = preUpdateQuarantineHelperOk === true,
   demoAppsOk: boolean = demoAppsPythonOk === true,
 ): string[] => {
   const caps = [...ENGINE_CAPABILITIES]
   if (helperInstalled) caps.push(FLASH_CARD_CAPABILITY)
   if (cleanupHelperOk) caps.push(BACKUP_CLEANUP_CAPABILITY)
+  if (quarantineHelperOk) caps.push(PRE_UPDATE_QUARANTINE_CAPABILITY)
   if (demoAppsOk) caps.push(DEMO_APPS_CAPABILITY)
   return caps
 }

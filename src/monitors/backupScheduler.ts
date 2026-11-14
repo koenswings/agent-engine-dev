@@ -47,6 +47,7 @@ import { recordBackupResult } from '../data/BackupResults.js'
 import { resourceLock } from '../utils/ResourceLock.js'
 import { readBuildInfo } from '../utils/buildInfo.js'
 import { defaultReadBootId, defaultReadNtpSynced, defaultReadUptimeS } from '../usage/sampler.js'
+import { bindEngineClockTrusted } from '../utils/engineClockStatus.js'
 import {
     BackupDue, ClockJumpState, DEFAULT_BACKUP_TIME, ClockSample, ClockTrust, SkippedRun,
     advanceClockJumpState, advanceUptimeCounter, decideBackupDue, detectClockJump, effectiveSchedule,
@@ -442,7 +443,14 @@ export const startBackupScheduler = (storeHandle: DocHandle<Store>): BackupSched
     if (!engineScheduler) {
         engineScheduler = new BackupScheduler(storeHandle)
         engineScheduler.start()
+        bindEngineClockTrusted(() => engineScheduler!.clockStatus().clockTrusted)
         log(`Backup scheduler started (${SCHEDULER_TICK_MS / 1000} s tick, in the Engine; idea#400)`)
     }
     return engineScheduler
 }
+
+/** The running scheduler, if startBackupScheduler has run (idea#396 clock trust). */
+export const getBackupScheduler = (): BackupScheduler | null => engineScheduler
+
+/** Test seam: drop the process-wide scheduler. */
+export const resetBackupSchedulerForTests = (): void => { engineScheduler = null }

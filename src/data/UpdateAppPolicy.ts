@@ -27,6 +27,8 @@ export type UpdateRefusal =
     | 'BAD_BACKUP_SPEC' | 'HOOK_FAILED' | 'BACKUP_FAILED'
     // idea#448: the new bundle ships a path the snapshot and rollback leave out
     | 'BUNDLE_CONTAINS_EXCLUDED'
+    // idea#396: a snapshot / estimate exclude token is refused (helper v14 rules)
+    | 'INVALID_EXCLUDE'
     // idea#479: id checked before any compose or Docker action
     | 'INVALID_INSTANCE_ID'
 

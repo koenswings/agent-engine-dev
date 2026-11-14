@@ -34,6 +34,7 @@ export interface Settings {
     ideaLocalHttpPort?: number;   // Port that http://idea.local is served on, in addition to httpPort (idea#203; default 80). See httpMonitor.ts.
     ideaLocal?: boolean;          // Publish the shared name idea.local via avahi D-Bus when mdns is on (idea#203; default true). See monitors/ideaLocal.ts.
     lanPreferCidrs?: string[];    // IPv4 CIDRs whose addresses win the Engine.lanAddress choice over the default route (default ['10.42.0.0/16'], the school/kit LAN; [] = default-route order only). See lanPreferCidrs() and LanAddress.ts.
+    quarantineAfterMs?: number;   // idea#396: shorten the 24 h pre-update snapshot quarantine window (honoured only when isDev or testMode; ignored in production).
 }
 
 export interface Defaults {
@@ -139,6 +140,7 @@ export function validateSettings(obj: any, path: string): string[] {
     if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
     if (obj.autoStartChannelBuilder !== undefined && typeof obj.autoStartChannelBuilder !== 'boolean') errors.push(`'${path}autoStartChannelBuilder' must be a boolean.`);
     if (obj.lanPreferCidrs !== undefined && (!Array.isArray(obj.lanPreferCidrs) || obj.lanPreferCidrs.some((c: unknown) => typeof c !== 'string' || !LAN_CIDR.test(c)))) errors.push(`'${path}lanPreferCidrs' must be a list of IPv4 CIDRs such as '10.42.0.0/16'.`);
+    if (obj.quarantineAfterMs !== undefined && (typeof obj.quarantineAfterMs !== 'number' || !Number.isFinite(obj.quarantineAfterMs) || obj.quarantineAfterMs <= 0)) errors.push(`'${path}quarantineAfterMs' must be a positive number.`);
     if (obj.ideaLocalHttpPort !== undefined && (typeof obj.ideaLocalHttpPort !== 'number' || !Number.isInteger(obj.ideaLocalHttpPort) || obj.ideaLocalHttpPort < 1 || obj.ideaLocalHttpPort > 65535)) errors.push(`'${path}ideaLocalHttpPort' must be a port number.`);
     if (obj.ideaLocal !== undefined && typeof obj.ideaLocal !== 'boolean') errors.push(`'${path}ideaLocal' must be a boolean.`);
     if (obj.usbRoot !== undefined && typeof obj.usbRoot !== 'string') errors.push(`'${path}usbRoot' must be a string.`);
@@ -387,6 +389,17 @@ export const LAN_PREFER_CIDRS_DEFAULT: readonly string[] = ['10.42.0.0/16']
 const LAN_CIDR = /^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\/(3[0-2]|[12]?\d)$/
 /** settings.lanPreferCidrs (default ['10.42.0.0/16']; [] switches the preference off). See LanAddress.ts. */
 export const lanPreferCidrs = (): string[] => [...(config.settings.lanPreferCidrs ?? LAN_PREFER_CIDRS_DEFAULT)]
+/** idea#396: 24 h before a pre-update snapshot is quarantined. */
+export const QUARANTINE_AFTER_MS_DEFAULT = 86_400_000
+/**
+ * Honour settings.quarantineAfterMs only in isDev or testMode (Pi tests may
+ * shorten the window). Production always uses 24 h.
+ */
+export const quarantineAfterMs = (): number => {
+    const n = config.settings.quarantineAfterMs
+    if ((config.settings.isDev || config.settings.testMode) && typeof n === 'number' && Number.isFinite(n) && n > 0) return n
+    return QUARANTINE_AFTER_MS_DEFAULT
+}
 export const disksRoot = (): string => config.settings.disksRoot || DEFAULT_DISKS_ROOT;
 
 // Allow IDEA_DOCKER_AVAILABLE=true|false to force whether the Docker-only paths

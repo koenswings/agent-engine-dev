@@ -294,6 +294,13 @@ export interface Instance {
   updateAvailable?: UpdateAvailable | null;
   /** App ID before the last successful updateApp ("Updated from 0.15.5", idea#76); null/absent otherwise. */
   previousAppId?: AppID | null;
+  /**
+   * idea#396: when the Health gate last passed. `at` is wall ms if the clock was
+   * trusted then, otherwise null. Cleared after a successful (or no-op)
+   * quarantine-snapshot, a new snapshot of this id, a rollback, or removeInstance.
+   * Optional: do not add to store-template.json.
+   */
+  preUpdateGate?: { at: number | null, bootId: string, uptimeS: number } | null;
   /** True only for a setupDemo instance (engine#369); mirrored from compose.yaml x-app.demo. Present only when true, never false. */
   demo?: true;
   /** On-disk demo pack is older than the running bundle's demo.pack.minVersion (engine#369). Set by updateApp, cleared by setupDemo. */

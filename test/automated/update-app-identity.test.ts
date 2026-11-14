@@ -15,7 +15,7 @@ import { fs, path, os, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { updateApp, UpdateDeps, recoverInterruptedUpdates, UPDATE_HELPER_MIN, readComposeBackup, linkedBackupDisk, bundleExcludedPaths } from '../../src/data/UpdateApp.js'
-import { snapshotArgs, restoreSnapshotArgs } from '../../src/utils/appDataHelper.js'
+import { snapshotArgs, restoreSnapshotArgs, estimateArgs, quarantineSnapshotArgs } from '../../src/utils/appDataHelper.js'
 import { createOperation, updateOperation } from '../../src/data/Operations.js'
 
 const ME = String(localEngineId)
@@ -25,9 +25,9 @@ let h: DocHandle<Store>, tmp: string, calls: string[]
 let backups: { opts: Record<string, unknown>, backupDiskId: string }[]
 let snapEx: string[][], restoreEx: string[][]
 
-const composeYaml = (version: string, backup?: Record<string, unknown>) => YAML.stringify({
+const composeYaml = (version: string, backup?: Record<string, unknown>, extra: Record<string, unknown> = {}) => YAML.stringify({
     services: { web: { image: 'x' }, collector: { image: 'y' }, tailscale: { image: 'z' } },
-    'x-app': { name: 'usage-dashboard', version, instanceName: 'Hub', ...(backup ? { backup } : {}) },
+    'x-app': { name: 'usage-dashboard', version, instanceName: 'Hub', ...(backup ? { backup } : {}), ...extra },
 })
 const hook = {
     method: 'hook', fallback: 'stop',
@@ -95,14 +95,18 @@ beforeEach(async () => {
 afterEach(async () => { await fs.remove(tmp) })
 
 describe('updateApp identity (idea#448)', () => {
-    it('needs helper v9 (snapshot excludes and in-place restore)', () => {
-        expect(UPDATE_HELPER_MIN).toBe(9)
+    it('needs helper v14 (snapshot/estimate excludes under data/ and quarantine-snapshot)', () => {
+        expect(UPDATE_HELPER_MIN).toBe(14)
     })
 
     it('helper argv: snapshot and restore-snapshot carry normalised, de-duplicated excludes; a bad one throws', () => {
         expect(snapshotArgs('system', ID, ['tailscale', 'data/tailscale', './data/keys/'])).toEqual(['snapshot', 'system', ID, 'data/tailscale', 'data/keys'])
         expect(restoreSnapshotArgs('sdb1', ID, ['keys'])).toEqual(['restore-snapshot', 'sdb1', ID, 'data/keys'])
         expect(snapshotArgs('sdb1', ID)).toEqual(['snapshot', 'sdb1', ID])
+        expect(estimateArgs('sdb1', ID)).toEqual(['estimate', 'sdb1', ID])
+        expect(estimateArgs('sdb1', ID, ['keys', 'data/cache'])).toEqual(['estimate', 'sdb1', ID, 'data/keys', 'data/cache'])
+        expect(quarantineSnapshotArgs('sdb1', ID)).toEqual(['quarantine-snapshot', 'sdb1', ID])
+        expect(() => quarantineSnapshotArgs('sdb1', 'foo.backup-1')).toThrow(/not an instance id/)
         expect(() => snapshotArgs('sdb1', ID, ['../etc'])).toThrow(/'\.' or '\.\.' component/)
         expect(() => restoreSnapshotArgs('sdb1', ID, ['-rf'])).toThrow(/looks like an option/)
     })
@@ -315,5 +319,28 @@ describe('updateApp identity (idea#448)', () => {
             expect(await bundleExcludedPaths(`${tmp}/b3`, ['data/keys'])).toEqual(['data/keys'])
             expect(await bundleExcludedPaths(`${tmp}/missing`, ['data/keys'])).toEqual([])
         })
+    })
+
+    it('idea#396: live.snapshotExclude is in the snapshot/estimate list but not restore-snapshot', async () => {
+        linkBackupDisk()
+        await fs.writeFile(`${instDir()}/compose.yaml`, composeYaml(SHA, { exclude: ['keys', 'tailscale'] }, { snapshotExclude: ['cache'] }))
+        const estimateEx: string[][] = []
+        const r = await updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({
+            estimate: async (_d, _id, ex = []) => { estimateEx.push(ex); return { folderBytes: 1000, volumeBytes: 0, freeBytes: 50 * 1024 ** 3 } },
+        }))
+        expect(r.snapshotExcludes).toEqual(['data/keys', 'data/tailscale', 'data/tailscale-run', 'data/cache'])
+        expect(estimateEx).toEqual([['data/keys', 'data/tailscale', 'data/tailscale-run', 'data/cache']])
+        expect(inst().preUpdateGate).toMatchObject({ bootId: expect.any(String), uptimeS: expect.any(Number) })
+    })
+
+    it('idea#396: rollback restore-snapshot gets only backup.exclude, not snapshotExclude', async () => {
+        linkBackupDisk()
+        await fs.writeFile(`${instDir()}/compose.yaml`, composeYaml(SHA, { exclude: ['keys', 'tailscale'] }, { snapshotExclude: ['cache'] }))
+        expect(await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({
+            health: async () => ({ state: 'exited', restartCount: 0 }),
+        })))).toMatch(/^ROLLED BACK: /)
+        expect(snapEx[0]).toEqual(['data/keys', 'data/tailscale', 'data/tailscale-run', 'data/cache'])
+        expect(restoreEx[0]).toEqual(['data/keys', 'data/tailscale', 'data/tailscale-run'])
+        expect(inst().preUpdateGate ?? null).toBeNull()
     })
 })

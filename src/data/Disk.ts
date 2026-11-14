@@ -821,6 +821,12 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     } catch (e) {
         log(`updateAvailable refresh failed on dock of ${disk.id}: ${(e as Error).message}`)
     }
+    try {
+        const { scanPreUpdateQuarantine } = await import('../monitors/preUpdateQuarantine.js')
+        await scanPreUpdateQuarantine(storeHandle, {}, String(disk.id))
+    } catch (e) {
+        log(`preUpdateQuarantine on dock of ${disk.id}: ${(e as Error).message}`)
+    }
 
     // Trigger backups on any docked Backup Disk linked to instances on this App Disk
     const { checkPendingBackups } = await import('../monitors/backupMonitor.js')

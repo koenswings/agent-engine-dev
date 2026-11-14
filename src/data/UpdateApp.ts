@@ -60,12 +60,14 @@ import { parseAppId } from './App.js'
 import { stampComposeInstanceIdentity } from './InstanceCopy.js'
 import { isUnfinishedFetch } from './UpdateFetch.js'
 import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
-import { parseBackupExcludeList, mergeBackupExcludeLists } from '../utils/backupExclude.js'
+import { parseBackupExcludeList, parseSnapshotExcludeList, mergeBackupExcludeLists, assertSnapshotExcludeList } from '../utils/backupExclude.js'
+import { defaultReadBootId, defaultReadUptimeS } from '../usage/sampler.js'
+import { engineClockTrusted } from '../utils/engineClockStatus.js'
 import { parseBackupSpec, BackupMethod } from '../utils/backupMethod.js'
 import type { PreUpdateBackupOptions } from '../monitors/backupMonitor.js'
 
-/** v9 (idea#448): snapshot excludes and the in-place restore-snapshot. */
-export const UPDATE_HELPER_MIN = 9
+/** v14 (idea#396): snapshot/estimate excludes under data/, 24 h pre-update quarantine. */
+export const UPDATE_HELPER_MIN = 14
 export const UPDATE_PROGRESS_TYPE = 'idea/updateProgress'
 export const PRE_UPDATE_DIR = '.pre-update'
 export const UPDATE_APP_USAGE = 'Usage: updateApp <instanceId|name> <newAppId> [--allow-major] [--source <diskId>]'
@@ -97,8 +99,12 @@ export interface UpdateDeps {
     helperProblem: () => Promise<string | null>
     mountRoot: (disk: Disk) => Promise<string>
     verifySums: (bundleDir: string) => Promise<boolean>
-    /** read-only helper `estimate`: folder + named-volume bytes and the App Disk's free bytes; stops nothing */
-    estimate: (disk: Disk, id: InstanceID) => Promise<{ folderBytes: number, volumeBytes: number, freeBytes: number }>
+    /** read-only helper `estimate`: folder + named-volume bytes and the App Disk's free bytes; stops nothing. idea#396: trailing excludes are the snapshot list. */
+    estimate: (disk: Disk, id: InstanceID, excludes?: string[]) => Promise<{ folderBytes: number, volumeBytes: number, freeBytes: number }>
+    /** idea#396: clock/boot at the Health gate for Instance.preUpdateGate. */
+    clockTrusted: () => boolean
+    bootId: () => string
+    uptimeS: () => number
     dirBytes: (dir: string) => Promise<number>
     copyBundle: (src: string, dst: string) => Promise<void>
     stop: (inst: Instance, disk: Disk) => Promise<void>
@@ -156,7 +162,18 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
         const f = await import('./UpdateFetch.js')
         return f.fetchBundle(req, f.defaultFetchTargetDeps(storeHandle, defaultVerifySums))
     },
-    estimate: async (disk, id) => parseEstimate(await runAppData(estimateArgs(await appDataRoot(disk), String(id)))),
+    estimate: async (disk, id, excludes = []) => {
+        try {
+            return parseEstimate(await runAppData(estimateArgs(await appDataRoot(disk), String(id), excludes)))
+        } catch (e) {
+            const mapped = invalidExcludeFromHelper(e)
+            if (mapped) throw mapped
+            throw e
+        }
+    },
+    clockTrusted: engineClockTrusted,
+    bootId: defaultReadBootId,
+    uptimeS: defaultReadUptimeS,
     dirBytes: async (dir) => (await import('./CopyMoveApp.js')).directoryBytes(dir),
     copyBundle: async (src, dst) => {
         for (const name of await fs.readdir(src)) {
@@ -328,6 +345,50 @@ export const readComposeBackup = async (composePath: string, which: string): Pro
 }
 
 /** idea#448: a Backup Disk docked to this Engine and linked to the instance (backupApp's default choice). */
+/** Map a helper `refused:` (exit 2) from estimate / snapshot to INVALID_EXCLUDE. */
+export const invalidExcludeFromHelper = (e: unknown): UpdateAppError | null => {
+    const msg = e instanceof Error ? e.message : String(e)
+    const m = msg.match(/refused:\s*(.*)/)
+    if (!m) return null
+    const why = m[1].trim().replace(/\s+/g, ' ')
+    return new UpdateAppError('INVALID_EXCLUDE', `${why}; nothing was stopped or changed`)
+}
+
+/** idea#396: top-level x-app.snapshotExclude of a compose file (fail closed). */
+export const readComposeSnapshotExclude = async (composePath: string, which: string): Promise<string[]> => {
+    if (!await fs.pathExists(composePath)) return []
+    try {
+        const xapp = YAML.parse(await fs.readFile(composePath, 'utf8'))?.['x-app']
+        return parseSnapshotExcludeList(xapp)
+    } catch (e) {
+        const msg = (e as Error).message
+        throw new UpdateAppError('INVALID_EXCLUDE', `the ${which} compose ${composePath} has an invalid x-app.snapshotExclude: ${msg}; nothing was stopped or changed`)
+    }
+}
+
+const namedExcludeLists = (pathRel: string, backupExcludes: string[], snapshotExcludes: string[]): string[] => {
+    const names: string[] = []
+    if (backupExcludes.includes(pathRel)) names.push('x-app.backup.exclude')
+    if (snapshotExcludes.includes(pathRel)) names.push('x-app.snapshotExclude')
+    return names.length ? names : ['x-app.backup.exclude']
+}
+
+const bundleContainsExcludedMessage = (dir: string, shipped: string[], backupExcludes: string[], snapshotExcludes: string[]): string => {
+    const lists = [...new Set(shipped.flatMap(p => namedExcludeLists(p, backupExcludes, snapshotExcludes)))]
+    const listTxt = lists.join(' and ')
+    return `the bundle ${dir} contains ${shipped.join(', ')}, which the snapshot and rollback leave out (${listTxt}); remove ${shipped.length === 1 ? 'it' : 'them'} from the bundle. Nothing was stopped or changed`
+}
+
+export const writePreUpdateGate = (
+    storeHandle: DocHandle<Store>, instanceId: InstanceID,
+    gate: { at: number | null, bootId: string, uptimeS: number } | null,
+): void => {
+    storeHandle.change(doc => {
+        const i = doc.instanceDB[instanceId]
+        if (i) i.preUpdateGate = gate
+    })
+}
+
 export const linkedBackupDisk = (store: Store, engineId: string, inst: Instance): Disk | null =>
     (Object.values(store.diskDB ?? {}).find(x =>
         x && x.device && String(x.dockedTo) === engineId && x.diskTypes?.includes('backup') &&
@@ -380,37 +441,62 @@ export const updateApp = async (
         const instDir = joinMountRoot(instRoot, 'instances', String(inst.id))
         let shortDisks: string[] = []
         let dataBytes = 0
+        let snapExcludes: string[] = []
+        let liveBackupExcludes: string[] = []
+        let backupExcludes: string[] = []
+        let liveSnapshotExcludes: string[] = []
+        let live: Awaited<ReturnType<typeof readComposeBackup>> | undefined
+        const newCompose = bundle ? path.join(bundle.dir, 'compose.yaml') : ''
+        const backupAgeMs = inst.lastBackup ? d.now() - Number(inst.lastBackup) : null
+        const backupDisk = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs) ? linkedBackupDisk(store, engineId, inst) : null
+        const facts = {
+            diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,
+            sourcePresent: !!bundle, sumsValid: bundle ? await d.verifySums(bundle.dir) : false,
+            allowMajor: !!opts.allowMajor,
+            backupAgeMs,
+            shortDisks: [] as string[],
+            updatesFrom: bundle ? (await readXApp(path.join(bundle.dir, 'compose.yaml'))).updatesFrom : undefined,
+            backupPlanned: !!backupDisk,
+        }
+        // NEEDS_BACKUP / MAJOR / NO_SUMS still win over exclude parsing (existing agreed order).
+        const early = checkUpdate(facts)
+        if (early) throw early
+        // idea#396: merge excludes and refuse INVALID_EXCLUDE / BUNDLE_CONTAINS_EXCLUDED
+        // before estimate and before anything is stopped.
+        if (bundle) {
+            live = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live')
+            const next = await readComposeBackup(newCompose, 'new')
+            liveBackupExcludes = live.exclude
+            backupExcludes = mergeBackupExcludeLists(live.exclude, next.exclude)
+            liveSnapshotExcludes = await readComposeSnapshotExclude(path.join(instDir, 'compose.yaml'), 'live')
+            try {
+                snapExcludes = assertSnapshotExcludeList(mergeBackupExcludeLists(backupExcludes, liveSnapshotExcludes), 'snapshot exclude')
+            } catch (e) {
+                throw new UpdateAppError('INVALID_EXCLUDE', `${(e as Error).message}; nothing was stopped or changed`)
+            }
+            const shipped = await bundleExcludedPaths(bundle.dir, snapExcludes)
+            if (shipped.length) throw new UpdateAppError('BUNDLE_CONTAINS_EXCLUDED', bundleContainsExcludedMessage(bundle.dir, shipped, backupExcludes, liveSnapshotExcludes))
+        }
         if (bundle && gotLock) {
             // NO_SPACE changes nothing (Steve): the helper's read-only estimate counts the folder AND
-            // the named volumes before anything is stopped; the snapshot's own check is the backstop.
-            const est = await d.estimate(disk, inst.id)
+            // the named volumes before anything is stopped, net of the snapshot excludes (idea#396).
+            let est: Awaited<ReturnType<UpdateDeps['estimate']>>
+            try { est = await d.estimate(disk, inst.id, snapExcludes) } catch (e) {
+                const mapped = invalidExcludeFromHelper(e)
+                if (mapped) throw mapped
+                throw e
+            }
             dataBytes = est.folderBytes + est.volumeBytes
             const bundleBytes = String(bundle.disk.id) === String(disk.id) ? 0 : await d.dirBytes(bundle.dir)
             const need = dataBytes + snapshotMarginBytes(dataBytes) + bundleBytes
             if (est.freeBytes < need) shortDisks = [`${disk.name} (snapshot needs ${need}, free ${est.freeBytes})`]
         }
-        const backupAgeMs = inst.lastBackup ? d.now() - Number(inst.lastBackup) : null
-        const backupDisk = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs) ? linkedBackupDisk(store, engineId, inst) : null
-        const refusal = checkUpdate({
-            diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,
-            sourcePresent: !!bundle, sumsValid: bundle ? await d.verifySums(bundle.dir) : false,
-            allowMajor: !!opts.allowMajor,
-            backupAgeMs,
-            shortDisks,
-            updatesFrom: bundle ? (await readXApp(path.join(bundle.dir, 'compose.yaml'))).updatesFrom : undefined,
-            backupPlanned: !!backupDisk,
-        })
-        if (refusal) throw refusal
-        // idea#448: the snapshot leaves out the union of the live and the new compose's
-        // x-app.backup.exclude (Steve Q5). idea#458: the pre-update backup method comes from the
-        // LIVE compose (a backup of the current instance), never from the new bundle.
-        const newCompose = path.join(bundle!.dir, 'compose.yaml')
-        const live = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live')
-        const next = await readComposeBackup(newCompose, 'new')
-        const snapExcludes = mergeBackupExcludeLists(live.exclude, next.exclude)
-        // idea#448: refuse before anything stops or is written when the bundle ships an excluded path
-        const shipped = await bundleExcludedPaths(bundle!.dir, snapExcludes)
-        if (shipped.length) throw new UpdateAppError('BUNDLE_CONTAINS_EXCLUDED', `the bundle ${bundle!.dir} contains ${shipped.join(', ')}, which the snapshot and rollback leave out (x-app.backup.exclude); remove ${shipped.length === 1 ? 'it' : 'them'} from the bundle. Nothing was stopped or changed`)
+        if (shortDisks.length) {
+            const space = checkUpdate({ ...facts, shortDisks })
+            if (space) throw space
+        }
+        // idea#458: the pre-update backup method comes from the LIVE compose (a backup of the
+        // current instance), never from the new bundle.
         progress('Check')
 
         const fromAppId = inst.instanceOf
@@ -425,7 +511,7 @@ export const updateApp = async (
         const done: UpdateStep[] = ['Fetch', 'Check']
         const wasUp = inst.status === 'Running' || inst.status === 'Starting'
         // hook: before anything stops; stop (or not running): inside the one Snapshot stop (Steve Q3)
-        const hookFirst = !!backupDisk && wasUp && live.method === 'hook'
+        const hookFirst = !!backupDisk && wasUp && live?.method === 'hook'
         const takeBackup = async (instanceStopped: boolean) => {
             updateOperation(storeHandle, opId, { stepLabel: `Pre-update backup to ${backupDisk!.name} (${instanceStopped ? 'inside the snapshot stop' : 'hook, no stop'})` })
             try { await d.backup(inst, backupDisk!, { instanceStopped }) } catch (e) {
@@ -454,6 +540,7 @@ export const updateApp = async (
             for (const v of snap.volumes) log(`updateApp: ${inst.id}: volume ${v.name} exported (${v.bytes} bytes, ${v.exportMs} ms)`)
             updateOperation(storeHandle, opId, { stepLabel: `Snapshot ${snap.path} (${snap.sizeBytes} bytes${snap.volumes.length ? `; volumes ${snap.volumes.map(v => `${v.name} ${v.bytes} B in ${v.exportMs} ms`).join(', ')}` : ''}${snap.previousQuarantinedAt ? `; previous snapshot quarantined at ${snap.previousQuarantinedAt}` : ''})` })
             await refreshPreUpdateSnapshots(storeHandle, disk, d.listSnapshots)
+            writePreUpdateGate(storeHandle, inst.id, null)
             // ── Swap
             step = 'Swap'; setStep('Swap'); progress('Swap')
             const liveComposePath = path.join(instDir, 'compose.yaml')
@@ -499,7 +586,15 @@ export const updateApp = async (
             done.push('Health')
             storeHandle.change(doc => {
                 const i = doc.instanceDB[inst.id]
-                if (i) { i.previousAppId = fromAppId; i.updateAvailable = null }
+                if (i) {
+                    i.previousAppId = fromAppId
+                    i.updateAvailable = null
+                    i.preUpdateGate = {
+                        at: d.clockTrusted() ? d.now() : null,
+                        bootId: d.bootId(),
+                        uptimeS: d.uptimeS(),
+                    }
+                }
             })
             updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
             log(`updateApp: ${inst.id} ('${inst.name}') ${fromAppId} -> ${newAppId}; snapshot ${snap.path} (${snap.sizeBytes} bytes) kept`)
@@ -516,7 +611,14 @@ export const updateApp = async (
                 updateOperation(storeHandle, opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
                 throw err
             }
-            const err = await rollBack(storeHandle, d, inst, disk, instDir, step, why, snap, snapExcludes)
+            let restoreExcludes = liveBackupExcludes
+            try {
+                const current = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'current')
+                restoreExcludes = mergeBackupExcludeLists(liveBackupExcludes, current.exclude)
+            } catch (e) {
+                log(`updateApp: ${inst.id}: ${(e as Error).message}; restore-snapshot will use the live backup.exclude list only`)
+            }
+            const err = await rollBack(storeHandle, d, inst, disk, instDir, step, why, snap, restoreExcludes)
             updateOperation(storeHandle, opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
             throw err
         }
@@ -536,6 +638,7 @@ const rollBack = async (
 ): Promise<UpdateAppError> => {
     const plan = rollbackPlan(failedAt)
     log(`updateApp: ${failedAt} failed for ${inst.id} (${why}); rolling back from ${snap.path}`)
+    writePreUpdateGate(storeHandle, inst.id, null)
     try {
         await d.composeDown(instDir, inst.id)
         await waitContainersGone(d, inst.id)
@@ -612,16 +715,19 @@ export interface UpdateAvailableDeps {
     readSums: (bundleDir: string) => Promise<string | null>
     /** x-app of a bundle (updatesFrom, healthTimeout, migrationNote) */
     readXApp: (bundleDir: string) => Promise<Record<string, any>>
-    /** data bytes a snapshot of the instance would copy; null when unknown (estimatedMinutes then left out) */
-    dataBytes: (disk: Disk, id: InstanceID) => Promise<number | null>
+    /** data bytes a snapshot of the instance would copy (idea#396: net of the snapshot exclude list); null when unknown (estimatedMinutes then left out) */
+    dataBytes: (disk: Disk, id: InstanceID, excludes?: string[]) => Promise<number | null>
 }
 const defaultAvailableDeps: UpdateAvailableDeps = {
     mountRoot: (disk) => diskMountRoot(disk),
     listApps: async (dir) => (await fs.pathExists(dir)) ? (await fs.readdir(dir)).filter(n => !n.startsWith('.')) : [],
     readSums: async (dir) => { try { return await fs.readFile(path.join(dir, 'SHA256SUMS'), 'utf8') } catch { return null } },
     readXApp: (dir) => readXApp(path.join(dir, 'compose.yaml')),
-    dataBytes: async (disk, id) => {
-        try { const e = parseEstimate(await runAppData(estimateArgs(await appDataRoot(disk), String(id)))); return e.folderBytes + e.volumeBytes } catch { return null }
+    dataBytes: async (disk, id, excludes = []) => {
+        try {
+            const e = parseEstimate(await runAppData(estimateArgs(await appDataRoot(disk), String(id), excludes)))
+            return e.folderBytes + e.volumeBytes
+        } catch { return null }
     },
 }
 export const sumsLookUsable = (sums: string | null): boolean =>
@@ -729,7 +835,15 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
         }
         // idea#76: estimatedMinutes (snapshot copy + health timeout) and the App's migrationNote
         const disk = docked.find(x => String(x.id) === String(inst.storedOn))!
-        const bytes = await d.dataBytes(disk, inst.id).catch(() => null)
+        let hintExcludes: string[] = []
+        try {
+            const instDir = joinMountRoot(await d.mountRoot(disk), 'instances', String(inst.id))
+            const liveCompose = path.join(instDir, 'compose.yaml')
+            const live = await readComposeBackup(liveCompose, 'live')
+            const liveSnap = await readComposeSnapshotExclude(liveCompose, 'live')
+            hintExcludes = assertSnapshotExcludeList(mergeBackupExcludeLists(live.exclude, parseBackupExcludeList(best.xapp), liveSnap), 'snapshot exclude')
+        } catch { hintExcludes = [] }
+        const bytes = await d.dataBytes(disk, inst.id, hintExcludes).catch(() => null)
         const remote = String(best.disk.dockedTo) !== engineId
         if (remote) u.sizeBytes = best.sizeBytes ?? 0
         if (bytes !== null) u.estimatedMinutes = estimateUpdateMinutes(bytes, healthTimeoutSeconds(parseAppId(best.appId).name, best.xapp.healthTimeout))
