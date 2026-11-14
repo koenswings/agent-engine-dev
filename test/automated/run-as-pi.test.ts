@@ -157,8 +157,11 @@ describe('Engine sudoers asset (idea#80)', () => {
             'pi ALL=(root) NOPASSWD: /usr/bin/chown -h pi\\:pi /disks/sd[a-z][1-9]',
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-erase-disk',
             'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-flash-card',
-            // app data as root (idea#168): one helper, no argument list (the helper validates)
-            'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data',
+            // app data as root (idea#168): one helper, the helper validates; engine#376: sync-peers only
+            // as '<engineId> <storeDocId>', never the old argument-less form, never clear-peers (Ops only)
+            'pi ALL=(root) NOPASSWD: /usr/local/sbin/idea-app-data, !/usr/local/sbin/idea-app-data sync-peers, !/usr/local/sbin/idea-app-data sync-peers *, ' +
+                '!/usr/local/sbin/idea-app-data clear-peers, !/usr/local/sbin/idea-app-data clear-peers *, ' +
+                '/usr/local/sbin/idea-app-data sync-peers [A-Za-z0-9]* [1-9A-HJ-NP-Za-km-z]*',
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]',
             // read-only look for META.yaml before any rw mount (idea#201 §10 rule 1)
             'pi ALL=(root) NOPASSWD: /usr/bin/mount -t ext4 -o ro\\,noload /dev/sd[a-z][1-9] /disks/sd[a-z][1-9]',

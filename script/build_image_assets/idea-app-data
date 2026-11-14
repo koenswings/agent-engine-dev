@@ -42,7 +42,12 @@
 #   idea-app-data erase-slot       <slot> <stagingDir>   (TEST-ONLY: umount+mkfs+remount a loop-backed slot)
 #   idea-app-data put-files        <root> <id> <stagingDir>  (local Engine: copy basenames from staging into instance as root)
 #   Peer keys (the Engine, from its store):
-#   idea-app-data sync-peers   < "<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>" lines
+#   idea-app-data sync-peers   <engineId> <storeDocId> < "<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>" lines
+#                                    (v15, engine#376: the caller's own Engine id and store document id;
+#                                    owner stamp, never empties the files, quarantine copy before a change)
+#   idea-app-data clear-peers  <engineId> <storeDocId>
+#                                    (v15, engine#376: Ops only, by hand; the ONLY way to empty the peer
+#                                    files. 11-engine-files does not allow it for the Engine)
 #   idea-app-data install-usage-key <ipv4> ssh-ed25519 <base64>
 #                                    (v7, idea#412: write /etc/ssh/idea_usage_keys/pi with
 #                                    restrict,from="<ipv4>",command="/usr/local/sbin/idea-usage-export"
@@ -136,7 +141,25 @@
 # folder, and only when the content changed:
 #   /etc/ssh/idea_authorized_keys/pi   restrict,command="/usr/local/sbin/idea-peer-gate <id>" ssh-ed25519 <key> idea-peer:<id>
 #   /etc/idea/peer_known_hosts         <id> ssh-ed25519 <hostkey>   (HostKeyAlias=<id>)
-# The prefix is written here, never taken from the caller. An empty set empties both.
+# The prefix is written here, never taken from the caller.
+#
+# v15 (engine#376): the two peer files are host-wide (one pair per Pi), but every
+# Engine process used to rewrite them from ITS OWN store view, so a second Engine on
+# the Pi (a separate checkout, an isolated store, an empty peer set) emptied the
+# pool's keys. Now:
+#   - sync-peers <engineId> <storeDocId>: the caller names its own Engine id and
+#     store document id (bare id, no 'automerge:'). /etc/idea/peer-owner holds
+#     '<engineId> <storeDocId>' of the Engine that owns the files: the first v15
+#     sync-peers on the Pi records it; any other Engine id or store is refused
+#     with PEER_OWNER_MISMATCH and nothing changes. There is no automatic takeover:
+#     after a store change Ops moves /etc/idea/peer-owner aside by hand.
+#   - An empty stdin is refused with PEER_SHRINK_TO_EMPTY while either file still
+#     holds a peer line. A smaller, non-empty set is allowed (stale peers expire).
+#   - Before every swap that changes a file, the current files are copied to
+#     /etc/idea/.peer-quarantine/<UTC stamp>/ (root, 0700). Never deleted here.
+#   - clear-peers <engineId> <storeDocId> (Ops, by hand; not allowed for pi in
+#     11-engine-files) is the only way to empty the files: owner checked, quarantine
+#     copy first, journaled.
 # sshd reads the first file through /etc/ssh/sshd_config.d/10-idea-peer.conf
 # (AuthorizedKeysFile), installed by build-engine.
 # sync-peers must never touch /etc/ssh/idea_usage_keys (idea#412); that file is
@@ -156,7 +179,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=14
+readonly IDEA_APP_DATA_VERSION=15
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -222,6 +245,8 @@ LOCK_WAIT_SECONDS=600
 PEER_KEY=/home/pi/.ssh/idea_engine_ed25519
 PEER_KNOWN_HOSTS=/etc/idea/peer_known_hosts
 PEER_AUTH_DIR=/etc/ssh/idea_authorized_keys
+PEER_OWNER=/etc/idea/peer-owner
+PEER_QUARANTINE_DIR=/etc/idea/.peer-quarantine
 PEER_GATE=/usr/local/sbin/idea-peer-gate
 USAGE_EXPORT=/usr/local/sbin/idea-usage-export
 USAGE_EXPORT_CMD=/usr/local/sbin/idea-usage-export
@@ -254,6 +279,7 @@ RE_ENGINE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
 RE_VOL='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
 RE_APP='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
 RE_KEY64='AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}'
+RE_STORE_DOC='^[1-9A-HJ-NP-Za-km-z]{16,64}$'
 RE_PEER_LINE="^([A-Za-z0-9][A-Za-z0-9_.-]{0,127}) ssh-ed25519 ($RE_KEY64) ssh-ed25519 ($RE_KEY64)\$"
 
 RSYNC_OPTS=(-aHAX --numeric-ids -x --info=progress2 --no-inc-recursive)
@@ -870,6 +896,65 @@ swap_file() {   # swap_file <file> <content>
     echo updated
 }
 
+# ── Peer files: owner stamp, shrink guard, quarantine copy (v15, engine#376) ──
+check_store_doc() { [[ "$1" =~ $RE_STORE_DOC ]] || refuse "store document id '$(printf '%q' "${1:0:80}")' does not match $RE_STORE_DOC (a bare Automerge document id, no 'automerge:')"; }
+
+# Peer lines (not empty, not a '#' comment) in <file>; 0 when it does not exist.
+peer_line_count() {   # peer_line_count <file>
+    local n=0 line
+    [[ -f "$1" ]] || { echo 0; return 0; }
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" && "$line" != \#* ]] && n=$((n + 1))
+    done < "$1"
+    echo "$n"
+}
+
+# Sets OWNER_LINE to the recorded '<engineId> <storeDocId>' ('' when there is no
+# owner file yet) and refuses PEER_OWNER_MISMATCH when it is another Engine or store.
+check_peer_owner() {   # check_peer_owner <engineId> <storeDocId>
+    OWNER_LINE=""
+    if [[ -L "$PEER_OWNER" ]]; then refuse "peer owner file $PEER_OWNER is a symlink"; fi
+    [[ -e "$PEER_OWNER" ]] || return 0
+    [[ -f "$PEER_OWNER" ]] || refuse "peer owner file $PEER_OWNER is not a regular file"
+    local st uid gid mode
+    st=$(stat_fields "$PEER_OWNER") || refuse "cannot stat $PEER_OWNER"
+    read -r uid gid mode <<<"$st"
+    [[ "$uid" == "$ROOT_UID" ]] || refuse "peer owner file $PEER_OWNER must be owned by root (got uid $uid)"
+    no_group_other_write "$mode" || refuse "peer owner file $PEER_OWNER (mode 0$mode) must not be group or other writable"
+    local o_id o_store rest
+    IFS=' ' read -r o_id o_store rest < "$PEER_OWNER" || true
+    [[ "$o_id" =~ $RE_ENGINE && "$o_store" =~ $RE_STORE_DOC && -z "${rest:-}" ]] \
+        || refuse "peer owner file $PEER_OWNER is not one '<engineId> <storeDocId>' line; Ops must fix it by hand (engine#376)"
+    OWNER_LINE="$o_id $o_store"
+    if [[ "$o_id" != "$1" || "$o_store" != "$2" ]]; then
+        refuse "PEER_OWNER_MISMATCH: the peer files on this Pi belong to Engine $o_id in store $o_store ($PEER_OWNER), not to Engine $1 in store $2; nothing was changed. After a store change Ops moves $PEER_OWNER aside by hand (engine#376)"
+    fi
+}
+
+# Copy the current peer files (those that exist) to a new
+# $PEER_QUARANTINE_DIR/<UTC stamp>/ and echo that folder ('' when there was nothing).
+quarantine_peer_files() {
+    local any=0 dest
+    [[ -f "$PEER_AUTH_DIR/$REMOTE_USER" ]] && any=1
+    [[ -f "$PEER_KNOWN_HOSTS" ]] && any=1
+    (( any )) || { echo ""; return 0; }
+    root_dir "$PEER_QUARANTINE_DIR" 0700 "peer quarantine folder"
+    dest="$PEER_QUARANTINE_DIR/$($DATE -u +%Y%m%dT%H%M%S%NZ)"
+    $MKDIR -m 0700 -- "$dest" || refuse "cannot create $dest"
+    if [[ -f "$PEER_AUTH_DIR/$REMOTE_USER" ]]; then
+        $CP -p -- "$PEER_AUTH_DIR/$REMOTE_USER" "$dest/idea_authorized_keys-$REMOTE_USER" || refuse "cannot copy $PEER_AUTH_DIR/$REMOTE_USER to $dest"
+    fi
+    if [[ -f "$PEER_KNOWN_HOSTS" ]]; then
+        $CP -p -- "$PEER_KNOWN_HOSTS" "$dest/peer_known_hosts" || refuse "cannot copy $PEER_KNOWN_HOSTS to $dest"
+    fi
+    echo "$dest"
+}
+
+# 0 when <file> exists and holds exactly <content>.
+same_content() {   # same_content <file> <content>
+    [[ -f "$1" ]] && $CMP -s -- "$1" <(printf '%s' "$2")
+}
+
 # Ledger of instance folders a peer's receive created: '<epoch> <peerEngineId>
 # <root> <id>' lines in a root-only file. peer-delete and peer-receive-files need a
 # matching line younger than LEDGER_TTL_SECONDS; older lines are pruned on write.
@@ -1124,10 +1209,13 @@ case "$SUB" in
         ;;
 
     sync-peers)
-        need 0 $(($# - 1)) "none; the peer set comes on stdin"
+        need 2 $(($# - 1)) "<engineId> <storeDocId>; the peer set comes on stdin"
+        check_engine_id "$2"
+        check_store_doc "$3"
         root_dir "$PEER_AUTH_DIR" 0755 "authorized keys folder"
         root_dir "${PEER_KNOWN_HOSTS%/*}" 0755 "known hosts folder"
         take_locks peers
+        check_peer_owner "$2" "$3"
         AUTH="# Managed by idea-app-data sync-peers: peer Engine keys, each limited to $PEER_GATE."$'\n'"# Do not edit; the Engine rewrites this file from its store."$'\n'
         KNOWN="# Managed by idea-app-data sync-peers: peer Engine host keys by Engine id (HostKeyAlias)."$'\n'
         N=0
@@ -1145,10 +1233,52 @@ case "$SUB" in
             AUTH+="restrict,command=\"$PEER_GATE $P_ID\" ssh-ed25519 $P_KEY idea-peer:$P_ID"$'\n'
             KNOWN+="$P_ID ssh-ed25519 $P_HOST"$'\n'
         done
+        if (( N == 0 )); then
+            HAVE_AUTH=$(peer_line_count "$PEER_AUTH_DIR/$REMOTE_USER")
+            HAVE_KNOWN=$(peer_line_count "$PEER_KNOWN_HOSTS")
+            if (( HAVE_AUTH > 0 || HAVE_KNOWN > 0 )); then
+                refuse "PEER_SHRINK_TO_EMPTY: the peer set on stdin is empty, but $PEER_AUTH_DIR/$REMOTE_USER holds $HAVE_AUTH peer key(s) and $PEER_KNOWN_HOSTS $HAVE_KNOWN host key(s); sync-peers never empties them, nothing was changed. Only Ops empties them, by hand: idea-app-data clear-peers $2 $3 (engine#376)"
+            fi
+        fi
+        QDEST=""
+        if ! same_content "$PEER_KNOWN_HOSTS" "$KNOWN" || ! same_content "$PEER_AUTH_DIR/$REMOTE_USER" "$AUTH"; then
+            QDEST=$(quarantine_peer_files) || exit $?
+        fi
         R_KNOWN=$(swap_file "$PEER_KNOWN_HOSTS" "$KNOWN") || exit $?
         R_AUTH=$(swap_file "$PEER_AUTH_DIR/$REMOTE_USER" "$AUTH") || exit $?
-        echo "sync-peers: $N peer(s); authorized_keys $R_AUTH; known_hosts $R_KNOWN"
-        journal "sync-peers: $N peer(s); authorized_keys $R_AUTH; known_hosts $R_KNOWN; peers=[${SEEN_IDS# }]"
+        OWNER_NOTE=""
+        if [[ -z "$OWNER_LINE" ]]; then
+            R_OWNER=$(swap_file "$PEER_OWNER" "$2 $3"$'\n') || exit $?
+            OWNER_NOTE="; owner $2 $3 recorded"
+        fi
+        Q_NOTE=""
+        [[ -n "$QDEST" ]] && Q_NOTE="; previous files copied to $QDEST"
+        echo "sync-peers: $N peer(s); authorized_keys $R_AUTH; known_hosts $R_KNOWN$OWNER_NOTE$Q_NOTE"
+        journal "sync-peers: $N peer(s); authorized_keys $R_AUTH; known_hosts $R_KNOWN; peers=[${SEEN_IDS# }]; caller=$2 $3$OWNER_NOTE$Q_NOTE"
+        ;;
+
+    clear-peers)
+        need 2 $(($# - 1)) "<engineId> <storeDocId> (Ops only, by hand)"
+        check_engine_id "$2"
+        check_store_doc "$3"
+        root_dir "$PEER_AUTH_DIR" 0755 "authorized keys folder"
+        root_dir "${PEER_KNOWN_HOSTS%/*}" 0755 "known hosts folder"
+        take_locks peers
+        check_peer_owner "$2" "$3"
+        HAVE_AUTH=$(peer_line_count "$PEER_AUTH_DIR/$REMOTE_USER")
+        HAVE_KNOWN=$(peer_line_count "$PEER_KNOWN_HOSTS")
+        AUTH="# Managed by idea-app-data sync-peers: peer Engine keys, each limited to $PEER_GATE."$'\n'"# Do not edit; the Engine rewrites this file from its store."$'\n'"# Emptied by idea-app-data clear-peers (Ops)."$'\n'
+        KNOWN="# Managed by idea-app-data sync-peers: peer Engine host keys by Engine id (HostKeyAlias)."$'\n'"# Emptied by idea-app-data clear-peers (Ops)."$'\n'
+        QDEST=""
+        if ! same_content "$PEER_KNOWN_HOSTS" "$KNOWN" || ! same_content "$PEER_AUTH_DIR/$REMOTE_USER" "$AUTH"; then
+            QDEST=$(quarantine_peer_files) || exit $?
+        fi
+        R_KNOWN=$(swap_file "$PEER_KNOWN_HOSTS" "$KNOWN") || exit $?
+        R_AUTH=$(swap_file "$PEER_AUTH_DIR/$REMOTE_USER" "$AUTH") || exit $?
+        Q_NOTE=""
+        [[ -n "$QDEST" ]] && Q_NOTE="; previous files copied to $QDEST"
+        echo "clear-peers: removed $HAVE_AUTH peer key(s) and $HAVE_KNOWN host key(s); authorized_keys $R_AUTH; known_hosts $R_KNOWN$Q_NOTE"
+        journal "clear-peers: by ${SUDO_USER:-root} for Engine $2 store $3: removed $HAVE_AUTH peer key(s) and $HAVE_KNOWN host key(s); authorized_keys $R_AUTH; known_hosts $R_KNOWN$Q_NOTE"
         ;;
 
     install-usage-key)
@@ -1889,7 +2019,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, clear-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

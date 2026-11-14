@@ -22,7 +22,7 @@ import os from 'os'
 import type { Store } from '../../src/data/Store.js'
 import {
     computePeerSet, peerSetInput, describePeerChanges, peerCopyRefusal, authorizedEntry,
-    ensurePeerKey, readHostKey, publishPeerAccess, PeerAccessController, startPeerAccess,
+    ensurePeerKey, readHostKey, publishPeerAccess, PeerAccessController, startPeerAccess, peerAccessModeFor,
     peerAccessProblem, setPeerAccessProblem, PEER_STALE_MS, PEER_SET_MAX, PeerLine,
 } from '../../src/data/PeerAccess.js'
 import {
@@ -37,6 +37,9 @@ import { peerAccessEnabled, peerStaleMs, PEER_STALE_HOURS_DEFAULT } from '../../
 import { testKey } from '../harness/peerKeys.js'
 
 const DAY = 24 * 60 * 60 * 1000
+/** A known fleet store (the dev pool) and an isolated one (engine#376). */
+const DOC = '2VroEUvDkmYsDAwE5oG9YeFNadWH'
+const OTHER_DOC = '4uXisoLatedStore1111abcdefg'
 const T0 = Date.UTC(2026, 9, 6, 12, 0, 0)
 
 let tmp: string
@@ -283,16 +286,21 @@ describe('publishPeerAccess', () => {
 
 // ── the controller ───────────────────────────────────────────────────────────
 
+/** A fake helper: answers `version` (v15 unless set), records every other call. */
 const recorder = () => {
     const calls: { args: string[], input: string }[] = []
+    const versions: string[] = []
     let fail: string | null = null
+    let version = 'idea-app-data 15'
     const run = async (args: string[], input: string) => {
+        if (args[0] === 'version') { versions.push(version); return `${version}\n` }
         calls.push({ args, input })
         if (fail) throw new Error(fail)
         return `sync-peers: ${input.split('\n').filter(Boolean).length} peer(s); authorized_keys updated; known_hosts updated`
     }
-    return { calls, run, setFail: (f: string | null) => { fail = f } }
+    return { calls, versions, run, setFail: (f: string | null) => { fail = f }, setVersion: (v: string) => { version = v } }
 }
+const SYNC_ARGS = ['sync-peers', 'ENGINE_me', DOC]
 
 describe('PeerAccessController', () => {
     let clock: number
@@ -301,7 +309,7 @@ describe('PeerAccessController', () => {
     let hostKeyPath: string
     let keyPath: string
     const make = (h: DocHandle<Store>, mode: 'on' | 'fail-closed' | 'off' = 'on', extra: Record<string, unknown> = {}) =>
-        new PeerAccessController(h, 'ENGINE_me', { mode, run: rec.run, now: () => clock, keyPath, hostKeyPath, debounceMs: 20, logger: l => said.push(l), ...extra })
+        new PeerAccessController(h, 'ENGINE_me', { mode, run: rec.run, storeDocId: DOC, now: () => clock, keyPath, hostKeyPath, debounceMs: 20, logger: l => said.push(l), ...extra })
     const me = (h: DocHandle<Store>) => (h.doc().engineDB as any).ENGINE_me
     const text = () => said.join('\n')
 
@@ -321,7 +329,7 @@ describe('PeerAccessController', () => {
         expect(normaliseEd25519(mine.sshKey)).toBe(mine.sshKey)
         expect(mine.hostKey).toBe(testKey('me-host'))
         expect(mine.publishedAt).toBe(T0)
-        expect(rec.calls).toEqual([{ args: ['sync-peers'], input: `ENGINE_b ${testKey('b-ssh')} ${testKey('b-host')}\nENGINE_c ${testKey('c-ssh')} ${testKey('c-host')}\n` }])
+        expect(rec.calls).toEqual([{ args: SYNC_ARGS, input: `ENGINE_b ${testKey('b-ssh')} ${testKey('b-host')}\nENGINE_c ${testKey('c-ssh')} ${testKey('c-host')}\n` }])
         expect([...mine.authorized]).toEqual([authorizedEntry('ENGINE_b', pa('b')), authorizedEntry('ENGINE_c', pa('c'))])
         expect(text()).toMatch(/peer access: published this Engine's key SHA256:/)
         expect(text()).toMatch(/peer key added: Engine ENGINE_b/)
@@ -366,17 +374,84 @@ describe('PeerAccessController', () => {
         expect(rec.calls[2].input.split('\n').filter(Boolean).length).toBe(2)
     })
 
-    it('a deleted Engine entry drops out (store change, debounced); the set going to 0 is logged', async () => {
-        const h = newHandle({ ENGINE_me: eng('ENGINE_me'), ENGINE_b: eng('ENGINE_b', { peerAccess: pa('b') }) })
+    it('engine#376: the last peer dropping out never calls sync-peers with an empty set; the host files are kept, loudly', async () => {
+        const h = newHandle({ ENGINE_me: eng('ENGINE_me'), ENGINE_b: eng('ENGINE_b', { peerAccess: pa('b') }), ENGINE_c: eng('ENGINE_c', { peerAccess: pa('c') }) })
         const c = make(h)
         await c.start()
-        h.change(d => { delete (d.engineDB as any).ENGINE_b })
+        h.change(d => { delete (d.engineDB as any).ENGINE_c })   // N -> N-1 > 0: synced as before
         await new Promise(r => setTimeout(r, 100))
         await c.syncNow()
+        expect(rec.calls.map(x => x.input)).toEqual([
+            `ENGINE_b ${testKey('b-ssh')} ${testKey('b-host')}\nENGINE_c ${testKey('c-ssh')} ${testKey('c-host')}\n`,
+            `ENGINE_b ${testKey('b-ssh')} ${testKey('b-host')}\n`,
+        ])
+        h.change(d => { delete (d.engineDB as any).ENGINE_b })   // 1 -> 0: NOT synced
+        await new Promise(r => setTimeout(r, 100))
+        await c.syncNow()
+        await c.onHeartbeat()
         c.stop()
-        expect(rec.calls.map(x => x.input)).toEqual([`ENGINE_b ${testKey('b-ssh')} ${testKey('b-host')}\n`, ''])
-        expect(text()).toMatch(/peer key removed: Engine ENGINE_b .*its Engine entry or peer key is gone/)
-        expect(text()).toMatch(/the peer set went from 1 to 0/)
+        expect(rec.calls.length).toBe(2)
+        expect(rec.calls.every(x => x.input !== '')).toBe(true)
+        expect(text()).toMatch(/peer access: the peer set in this Engine's store is empty \(it went from 1 to 0: store reset, or every peer stale\/removed\); NOT calling sync-peers, the peer keys already on this Pi are kept as they are\. Only Ops empties them, by hand, with idea-app-data clear-peers \(engine#376\)/)
+        expect(text()).toMatch(/peer key removed: Engine ENGINE_b .*its Engine entry or peer key is gone.*\(in this Engine's store; the host files are unchanged\)/)
+        // what it listed as authorized is still what the host files hold
+        expect([...me(h).peerAccess.authorized]).toEqual([authorizedEntry('ENGINE_b', pa('b'))])
+        expect(said.filter(l => /is empty/.test(l)).length).toBe(1)   // said once, not on every heartbeat
+        // a peer coming back is synced again
+        h.change(d => { (d.engineDB as any).ENGINE_b = eng('ENGINE_b', { peerAccess: pa('b'), lastRun: clock }) })
+        await c.syncNow()
+        expect(rec.calls.length).toBe(3)
+    })
+
+    it('engine#376: a fresh store with no other live peer never calls sync-peers (lastInput null at start)', async () => {
+        const h = newHandle({ ENGINE_me: eng('ENGINE_me'), ENGINE_old: eng('ENGINE_old', { peerAccess: pa('old'), lastRun: T0 - 8 * DAY }) })
+        const c = make(h)
+        await c.start()
+        await c.onHeartbeat()
+        c.stop()
+        expect(rec.calls).toEqual([])
+        expect(text()).toMatch(/the peer set in this Engine's store is empty; NOT calling sync-peers/)
+        expect(me(h).peerAccess.sshKey).toBeTruthy()   // the key is still published
+    })
+
+    it('engine#376: below helper v15 sync-peers is never called (HELPER_OUTDATED, logged once); after the update it syncs', async () => {
+        const h = newHandle({ ENGINE_me: eng('ENGINE_me'), ENGINE_b: eng('ENGINE_b', { peerAccess: pa('b') }) })
+        rec.setVersion('idea-app-data 14')
+        const c = make(h)
+        await c.start()
+        await c.onHeartbeat()
+        c.stop()
+        expect(rec.calls).toEqual([])
+        expect(said.filter(l => /HELPER_OUTDATED/.test(l))).toHaveLength(1)
+        expect(text()).toMatch(/peer access: HELPER_OUTDATED: Peer access \(sync-peers with the owner check and shrink guard, engine#376\) needs the app-data root helper \/usr\/local\/sbin\/idea-app-data v15 or later, but the installed one reports 'idea-app-data 14'; .* Not calling sync-peers; the peer keys already on this Pi are kept as they are \(engine#376\)\./)
+        expect([...me(h).peerAccess.authorized]).toEqual([])
+        rec.setVersion('idea-app-data 15')
+        await c.onHeartbeat()
+        expect(rec.calls).toEqual([{ args: SYNC_ARGS, input: `ENGINE_b ${testKey('b-ssh')} ${testKey('b-host')}\n` }])
+        expect([...me(h).peerAccess.authorized]).toEqual([authorizedEntry('ENGINE_b', pa('b'))])
+        await c.onHeartbeat()
+        expect(rec.versions.length).toBe(3)   // checked until it passed, then not again
+    })
+
+    it('engine#376: without a valid store document id sync-peers is never called', async () => {
+        const h = newHandle({ ENGINE_me: eng('ENGINE_me'), ENGINE_b: eng('ENGINE_b', { peerAccess: pa('b') }) })
+        const c = make(h, 'on', { storeDocId: undefined })
+        await c.start()
+        c.stop()
+        expect(rec.calls).toEqual([])
+        expect(text()).toMatch(/store document id '\(none\)' is not one sync-peers accepts; not calling sync-peers/)
+    })
+
+    it('engine#376: a PEER_OWNER_MISMATCH refusal is logged loudly once, not on every retry', async () => {
+        const h = newHandle({ ENGINE_me: eng('ENGINE_me'), ENGINE_b: eng('ENGINE_b', { peerAccess: pa('b') }) })
+        rec.setFail('idea-app-data sync-peers refused: PEER_OWNER_MISMATCH: the peer files on this Pi belong to Engine ENGINE_pool in store x')
+        const c = make(h)
+        await c.start()
+        await c.onHeartbeat()
+        await c.onHeartbeat()
+        c.stop()
+        expect(rec.calls.length).toBe(3)
+        expect(said.filter(l => /PEER_OWNER_MISMATCH/.test(l))).toHaveLength(1)
         expect([...me(h).peerAccess.authorized]).toEqual([])
     })
 
@@ -432,19 +507,20 @@ describe('PeerAccessController', () => {
         expect(peerAccessProblem()).toMatch(/no readable ed25519 ssh host key/)
     })
 
-    it('fail-closed: removes this Engine\'s key from the store, authorizes nobody, keeps it that way on heartbeats', async () => {
+    it('fail-closed: removes this Engine\'s key from the store, never touches the host peer files (engine#376), keeps it that way on heartbeats', async () => {
         const h = newHandle({ ENGINE_me: eng('ENGINE_me', { peerAccess: pa('me') }), ENGINE_b: eng('ENGINE_b', { peerAccess: pa('b') }) })
         const c = make(h, 'fail-closed', { reason: 'store-url.txt was missing' })
         await c.start()
+        await c.syncNow()
         expect(me(h).peerAccess).toBeNull()
-        expect(rec.calls).toEqual([{ args: ['sync-peers'], input: '' }])
-        expect(text()).toMatch(/PEER ACCESS FAIL-CLOSED: store-url.txt was missing\. This Engine publishes no Engine key and authorizes no peer\./)
+        expect(rec.calls).toEqual([])   // engine#376: no empty sync-peers; the keys on the Pi stay
+        expect(text()).toMatch(/PEER ACCESS FAIL-CLOSED: store-url.txt was missing\. This Engine publishes no Engine key and authorizes no new peer; the peer keys already on this Pi are kept as they are \(engine#376\)\./)
         expect(peerAccessProblem()).toBe('store-url.txt was missing')
         expect(await fs.pathExists(keyPath)).toBe(false)
         h.change(d => { (d.engineDB as any).ENGINE_me.peerAccess = pa('me') })
         await c.onHeartbeat()
         expect(me(h).peerAccess).toBeNull()
-        expect(rec.calls.length).toBe(1)
+        expect(rec.calls.length).toBe(0)
     })
 
     it('off (dev/test, or settings.peerAccess=false): no key, no publish, no helper call', async () => {
@@ -454,6 +530,33 @@ describe('PeerAccessController', () => {
         expect(c.mode).toBe('off')
         expect(me(h).peerAccess).toBeUndefined()
         expect(peerAccessProblem()).toMatch(/peer access is off on this machine/)
+    })
+
+    it('engine#376: host-file mode is on only for a known fleet store, never in testMode or with IDEA_WATCH_DIR', () => {
+        const base = { enabled: true, fallbackStore: false }
+        expect(peerAccessModeFor({ ...base, storeDocId: DOC })).toEqual({ mode: 'on' })
+        expect(peerAccessModeFor({ ...base, storeDocId: `automerge:${DOC}` })).toEqual({ mode: 'on' })
+        expect(peerAccessModeFor({ ...base, storeDocId: OTHER_DOC })).toEqual({ mode: 'off', reason: `this Engine's store automerge:${OTHER_DOC} is not a known fleet store, so it never rewrites this Pi's host-wide peer files (engine#376)` })
+        expect(peerAccessModeFor({ ...base })).toMatchObject({ mode: 'off', reason: expect.stringMatching(/store \(unknown\) is not a known fleet store/) })
+        expect(peerAccessModeFor({ ...base, storeDocId: DOC, testMode: true })).toEqual({ mode: 'off', reason: `testMode is on, so this Engine never rewrites this Pi's host-wide peer files (engine#376)` })
+        expect(peerAccessModeFor({ ...base, storeDocId: DOC, watchDirSet: true })).toEqual({ mode: 'off', reason: `IDEA_WATCH_DIR is set, so this Engine never rewrites this Pi's host-wide peer files (engine#376)` })
+        expect(peerAccessModeFor({ ...base, storeDocId: DOC, fallbackStore: true }).mode).toBe('fail-closed')
+        expect(peerAccessModeFor({ ...base, enabled: false, storeDocId: DOC }).mode).toBe('off')
+    })
+
+    it('engine#376: startPeerAccess with a non-fleet store, testMode or IDEA_WATCH_DIR never calls the helper and publishes no key', async () => {
+        for (const extra of [{ storeDocId: OTHER_DOC }, { storeDocId: DOC, testMode: true }, { storeDocId: DOC, watchDirSet: true }]) {
+            const h = newHandle({ ENGINE_me: eng('ENGINE_me'), ENGINE_b: eng('ENGINE_b', { peerAccess: pa('b') }) })
+            const c = await startPeerAccess(h, 'ENGINE_me', { enabled: true, fallbackStore: false, run: rec.run, logger: l => said.push(l), keyPath, hostKeyPath, ...extra })
+            await c.onHeartbeat()
+            await c.syncNow()
+            c.stop()
+            expect(c.mode).toBe('off')
+            expect(me(h).peerAccess).toBeUndefined()
+            expect(peerAccessProblem()).toMatch(/never rewrites this Pi's host-wide peer files \(engine#376\)/)
+        }
+        expect(rec.calls).toEqual([])
+        expect(rec.versions).toEqual([])
     })
 })
 
@@ -508,7 +611,7 @@ describe('two-engine store simulation (per-Pi keys exchanged through the store)'
         await fs.writeFile(path.join(sbA.tmp, 'host.pub'), `${testKey('a-host')} root@idea-a\n`)
         await fs.writeFile(path.join(sbB.tmp, 'host.pub'), `${testKey('b-host')} root@idea-b\n`)
         const ctl = (h: DocHandle<Store>, id: string, sb: AppDataSandbox) => new PeerAccessController(h, id, {
-            mode: 'on', run: helperRunner(sb), now: () => clock, debounceMs: 10,
+            mode: 'on', run: helperRunner(sb), storeDocId: DOC, now: () => clock, debounceMs: 10,
             keyPath: path.join(sb.tmp, 'pi-ssh', 'idea_engine_ed25519'), hostKeyPath: path.join(sb.tmp, 'host.pub'),
             logger: l => said.push(`${id}: ${l}`),
         })
@@ -562,12 +665,103 @@ describe('two-engine store simulation (per-Pi keys exchanged through the store)'
         expect(await authLine(sbA, 'ENGINE_b')).toContain(normaliseEd25519(keyB2)!)
         expect(peerCopyRefusal(hB.doc(), 'ENGINE_b', 'ENGINE_a')).toBeNull()
 
-        // B goes away for 8 days: A drops its key at a heartbeat
+        // B goes away for 8 days: A's store set goes to 0, but A never empties its host
+        // files (engine#376); only Ops does, with clear-peers
         clock = T0 + 8 * DAY
         hA.change(d => { (d.engineDB as any).ENGINE_a.lastRun = clock })
+        const before = await fs.readFile(sbA.peerAuthFile, 'utf8')
         await a.onHeartbeat()
-        expect(await authIds(sbA)).toEqual([])
-        expect(await known(sbA)).toEqual([])
-        expect(said.join('\n')).toMatch(/ENGINE_a: peer access: peer key removed: Engine ENGINE_b .*stale: no heartbeat for 8 days/)
+        expect(await authIds(sbA)).toEqual(['ENGINE_b'])
+        expect(await fs.readFile(sbA.peerAuthFile, 'utf8')).toBe(before)
+        expect(said.join('\n')).toMatch(/ENGINE_a: peer access: peer key removed: Engine ENGINE_b .*stale: no heartbeat for 8 days \(in this Engine's store; the host files are unchanged\)/)
+        expect(said.join('\n')).toMatch(/ENGINE_a: .*NOT calling sync-peers, the peer keys already on this Pi are kept as they are/)
     }, 60_000)
+})
+
+// ── engine#376 reproduction: a second Engine on a pool Pi (mocked helper) ───
+
+describe('engine#376: a second Engine on a pool Pi never empties or rewrites the host peer files', () => {
+    let sb: AppDataSandbox
+    let said: string[]
+    let calls: { args: string[], input: string }[]
+    let clock: number
+    beforeEach(async () => {
+        sb = await makeAppDataSandbox(); said = []; calls = []; clock = T0
+        await fs.writeFile(path.join(sb.tmp, 'host.pub'), `${testKey('pi-host')} root@idea03\n`)
+    })
+    afterEach(async () => { await fs.remove(sb.tmp) })
+
+    /** The sandboxed real helper (fake /etc paths), every call counted. */
+    const helper = async (args: string[], input: string) => {
+        if (args[0] !== 'version') calls.push({ args, input })
+        const r = await sb.run(args, { FAKE_STDIN: input })
+        if (r.exitCode !== 0) throw new Error(`idea-app-data ${args[0]} exited with code ${r.exitCode}: ${r.stderr.trim()}`)
+        return r.stdout
+    }
+    const keyOpts = (who: string) => ({ keyPath: path.join(sb.tmp, `${who}-ssh`, 'idea_engine_ed25519'), hostKeyPath: path.join(sb.tmp, 'host.pub') })
+    const snapshot = async () => ({
+        auth: await fs.readFile(sb.peerAuthFile, 'utf8'), kh: await fs.readFile(sb.peerKnownHosts, 'utf8'),
+        owner: await fs.readFile(sb.peerOwner, 'utf8'), authIno: (await fs.stat(sb.peerAuthFile)).ino,
+        quarantine: (await fs.pathExists(sb.peerQuarantineDir)) ? (await fs.readdir(sb.peerQuarantineDir)).length : 0,
+    })
+
+    /** The pool Engine (fleet store, two live peers) writes the Pi's files first. */
+    const poolEngine = async () => {
+        const h = newHandle({ ENGINE_pool: eng('ENGINE_pool'), ENGINE_b: eng('ENGINE_b', { peerAccess: pa('b') }), ENGINE_c: eng('ENGINE_c', { peerAccess: pa('c') }) })
+        const c = await startPeerAccess(h, 'ENGINE_pool', { enabled: true, fallbackStore: false, storeDocId: DOC, now: () => clock, run: helper, logger: l => said.push(`pool: ${l}`), ...keyOpts('pool') })
+        c.stop()
+        expect(c.mode).toBe('on')
+        expect(calls).toEqual([{ args: ['sync-peers', 'ENGINE_pool', DOC], input: expect.stringMatching(/^ENGINE_b .*\nENGINE_c .*\n$/) }])
+        expect((await fs.readFile(sb.peerAuthFile, 'utf8')).split('\n').filter(l => l.startsWith('restrict,'))).toHaveLength(2)
+        calls = []
+        return snapshot()
+    }
+
+    it('isolated store (Atlas idea#498 option A): mode off, the helper is never called, the files are byte-identical', async () => {
+        const before = await poolEngine()
+        const h2 = newHandle({ ENGINE_pool: eng('ENGINE_pool') })   // separate checkout: only itself, no peers
+        const second = await startPeerAccess(h2, 'ENGINE_pool', { enabled: true, fallbackStore: false, storeDocId: OTHER_DOC, now: () => clock, run: helper, logger: l => said.push(`second: ${l}`), ...keyOpts('second') })
+        await second.onHeartbeat(); await second.syncNow(); second.stop()
+        expect(second.mode).toBe('off')
+        expect(calls).toEqual([])
+        expect(await snapshot()).toEqual(before)
+    })
+
+    it('fleet store, but an empty peer set in its own store view: sync-peers is never called, the files are byte-identical', async () => {
+        const before = await poolEngine()
+        const h2 = newHandle({ ENGINE_pool: eng('ENGINE_pool') })
+        const second = await startPeerAccess(h2, 'ENGINE_pool', { enabled: true, fallbackStore: false, storeDocId: DOC, now: () => clock, run: helper, logger: l => said.push(`second: ${l}`), ...keyOpts('second') })
+        await second.onHeartbeat(); await second.syncNow(); second.stop()
+        expect(second.mode).toBe('on')
+        expect(calls).toEqual([])
+        expect(await snapshot()).toEqual(before)
+        expect(said.join('\n')).toMatch(/second: .*the peer set in this Engine's store is empty; NOT calling sync-peers/)
+    })
+
+    it('another Engine id (or store) with a non-empty set: the helper refuses PEER_OWNER_MISMATCH, the files are byte-identical', async () => {
+        const before = await poolEngine()
+        const h2 = newHandle({ ENGINE_dev: eng('ENGINE_dev'), ENGINE_x: eng('ENGINE_x', { peerAccess: pa('x') }) })
+        const second = await startPeerAccess(h2, 'ENGINE_dev', { enabled: true, fallbackStore: false, storeDocId: DOC, now: () => clock, run: helper, logger: l => said.push(`second: ${l}`), ...keyOpts('second') })
+        await second.onHeartbeat(); second.stop()
+        expect(calls.map(c => c.args)).toEqual([['sync-peers', 'ENGINE_dev', DOC], ['sync-peers', 'ENGINE_dev', DOC]])
+        expect(await snapshot()).toEqual(before)
+        expect(said.filter(l => /second: .*PEER_OWNER_MISMATCH: the peer files on this Pi belong to Engine ENGINE_pool/.test(l))).toHaveLength(1)
+    })
+
+    it('fail-closed second Engine: never calls the helper, the files are byte-identical', async () => {
+        const before = await poolEngine()
+        const h2 = newHandle({ ENGINE_pool: eng('ENGINE_pool'), ENGINE_b: eng('ENGINE_b', { peerAccess: pa('b') }) })
+        const second = await startPeerAccess(h2, 'ENGINE_pool', { enabled: true, fallbackStore: true, storeDocId: DOC, now: () => clock, run: helper, logger: l => said.push(`second: ${l}`), ...keyOpts('second') })
+        await second.onHeartbeat(); await second.syncNow(); second.stop()
+        expect(second.mode).toBe('fail-closed')
+        expect(calls).toEqual([])
+        expect(await snapshot()).toEqual(before)
+    })
+
+    it('and even an old-style empty call that reaches the helper is refused (PEER_SHRINK_TO_EMPTY), the files are byte-identical', async () => {
+        const before = await poolEngine()
+        await expect(helper(['sync-peers', 'ENGINE_pool', DOC], '')).rejects.toThrow(/PEER_SHRINK_TO_EMPTY/)
+        await expect(helper(['sync-peers'], '')).rejects.toThrow(/sync-peers takes exactly 2 argument/)
+        expect(await snapshot()).toEqual(before)
+    })
 })
