@@ -7,7 +7,7 @@ import { createHash } from 'node:crypto'
 import { fs, path, os } from 'zx'
 import {
     parsePackJson, PackVerifyError, verifyExtractedPack, verifyTarSha256, extractPackTar,
-    sha256File, pickBestLocalPack, scanIdeaDemoDir, readAppDemoSpec, spaceNeededBytes,
+    sha256File, pickBestLocalPack, scanIdeaDemoDir, ideaDemoTarName, readAppDemoSpec, spaceNeededBytes,
 } from '../../src/data/DemoPack.js'
 import { stepPlan } from '../../src/data/DemoApps.js'
 
@@ -140,6 +140,43 @@ describe('source selection', () => {
         const found = await scanIdeaDemoDir(idea, 'kolibri', 0, null)
         expect(found).toEqual([])
         expect(pickBestLocalPack(found, null)).toBeNull()
+    })
+
+    it('a nextcloud-only stick is not offered to kolibri; each app picks only its own tar when both are present', async () => {
+        expect(ideaDemoTarName('kolibri', 'idea-demo-kolibri-v4.tar')).toBe(4)
+        expect(ideaDemoTarName('kolibri', 'idea-demo-nextcloud-v1.tar')).toBeNull()
+        expect(ideaDemoTarName('nextcloud', 'idea-demo-nextcloud-v1.tar')).toBe(1)
+
+        const idea = path.join(tmp, 'IDEA-DEMO')
+        await fs.ensureDir(idea)
+        const { $ } = await import('zx')
+        const makeTar = async (app: 'kolibri' | 'nextcloud', ver: number, file: string) => {
+            const root = path.join(tmp, `${app}-v${ver}`)
+            await fs.outputFile(path.join(root, 'CREDITS.txt'), 'thanks\n')
+            await fs.outputFile(path.join(root, 'pack.json'), JSON.stringify(packDoc({ app, packVersion: ver }), null, 2))
+            const tar = path.join(idea, file)
+            await $`tar -cf ${tar} -C ${root} pack.json CREDITS.txt`
+            return tar
+        }
+        const ncOnly = path.join(idea, 'idea-demo-nextcloud-v1.tar')
+        await makeTar('nextcloud', 1, 'idea-demo-nextcloud-v1.tar')
+        const kolibriOnNcStick = await scanIdeaDemoDir(idea, 'kolibri', 0, null)
+        expect(kolibriOnNcStick).toEqual([])
+        expect(pickBestLocalPack(kolibriOnNcStick, null)).toBeNull()
+        const nextcloudOnNcStick = await scanIdeaDemoDir(idea, 'nextcloud', 0, null)
+        expect(nextcloudOnNcStick).toHaveLength(1)
+        expect(nextcloudOnNcStick[0].path).toBe(ncOnly)
+        expect(nextcloudOnNcStick[0].packVersion).toBe(1)
+
+        const kTar = await makeTar('kolibri', 4, 'idea-demo-kolibri-v4.tar')
+        const kFound = await scanIdeaDemoDir(idea, 'kolibri', 0, null)
+        const nFound = await scanIdeaDemoDir(idea, 'nextcloud', 0, null)
+        expect(kFound.map(f => path.basename(f.path))).toEqual(['idea-demo-kolibri-v4.tar'])
+        expect(nFound.map(f => path.basename(f.path))).toEqual(['idea-demo-nextcloud-v1.tar'])
+        expect(pickBestLocalPack(kFound, null)?.path).toBe(kTar)
+        expect(pickBestLocalPack(nFound, null)?.path).toBe(ncOnly)
+        expect(pickBestLocalPack(kFound, null)?.packVersion).toBe(4)
+        expect(pickBestLocalPack(nFound, null)?.packVersion).toBe(1)
     })
 })
 
