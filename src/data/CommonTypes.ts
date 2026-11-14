@@ -82,6 +82,8 @@ export type OperationKind =
   // idea#201 §10 (client cards)
   | 'flashCard'
   | 'initialiseDisk'
+  | 'setupDemo'     // engine#369
+  | 'removeDemo'    // engine#369
 
 /**
  * What triggered an operation.
@@ -171,6 +173,8 @@ export interface Operation {
   safeToRemove?: boolean
   /** cross-Engine moveApp only (idea#79): steps, verify verdict, result. See MoveAppShapes.ts. */
   move?: import('./MoveAppShapes.js').MoveProgress
+  /** setupDemo / removeDemo only (engine#369): per-app steps and codes. See DemoApps.ts. */
+  demo?: import('./DemoApps.js').DemoProgress
 }
 
 // References to top-level YMaps and YArrays in the Yjs document

@@ -103,6 +103,9 @@ export const validate = async (
     }
     if (!found.ok) return `Instance '${instanceName}' not found`
     const instance = found.instance
+    if ((instance as any).demo === true) {
+        return `NOT_DEMO: cannot ${kind} a demo instance (${instance.id}); demo instances are not copied or moved`
+    }
     if (found.via === 'name-on-disk') {
         console.warn(`Instance name '${instanceName}' is shared by several instances; using ${instance.id}, the one on disk ${sourceDiskId}. Send the instance id.`)
     }

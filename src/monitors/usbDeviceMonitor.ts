@@ -686,6 +686,15 @@ export type StartupDockDeps = {
  * mounts, unmounts or writes the device: it is not (or not known to be) that
  * disk, and may be the OS boot partition. Returns the ids changed.
  */
+
+const refreshDemoHbQuiet = (storeHandle: DocHandle<Store>, engineId?: string): void => {
+    void import('../data/DemoApps.js').then(async m => {
+        const { getLocalEngine } = await import('../data/Store.js')
+        const id = engineId ?? (getLocalEngine(storeHandle.doc())?.id as string | undefined)
+        if (id) await m.refreshDemoHb(storeHandle, String(id))
+    }).catch((e: any) => log(`demo hb: ${e?.message ?? e}`))
+}
+
 export const undockRecordsStoreOnly = (storeHandle: DocHandle<Store>, engineId: EngineID, device: DeviceName, diskIds: DiskID[], reason: string): DiskID[] => {
     const changed: DiskID[] = []
     if (diskIds.length === 0) return changed
@@ -712,6 +721,7 @@ export const undockRecordsStoreOnly = (storeHandle: DocHandle<Store>, engineId: 
         }
     })
     if (changed.length) log(`Undocked stale disk record(s) ${changed.join(', ')} on ${device} in the store only (${reason}); ${device} was not mounted, unmounted or written`)
+    if (changed.length) refreshDemoHbQuiet(storeHandle, String(engineId))
     return changed
 }
 
@@ -818,7 +828,10 @@ const liveMountChangedReason = async (device: string): Promise<string | null> =>
 
 export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean } = {}): Promise<UndockResult | void> => {
     markUndockPending(String(disk.id))
-    try { return await undockDiskInner(storeHandle, disk, opts) } finally { clearUndockPending(String(disk.id)) }
+    try { return await undockDiskInner(storeHandle, disk, opts) } finally {
+        clearUndockPending(String(disk.id))
+        refreshDemoHbQuiet(storeHandle)
+    }
 }
 
 const undockDiskInner = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean }): Promise<UndockResult> => {

@@ -294,6 +294,17 @@ export interface Instance {
   updateAvailable?: UpdateAvailable | null;
   /** App ID before the last successful updateApp ("Updated from 0.15.5", idea#76); null/absent otherwise. */
   previousAppId?: AppID | null;
+  /** True only for a setupDemo instance (engine#369); mirrored from compose.yaml x-app.demo. Present only when true, never false. */
+  demo?: true;
+  /** On-disk demo pack is older than the running bundle's demo.pack.minVersion (engine#369). Set by updateApp, cleared by setupDemo. */
+  demoPackWarning?: DemoPackWarning | null;
+}
+
+/** engine#369 addendum decision 5 / contract: warning only, no auto-download. */
+export interface DemoPackWarning {
+  code: 'PACK_OUTDATED'
+  packVersion: number
+  minVersion: number
 }
 
 export interface UpdateAvailable {
@@ -758,6 +769,19 @@ export const extractAppName = (instanceId: InstanceID): InstanceName => {
   return instanceId.split('-')[0] as InstanceName
 }
 
+
+/** engine#369: Instance.demo is present only when compose x-app.demo is the boolean true. */
+export const demoFlagFromCompose = (compose: any): true | undefined =>
+  compose?.['x-app']?.demo === true ? true : undefined
+
+export const applyDemoFlag = (instance: Instance, compose: any): void => {
+  if (demoFlagFromCompose(compose)) instance.demo = true
+  else {
+    if ('demo' in instance) delete instance.demo
+    if (instance.demoPackWarning) instance.demoPackWarning = null
+  }
+}
+
 export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, instanceId: InstanceID, disk: Disk): Promise<Instance | undefined> => {
   let instance: Instance
   try {
@@ -790,6 +814,7 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
           metrics: null,
           filesMounts: null,
         }
+        applyDemoFlag(instance, compose)
         doc.instanceDB[instanceId] = instance
       } else {
         // Granularly update the existing instance object
@@ -806,6 +831,7 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
         }
         instance.storedOn = disk.id
         instance.serviceImages = servicesImages as ServiceImage[]
+        applyDemoFlag(instance, compose)
 
       }
     })

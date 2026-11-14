@@ -41,7 +41,7 @@ export const BACKUP_LINK_NEXT_BACKUP_NOTE = 'next backup on the next dock / back
 
 export type BackupLinkRefusal =
     | 'NOT_DOCKED' | 'AMBIGUOUS' | 'SYSTEM_DISK' | 'NOT_A_BACKUP_DISK' | 'BAD_BACKUP_YAML'
-    | 'INSTANCE_NOT_FOUND' | 'ALREADY_LINKED' | 'NOT_LINKED' | 'BUSY' | 'BACKUP_IN_PROGRESS'
+    | 'INSTANCE_NOT_FOUND' | 'ALREADY_LINKED' | 'NOT_LINKED' | 'BUSY' | 'BACKUP_IN_PROGRESS' | 'NOT_DEMO'
 
 const refuse = (code: BackupLinkRefusal, command: string, why: string): Error =>
     new Error(`${code}: ${command}: ${why}`)
@@ -159,6 +159,9 @@ export const addBackupLink = async (
             throw refuse('INSTANCE_NOT_FOUND', command, `instance ${instanceArg} is not on this Engine (stored on disk ${inst.instance.storedOn ?? 'none'}, not docked here)`)
         }
         throw refuse('INSTANCE_NOT_FOUND', command, `instance '${instanceArg}' not found on this Engine`)
+    }
+    if (inst.instance.demo === true) {
+        throw refuse('NOT_DEMO', command, `instance ${inst.instance.id} is a demo instance; demo instances are excluded from backups`)
     }
     const instanceId = String(inst.instance.id)
 
