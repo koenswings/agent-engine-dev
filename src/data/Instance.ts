@@ -26,6 +26,7 @@ import { composeProjectLabelFilter, containerInInstanceProject, isLegacyDottedIn
 import { rebindKolibriMorangoInstanceId } from './InstanceCopy.js'
 import { hostIdentity, writeHostIdentityEnv, nextcloudUrl, writeNextcloudUrlEnv, isNextcloudInstance, nextcloudTrustedDomainsBridge, hostNetworkInterfaces } from './HostIdentity.js'
 import { trackInFlight, startDiskGoneReason, dockIdentityOf } from './InstanceInFlight.js'
+import { setPortReadyProgress } from './PortReadyProgress.js'
 
 // ── Step-progress helpers ─────────────────────────────────────────────────────
 
@@ -1089,18 +1090,26 @@ export const assertInstancePortReady = async (
   let didRecreate = false
 
   log(`assertInstancePortReady: ${instanceId} :${port} probing (${probe}, budget ${readyTimeoutMs}ms, stable ${stableMs}ms)`)
+  const publishPortReady = (stableReached = false) => {
+    setPortReadyProgress(String(instanceId), { firstReadyAt, stableMs, stableReached })
+  }
+  publishPortReady()
 
   while (Date.now() < deadline) {
     const { tcp, ready } = await probeOnce()
     if (tcp) sawTcp = true
     if (ready) {
-      if (firstReadyAt === null) firstReadyAt = Date.now()
-      else if (Date.now() - firstReadyAt >= stableMs) {
+      if (firstReadyAt === null) {
+        firstReadyAt = Date.now()
+        publishPortReady()
+      } else if (Date.now() - firstReadyAt >= stableMs) {
         log(`assertInstancePortReady: ${instanceId} :${port} stable for ${stableMs}ms (${probe}${didRecreate ? ', after force-recreate' : ''})`)
+        publishPortReady(true)
         return
       }
-    } else {
+    } else if (firstReadyAt !== null) {
       firstReadyAt = null
+      publishPortReady()
     }
 
     // Recreate only when TCP never came up within min(60 s, budget), and only

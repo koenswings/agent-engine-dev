@@ -6,7 +6,9 @@
  *   2. Checking — the target Engine runs verifyMoveTarget: the copy is registered
  *                 on a disk docked to it, its instance data size matches, and it
  *                 starts healthy when the source was running. The verdict is
- *                 written into Operation.move.verify.
+ *                 written into Operation.move.verify. While it waits, the target
+ *                 broadcasts ephemeral idea/progress Checking messages about once
+ *                 a second (never stored; idea#498 option 3).
  *   3. Removing — only when move.verified was recorded: removeInstance (helper v4
  *                 quarantine; never rm) on the source.
  * Copy or verify failure deletes nothing (MOVE FAILED: … source kept). A failed
@@ -19,6 +21,7 @@ import { log } from '../utils/utils.js'
 import { Store, getDisk, getInstance, getEngine } from './Store.js'
 import { Disk, appDataRoot } from './Disk.js'
 import { Instance, startInstance } from './Instance.js'
+import { CHECKING_PROGRESS_INTERVAL_MS, checkingProgressMessage, clearPortReadyProgress, getPortReadyProgress } from './PortReadyProgress.js'
 import { InstanceID, InstanceName, DiskID, EngineID, OperationCause, Timestamp, Command } from './CommonTypes.js'
 import { createOperation, updateOperation } from './Operations.js'
 import { attachTraceResult } from './SummariseDisk.js'
@@ -116,6 +119,13 @@ export interface MoveProgressMsg {
     step: string
     bytesDone: number
     bytesTotal: number
+    /** Ephemeral Checking payload (idea#498 option 3); never stored. */
+    checking?: {
+        phase: 'starting' | 'stabilising' | 'stable'
+        label: string
+        stableElapsedMs: number
+        stableTargetMs: number
+    }
 }
 
 /** Wait for Operation.move.verify: Automerge change event first, pollMs (default 250) as fallback (idea#498). */
@@ -280,6 +290,10 @@ export interface VerifyDeps {
     targetBytes: (disk: Disk, id: InstanceID) => Promise<number>
     timeoutMs: number
     pollMs: number
+    /** Ephemeral Checking idea/progress (never stored). Default: storeHandle.broadcast. */
+    broadcast?: (msg: object) => void
+    /** How often to emit Checking progress while waiting. Default 1000; do not use this as the verify poll. */
+    progressIntervalMs?: number
 }
 
 const defaultVerifyDeps: VerifyDeps = {
@@ -287,6 +301,7 @@ const defaultVerifyDeps: VerifyDeps = {
     targetBytes: async (disk, id) => instanceDataBytes(await appDataRoot(disk), String(id)),
     timeoutMs: 5 * 60 * 1000,
     pollMs: 2000,
+    progressIntervalMs: CHECKING_PROGRESS_INTERVAL_MS,
 }
 
 /**
@@ -299,33 +314,69 @@ export const verifyMoveTarget = async (
 ): Promise<MoveVerify> => {
     const d = { ...defaultVerifyDeps, ...deps }
     const me = await d.localEngineId()
+    const emit = d.broadcast ?? ((msg: object) => { try { storeHandle.broadcast(msg as any) } catch { /* no peers */ } })
+    const intervalMs = d.progressIntervalMs ?? CHECKING_PROGRESS_INTERVAL_MS
+    let stopped = false
+    let sentStable = false
+    let timer: ReturnType<typeof setInterval> | undefined
+    const stopTicks = () => {
+        stopped = true
+        if (timer !== undefined) clearInterval(timer)
+    }
+    const tick = () => {
+        // After 'stable' is sent once, nothing more goes out for this op (Pixel / idea#498).
+        if (stopped || sentStable) return
+        const msg = checkingProgressMessage(opId, getPortReadyProgress(instanceId))
+        if (msg.checking.phase === 'stable') sentStable = true
+        emit(msg)
+        if (sentStable) stopTicks()
+    }
+    tick()
+    timer = setInterval(tick, Math.max(1, intervalMs))
+    if (sentStable) stopTicks()
+    const stopProgress = (flushStable = false) => {
+        if (flushStable && !sentStable) {
+            const msg = checkingProgressMessage(opId, getPortReadyProgress(instanceId))
+            if (msg.checking.phase === 'stable') {
+                sentStable = true
+                if (!stopped) emit(msg)
+            }
+        }
+        stopTicks()
+    }
     const write = (v: MoveVerify) => {
+        stopProgress(v.ok === true)
         storeHandle.change(doc => { const op = doc.operationDB?.[opId] as any; if (op?.move) op.move.verify = { ...v } })
         return v
     }
-    const bad = (code: VerifyCode, detail: string) => write({ ok: false, code, bytes: null, detail, at: Date.now() })
-    const deadline = Date.now() + d.timeoutMs
-    let inst = getInstance(storeHandle.doc(), instanceId as InstanceID)
-    const wantRunning = expectRunning === 'true'
-    // Wait for the record (and, when the source ran, a healthy start)
-    while (Date.now() < deadline) {
-        inst = getInstance(storeHandle.doc(), instanceId as InstanceID)
-        if (inst && inst.status === 'Error') break
-        if (inst && (!wantRunning || inst.status === 'Running')) break
-        await new Promise(r => setTimeout(r, d.pollMs))
+    try {
+        const bad = (code: VerifyCode, detail: string) => write({ ok: false, code, bytes: null, detail, at: Date.now() })
+        const deadline = Date.now() + d.timeoutMs
+        let inst = getInstance(storeHandle.doc(), instanceId as InstanceID)
+        const wantRunning = expectRunning === 'true'
+        // Wait for the record (and, when the source ran, a healthy start)
+        while (Date.now() < deadline) {
+            inst = getInstance(storeHandle.doc(), instanceId as InstanceID)
+            if (inst && inst.status === 'Error') break
+            if (inst && (!wantRunning || inst.status === 'Running')) break
+            await new Promise(r => setTimeout(r, d.pollMs))
+        }
+        if (!inst) return bad('VERIFY_NOT_FOUND', 'the copy is not registered')
+        const disk = getDisk(storeHandle.doc(), inst.storedOn as DiskID)
+        if (!disk || String(disk.dockedTo) !== me) return bad('VERIFY_NOT_FOUND', 'the copy is not on a disk docked to this Engine')
+        if (inst.status === 'Error') return bad('VERIFY_NOT_RUNNING', 'the copy failed to start')
+        if (wantRunning && inst.status !== 'Running') return bad('VERIFY_NOT_RUNNING', `the copy did not start (status ${inst.status})`)
+        let bytes: number
+        try { bytes = await d.targetBytes(disk, inst.id) } catch (e: any) { return bad('VERIFY_FAILED', `cannot size the copy (${e?.message ?? e})`) }
+        const expected = Number(expectedBytes)
+        if (!Number.isFinite(expected) || !sizesMatch(expected, bytes)) {
+            const v = write({ ok: false, code: 'VERIFY_SIZE', bytes, detail: `size ${bytes} bytes, expected ${expectedBytes}`, at: Date.now() })
+            return v
+        }
+        log(`verifyMoveTarget: copy ${instanceId} checks out (${bytes} bytes)`)
+        return write({ ok: true, code: null, bytes, detail: null, at: Date.now() })
+    } finally {
+        stopProgress(false)
+        clearPortReadyProgress(instanceId)
     }
-    if (!inst) return bad('VERIFY_NOT_FOUND', 'the copy is not registered')
-    const disk = getDisk(storeHandle.doc(), inst.storedOn as DiskID)
-    if (!disk || String(disk.dockedTo) !== me) return bad('VERIFY_NOT_FOUND', 'the copy is not on a disk docked to this Engine')
-    if (inst.status === 'Error') return bad('VERIFY_NOT_RUNNING', 'the copy failed to start')
-    if (wantRunning && inst.status !== 'Running') return bad('VERIFY_NOT_RUNNING', `the copy did not start (status ${inst.status})`)
-    let bytes: number
-    try { bytes = await d.targetBytes(disk, inst.id) } catch (e: any) { return bad('VERIFY_FAILED', `cannot size the copy (${e?.message ?? e})`) }
-    const expected = Number(expectedBytes)
-    if (!Number.isFinite(expected) || !sizesMatch(expected, bytes)) {
-        const v = write({ ok: false, code: 'VERIFY_SIZE', bytes, detail: `size ${bytes} bytes, expected ${expectedBytes}`, at: Date.now() })
-        return v
-    }
-    log(`verifyMoveTarget: copy ${instanceId} checks out (${bytes} bytes)`)
-    return write({ ok: true, code: null, bytes, detail: null, at: Date.now() })
 }
