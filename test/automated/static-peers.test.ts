@@ -8,6 +8,8 @@
  *     connected (same ip:port key) is not dialled again
  *   - reconnect after the connection is gone; backoff on failures
  *   - this Engine itself is skipped
+ *   - engine#377: an entry given as an IP gets the real engineId from the store record whose
+ *     lanAddress / lanAddresses holds it (on connect or on the next check)
  *   - connectEngine: optional port (static peers); without it the key uses
  *     settings.port exactly as before (mDNS path)
  *
@@ -21,11 +23,11 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { config } from '../../src/data/Config.js'
-import { network, connectEngine, disconnectEngine } from '../../src/data/Network.js'
+import { network, connectEngine, disconnectEngine, getEngineAddress } from '../../src/data/Network.js'
 import { EngineID, Hostname, IPAddress, PortNumber } from '../../src/data/CommonTypes.js'
 import {
     parseStaticPeers, startStaticPeers, isSelfPeer, staticPeersSetting, STATIC_PEERS_ENV,
-    STATIC_PEER_BASE_DELAY_MS, STATIC_PEER_CHECK_INTERVAL_MS,
+    STATIC_PEER_BASE_DELAY_MS, STATIC_PEER_CHECK_INTERVAL_MS, staticPeerEngineId,
 } from '../../src/data/StaticPeers.js'
 
 const newStore = async (): Promise<DocHandle<Store>> => {
@@ -173,6 +175,51 @@ describe('startStaticPeers', () => {
         h.change(doc => { (doc.engineDB as any)['ENGINE_peer-fixture-a'] = record })
         await vi.advanceTimersByTimeAsync(STATIC_PEER_CHECK_INTERVAL_MS)
         expect((network.connections as any)['10.0.0.1:4321'].engineId).toBe('ENGINE_peer-fixture-a')
+    })
+
+    const peerRecord = (id: string, fields: Record<string, unknown>) =>
+        ({ ...JSON.parse(JSON.stringify(h.doc().engineDB[localEngineId])), id, ...fields })
+
+    it('engine#377 an entry given as an IP gets the real engineId from the record whose lanAddress is that IP (hostname differs)', async () => {
+        h.change(doc => { (doc.engineDB as any)['ENGINE_peer-fixture-d'] = peerRecord('ENGINE_peer-fixture-d', { hostname: 'peer-fixture-d', lanAddress: '10.0.0.4', lanAddresses: ['10.0.0.4'] }) })
+        start('10.0.0.4:4391')
+        await vi.advanceTimersByTimeAsync(0)
+        expect(connect.mock.calls[0][2]).toBe('ENGINE_peer-fixture-d')
+        expect((network.connections as any)['10.0.0.4:4391'].engineId).toBe('ENGINE_peer-fixture-d')
+        expect(getEngineAddress('ENGINE_peer-fixture-d' as EngineID)).toBe('10.0.0.4')
+    })
+
+    it('engine#377 an IP entry dialled before the store knows the peer is filled in on the next check (lanAddresses, not the first address)', async () => {
+        start('10.0.0.4')
+        await vi.advanceTimersByTimeAsync(0)
+        expect(connect.mock.calls[0][2]).toBe('static:10.0.0.4')
+        expect(getEngineAddress('ENGINE_peer-fixture-d' as EngineID)).toBeUndefined()
+        h.change(doc => { (doc.engineDB as any)['ENGINE_peer-fixture-d'] = peerRecord('ENGINE_peer-fixture-d', { hostname: 'peer-fixture-d', lanAddress: '192.168.1.4', lanAddresses: ['192.168.1.4', '10.0.0.4'] }) })
+        await vi.advanceTimersByTimeAsync(STATIC_PEER_CHECK_INTERVAL_MS)
+        expect((network.connections as any)['10.0.0.4:4321'].engineId).toBe('ENGINE_peer-fixture-d')
+        expect(getEngineAddress('ENGINE_peer-fixture-d' as EngineID)).toBe('10.0.0.4')
+        expect(connect).toHaveBeenCalledTimes(1)
+    })
+
+    it('engine#377 a hostname entry matches by its resolved address when the hostname differs', async () => {
+        h.change(doc => { (doc.engineDB as any)['ENGINE_peer-x'] = peerRecord('ENGINE_peer-x', { hostname: 'renamed-peer', lanAddress: '10.0.0.1', lanAddresses: ['10.0.0.1'] }) })
+        start('peer-fixture-a')
+        await vi.advanceTimersByTimeAsync(0)
+        expect(connect.mock.calls[0][2]).toBe('ENGINE_peer-x')
+    })
+
+    it('engine#377 staticPeerEngineId: hostname first, then a unique lanAddress, then a unique lanAddresses entry; ambiguity keeps the placeholder', () => {
+        const a = { id: 'A', hostname: 'peer-fixture-a', lanAddress: '10.0.0.9', lanAddresses: ['10.0.0.9'] }
+        const b = { id: 'B', hostname: 'peer-fixture-b', lanAddress: '10.0.0.4', lanAddresses: ['10.0.0.4', '10.0.0.5'] }
+        const c = { id: 'C', hostname: 'peer-fixture-c', lanAddress: '10.0.0.6', lanAddresses: ['10.0.0.6', '10.0.0.5'] }
+        expect(staticPeerEngineId([a, b], 'peer-fixture-a.local', '10.0.0.4')).toBe('A')   // the hostname wins
+        expect(staticPeerEngineId([a, b], '10.0.0.4', '10.0.0.4')).toBe('B')
+        expect(staticPeerEngineId([a, b], '10.0.0.6', '10.0.0.6')).toBeUndefined()
+        expect(staticPeerEngineId([a, b, c], '10.0.0.5', '10.0.0.5')).toBeUndefined()      // two records list it
+        expect(staticPeerEngineId([a, b], '10.0.0.5', '10.0.0.5')).toBe('B')
+        const stale = { id: 'OLD', hostname: 'old-name', lanAddress: '10.0.0.4', lanAddresses: null }
+        expect(staticPeerEngineId([b, stale], '10.0.0.4', '10.0.0.4')).toBeUndefined()      // stale record on the same IP
+        expect(staticPeerEngineId([{ id: 'N', hostname: null, lanAddress: null, lanAddresses: null }], '10.0.0.4', '10.0.0.4')).toBeUndefined()
     })
 
     it('a peer the mDNS path already connected (same ip:port) is not dialled again; its missed count is reset', async () => {
