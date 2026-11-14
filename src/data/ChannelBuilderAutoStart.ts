@@ -71,7 +71,7 @@ const defaultDeps: AutoStartDeps = {
         const { runWithTrace } = await import('../utils/CommandLogger.js')
         const disk = storeHandle.doc().diskDB[instance.storedOn!]
         const traceId = crypto.randomUUID()
-        const args = JSON.stringify({ instanceName: instance.name, diskId: disk.id, reason: `auto-start: usb stick ${stick.stickId} with kolibri folder` })
+        const args = JSON.stringify({ instanceId: instance.id, instanceName: instance.name, diskId: disk.id, reason: `auto-start: usb stick ${stick.stickId} with kolibri folder` })
         const h = getCommandLogHandle()
         if (h) addTrace(h, { traceId, command: 'startInstance', args, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
         try {

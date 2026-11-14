@@ -149,13 +149,15 @@ describe('startInstance / runInstance / stopInstance resolve the instance id-fir
         expect(inst.id).toBe('inst-k2')
         expect(disk.id).toBe('d-b')
         expect(cause).toBe('cross-engine-cmd')
-        // The trace keeps the 'instanceName' key the Console filters on
-        expect(JSON.parse(t.args as any).instanceName).toBe('inst-k2')
+        // engine#399: the id under instanceId, the display name under instanceName
+        expect(JSON.parse(t.args as any).instanceId).toBe('inst-k2')
+        expect(JSON.parse(t.args as any).instanceName).toBe('kolibri')
     })
 
-    it('the trace arg key stays instanceName for the Console wire format', async () => {
+    it('engine#399: a shared name + disk is traced as the resolved id plus the name', async () => {
         const t = await run('stopInstance kolibri d-b')
         const args = JSON.parse(t.args as any)
+        expect(args.instanceId).toBe('inst-k2')
         expect(args.instanceName).toBe('kolibri')
         expect(args.diskId).toBe('d-b')
     })
