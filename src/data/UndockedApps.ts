@@ -174,3 +174,46 @@ export const checkAndSetUndockedApps = async (
         }
     }))
 }
+
+/**
+ * engine#427 safety net: after the dock pass of `diskId`, an instance on it that is still
+ * `Starting` (marked at boot "until the dock pass checks it", but the pass never processed
+ * it) is set Running when its containers are up and healthy. Nothing is started or
+ * recreated; an instance whose containers are not all healthy stays Starting. Only this
+ * Engine's docked instances are touched, and never one the operator stopped.
+ * Returns the ids it set Running.
+ */
+export const healStartingOnDisk = async (
+    storeHandle: DocHandle<Store>,
+    diskId: string,
+    engineId: EngineID = localEngineId,
+    containersHealthy: ContainerRunningCheck = dockerContainersHealthy,
+): Promise<InstanceID[]> => {
+    const store = storeHandle.doc()
+    const left = Object.values(store.instanceDB ?? {}).filter((inst): inst is Instance =>
+        !!inst && String(inst.storedOn) === String(diskId) && inst.status === 'Starting'
+        && isInstanceDockedOn(store, inst, engineId) && !isUserStopped(store, inst))
+    const healed: InstanceID[] = []
+    for (const instance of left) {
+        const instanceId = instance.id
+        let healthy = false
+        try { healthy = await containersHealthy(instanceId) } catch (e) {
+            log(`healStartingOnDisk: cannot read the container health of ${instanceId} (${e}); leaving it Starting`)
+            continue
+        }
+        if (!healthy) {
+            log(`healStartingOnDisk: ${instanceId} stays Starting after the dock pass of ${diskId}: its containers are not all running and healthy`)
+            continue
+        }
+        storeHandle.change(doc => {
+            const inst = doc.instanceDB[instanceId]
+            if (!inst || inst.status !== 'Starting' || !isInstanceDockedOn(doc, inst, engineId)) return
+            log(`Setting status of instance ${instanceId} to Running: still Starting after the dock pass of ${diskId}, and its containers are up and healthy; nothing was restarted (engine#427)`)
+            inst.status = 'Running' as Status
+            inst.statusCondition = null
+            inst.lastStarted = Date.now() as Timestamp
+            healed.push(instanceId)
+        })
+    }
+    return healed
+}
