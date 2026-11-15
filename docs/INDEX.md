@@ -27,7 +27,7 @@ with usage examples.
 ## BACKUP_SCHEDULE.md
 **Status:** Draft (grows with idea#400 PRs A–D)  ·  **Maintained by:** Axle
 Scheduled Backup Disk: in-Engine daily schedule, due/catch-up rules, uptime fallback and clock
-trust, locks and retries, BACKUP.yaml fields, store summary fields and the `setBackupMode` command.
+trust, locks and retries, BACKUP.yaml fields, store summary fields, `setBackupMode`, and `makeBackupDisk` (idea#404).
 → [docs/BACKUP_SCHEDULE.md](BACKUP_SCHEDULE.md)
 
 ## SCRIPTS.md

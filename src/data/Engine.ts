@@ -174,6 +174,10 @@ export interface EraseInProgress {
  *               at startup (same pattern as flashCard). An older, missing, failing
  *               or timed-out helper leaves it out; runtime cleanup still records
  *               HELPER_OUTDATED and the backup still runs.
+ *   makeBackupDisk: makeBackupDisk <targetId> [<summaryTraceId> <confirmName…>]
+ *               (idea#404): one op, Check / Erase / Re-dock / Create, to turn a
+ *               blank stick or an adopted empty / App / Files disk into a
+ *               scheduled Backup Disk. Always on (uses the existing erase script).
  *   preUpdateQuarantine: 24 h cleanup of a pre-update snapshot (idea#396);
  *               advertised only when the app-data helper is at v14 or newer,
  *               checked once at startup (same pattern as backupCleanup).
@@ -183,7 +187,7 @@ export interface EraseInProgress {
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'traceInstanceId']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'traceInstanceId', 'makeBackupDisk']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'

@@ -1,6 +1,6 @@
 # Scheduled Backup Disk (idea#400)
 
-**Status:** Draft. It describes the design as agreed and grows with each PR (A to D). Only the parts marked *landed* exist in the code (A, B, C and D on this branch).
+**Status:** Draft. It describes the design as agreed and grows with each PR (A to D, plus idea#404 `makeBackupDisk`). Only the parts marked *landed* exist in the code.
 
 **Sources:**
 - [`proposals/scheduled-backup-disk.md`](https://github.com/koenswings/idea/blob/main/proposals/scheduled-backup-disk.md) (idea repo, accepted by Koen 30 Oct 2026).
@@ -19,6 +19,7 @@ A Backup Disk in `scheduled` mode, docked to an Engine, backs up its linked inst
 | B | `src/data/BackupYamlDoc.ts`: document-preserving BACKUP.yaml edits (#344's atomic writer, now shared) for the link `lastBackup` and the state keys `schedule` / `lastRun` / `uptimeCounter` / `missedRuns` / `lastAttempt`, plus a lenient state reader. `processBackupDisk` mirrors `schedule` / `missedRuns` / `lastAttempt`. `src/data/BackupResults.ts` and `backupInstance` write `lastResult` / `backupHistory` for every attempt. Manual refusals start with `BUSY`; automatic ones record `SKIPPED_LOCKED`; a stale lock found at dock is recorded once as `INTERRUPTED`. `createBackupDisk scheduled` adds the 02:30 default. | *landed with PR B* |
 | C | `src/monitors/backupScheduler.ts`: the tick, sequential runs per disk, locks, retry and catch-up, a one-change-per-run store summary (`freePct`, `clockTrusted` / `clockReason`, `cleaning` / `cleaningStartedAt`), `backupConfig.scheduleError`, and the build timestamp baked in at build (`script/write-build-info.mjs`, `src/utils/buildInfo.ts`). Tests: `test/automated/backup-scheduler.test.ts`. | *landed with PR C* |
 | D | `src/data/BackupModeCommand.ts`: the `setBackupMode` command (registered in `Commands.ts`) and the `scheduledBackups` capability. Tests: `test/automated/set-backup-mode.test.ts`. | *landed with PR D* |
+| idea#404 | `src/data/MakeBackupDisk.ts`: `makeBackupDisk` (Check / Erase / Re-dock / Create), the always-on `makeBackupDisk` capability, and `initialiseDisk … backup` using the same Create defaults (`scheduled` / 02:30, `backups/` root). Tests: `test/automated/make-backup-disk.test.ts`. | *this PR* |
 
 The 05:00 reboot wrapper (it waits while `/run/idea/backup-running` exists, with a 90-minute cap) is its own small PR, separate from #292 and from this work. The Engine already writes that marker for every backup (`beginUsageSkip('backup')`, idea#411).
 
