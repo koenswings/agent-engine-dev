@@ -9,7 +9,7 @@
  *  - Snapshot: stop the instance, wait until its containers are really gone (the
  *    restart: unless-stopped race), then `idea-app-data snapshot` copies instances/<id>
  *    (bundle files, .env and data) to <disk>/.pre-update/<id>/ with a COMPLETE marker last.
- *  - Swap: copy the new bundle files over the instance folder (.env kept), restamp
+ *  - Swap: copy the new bundle files over the instance folder (.env kept; engine#447: dest relative symlinks are unlinked first and copied as links), restamp
  *    x-app.instanceName and x-app.demo from the old instance compose, re-read the record (instanceOf = newAppId).
  *  - Start, Health: startInstance, then the health gate (healthGate) within healthTimeout.
  * Any failure from Snapshot on rolls back: compose down (no -v), `restore-snapshot` (in place,
@@ -155,6 +155,41 @@ const defaultVerifySums = async (dir: string): Promise<boolean> => {
     try { await $({ cwd: dir })`sha256sum --check --strict --quiet SHA256SUMS`.quiet(); return true } catch { return false }
 }
 
+/**
+ * engine#447: fs.copy({overwrite:true}) cannot replace an existing relative
+ * symlink ("Cannot copy '../pre-installation/…' to a subdirectory of itself").
+ * lstat the dest (never follow): a symlink is unlinked, including one that
+ * points at a directory, so the copy cannot descend into and empty the target.
+ * A type change (symlink ↔ file) removes the dest entry too. Recurses only
+ * through real directories. Only paths present in `src` are touched.
+ */
+export const unlinkDestSymlinks = async (src: string, dst: string): Promise<void> => {
+    const srcStat = await fs.lstat(src)
+    const dstStat = await fs.lstat(dst).catch(() => null)
+    if (!dstStat) return
+    if (dstStat.isSymbolicLink()) { await fs.unlink(dst); return }
+    if (srcStat.isSymbolicLink()) { await fs.remove(dst); return }
+    if (srcStat.isDirectory() && dstStat.isDirectory()) {
+        for (const name of await fs.readdir(src)) {
+            await unlinkDestSymlinks(path.join(src, name), path.join(dst, name))
+        }
+    }
+}
+
+/**
+ * Copy one bundle tree over a dest folder (apps/<id> or instances/<id>).
+ * Skips .env, SHA256SUMS and .idea-* so the instance identity and markers stay.
+ * Links are copied as links with their relative targets unchanged (dereference: false).
+ */
+export const copyBundle = async (src: string, dst: string): Promise<void> => {
+    for (const name of await fs.readdir(src)) {
+        if (name === '.env' || name === 'SHA256SUMS' || name.startsWith('.idea-')) continue
+        const from = path.join(src, name), to = path.join(dst, name)
+        await unlinkDestSymlinks(from, to)
+        await fs.copy(from, to, { overwrite: true, dereference: false })
+    }
+}
+
 export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => ({
     helperProblem: () => helperAtLeast(UPDATE_HELPER_MIN, 'updateApp'),
     mountRoot: (disk) => diskMountRoot(disk),
@@ -176,12 +211,7 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
     bootId: defaultReadBootId,
     uptimeS: defaultReadUptimeS,
     dirBytes: async (dir) => (await import('./CopyMoveApp.js')).directoryBytes(dir),
-    copyBundle: async (src, dst) => {
-        for (const name of await fs.readdir(src)) {
-            if (name === '.env' || name === 'SHA256SUMS' || name.startsWith('.idea-')) continue
-            await fs.copy(path.join(src, name), path.join(dst, name), { overwrite: true })
-        }
-    },
+    copyBundle,
     stop: async (inst, disk) => (await import('./Instance.js')).stopInstance(storeHandle, inst, disk),
     containerIds: async (id) => (await docker(['ps', '-q', '--filter', `label=${COMPOSE_PROJECT_LABEL}=${composeProjectFor(String(id))}`])).split('\n').map(s => s.trim()).filter(Boolean),
     composeDown: async (dir, id) => {
