@@ -225,7 +225,7 @@ export const isIP4 = (str: string): boolean => {
 export const isNetmask = isIP4
 
 // See https://stackoverflow.com/questions/503052/how-to-check-if-ip-is-in-one-of-these-subnets
-
+// IPnumber + sameNet replace the old ip2long/inSubNet helpers; inSubNet was wrong, so we compare two IPs against a netmask instead.
 export const IPnumber = (ip:IPAddress):number => {
 //  var ip = IPaddress.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
 //  if(ip) {

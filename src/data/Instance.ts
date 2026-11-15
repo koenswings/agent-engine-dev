@@ -1979,6 +1979,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
 export const stopInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command'): Promise<void> => {
   print(`Stopping app '${instance.id}' on disk '${disk.id}' of engine '${localEngineId}'.`)
 
+  // Stop via the Docker API, not compose in the instance dir: compose cannot run once the disk has already been removed.
   const totalStopSteps = STOP_STEPS.length
 
   // Create an Operation record so stop progress appears in operationDB uniformly
