@@ -308,6 +308,50 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         await fs.remove(binDir)
     })
 
+    // engine#414: a method-none app (Kiwix) has no repo by design; say so instead of
+    // "no docked Backup Disk repository". Still an error; other methods unchanged.
+    const composeOnly = async (xapp: unknown) => {
+        const instDir = `${DISKS_ROOT}/${appDevice}/instances/${INST}`
+        await fs.ensureDir(instDir)
+        await fs.writeFile(`${instDir}/compose.yaml`, YAML.stringify({ 'x-app': xapp, services: {} }))
+    }
+    it('method none and no repo: listBackup and verifyBackup say nothing is stored (engine#414), and never call borg', async () => {
+        await composeOnly({ name: 'kiwix', backup: { method: 'none' } })
+        const { h } = await storeWithDisks()
+        const none = `instance ${INST} uses x-app.backup.method none: nothing is stored on the Backup Disk`
+        await expect(listBackup(h, INST, 'ver-bd')).rejects.toThrow(`listBackup: ${none}`)
+        await expect(verifyBackup(h, INST, 'ver-bd')).rejects.toThrow(`verifyBackup: ${none}`)
+        await expect(listBackup(h, INST, 'ver-bd')).rejects.not.toThrow(/no docked Backup Disk repository/)
+        const log = (await fs.pathExists(borgLog)) ? await fs.readFile(borgLog, 'utf8') : ''
+        expect(log).not.toMatch(/borg-/)
+    })
+    it('method hook, stop or default with no repo keeps the existing repo error (engine#414)', async () => {
+        for (const xapp of [
+            { name: 'nc', backup: { method: 'hook', preHook: [{ service: 'app', command: ['true'] }] } },
+            { name: 'kolibri', backup: { method: 'stop' } },
+            { name: 'plain' },
+        ]) {
+            await composeOnly(xapp)
+            const { h } = await storeWithDisks()
+            await expect(listBackup(h, INST, 'ver-bd'), JSON.stringify(xapp)).rejects.toThrow(`listBackup: no docked Backup Disk repository for instance ${INST}`)
+            await expect(verifyBackup(h, INST, 'ver-bd'), JSON.stringify(xapp)).rejects.toThrow(`verifyBackup: no docked Backup Disk repository for instance ${INST}`)
+        }
+    })
+    it('a bad x-app.backup fails closed before the repo check (engine#414)', async () => {
+        for (const xapp of [{ backup: { method: 'live' } }, { backup: { method: 'bogus' } }, { backup: 'stop' }]) {
+            await composeOnly(xapp)
+            const { h } = await storeWithDisks()
+            await expect(listBackup(h, INST, 'ver-bd')).rejects.toThrow(/^listBackup: invalid x-app\.backup on the instance compose/)
+            await expect(verifyBackup(h, INST, 'ver-bd')).rejects.toThrow(/^verifyBackup: invalid x-app\.backup on the instance compose/)
+        }
+    })
+    it('method none with a repo left from an earlier method still lists it (engine#414)', async () => {
+        await seedRepo({ compose: { 'x-app': { name: 'kiwix', backup: { method: 'none' } }, services: {} } })
+        const { h } = await storeWithDisks()
+        const r = await listBackup(h, INST, 'ver-bd')
+        expect((r.archives as any[]).map(a => a.name)).toEqual([OLDER, ARCHIVE])
+    })
+
     const calls = async (): Promise<string[]> =>
         (await fs.pathExists(borgLog)) ? (await fs.readFile(borgLog, 'utf8')).split('\n').filter(Boolean) : []
 

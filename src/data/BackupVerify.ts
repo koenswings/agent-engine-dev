@@ -32,6 +32,7 @@ import {
 } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, parseBackupVerifyLists, parseBackupVerifyModeLists } from '../utils/backupExclude.js'
 import { parseArchiveName, type ArchiveMode } from '../utils/backupArchiveName.js'
+import { parseBackupSpec } from '../utils/backupMethod.js'
 import { isBackupActive, runningBackupOnDisk, BACKUP_IN_PROGRESS, recordBackupStaleLocks, clearBackupStaleLock } from '../monitors/backupMonitor.js'
 
 /** idea#450: v9's 2-arg borg-list printed no archives list on real borg; require the fixed v10.
@@ -127,6 +128,27 @@ export const cleanVerifyCopies = async (
         log(`WARNING: verifyBackup: ${warning}`)
         return { removed: [], warning }
     }
+}
+
+/**
+ * engine#414: read the instance's x-app.backup before the repo check. A method-none
+ * instance never gets a Borg repo (backupInstance copies nothing), so "no docked Backup
+ * Disk repository" is the wrong explanation for it: say so plainly, still as an error
+ * (the success result shape is unchanged). A repo left from an earlier method is still
+ * listed/verified. Any other method keeps the existing repo error. A compose whose
+ * x-app.backup does not parse fails closed.
+ */
+const requireRepoForSpec = async (store: Store, device: string, instanceId: InstanceID, command: string): Promise<string> => {
+    let method: string
+    try {
+        method = parseBackupSpec(await readInstanceComposeXapp(store, instanceId)).method
+    } catch (e: any) {
+        throw new Error(`${command}: invalid x-app.backup on the instance compose (${e?.message ?? e})`)
+    }
+    if (method === 'none' && !(await fs.pathExists(`${repoDir(device, instanceId)}/config`))) {
+        throw new Error(`${command}: instance ${instanceId} uses x-app.backup.method none: nothing is stored on the Backup Disk`)
+    }
+    return requireRepo(device, instanceId, command)
 }
 
 const requireNotSkipBorg = (command: string): void => {
@@ -352,7 +374,7 @@ export const listBackup = async (
     const instance = resolveInstanceArg(store, instanceArg, 'listBackup')
     const disk = resolveDiskArg(store, getLocalEngine(store)?.id, backupDiskId, 'listBackup')
     const device = await requireBackupTarget(disk as Disk, 'listBackup')
-    await requireRepo(device, instance.id, 'listBackup')
+    await requireRepoForSpec(store, device, instance.id, 'listBackup')
 
     const inventoryJson = await run(borgListArgs(device, instance.id))
     const archives = parseBorgListInventory(inventoryJson)
@@ -392,7 +414,7 @@ export const verifyBackup = async (
     const instance = resolveInstanceArg(store, instanceArg, 'verifyBackup')
     const disk = resolveDiskArg(store, getLocalEngine(store)?.id, backupDiskId, 'verifyBackup')
     const device = await requireBackupTarget(disk as Disk, 'verifyBackup')
-    await requireRepo(device, instance.id, 'verifyBackup')
+    await requireRepoForSpec(store, device, instance.id, 'verifyBackup')
 
     const busy = backupToDiskBusy(store, disk.id)
     if (busy) throw new Error(`verifyBackup: ${busy}`)
