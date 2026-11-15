@@ -101,9 +101,14 @@ describe('SHA-source majors (engine#456 B)', () => {
         expect(unversionedMayTakeTarget('1.0-2024.12.03', '2.0')).toBe(false)
         expect(unversionedMayTakeTarget('1.8-31.0.14', '2.0-32.0.15')).toBe(true) // versioned source unchanged
 
+        // omitted updatesFrom
         expect(offerable({ ...sha17, sumsValid: true })).toBe(true)
-        expect(offerable({ ...sha17, sumsValid: true, updatesFrom: [1] })).toBe(true)
         expect(checkUpdate(facts({ ...sha17, allowMajor: true, backupAgeMs: 1000 }))).toBeNull()
+        // real 1.7 shape: updatesFrom: [] (an empty list, not absent)
+        expect(majorAllowedByUpdatesFrom('b8ad438', [])).toBe(true)
+        expect(offerable({ ...sha17, sumsValid: true, updatesFrom: [] })).toBe(true)
+        expect(checkUpdate(facts({ ...sha17, allowMajor: true, updatesFrom: [], backupAgeMs: 1000 }))).toBeNull()
+        expect(offerable({ ...sha17, sumsValid: true, updatesFrom: [1] })).toBe(true)
         expect(checkUpdate(facts({ ...sha17, allowMajor: true, updatesFrom: [1], backupAgeMs: 1000 }))).toBeNull()
 
         expect(offerable({ ...sha20, sumsValid: true })).toBe(false)
@@ -112,6 +117,22 @@ describe('SHA-source majors (engine#456 B)', () => {
         expect(err?.code).toBe('MAJOR_NOT_ALLOWED')
         expect(err?.message).toBe('MAJOR_NOT_ALLOWED: unversioned b8ad438 can only update to the first tagged major (1.x), not 2.0-32.0.15')
         expect(checkUpdate(facts({ ...sha20, allowMajor: true }))?.code).toBe('MAJOR_NOT_ALLOWED')
+    })
+
+    it('SHA → 1.7 is allowed with the real 1.7 updatesFrom: [] and when updatesFrom is omitted', () => {
+        // 7365d02 treated any array (including []) as a listed major the SHA could not satisfy.
+        expect(majorAllowedByUpdatesFrom('b8ad438', [])).toBe(true)
+        expect(majorAllowedByUpdatesFrom('b8ad438', undefined)).toBe(true)
+        expect(majorAllowedByUpdatesFrom('5ab9f64', [])).toBe(true)
+
+        expect(offerable({ ...sha17, sumsValid: true, updatesFrom: [] })).toBe(true)
+        expect(offerable({ ...sha17, sumsValid: true })).toBe(true)
+        expect(checkUpdate(facts({ ...sha17, allowMajor: true, updatesFrom: [], backupAgeMs: 1000 }))).toBeNull()
+        expect(checkUpdate(facts({ ...sha17, allowMajor: true, backupAgeMs: 1000 }))).toBeNull()
+
+        // empty updatesFrom must not open a 2.0+ hop
+        expect(offerable({ ...sha20, sumsValid: true, updatesFrom: [] })).toBe(false)
+        expect(checkUpdate(facts({ ...sha20, allowMajor: true, updatesFrom: [] }))?.code).toBe('MAJOR_NOT_ALLOWED')
     })
 
     it('SHA → 1.7 stays classified as a major (NEEDS_BACKUP path); classification is unchanged', () => {
@@ -126,8 +147,10 @@ describe('SHA-source majors (engine#456 B)', () => {
     it('offer and execute: SHA is never offered or allowed 2.0–5.0, even without updatesFrom', () => {
         for (const to of ['nextcloud-2.0', 'nextcloud-3.0', 'nextcloud-4.0', 'nextcloud-5.0']) {
             expect(offerable({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, sumsValid: true })).toBe(false)
+            expect(offerable({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, sumsValid: true, updatesFrom: [] })).toBe(false)
             expect(offerable({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, sumsValid: true, updatesFrom: [1] })).toBe(false)
             expect(checkUpdate(facts({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, allowMajor: true }))?.code).toBe('MAJOR_NOT_ALLOWED')
+            expect(checkUpdate(facts({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, allowMajor: true, updatesFrom: [] }))?.code).toBe('MAJOR_NOT_ALLOWED')
         }
         expect(offerable({ currentAppId: 'nextcloud-1.8-31.0.14', newAppId: 'nextcloud-2.0', sumsValid: true, updatesFrom: [1] })).toBe(true)
         expect(majorAllowedByUpdatesFrom('5ab9f64', [1])).toBe(true) // idea#76: SHA is not restricted by updatesFrom; 2.0+ is refused by unversionedMayTakeTarget
