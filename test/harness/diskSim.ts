@@ -23,6 +23,7 @@
 
 import { $, fs, path, YAML } from 'zx'
 import { Status } from '../../src/data/Instance.js'
+import { drainDataBytesQueue } from './drainDataBytes.js'
 
 // Resolve fixtures from the repo root (process.cwd()), not from __dirname.
 // Compiled files land in dist-test/test/harness/ — __dirname-relative paths to
@@ -188,6 +189,9 @@ export const triggerUndock = async (device = TEST_DEVICE): Promise<void> => {
  * system clean. Does not interact with the engine — purely filesystem cleanup.
  */
 export const cleanupDisk = async (device = TEST_DEVICE): Promise<void> => {
+    // engine#430 follow-up: processDisk queues a background size measurement of
+    // each instance; wait for it so rmdir of the instance folder is not ENOTEMPTY.
+    await drainDataBytesQueue()
     await fs.remove(diskPath(device))
 }
 

@@ -26,6 +26,7 @@ import { parseArchiveName, backupArchiveName } from '../../src/utils/backupArchi
 import { resourceLock, diskKey, instanceKey } from '../../src/utils/ResourceLock.js'
 import { APP_DATA_HELPER_VERSION, borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
+import { drainDataBytesQueue } from '../harness/drainDataBytes.js'
 
 const INST = 'inst-ver-1' as InstanceID
 const ARCHIVE = '2026-11-11T23-18-06-123Z'
@@ -291,6 +292,9 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
     })
 
     afterEach(async () => {
+        // engine#430 follow-up: wait for the background size measurement before
+        // removing the fake sudo dir (it appends to calls.log in binDir).
+        await drainDataBytesQueue()
         vi.restoreAllMocks()
         config.settings.testMode = saved.testMode
         config.settings.skipBorg = saved.skipBorg
