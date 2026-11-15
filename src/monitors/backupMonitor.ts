@@ -36,7 +36,7 @@ import { readBackupYamlState, setLinkLastBackup, editBackupYaml } from '../data/
 import { applyBackupResult, recordBackupResult, successResultCode, failureResultCode, isManualBackupCause } from '../data/BackupResults.js'
 import { DEFAULT_BACKUP_TIME } from '../utils/backupSchedule.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
-import { stopInstance as stopInstanceImpl, startInstance as startInstanceImpl, BACKUP_STEPS } from '../data/Instance.js'
+import { stopInstance as stopInstanceImpl, startInstance as startInstanceImpl, BACKUP_STEPS, type Instance, type Status } from '../data/Instance.js'
 
 /** Tests replace stop/start. Production uses Instance.ts. */
 export const backupLifecycle = {
@@ -862,6 +862,31 @@ export const extractLatestArchive = async (backupRoot: string, instanceId: strin
 /** engine#413: cause of the start after an in-place restore of a Running instance (not a user cause). */
 export const RESTORE_POST_START_CAUSE: OperationCause = 'backup-post-start'
 
+const RESTORE_RUNNING_STATES = new Set(['Running', 'Starting'])
+
+/** engine#422: what restoreApp's pre-stop should do with the instance's recorded status. */
+export type RestoreRunningState =
+    | { kind: 'not-running' }
+    | { kind: 'running-here', disk: Disk }
+    | { kind: 'stale' }
+    | { kind: 'other-engine', dockedTo: string }
+
+/**
+ * engine#422: a recorded Running is real only when the storedOn disk is docked to
+ * this Engine (device set, dockedTo local); then restoreApp stops it and restarts it
+ * afterwards (engine#413). A Running or Starting record whose storedOn disk has no
+ * record or no device is stale: nothing can run from a disk that is not docked.
+ * A storedOn disk docked to another Engine is never stopped from here. Pure.
+ */
+export const restoreRunningState = (store: Store, instance: Pick<Instance, 'storedOn' | 'status'> | undefined, engineId: string): RestoreRunningState => {
+    if (!instance || !RESTORE_RUNNING_STATES.has(String(instance.status))) return { kind: 'not-running' }
+    const disk = instance.storedOn ? store.diskDB?.[instance.storedOn] as Disk | undefined : undefined
+    if (!disk || disk.device == null) return { kind: 'stale' }
+    if (String(disk.dockedTo) !== String(engineId)) return { kind: 'other-engine', dockedTo: String(disk.dockedTo) }
+    // Starting here is refused up front (INSTANCE_STARTING); only Running is stopped
+    return instance.status === 'Running' ? { kind: 'running-here', disk } : { kind: 'not-running' }
+}
+
 /**
  * Restore the latest archive for instanceId from any docked Backup Disk
  * onto targetDisk.
@@ -928,11 +953,21 @@ export const restoreApp = async (
         // Stop instance if currently running. engine#413: remember that it was
         // Running, because the stop writes status Stopped and processInstance then
         // skips the auto-start (shouldAutoStart: 'status is Stopped').
+        // engine#422: only a storedOn disk docked to THIS Engine can hold a running
+        // copy we may stop; see restoreRunningState.
         const instance = getInstance(store, instanceId)
-        const wasRunning = instance?.status === 'Running'
-        if (wasRunning) {
-            const currentDisk = instance.storedOn ? store.diskDB[instance.storedOn] : null
-            if (currentDisk) await backupLifecycle.stopInstance(storeHandle, instance, currentDisk, 'backup-pre-stop')
+        const running = restoreRunningState(store, instance, String(localEngineId))
+        const wasRunning = running.kind === 'running-here'
+        if (running.kind === 'running-here') {
+            await backupLifecycle.stopInstance(storeHandle, instance!, running.disk, 'backup-pre-stop')
+        } else if (running.kind === 'stale') {
+            log(`restoreApp: ${instanceId} is recorded ${instance!.status} but its storedOn disk ${instance!.storedOn ?? 'none'} is not docked anywhere; treating the status as stale (no stop, no engine#413 restart; the dock gate decides the start) (engine#422)`)
+            storeHandle.change(doc => {
+                const inst = doc.instanceDB[instanceId]
+                if (inst && RESTORE_RUNNING_STATES.has(String(inst.status))) inst.status = 'Undocked' as Status
+            })
+        } else if (running.kind === 'other-engine') {
+            log(`restoreApp: ${instanceId} is recorded ${instance!.status} on disk ${instance!.storedOn}, docked to another Engine (${running.dockedTo}); not stopping it from here (engine#422)`)
         }
 
         await fs.ensureDir(instancesDir)
