@@ -45,6 +45,7 @@ const addDisk = (h: DocHandle<Store>, id: string, name: string, device: string |
         doc.diskDB[id as DiskID] = {
             id: id as DiskID, name: name as DiskName, device: device as DeviceName | null, dockedTo,
             created: 1 as Timestamp, lastDocked: 1 as Timestamp, diskTypes: device ? diskTypes : [], backupConfig: null,
+            sizeBytes: 32 * 1024 * 1024 * 1024,
         }
     })
 }
