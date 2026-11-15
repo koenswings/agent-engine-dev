@@ -53,6 +53,7 @@ case "$1" in
     mkdir -p "\$dest"
     src="$IDEA_DISKS_ROOT/\$bdev/.idea-verify-src/\$id/\$archive"
     if [ -d "\$src" ]; then cp -a "\$src/." "\$dest/"; fi
+    if [ "\${FAKE_EXTRACT_FAIL:-}" = 1 ]; then echo "borg extract failed" >&2; exit 1; fi
     if [ "\${FAKE_OMIT_SCRATCH_BYTES:-}" = 1 ]; then
       :
     elif [ -n "\${FAKE_SCRATCH_BYTES:-}" ]; then
@@ -61,6 +62,11 @@ case "$1" in
       bytes=\$(du -sb -- "\$dest" 2>/dev/null | awk '{print \$1}')
       [ -n "\$bytes" ] && echo "scratchBytes=\$bytes"
     fi
+    ;;
+  clean-verify)
+    [ -n "\${FAKE_CLEAN_STDERR:-}" ] && echo "\$FAKE_CLEAN_STDERR" >&2
+    [ -n "\${FAKE_CLEAN_OUT:-}" ] && printf '%b\\n' "\$FAKE_CLEAN_OUT"
+    exit "\${FAKE_CLEAN_EXIT:-0}"
     ;;
   quarantine-backups)
     bdev="$2"
@@ -200,9 +206,9 @@ describe('parse helpers (idea#446)', () => {
         expect(parseScratchBytes('scratchBytes=9007199254740992\n')).toBeNull() // > MAX_SAFE_INTEGER
     })
 
-    it('registers the four commands and the backupVerify capability; Engine speaks helper v16 (engine#401), verify min stays v10', () => {
+    it('registers the four commands and the backupVerify capability; Engine speaks helper v17 (engine#415), verify min stays v10', () => {
         expect(BACKUP_VERIFY_HELPER_MIN).toBe(10)
-        expect(APP_DATA_HELPER_VERSION).toBe('16')
+        expect(APP_DATA_HELPER_VERSION).toBe('17')
         expect(ENGINE_CAPABILITIES).toContain('backupVerify')
         for (const name of ['listBackup', 'verifyBackup', 'clearBackupLock', 'removeBackupRole']) {
             expect(commands.find(c => c.name === name), name).toBeTruthy()
@@ -295,6 +301,7 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         else process.env.FAKE_HELPER_VERSION = saved.ver
         delete process.env.FAKE_SCRATCH_BYTES
         delete process.env.FAKE_OMIT_SCRATCH_BYTES
+        for (const k of ['FAKE_EXTRACT_FAIL', 'FAKE_CLEAN_OUT', 'FAKE_CLEAN_EXIT', 'FAKE_CLEAN_STDERR']) delete process.env[k]
         resourceLock.releaseAll([diskKey('ver-bd'), instanceKey(INST)])
         await fs.remove(`${DISKS_ROOT}/${appDevice}`)
         await fs.remove(`${DISKS_ROOT}/${backupDevice}`)
@@ -424,6 +431,79 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         const log = await calls()
         expect(log.some(l => l.startsWith('borg-extract '))).toBe(false)
         expect(log.some(l => l.startsWith(`borg-extract-verify ${backupDevice} ${INST} ${ARCHIVE} `))).toBe(true)
+    })
+
+    // ── engine#415: keep-latest (Koen's decision (b)) ────────────────────────
+    it('engine#415 after a successful verify (helper v17) calls clean-verify with the same stamp, after the checks, and reports what it removed', async () => {
+        await seedRepo()
+        const { h } = await storeWithDisks()
+        process.env.FAKE_HELPER_VERSION = '17'
+        const older = `${DISKS_ROOT}/${backupDevice}/.idea-verify/${INST}-20261101T000000000Z`
+        process.env.FAKE_CLEAN_OUT = `removed ${older}\\nkept x`
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.ok).toBe(true)
+        expect(result.cleanup).toEqual({ removed: [older], warning: null })
+        const log = await calls()
+        const stamp = result.scratchPath.match(/-(\d{8}T\d{6,15}Z)$/)[1]
+        const ex = log.findIndex(l => l.startsWith(`borg-extract-verify ${backupDevice} ${INST} ${ARCHIVE} ${stamp}`))
+        const members = log.findIndex((l, i) => i > ex && l === `borg-list ${backupDevice} ${INST} ${ARCHIVE}`)
+        const clean = log.indexOf(`clean-verify ${backupDevice} ${INST} ${stamp}`)
+        expect(ex).toBeGreaterThanOrEqual(0)
+        expect(clean).toBeGreaterThan(members)
+        expect(log.filter(l => l.startsWith('clean-verify'))).toHaveLength(1)
+        expect(await fs.pathExists(result.scratchPath)).toBe(true)
+    })
+
+    it('engine#415 failed path-checks still clean older copies (checks recorded first)', async () => {
+        await seedRepo({
+            members: [`disks/${backupDevice}/instances/${INST}/data/keys/secret`],
+            extract: { 'data/keys/secret': 'nope\n' },
+            compose: { 'x-app': { backup: { exclude: ['keys'] } }, services: {} },
+        })
+        const { h } = await storeWithDisks()
+        process.env.FAKE_HELPER_VERSION = '17'
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.ok).toBe(false)
+        expect(result.cleanup).toEqual({ removed: [], warning: null })
+        expect((await calls()).some(l => l.startsWith(`clean-verify ${backupDevice} ${INST} `))).toBe(true)
+    })
+
+    it('engine#415 a failed extract never calls clean-verify and leaves its tree in place', async () => {
+        await seedRepo()
+        const { h } = await storeWithDisks()
+        process.env.FAKE_HELPER_VERSION = '17'
+        process.env.FAKE_EXTRACT_FAIL = '1'
+        await expect(verifyBackup(h, INST, 'ver-bd')).rejects.toThrow()
+        const log = await calls()
+        expect(log.some(l => l.startsWith('borg-extract-verify'))).toBe(true)
+        expect(log.some(l => l.startsWith('clean-verify'))).toBe(false)
+        const left = (await fs.readdir(`${DISKS_ROOT}/${backupDevice}/.idea-verify`)).filter(n => n.startsWith(`${INST}-`))
+        expect(left).toHaveLength(1)
+        expect(resourceLock.isLocked(diskKey('ver-bd'))).toBe(false)
+    })
+
+    it('engine#415 a helper older than v17 (no clean-verify) only warns; verify still succeeds and the verb is not called', async () => {
+        await seedRepo()
+        const { h } = await storeWithDisks()
+        process.env.FAKE_HELPER_VERSION = '16'
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.ok).toBe(true)
+        expect(result.cleanup.removed).toEqual([])
+        expect(result.cleanup.warning).toMatch(/older verify copies were not removed: .*v17 or later.*idea-app-data 16/)
+        expect((await calls()).some(l => l.startsWith('clean-verify'))).toBe(false)
+    })
+
+    it('engine#415 a clean-verify that fails (unknown verb or a refusal) only warns; verify still succeeds', async () => {
+        await seedRepo()
+        const { h } = await storeWithDisks()
+        process.env.FAKE_HELPER_VERSION = '17'
+        process.env.FAKE_CLEAN_EXIT = '2'
+        process.env.FAKE_CLEAN_STDERR = "refused: unknown subcommand 'clean-verify'"
+        const result = await verifyBackup(h, INST, 'ver-bd') as any
+        expect(result.ok).toBe(true)
+        expect(result.cleanup.removed).toEqual([])
+        expect(result.cleanup.warning).toMatch(/^older verify copies were not removed: clean-verify failed/)
+        expect(resourceLock.isLocked(diskKey('ver-bd'))).toBe(false)
     })
 
     // ── engine#401: per-mode verify lists ─────────────────────────────────────

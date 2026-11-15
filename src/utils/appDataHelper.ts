@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '16'
+export const APP_DATA_HELPER_VERSION = '17'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -199,6 +199,16 @@ export const borgExtractVerifyArgs = (bdev: string, id: string, archive: string,
     ['borg-extract-verify', checkRoot(bdev), checkId(id), checkArchive(archive), checkStamp(stamp)]
 /** idea#446 / helper v9: move <disk>/backups/ to <disk>/.idea-quarantine/backups-<UTC stamp>/. */
 export const quarantineBackupsArgs = (bdev: string): string[] => ['quarantine-backups', checkRoot(bdev)]
+/**
+ * engine#415 / helper v17 (Koen's decision (b), keep-latest): keep the verify copy
+ * <id>-<stamp> just checked and remove the instance's OTHER complete verify copies under
+ * <backup disk>/.idea-verify/. Copies without the v17 complete-extract marker (a failed
+ * extract) are never touched. Prints `removed <path>` per copy and `kept <path>`.
+ */
+export const cleanVerifyArgs = (bdev: string, id: string, stamp: string): string[] =>
+    ['clean-verify', checkRoot(bdev), checkId(id), checkStamp(stamp)]
+/** engine#415: first helper with clean-verify and the complete-extract marker. */
+export const CLEAN_VERIFY_HELPER_MIN = 17
 /** idea#401: delete one archive. Omit keepMin to use the helper default (3). */
 export const borgDeleteArgs = (bdev: string, id: string, archive: string, keepMin?: number): string[] => {
     const args = ['borg-delete', checkRoot(bdev), checkId(id), checkArchive(archive)]
