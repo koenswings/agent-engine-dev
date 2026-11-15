@@ -19,6 +19,7 @@ import { startStaticPeers, staticPeersSetting } from './data/StaticPeers.js'
 import { createServerStore } from './data/Store.js'
 import { assertStoreIdentityMatchesData, prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
+import { enableInstanceStatusMonitor } from './monitors/instanceStatusMonitor.js'
 import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
 import { startBackupScheduler } from './monitors/backupScheduler.js'
 import { startDataBytesMonitor } from './data/DataBytes.js'
@@ -214,9 +215,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // idea#203: http://idea.local (port 80) must reach this Engine's Console even when httpPort is not 80
     const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle, config.settings.ideaLocalHttpPort ?? 80, { engineId: String(localEngineId) })
 
-    // Start the instances monitor
-    // log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))
-    // await enableInstanceStatusMonitor(storeHandle)
+    // Start the instances monitor (engine#428: heal late PORT_NOT_READY starts)
+    log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))
+    enableInstanceStatusMonitor(storeHandle)
     
     // Safety net: log unhandled async errors instead of crashing.
     // The primary fix is suppressing the WebSocket async error event in Network.ts,

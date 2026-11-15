@@ -1081,6 +1081,35 @@ export const readPortReadyTimeoutMs = async (composePath: string, appName: strin
  * become 600 s. If TCP is up but HTTP has not answered, do not force-recreate:
  * that would kill a long entrypoint (Nextcloud first install).
  */
+/** engine#428: a start that timed out at the port-ready gate. The instance monitor may heal this Error. */
+export const PORT_NOT_READY_PREFIX = 'PORT_NOT_READY:'
+
+export const isPortNotReadyCondition = (condition: string | null | undefined): boolean =>
+  typeof condition === 'string' && condition.startsWith(PORT_NOT_READY_PREFIX)
+
+export const isPortNotReadyError = (e: unknown): boolean => {
+  const msg = e instanceof Error ? e.message : String(e ?? '')
+  return msg.startsWith(PORT_NOT_READY_PREFIX)
+}
+
+/** Timestamp (ms) written into a PORT_NOT_READY statusCondition; null if absent. */
+export const parsePortNotReadyAt = (condition: string | null | undefined): number | null => {
+  const m = typeof condition === 'string' ? condition.match(/^PORT_NOT_READY:\s*at=(\d+)/) : null
+  if (!m) return null
+  const n = Number(m[1])
+  return Number.isFinite(n) ? n : null
+}
+
+/** Seconds named in "within <n>ms" (the start budget), or fallbackMs, or 0. */
+export const portNotReadyTimeoutSeconds = (condition: string | null | undefined, fallbackMs?: number): number => {
+  const m = typeof condition === 'string' ? condition.match(/within\s+(\d+)\s*ms/i) : null
+  if (m) return Math.round(Number(m[1]) / 1000)
+  if (fallbackMs && fallbackMs > 0) return Math.round(fallbackMs / 1000)
+  return 0
+}
+
+const portNotReadyMessage = (detail: string): string => `${PORT_NOT_READY_PREFIX} ${detail}`
+
 export const assertInstancePortReady = async (
   instanceId: InstanceID,
   port: number,
@@ -1213,20 +1242,20 @@ export const assertInstancePortReady = async (
 
   const recreateNote = didRecreate ? ' (and after one force-recreate)' : ''
   if (probe === 'http' && outcome === 'tcp-only') {
-    throw new Error(
+    throw new Error(portNotReadyMessage(
       `Instance ${instanceId} container is up but host port ${port} accepted TCP without answering HTTP ` +
       `for ${stableMs}ms within ${readyTimeoutMs}ms${recreateNote}. ` +
       `docker-proxy can accept TCP before the app serves (idea#437). ` +
       `Automerge must not stay Running until an HTTP status line is seen.${hint}`,
-    )
+    ))
   }
-  throw new Error(
+  throw new Error(portNotReadyMessage(
     `Instance ${instanceId} container is up but host port ${port} never stayed ready ` +
     `for ${stableMs}ms within ${readyTimeoutMs}ms${recreateNote}. ` +
     `Automerge must not stay Running with a dead sidecar.${hint} ` +
     `If this is Kolibri after copyApp, the copy likely still shares the original morango ` +
     `instance id (zeroconf NonUniqueNameException); see rebindKolibriMorangoInstanceId.`,
-  )
+  ))
 }
 
 export const createPortNumber = async (store: Store, exclude: readonly number[] = []): Promise<PortNumber> => {
@@ -1396,10 +1425,16 @@ export const choosePortZipForStart = async (
 export const diagnoseInstance = async (instance: Instance, disk: Disk, caughtError: unknown): Promise<string> => {
   const parts: string[] = []
 
-  // 1. Engine-level error message
+  // 1. Engine-level error message. A port-ready timeout keeps PORT_NOT_READY:
+  // at the front of statusCondition so the instance monitor can heal it (engine#428).
   if (caughtError) {
     const msg = caughtError instanceof Error ? caughtError.message : String(caughtError)
-    parts.push(`Engine error: ${msg}`)
+    if (msg.startsWith(PORT_NOT_READY_PREFIX)) {
+      const rest = msg.slice(PORT_NOT_READY_PREFIX.length).trim()
+      parts.push(parsePortNotReadyAt(msg) != null ? msg : `${PORT_NOT_READY_PREFIX} at=${Date.now()}; ${rest}`)
+    } else {
+      parts.push(`Engine error: ${msg}`)
+    }
   }
 
   // 2. Docker container logs (last 20 lines per service) — whenever Docker answers (idea#168; was !testMode)

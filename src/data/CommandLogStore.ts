@@ -480,6 +480,19 @@ export const takePendingTraceResult = (traceId: string): string | undefined => {
   return v
 }
 
+/** Optional close message for an ok trace (engine#428 START_PENDING). */
+const pendingTraceCloseMessages = new Map<string, string>()
+
+export const stashTraceCloseMessage = (traceId: string, message: string): void => {
+  pendingTraceCloseMessages.set(traceId, message)
+}
+
+export const takePendingTraceCloseMessage = (traceId: string): string | undefined => {
+  const v = pendingTraceCloseMessages.get(traceId)
+  pendingTraceCloseMessages.delete(traceId)
+  return v
+}
+
 /**
  * Mark a trace as completed. Call after the command resolves or rejects.
  * A trace already closed as 'error' stays 'error': a later 'ok' close (e.g. the

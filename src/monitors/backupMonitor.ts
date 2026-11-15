@@ -40,7 +40,7 @@ import { applyBackupResult, recordBackupResult, successResultCode, failureResult
 import { DEFAULT_BACKUP_TIME } from '../utils/backupSchedule.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { requestDataBytes } from '../data/DataBytes.js'
-import { stopInstance as stopInstanceImpl, startInstance as startInstanceImpl, BACKUP_STEPS, type Instance, type Status } from '../data/Instance.js'
+import { stopInstance as stopInstanceImpl, startInstance as startInstanceImpl, BACKUP_STEPS, type Instance, type Status, isPortNotReadyCondition, portNotReadyTimeoutSeconds } from '../data/Instance.js'
 
 /** Tests replace stop/start. Production uses Instance.ts. */
 export const backupLifecycle = {
@@ -51,7 +51,8 @@ import { BackupMode, BackupMethodUsed, DiskID, DiskName, InstanceID, Timestamp, 
 import { Store, getInstance, getDisks, findDiskByName, getLocalEngine } from '../data/Store.js'
 import { isDockedOnEngine, localEngineName, noLocalBackupDiskMessage } from '../data/LocalBackupDisk.js'
 import { DocHandle } from '@automerge/automerge-repo'
-import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js'
+import { getCommandLogHandle, addTrace, closeTrace, stashTraceCloseMessage } from '../data/CommandLogStore.js'
+import { attachTraceResult } from '../data/SummariseDisk.js'
 import { runWithTrace, flushTrace, getActiveTrace } from '../utils/CommandLogger.js'
 import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
 
@@ -1033,6 +1034,27 @@ export const extractLatestArchive = async (backupRoot: string, instanceId: strin
 /** engine#413: cause of the start after an in-place restore of a Running instance (not a user cause). */
 export const RESTORE_POST_START_CAUSE: OperationCause = 'backup-post-start'
 
+/** engine#428: honest restore result when the post-restore start did not reach Running. */
+export const restoreStartPendingMessage = (instance: Instance): string => {
+    const cond = String(instance.statusCondition ?? '')
+    if (isPortNotReadyCondition(cond)) {
+        const n = portNotReadyTimeoutSeconds(cond)
+        return `START_PENDING: restored; the app did not answer within ${n} s and will show Running once it does`
+    }
+    const err = cond || `status is ${instance.status}`
+    return `START_PENDING: restored; ${err}`
+}
+
+const recordRestoreStartPending = (instance: Instance): string => {
+    const msg = restoreStartPendingMessage(instance)
+    log(msg)
+    attachTraceResult({ startPending: msg })
+    const tid = getActiveTrace()?.traceId
+    if (tid) stashTraceCloseMessage(tid, msg)
+    return msg
+}
+
+
 const RESTORE_RUNNING_STATES = new Set(['Running', 'Starting'])
 
 /** engine#422: what restoreApp's pre-stop should do with the instance's recorded status. */
@@ -1183,6 +1205,11 @@ export const restoreApp = async (
             } else if (restored) {
                 log(`Starting restored instance ${instanceId} on disk ${targetDisk.name} (it was Running before the restore)`)
                 await backupLifecycle.startInstance(storeHandle, restored, targetDisk, RESTORE_POST_START_CAUSE)
+                // engine#428: startInstance swallows a port-ready timeout into Error
+                // and does not throw. The files are restored, so the Operation stays
+                // Done, but the trace must not be a plain ok.
+                const after = getInstance(storeHandle.doc(), instanceId)
+                if (after && after.status !== 'Running') recordRestoreStartPending(after)
             }
         }
 
