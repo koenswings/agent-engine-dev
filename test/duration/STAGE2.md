@@ -20,6 +20,10 @@ Disks are addressed only by diskId → PARTLABEL (the script resolves `/dev/disk
 never by sdX: idea01's fixture SSD is `sda` (root `sdb`), idea03/idea04's is `sdb` (root `sda`).
 idea02 is never in the pool, never a host, never a target.
 
+There is no separate Kiwix partition. In the Path A READY store (r86t),
+`kiwix-ideaa-001` is a second instance on `duration-nextcloud-grade5a-001`
+(IDEA-NEXTCLOUD, idea03 p1), so it comes online when that disk is docked on idea03.
+
 ## Roles and the move-only target (READY §4.4)
 
 Only three Empties exist but cover-all has four Empty uses. Resolution (`STAGE2_ROLE_MAP`):
@@ -157,8 +161,13 @@ Step 34 used `idea166-kiwix-live` on idea01:18380 the same way. The Console Inte
 - the `infra_dock_fixture` Nextcloud wait uses the store URL only and fails fast on repeated
   "untrusted domain" answers (`untrustedFailAfter`, default 30).
 
-Kiwix has no instance in the Stage 2 store, so `open_wikipedia_*` / `search_browse_wikipedia` fail
-loud until a Kiwix fixture exists.
+Kiwix is not a Stage 2 SSD fixture (no `duration-kiwix-ideaa-001` row in `STAGE2_FIXTURES`).
+The Path A READY store (r86t) has `kiwix-ideaa-001` storedOn `duration-nextcloud-grade5a-001`
+(IDEA-NEXTCLOUD, idea03 p1). `store-check` / `STORE_CHECK_EXPECTED` therefore requires
+`kiwix-ideaa-001@idea03` alongside `kolibri-grade5a-001@idea01` and
+`nextcloud-grade5a-001@idea03` (`test/duration/walkHost.ts`). Wikipedia steps resolve that
+instance from the store; they fail loud only if it is missing or the NC disk is not docked
+on idea03.
 
 ## infra_dock_fixture docks only what needs docking (r54 step 58)
 

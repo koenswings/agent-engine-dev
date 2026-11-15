@@ -20,7 +20,7 @@ Parent: [idea#166](https://github.com/koenswings/idea/issues/166).
 |------|--------|------------|
 | Kolibri Grade 5A | `duration-kolibri-grade5a-001` | `kolibri-grade5a-001` |
 | Nextcloud Grade 5A | `duration-nextcloud-grade5a-001` | `nextcloud-grade5a-001` |
-| Kiwix | — | deferred (wiki_browse live later) |
+| Kiwix | no own Stage 2 disk — instance lives on `duration-nextcloud-grade5a-001` (idea03 p1) | `kiwix-ideaa-001` |
 
 Paths live under `agent-app-dev/tests/duration-tests/fixtures/`. Scenario YAML `fixtures:` maps these IDs; do not invent others. See Kid `walker-ref.yaml`.
 
