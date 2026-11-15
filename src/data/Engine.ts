@@ -798,19 +798,32 @@ export const DHCP_VENDOR_CLASS = 'idea-engine'
  * idempotently, with a .idea-bak-<UTC> backup. Only the NM *config* is reloaded: no
  * connection is touched and no link drops; the value is used from the next DHCP
  * activation (the nightly 05:00 reboot at the latest).
+ *
+ * idea#284: this runs on every update (install-root-helpers), so it changes nothing
+ * when nothing differs: the helper copy in /usr/local/sbin is only reinstalled when its
+ * content differs from the checkout's, and NetworkManager's config is only reloaded
+ * when the helper reports that it changed the NM drop-in ("nm changed").
  */
 export const installDhcpVendorClass = async (exec: any, enginePath: string) => {
   print(chalk.blue(`Setting DHCP vendor class (option 60) to ${DHCP_VENDOR_CLASS}...`));
   try {
-    await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-dhcp-vendor-class ${DHCP_VENDOR_CLASS_HELPER}`;
-    await exec`sudo ${DHCP_VENDOR_CLASS_HELPER}`;
-    // Reload NM's config files only (like SIGHUP); never restart NM or dhcpcd.
-    await exec`if systemctl is-active --quiet NetworkManager; then sudo nmcli general reload conf; fi`;
+    const asset = `${enginePath}/script/build_image_assets/idea-dhcp-vendor-class`
+    await exec`if ! cmp -s ${asset} ${DHCP_VENDOR_CLASS_HELPER}; then sudo install -o root -g root -m 0755 ${asset} ${DHCP_VENDOR_CLASS_HELPER}; fi`;
+    const out = String((await exec`sudo ${DHCP_VENDOR_CLASS_HELPER}`)?.stdout ?? '')
+    if (dhcpVendorClassNmChanged(out)) {
+      // Reload NM's config files only (like SIGHUP); never restart NM or dhcpcd.
+      await exec`if systemctl is-active --quiet NetworkManager; then sudo nmcli general reload conf; fi`;
+    } else {
+      print(`DHCP vendor class: NetworkManager drop-in unchanged; no reload (${out.trim().replace(/\s*\n\s*/g, '; ') || 'no output'})`)
+    }
   } catch (e) {
     print(chalk.red('Error setting the DHCP vendor class'));
     console.error(e);
   }
 }
+
+/** idea#284: true when idea-dhcp-vendor-class wrote the NetworkManager drop-in ("nm changed ..."). */
+export const dhcpVendorClassNmChanged = (helperStdout: string): boolean => /^nm changed\b/m.test(helperStdout)
 
 /** sysctl.d drop-in (idea#467): raise IGMP group memberships so multicast-heavy
  *  containers (Kolibri zeroconf) do not hit OSError 105 on busy Docker hosts. */

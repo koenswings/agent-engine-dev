@@ -11,7 +11,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { installRootHelpers, ensureAptPackages, ROOT_HELPER_PACKAGES, IGMP_SYSCTL_CONF, IGMP_SYSCTL_ASSET } from '../../src/data/Engine.js'
 import { borgProblem, BORG_PATH, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
 
-const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: string } = {}) => {
+const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: string, dhcpOut?: string } = {}) => {
     const cmds: string[] = []
     const exec = async (strings: TemplateStringsArray, ...vals: unknown[]) => {
         const cmd = strings.reduce((acc, s, i) => acc + s + (i < vals.length ? (Array.isArray(vals[i]) ? (vals[i] as string[]).join(' ') : String(vals[i])) : ''), '')
@@ -23,6 +23,7 @@ const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: 
             throw new Error(`dpkg-query: no packages found matching ${m[1]}`)
         }
         if (/sshd -T/.test(cmd)) return { stdout: 'authorizedkeysfile .ssh/authorized_keys /etc/ssh/idea_authorized_keys/%u /etc/ssh/idea_usage_keys/%u\n' }
+        if (cmd === 'sudo /usr/local/sbin/idea-dhcp-vendor-class') return { stdout: opts.dhcpOut ?? 'nm unchanged\ndhcpcd absent\n' }
         if (/idea-app-data version$/.test(cmd)) return { stdout: `${opts.version ?? `idea-app-data ${APP_DATA_HELPER_VERSION}`}\n` }
         return { stdout: '' }
     }
@@ -88,19 +89,28 @@ describe('installRootHelpers', () => {
 
 describe('installRootHelpers applies the DHCP vendor class on every update (idea#284)', () => {
     const helper = '/usr/local/sbin/idea-dhcp-vendor-class'
-    it('installs and runs idea-dhcp-vendor-class, only reloads NM config, before the final checks', async () => {
-        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'] })
+    const reloadCmd = 'if systemctl is-active --quiet NetworkManager; then sudo nmcli general reload conf; fi'
+    it('installs (only when it differs) and runs idea-dhcp-vendor-class, reloads NM config only after a change, before the final checks', async () => {
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'], dhcpOut: 'nm changed\ndhcpcd absent\n' })
         const q = quiet()
         try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
         const idx = (c: string) => cmds.indexOf(c)
-        const inst = idx(`sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-dhcp-vendor-class ${helper}`)
+        const inst = idx(`if ! cmp -s /e/script/build_image_assets/idea-dhcp-vendor-class ${helper}; then sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-dhcp-vendor-class ${helper}; fi`)
         const run = idx(`sudo ${helper}`)
-        const reload = idx('if systemctl is-active --quiet NetworkManager; then sudo nmcli general reload conf; fi')
+        const reload = idx(reloadCmd)
         expect(inst).toBeGreaterThanOrEqual(0)
         expect(run).toBeGreaterThan(inst)
         expect(reload).toBeGreaterThan(run)
         expect(reload).toBeLessThan(idx(`test -x ${BORG_PATH}`))
         for (const c of cmds) expect(c).not.toMatch(/restart NetworkManager|connection (up|down)|device (disconnect|reapply)|dhcpcd -[nk]/)
+    })
+    it('idea#284: an update where nothing differs does not reload NetworkManager', async () => {
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'], dhcpOut: 'nm unchanged\ndhcpcd unchanged\n' })
+        const q = quiet()
+        try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
+        expect(cmds).toContain(`sudo ${helper}`)
+        expect(cmds).not.toContain(reloadCmd)
+        expect(cmds.filter(c => /nmcli/.test(c))).toEqual([])
     })
     it('runs it again on a second update (the helper itself is idempotent)', async () => {
         const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'] })
