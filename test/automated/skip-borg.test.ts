@@ -25,6 +25,7 @@ import { config, skipBorg } from '../../src/data/Config.js'
 import { backupInstance, restoreApp, runningBackupOnDisk } from '../../src/monitors/backupMonitor.js'
 import { resourceLock, instanceKey, diskKey } from '../../src/utils/ResourceLock.js'
 import { borgPresence } from '../../src/utils/appDataHelper.js'
+import { dataBytesQueue } from '../../src/data/DataBytes.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 
 const INST = 'inst-borg-1' as InstanceID
@@ -102,6 +103,9 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+    // engine#430: a successful backup queues a background `size` measurement; let it
+    // finish under this test's fake sudo, so it never lands in the next test's log
+    await dataBytesQueue.idle()
     borgPresence.exists = (p) => fs.existsSync(p)
     vi.restoreAllMocks()
     config.settings.testMode = saved.testMode
@@ -115,8 +119,10 @@ afterEach(async () => {
     await fs.remove(binDir)
 })
 
-const calls = async (): Promise<string[]> =>
+const allCalls = async (): Promise<string[]> =>
     (await fs.pathExists(borgLog)) ? (await fs.readFile(borgLog, 'utf8')).split('\n').filter(Boolean) : []
+/** Helper calls of the backup and restore themselves: without engine#430's background `size` measurement. */
+const calls = async (): Promise<string[]> => (await allCalls()).filter(c => !c.startsWith('size '))
 
 const backupThenRestore = async (): Promise<{ backupOp: any; restoreError: string | null }> => {
     const h = await createMinimalStore()
@@ -203,6 +209,9 @@ describe('backupInstance / restoreApp with testMode on', () => {
         expect(log[3]).toBe(`borg-info ${backupDevice} ${INST}`)
         expect(log[4]).toBe(`borg-extract ${backupDevice} ${INST} 2026-10-06T08-00-00-000Z 3 ${appDevice}`)
         expect(log).toHaveLength(5)
+        // engine#430: the successful backup queued one low-priority size measurement of the instance
+        await dataBytesQueue.idle()
+        expect((await allCalls()).filter(c => c.startsWith('size '))).toEqual([`size ${appDevice} ${INST}`])
     })
     it('a failed borg create keeps the .backup-in-progress lock (boot-resume) but blocks nothing: no running op, locks released, the next backup runs and removes it', async () => {
         // On-Pi triage idea04 2026-10-25: the real helper refused borg-create and the lock stayed.
