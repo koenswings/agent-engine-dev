@@ -1,6 +1,6 @@
 # Deterministic cover-all walk — NOT a Markov graph.
 # Loads states/invariants/fixtures/pool from scenarios/unified.yaml.
-# Covers 90/90 distinct action names (re-enters via return_to_start / layer hubs).
+# Covers 92/92 distinct action names (re-enters via return_to_start / layer hubs).
 # Prefer short cycles per layer (usage → operator → infra). Gaps: none — full action coverage.
 kind: walk
 name: cover-all
@@ -397,3 +397,22 @@ steps:
   - from: op_settings
     to: op_settings
     action: reboot_engine
+  # console#212 / #171: after the existing 128-step Path A sequence so historic
+  # @95 / @104 fixture-disk numbers stay aligned. close_settings + instance/disk
+  # hubs re-enter so live --ui is on the right panel. Size-gate refusal, update,
+  # remove-app, and update_restart_failed stay out of this walk.
+  - from: op_settings
+    to: op_overview
+    action: close_settings
+  - from: op_overview
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_instance
+    action: rename_instance
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
+  - from: op_disk
+    to: op_backup
+    action: backup_schedule

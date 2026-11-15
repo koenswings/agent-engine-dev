@@ -143,6 +143,8 @@ export const PIXEL_REGISTERED_INTENTS = [
     'restore_from_backup',
     'open_app',
     'backup_instance',
+    'backup_schedule',
+    'rename_instance',
     'back_to_disk',
     'back_to_overview',
     'log_out',
