@@ -404,6 +404,15 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
         }
     })
 
+    // engine#427 safety net: an instance still Starting after this dock pass (marked at boot,
+    // but not processed here) is set Running when its containers are healthy; no restart.
+    try {
+        const { healStartingOnDisk } = await import('./UndockedApps.js')
+        await healStartingOnDisk(storeHandle, disk.id)
+    } catch (e: any) {
+        log(`healStartingOnDisk after processDisk ${disk.id}: ${e.message ?? e}`)
+    }
+
     // Size and free space of every docked disk, on dock (idea#131)
     try {
         await updateDiskSize(storeHandle, disk.id, await diskFsRoot(disk), true)

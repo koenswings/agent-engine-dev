@@ -48,7 +48,7 @@ describe('isAppDisk counts instances without apps/ (engine#427)', () => {
         expect(await isAppDisk(diskOn(device))).toBe(false)
     })
 
-    it('a Backup Disk or a blank disk without either folder is not', async () => {
+    it('a disk with only a backups/ folder, or a blank disk, is not', async () => {
         const device = await fresh()
         await fs.ensureDir(`${diskPath(device)}/backups/x`)
         expect(await isAppDisk(diskOn(device))).toBe(false)
