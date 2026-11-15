@@ -90,7 +90,7 @@ across filesystems). The harness never downloads, builds or deletes a staged tar
 
 **`--scenario` semantics:**
 - `random` / `unified` / default → **Markov** simulation on `scenarios/unified.yaml`
-- `cover-all` → **deterministic walk** (`walks/cover-all.yaml`) covering every graph action once — strict full-graph regression (under `--ui`, Pixel-missing still **failLoud** abort; live retry requires Console@`ba0cfa1`)
+- `cover-all` → **deterministic walk** (`walks/cover-all.yaml`) covering every graph action once — strict full-graph regression (under `--ui`, Pixel-missing still **failLoud** abort; live retry requires Console@`2ce289d` or newer)
 - `cover-registered-intents` (chat: **registered-intents walk**; alias `cover-hardpass`) → **deterministic walk** (`walks/cover-registered-intents.yaml`) covering the current Pixel-registered demo subset + Engine infra FleetOps — **live `--ui` demo now** (coaching Intents are registered but walk expansion is deferred; excludes DEFERRED + PIXEL_MISSING)
 - `kolibri-learn-smoke` / `kolibri-teacher-preview-smoke` → short Prefer A walks to `finish_exercise` (6 / 7 steps; skips coaching 3–7)
 - `--start-from <N|action>` (walks only): slice from 1-based step or first matching action; seeds `walker.current` to that step's `from`. With `--iterations`, start-from applies first then remaining are truncated.

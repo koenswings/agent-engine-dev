@@ -108,9 +108,9 @@ describe('fixture disk roles (idea#168 r38@103)', () => {
 })
 
 describe('fixtureDiskPreflight — before step 1', () => {
-    it('cover-all (128) and skip-copy (125) consume all three roles at the expected steps', () => {
-        expect(coverAll.steps).toHaveLength(128)
-        expect(skipCopy.steps).toHaveLength(125)
+    it('cover-all (133) and skip-copy (130) consume all three roles at the expected steps', () => {
+        expect(coverAll.steps).toHaveLength(133)
+        expect(skipCopy.steps).toHaveLength(130)
         const a = run(coverAll.steps, GOOD(), ENV_OK)
         expect(a.ok, a.message).toBe(true)
         expect(a.roles.map(r => [r.role, r.diskId, r.steps])).toEqual([
@@ -120,7 +120,7 @@ describe('fixtureDiskPreflight — before step 1', () => {
         ])
         const b = run(skipCopy.steps, GOOD(), ENV_OK)
         expect(b.ok, b.message).toBe(true)
-        // variant 44-114 = parent 45-115, 115-125 = parent 118-128
+        // variant 44-114 = parent 45-115, 115-122 = parent 118-125, 123-130 = parent 126-133
         expect(b.roles.map(r => [r.role, r.diskId, r.steps])).toEqual([
             ['files', E1, [87, 90, 113, 116]],
             ['backup', E3, [94]],
