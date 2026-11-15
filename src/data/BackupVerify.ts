@@ -9,6 +9,9 @@
  * stdout after `du -sb -x` of the root:root 0700 dest). An older helper that
  * prints no count still verifies; scratchBytes is then null. The Engine (pi)
  * does not walk that tree for the size — it cannot read it.
+ * Keep-latest (engine#415, Koen's decision (b)): once the checks are recorded,
+ * helper v17 `clean-verify` removes the instance's OLDER complete verify copies and
+ * keeps the one just checked. A failed extract is never cleaned (left for diagnosis).
  */
 
 import { YAML, chalk, fs } from 'zx'
@@ -25,6 +28,7 @@ import { resourceLock, diskKey } from '../utils/ResourceLock.js'
 import {
     AppDataRunner, runAppData, helperAtLeast,
     borgListArgs, borgExtractVerifyArgs, quarantineBackupsArgs, verifyStampNow,
+    cleanVerifyArgs, CLEAN_VERIFY_HELPER_MIN,
 } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, parseBackupVerifyLists, parseBackupVerifyModeLists } from '../utils/backupExclude.js'
 import { parseArchiveName, type ArchiveMode } from '../utils/backupArchiveName.js'
@@ -86,6 +90,43 @@ const requireRepo = async (device: string, instanceId: string, command: string):
         throw new Error(`${command}: no docked Backup Disk repository for instance ${instanceId}`)
     }
     return dir
+}
+
+/** engine#415: what keep-latest did after a verify. */
+export interface VerifyCleanup {
+    /** Older complete verify copies of this instance the helper removed. */
+    removed: string[]
+    /** Set when nothing was cleaned: helper older than v17, no clean-verify verb, or it failed. */
+    warning: string | null
+}
+
+/**
+ * engine#415 (Koen's decision (b), keep-latest): after the checks of a verify whose
+ * extract succeeded are recorded, ask the helper to remove this instance's OLDER
+ * verify copies and keep <stamp>. Never called after a failed extract (that tree stays
+ * for diagnosis, and has no complete-extract marker, so clean-verify never removes it).
+ * A helper older than v17, or one without the verb, only gives a warning: verify
+ * still succeeds (BACKUP_VERIFY_HELPER_MIN stays v10).
+ */
+export const cleanVerifyCopies = async (
+    device: string, instanceId: string, stamp: string, run: AppDataRunner = runAppData,
+): Promise<VerifyCleanup> => {
+    const old = await helperAtLeast(CLEAN_VERIFY_HELPER_MIN, 'verifyBackup keep-latest cleanup (clean-verify)', run)
+    if (old) {
+        const warning = `older verify copies were not removed: ${old}`
+        log(`WARNING: verifyBackup: ${warning}`)
+        return { removed: [], warning }
+    }
+    try {
+        const out = await run(cleanVerifyArgs(device, instanceId, stamp))
+        const removed = out.split('\n').map(l => l.match(/^removed (.+)$/)?.[1]).filter((p): p is string => !!p)
+        log(`verifyBackup: keep-latest removed ${removed.length} older verify cop${removed.length === 1 ? 'y' : 'ies'} of ${instanceId}`)
+        return { removed, warning: null }
+    } catch (e: any) {
+        const warning = `older verify copies were not removed: clean-verify failed (${e?.message ?? e})`
+        log(`WARNING: verifyBackup: ${warning}`)
+        return { removed: [], warning }
+    }
 }
 
 const requireNotSkipBorg = (command: string): void => {
@@ -425,6 +466,8 @@ export const verifyBackup = async (
             memberCount: (members.length ? members : scratchRels).length,
             partial: (members.length ? members : scratchRels).length > VERIFY_MEMBER_CAP,
             checks,
+            // engine#415: keep-latest, after the checks are recorded (ok or failed path-checks)
+            cleanup: await cleanVerifyCopies(device, instance.id, stamp, run),
         }
         attachTraceResult(result)
         print(chalk.green(`verifyBackup: archive ${arch.name} → ${usedPath} (${result.ok ? 'ok' : 'checks failed'})`))

@@ -109,7 +109,7 @@ describe('idea-app-data: argument checks', () => {
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
             ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['quarantine-snapshot', 2],
-            ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1],
+            ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1], ['clean-verify', 3],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 2], ['clear-peers', 2], ['install-usage-key', 3],
         ]
         for (const [sub, n] of cases) {
@@ -1143,6 +1143,131 @@ describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helpe
 })
 
 
+describe('idea-app-data clean-verify: keep-latest verify copies (helper v17, engine#415, Koen decision (b))', () => {
+    let bk: string
+    const A0 = '2026-10-06T10-00-00-000Z'
+    const S = ['20261115T080000000Z', '20261115T090000000Z', '20261115T100000000Z']
+    const vdir = () => path.join(bk, '.idea-verify')
+    const copy = (id: string, stamp: string) => path.join(vdir(), `${id}-${stamp}`)
+    const extract = async (stamp: string, o: { fail?: boolean, id?: string } = {}) => {
+        const id = o.id ?? 'inst1'
+        const repo = path.join(bk, 'backups', id)
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        return sb.run(['borg-extract-verify', 'sdc1', id, A0, stamp], { FAKE_BORG_EXTRACT: `instances/${id}`, ...(o.fail ? { FAKE_BORG_EXIT: '1' } : {}) })
+    }
+    beforeEach(async () => {
+        bk = await sb.addDisk('sdc1', { backup: true })
+    })
+
+    it('borg-extract-verify marks a complete extract next to the tree (never inside it); a failed extract gets no marker', async () => {
+        const ok = await extract(S[0])
+        expect(ok.exitCode, ok.stderr).toBe(0)
+        expect(await fs.pathExists(`${copy('inst1', S[0])}.extract-ok`)).toBe(true)
+        expect(await fs.readdir(copy('inst1', S[0]))).toEqual(['instances'])
+        const bad = await extract(S[1], { fail: true })
+        expect(bad.exitCode).toBe(1)
+        expect(await fs.pathExists(copy('inst1', S[1]))).toBe(true)
+        expect(await fs.pathExists(`${copy('inst1', S[1])}.extract-ok`)).toBe(false)
+    })
+
+    it('keep-latest with three successful copies: the two older ones are removed, the newest kept', async () => {
+        for (const st of S) expect((await extract(st)).exitCode).toBe(0)
+        const r = await sb.run(['clean-verify', 'sdc1', 'inst1', S[2]])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout.split('\n').filter(l => l.startsWith('removed ')).sort()).toEqual([`removed ${copy('inst1', S[0])}`, `removed ${copy('inst1', S[1])}`])
+        expect(r.stdout).toContain(`kept ${copy('inst1', S[2])}`)
+        expect((await fs.readdir(vdir())).sort()).toEqual([`inst1-${S[2]}`, `inst1-${S[2]}.extract-ok`])
+        expect(await fs.pathExists(path.join(copy('inst1', S[2]), 'instances', 'inst1', 'data.txt'))).toBe(true)
+        expect(await sb.journalText()).toMatch(/clean-verify: removed .*inst1-20261115T080000000Z/)
+        // idempotent: a second run removes nothing
+        const again = await sb.run(['clean-verify', 'sdc1', 'inst1', S[2]])
+        expect(again.exitCode, again.stderr).toBe(0)
+        expect(again.stdout).not.toMatch(/^removed /m)
+    })
+
+    it('a failed-extract copy survives keep-latest (no marker, kept for diagnosis), and so does a copy without a marker from an older helper', async () => {
+        expect((await extract(S[0], { fail: true })).exitCode).toBe(1)
+        await fs.ensureDir(copy('inst1', '20261114T000000000Z'))   // made by a helper older than v17: no marker
+        expect((await extract(S[1])).exitCode).toBe(0)
+        expect((await extract(S[2])).exitCode).toBe(0)
+        const r = await sb.run(['clean-verify', 'sdc1', 'inst1', S[2]])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(await fs.pathExists(copy('inst1', S[1]))).toBe(false)
+        expect(await fs.pathExists(path.join(copy('inst1', S[0]), 'instances', 'inst1', 'data.txt'))).toBe(true)
+        expect(await fs.pathExists(copy('inst1', '20261114T000000000Z'))).toBe(true)
+        expect(r.stderr).toMatch(/kept .*inst1-20261115T080000000Z: no complete-extract marker \(failed extract, kept for diagnosis\)/)
+    })
+
+    it('touches only this instance, only inside .idea-verify/, and never follows a symlink', async () => {
+        expect((await extract(S[0])).exitCode).toBe(0)
+        expect((await extract(S[1])).exitCode).toBe(0)
+        expect((await extract(S[0], { id: 'inst1-b' })).exitCode).toBe(0)   // another instance whose id starts with inst1-
+        // a symlinked older copy pointing outside .idea-verify, with a marker
+        const outside = path.join(bk, 'instances', 'precious')
+        await fs.ensureDir(outside)
+        await fs.writeFile(path.join(outside, 'keep.txt'), 'keep')
+        const linkStamp = '20261101T000000000Z'
+        await fs.symlink(outside, copy('inst1', linkStamp))
+        await fs.writeFile(`${copy('inst1', linkStamp)}.extract-ok`, '')
+        await fs.ensureDir(path.join(bk, '.idea-quarantine', 'inst1-20261101T000000Z'))
+        const r = await sb.run(['clean-verify', 'sdc1', 'inst1', S[1]])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(await fs.pathExists(copy('inst1', S[0]))).toBe(false)
+        expect(await fs.pathExists(copy('inst1-b', S[0]))).toBe(true)
+        expect(await fs.readFile(path.join(outside, 'keep.txt'), 'utf8')).toBe('keep')
+        expect((await fs.lstat(copy('inst1', linkStamp))).isSymbolicLink()).toBe(true)
+        expect(r.stderr).toMatch(/skipped .*inst1-20261101T000000000Z: a symlink \(never followed\)/)
+        expect(await fs.pathExists(path.join(bk, '.idea-quarantine', 'inst1-20261101T000000Z'))).toBe(true)
+        expect(await fs.pathExists(path.join(bk, 'backups', 'inst1', 'config'))).toBe(true)
+    })
+
+    it('refuses the system disk, a bad id or stamp (.., /, leading -), and removes nothing', async () => {
+        expect((await extract(S[0])).exitCode).toBe(0)
+        expect((await extract(S[1])).exitCode).toBe(0)
+        refused(await sb.run(['clean-verify', 'system', 'inst1', S[1]]), /a Backup Disk is never the system disk/)
+        for (const root of ['..', '-rf', '/disks/sdc1', 'sdc1/../x']) {
+            refused(await sb.run(['clean-verify', root, 'inst1', S[1]]), /root '.*' is not sd\[a-z\]\[1-9\]|unknown root/)
+        }
+        for (const id of ['..', '-rf', 'a/b', 'inst1/..', '../inst1', 'Inst1', '']) {
+            refused(await sb.run(['clean-verify', 'sdc1', id, S[1]]), /instance id '.*' does not match/)
+        }
+        for (const stamp of ['..', `../${S[1]}`, `${S[1]}/..`, `-${S[1]}`, '20261115T100000Z/../../instances', '2026-11-15T10:00:00Z', 'latest', '*']) {
+            refused(await sb.run(['clean-verify', 'sdc1', 'inst1', stamp]), /stamp '.*'/)
+        }
+        expect(await fs.pathExists(copy('inst1', S[0]))).toBe(true)
+        expect(await fs.pathExists(copy('inst1', S[1]))).toBe(true)
+    })
+
+    it('refuses a missing, symlinked or unmarked kept copy, and a symlinked .idea-verify, and then removes nothing', async () => {
+        expect((await extract(S[0])).exitCode).toBe(0)
+        refused(await sb.run(['clean-verify', 'sdc1', 'inst1', S[2]]), /verify folder .* is missing/)
+        expect((await extract(S[1], { fail: true })).exitCode).toBe(1)
+        refused(await sb.run(['clean-verify', 'sdc1', 'inst1', S[1]]), /has no complete-extract marker .*nothing removed/)
+        await fs.symlink(copy('inst1', S[0]), copy('inst1', S[2]))
+        refused(await sb.run(['clean-verify', 'sdc1', 'inst1', S[2]]), /verify folder .* is a symlink/)
+        expect(await fs.pathExists(copy('inst1', S[0]))).toBe(true)
+        expect(await fs.pathExists(copy('inst1', S[1]))).toBe(true)
+
+        const s2 = await sandbox()
+        const bk2 = await s2.addDisk('sdc1', { backup: true })
+        const real = path.join(bk2, 'elsewhere')
+        await fs.ensureDir(path.join(real, `inst1-${S[0]}`))
+        await fs.writeFile(path.join(real, `inst1-${S[0]}.extract-ok`), '')
+        await fs.ensureDir(path.join(real, `inst1-${S[1]}`))
+        await fs.writeFile(path.join(real, `inst1-${S[1]}.extract-ok`), '')
+        await fs.symlink(real, path.join(bk2, '.idea-verify'))
+        refused(await s2.run(['clean-verify', 'sdc1', 'inst1', S[1]]), /\.idea-verify is a symlink/)
+        expect(await fs.pathExists(path.join(real, `inst1-${S[0]}`))).toBe(true)
+    })
+
+    it('refuses a disk without BACKUP.yaml (not a Backup Disk)', async () => {
+        await sb.addDisk('sdb1')
+        refused(await sb.run(['clean-verify', 'sdb1', 'inst1', S[0]]), /BACKUP\.yaml/)
+    })
+})
+
+
 describe('Engine argv builders agree with helper v9 (idea#446)', () => {
     const A = [
         '2026-01-01T00-00-00-000Z',
@@ -1489,10 +1614,10 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v16 (v15 peer-file guards of engine#376 unchanged; v16 adds the engine#401 archive-mode suffix)', async () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('16')
+    it('helper and Engine speak v17 (v15 peer-file guards of engine#376 and the v16 archive-mode suffix unchanged; v17 adds engine#415 clean-verify)', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('17')
         const r = await sb.run(['version'])
-        expect(r.stdout.trim()).toBe('idea-app-data 16')
+        expect(r.stdout.trim()).toBe('idea-app-data 17')
     })
 
     it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {
