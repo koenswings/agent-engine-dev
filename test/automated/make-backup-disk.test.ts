@@ -354,6 +354,57 @@ describe('makeBackupDisk adopt / erase / create', () => {
         expect(op.status).toBe('Done')
     })
 
+    it('shows Re-dock while the wiped disk is re-added, then Create (engine#432)', async () => {
+        h.change(doc => {
+            doc.engineDB[LOCAL].unformattedDisks = [{
+                candidateId: 'STICK1', device: 'sdf', sizeBytes: BIG, model: 'SanDisk',
+                fsType: 'exfat', label: 'SanDisk 32 GB', serial: 'STICK1',
+            } as any]
+        })
+        putSummary(logHandle, 'STICK1', 'SanDisk 32 GB', BIG, 'STICK1')
+        const labels: string[] = []
+        const opLabel = () => {
+            const op = Object.values(h.doc()!.operationDB).find((o: any) => o.kind === 'makeBackupDisk') as any
+            return op?.stepLabel ?? null
+        }
+        h.on('change', () => {
+            const l = opLabel()
+            if (l && labels[labels.length - 1] !== l) labels.push(l)
+        })
+        const addSeen: (string | null)[] = []
+        setEraseOpsForTests({
+            mountedPartitions: async () => [],
+            hiddenTablePartitions: async () => [],
+            runScript: async (a) => {
+                const part = a.device.replace('/dev/', '') + '1'
+                const root = `${DISKS_ROOT}/${part}`
+                await fs.ensureDir(root)
+                await fs.copy(path.join(a.stagingDir, 'META.yaml'), path.join(root, 'META.yaml'))
+                roots.push(root)
+                return { stdout: 'ok: erased\n' }
+            },
+            runSlotErase: async () => ({ stdout: 'ok\n' }),
+            udevadmSettle: async () => {},
+            composeDownV: async () => {},
+            lsblkSizeSerial: async () => ({ sizeBytes: BIG, serial: 'STICK1' }),
+            isMountPoint: async () => false,
+            addDevice: async (p) => {
+                addSeen.push(opLabel())
+                const device = p.split('/').pop()!
+                const root = `${DISKS_ROOT}/${device}`
+                const meta = YAML.parse(await fs.readFile(path.join(root, 'META.yaml'), 'utf8'))
+                const disk = createOrUpdateDisk(h, LOCAL, device as DeviceName, meta.diskId as DiskID, 'IDEA Disk' as DiskName, 1 as Timestamp)
+                await processDisk(h, disk)
+            },
+        })
+        const r = await makeBackupDisk(h, 'STICK1', 'sum-1', 'SanDisk 32 GB')
+        expect(r.erased).toBe(true)
+        // The op already says Re-dock when the wiped disk is added again, not after eraseDisk returns
+        expect(addSeen).toEqual(['Re-dock'])
+        expect(labels).toEqual(['Check', 'Erase', 'Re-dock', 'Create'])
+        expect(h.doc()!.operationDB[r.operationId].status).toBe('Done')
+    })
+
     it('UNPLUGGED when the disk is gone from sysfs during Erase', async () => {
         h.change(doc => {
             doc.engineDB[LOCAL].unformattedDisks = [{

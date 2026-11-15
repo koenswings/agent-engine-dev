@@ -300,11 +300,18 @@ export const isEspPartType = (partType: string): boolean => {
 /** A teacher-stick mount (read-only, directly under the USB root, idea#193 §3.2). */
 const isUsbStickMount = (mountpoint: string): boolean => path.dirname(mountpoint) === usbRoot()
 
+/** engine#432: optional progress hooks for a caller that shows its own op steps (makeBackupDisk). */
+export interface EraseDiskHooks {
+    /** Called once, right before the wiped disk is mounted and registered again (the re-dock). */
+    onRedock?: () => void
+}
+
 export const eraseDisk = async (
     storeHandle: DocHandle<Store>,
     targetId: string,
     summaryTraceId: string,
     confirmName: string,
+    hooks: EraseDiskHooks = {},
 ): Promise<{ diskId: DiskID; removedInstances: { id: string; name: string; dataBytes: number }[] }> => {
     const store = storeHandle.doc()!
     const eng = store.engineDB[localEngineId]
@@ -568,6 +575,8 @@ export const eraseDisk = async (
         }
 
         setEraseStep(storeHandle, 'mounting', targetId, summary.label)
+        // engine#432: the caller's Re-dock step starts here, not after eraseDisk returns
+        try { hooks.onRedock?.() } catch (e: any) { log(`eraseDisk onRedock hook failed: ${e?.message ?? e}`) }
         if (!slotErase) await ops.udevadmSettle()
         // USB: partition is whole+1 (sdb → sdb1). Loop slots keep the slot name.
         const partition = slotErase ? (devicePartition ?? whole) : `${whole}1`
