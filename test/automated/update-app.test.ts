@@ -274,12 +274,13 @@ describe('updateApp (#230)', () => {
 
 describe('idea#76 gaps', () => {
     const facts = { diskDocked: true, busy: false, sourcePresent: true, sumsValid: true, allowMajor: true, backupAgeMs: 1000, shortDisks: [] as string[] }
-    it('x-app.updatesFrom: absent keeps the old rule; listed major allowed; unlisted refused; unversioned not restricted', () => {
+    it('x-app.updatesFrom: absent keeps the old rule; listed major allowed; unlisted refused; unversioned not restricted by updatesFrom', () => {
         expect(majorAllowedByUpdatesFrom('1.0', undefined)).toBe(true)
         expect(majorAllowedByUpdatesFrom('1.0', [1])).toBe(true)
         expect(majorAllowedByUpdatesFrom('1.0', ['1'])).toBe(true)
         expect(majorAllowedByUpdatesFrom('1.0', [2])).toBe(false)
         expect(majorAllowedByUpdatesFrom('5ab9f64', [1])).toBe(true)
+        expect(majorAllowedByUpdatesFrom('5ab9f64', undefined)).toBe(true)
         expect(checkUpdate({ ...facts, currentAppId: 'nextcloud-1.0', newAppId: 'nextcloud-2.0' })).toBeNull()
         expect(checkUpdate({ ...facts, currentAppId: 'nextcloud-1.0', newAppId: 'nextcloud-3.0', updatesFrom: [2] })?.code).toBe('MAJOR_NOT_ALLOWED')
         expect(checkUpdate({ ...facts, currentAppId: 'nextcloud-2.0', newAppId: 'nextcloud-3.0', updatesFrom: [2] })).toBeNull()
