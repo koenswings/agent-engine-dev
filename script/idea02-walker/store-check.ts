@@ -3,7 +3,7 @@
 import { Repo } from '@automerge/automerge-repo'
 import { BrowserWebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
 import { storeCheckVerdict, type StoreCheckDoc } from '../../test/duration/walkHost.js'
-const HOSTS: Record<string, string> = { idea01: '10.99.0.11', idea03: '10.99.0.13', idea04: '10.99.0.14' }
+const HOSTS: Record<string, string> = { idea01: '192.168.0.138', idea03: '192.168.0.228', idea04: '192.168.0.113' }
 const DOC = process.env.STORE_DOC, PORT = process.env.WS_PORT || '4321'
 const WAIT = Number(process.env.DURATION_DOC_WAIT_MS || 45000)
 if (!DOC) { console.error('STORE_DOC required'); process.exit(2) }

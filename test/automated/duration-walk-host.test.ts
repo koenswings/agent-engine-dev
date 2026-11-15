@@ -57,6 +57,15 @@ describe('idea02 launcher contract (script/idea02-walker/launch.sh)', () => {
     })
     it('runs the store-check gate before launching and keeps the declared pins + deviation', () => {
         expect(sh).toMatch(/store-check\.ts/)
-        for (const v of ['DURATION_STAGE=2', 'a6b34449c84713094164e1ee11b40dd405b0e855', 'index-Cy43iuhk.js', '17d2bcd596e66f0d8f7f63bce799eb81', 'DURATION_DOC_WAIT_MS', '--start-instances', '--console-url http://idea01:8080']) expect(sh).toContain(v)
+        for (const v of ['DURATION_STAGE=2', '6e359bdda538e5b9fc4b9a90c1be9b5d52544b96', 'index-CZcx48Dc.js', '231b08c72f0f5928e3b273bdf9d508a5', 'DURATION_DOC_WAIT_MS', '--start-instances', '--console-url http://idea01:8080']) expect(sh).toContain(v)
+    })
+    it('defaults FLEET_HOSTS to fleet-state Tailscale IPs and LAN_HOSTS to current pool LAN IPs', () => {
+        expect(sh).toContain('idea01=100.99.231.94,idea03=100.126.117.80,idea04=100.108.39.45')
+        expect(sh).toContain('idea01=192.168.0.138,idea03=192.168.0.228,idea04=192.168.0.113')
+        expect(sh).not.toMatch(/DURATION_FLEET_HOSTS=.*idea02=/)
+        expect(sh).not.toMatch(/DURATION_LAN_HOSTS=.*idea02=/)
+        expect(sh).not.toContain('10.99.0.11')
+        expect(sh).not.toContain('100.115.60.6')
+        expect(sh).not.toContain('100.85.108.118')
     })
 })

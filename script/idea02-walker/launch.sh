@@ -12,7 +12,7 @@ EVID=/home/walker/duration-evidence/$RUN
 git -C "$REPO" diff --quiet || { echo "REFUSE: dirty harness tree"; exit 3; }
 SHA=$(git -C "$REPO" rev-parse HEAD)
 git -C "$REPO" branch -r --contains "$SHA" | grep -q origin/ || { echo "REFUSE: $SHA not pushed"; exit 3; }
-CONSOLE_PIN=a6b34449c84713094164e1ee11b40dd405b0e855  # Console PR #148 head (main merged in): e2e/intents == 4788cc4, src == pool fc8cf78 (index-Cy43iuhk.js) — idea#168 r87a store-growth proof
+CONSOLE_PIN=6e359bdda538e5b9fc4b9a90c1be9b5d52544b96  # Console main (console#221): backup_schedule, rename_instance, make_backup_disk size gate
 [ "$(git -C /home/walker/agent-console-dev rev-parse HEAD)" = "$CONSOLE_PIN" ] || { echo "REFUSE: console intents checkout is not $CONSOLE_PIN"; exit 3; }
 git -C /home/walker/agent-console-dev diff --quiet || { echo "REFUSE: dirty console intents tree"; exit 3; }
 mkdir -p "$EVID"; [ -f "$EVID/run.pid" ] && kill -0 "$(cat "$EVID/run.pid")" 2>/dev/null && { echo "REFUSE: already running"; exit 4; }
@@ -22,15 +22,16 @@ cat > "$EVID/run.sh" <<R
 #!/usr/bin/env bash
 cd $REPO
 export DURATION_EVIDENCE_DIR=$EVID
-export DURATION_FLEET_HOSTS=\${DURATION_FLEET_HOSTS:-idea01=10.99.0.11,idea03=10.99.0.13,idea04=10.99.0.14}
-export DURATION_LAN_HOSTS=\${DURATION_LAN_HOSTS:-idea01=10.99.0.11,idea03=10.99.0.13,idea04=10.99.0.14}
+export DURATION_FLEET_HOSTS=\${DURATION_FLEET_HOSTS:-idea01=100.99.231.94,idea03=100.126.117.80,idea04=100.108.39.45}
+export DURATION_LAN_HOSTS=\${DURATION_LAN_HOSTS:-idea01=192.168.0.138,idea03=192.168.0.228,idea04=192.168.0.113}
 export DURATION_CONSOLE_INTENTS=/home/walker/agent-console-dev/e2e/intents
 export DURATION_STAGE=2
 export DURATION_EXPECTED_CONSOLE_SHA=$CONSOLE_PIN
-# Product pin = intents pin = a6b34449c84713094164e1ee11b40dd405b0e855 (#148 head); build byte-identical to pool fc8cf78.
-export DURATION_CONSOLE_PRODUCT_SHA=a6b34449c84713094164e1ee11b40dd405b0e855
-export DURATION_CONSOLE_PRODUCT_ASSET=index-Cy43iuhk.js
-export DURATION_CONSOLE_PRODUCT_ASSET_MD5=17d2bcd596e66f0d8f7f63bce799eb81
+# Product pin = intents pin = 6e359bdda538e5b9fc4b9a90c1be9b5d52544b96 (console#221 on main).
+# Asset md5: box `pnpm build` of that commit; main script from dist/index.html (see PR).
+export DURATION_CONSOLE_PRODUCT_SHA=6e359bdda538e5b9fc4b9a90c1be9b5d52544b96
+export DURATION_CONSOLE_PRODUCT_ASSET=index-CZcx48Dc.js
+export DURATION_CONSOLE_PRODUCT_ASSET_MD5=231b08c72f0f5928e3b273bdf9d508a5
 export DURATION_EXPECTED_STORE_ID=2VroE
 export DURATION_POST_OP_SETTLE_MS=\${DURATION_POST_OP_SETTLE_MS:-300000}
 export DURATION_DOC_WAIT_MS=\${DURATION_DOC_WAIT_MS:-45000}
