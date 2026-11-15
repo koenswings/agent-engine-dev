@@ -109,6 +109,7 @@ export const majorAllowedByUpdatesFrom = (fromVersion: string, updatesFrom: unkn
  * Versioned sources are unchanged. This does not recategorise SHA → 1.x: it stays a
  * major (isMajorChange), so --allow-major and the NEEDS_BACKUP path still apply.
  */
+// Unversioned (SHA/date) sources may take only the first tagged major; < 2 so apps still on 0.x aren't blocked (Steve, #463)
 export const unversionedMayTakeTarget = (fromVersion: string, toVersion: string): boolean => {
     if (!isUnversioned(fromVersion)) return true
     const y = parseVersion(toVersion)
