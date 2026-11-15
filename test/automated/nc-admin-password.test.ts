@@ -1,14 +1,15 @@
 /**
- * nc-admin-password.test.ts — separate Nextcloud admin secret per instance (idea#202)
+ * nc-admin-password.test.ts — separate Nextcloud admin secret per instance
+ * (agent-engine-dev#202, #450)
  *
- *   1. create: a new instance whose compose reads IDEA_NC_ADMIN_PASSWORD gets a
- *      strong value (32 of [A-Za-z0-9], crypto) in .env, distinct from pass
- *   2. restart: a later start keeps it, never regenerates
+ *   1. create: a new instance whose compose reads IDEA_NC_ADMIN_PASSWORD gets
+ *      the documented default admin911! in .env, distinct from pass
+ *   2. restart: a later start keeps it, never regenerates or rotates
  *   3. copy: copy's prepared .env keeps it (only port= is dropped), and the
  *      copy's first start keeps it
  *   4. move: the moved folder's start keeps it
  *   5. an existing value is preserved, and an older instance (pass, no value)
- *      gets none, so the compose ${pass} fallback stays right
+ *      gets none, so the already-installed admin stays in effect
  *   6. scope: an app whose compose does not reference it gets nothing
  *   7. the value never reaches the log
  *   8. startInstance wires it in after the pass step
@@ -20,8 +21,8 @@ import path from 'path'
 import { fs } from 'zx'
 import * as utils from '../../src/utils/utils.js'
 import {
-    ensureNcAdminPassword, generateNcAdminPassword, composeUsesNcAdminPassword,
-    NC_ADMIN_PASSWORD_VAR, NC_ADMIN_PASSWORD_LENGTH,
+    ensureNcAdminPassword, composeUsesNcAdminPassword,
+    NC_ADMIN_PASSWORD_VAR, NC_ADMIN_PASSWORD_DEFAULT,
 } from '../../src/data/AppSecrets.js'
 import { preparedCopyFiles } from '../../src/data/InstanceCopy.js'
 
@@ -30,7 +31,7 @@ const NC_COMPOSE = [
     '  nextcloud:',
     '    image: nextcloud:stable',
     '    environment:',
-    '      - NEXTCLOUD_ADMIN_PASSWORD=${IDEA_NC_ADMIN_PASSWORD:-${pass}}',
+    '      - NEXTCLOUD_ADMIN_PASSWORD=${IDEA_NC_ADMIN_PASSWORD:-admin911!}',
     '      - MYSQL_PASSWORD=${pass}',
     'x-app:',
     '  name: nextcloud',
@@ -62,31 +63,21 @@ const makeInstance = async (name: string, compose: string, env?: string) => {
 beforeEach(async () => { root = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-test-ncadmin-')) })
 afterEach(async () => { vi.restoreAllMocks(); await fs.remove(root) })
 
-describe('IDEA_NC_ADMIN_PASSWORD (idea#202)', () => {
-    it('generates strong, unique values from the crypto source', () => {
-        const seen = new Set<string>()
-        for (let i = 0; i < 2000; i++) {
-            const v = generateNcAdminPassword()
-            expect(v).to.match(new RegExp(`^[A-Za-z0-9]{${NC_ADMIN_PASSWORD_LENGTH}}$`))
-            seen.add(v)
-        }
-        expect(seen.size).to.equal(2000)
-        vi.spyOn(Math, 'random').mockReturnValue(0)
-        expect(generateNcAdminPassword()).not.to.equal(generateNcAdminPassword())
-    })
-
+describe('IDEA_NC_ADMIN_PASSWORD (agent-engine-dev#202, #450)', () => {
     it('scopes on the compose reference', () => {
         expect(composeUsesNcAdminPassword(NC_COMPOSE)).to.be.true
         expect(composeUsesNcAdminPassword(OTHER_COMPOSE)).to.be.false
         expect(composeUsesNcAdminPassword('X=${IDEA_NC_ADMIN_PASSWORDX}')).to.be.false
     })
 
-    it('create: writes a value on the first start, separate from pass', async () => {
+    it('create: writes admin911! on the first start, separate from pass', async () => {
         const dir = await makeInstance('nc1', NC_COMPOSE)
         expect(await start(dir)).to.equal('generated')
         const v = await valueOf(dir)
-        expect(v).to.match(/^[A-Za-z0-9]{32}$/)
+        expect(v).to.equal(NC_ADMIN_PASSWORD_DEFAULT)
         expect(v).not.to.equal(await utils.readEnvVariable(path.join(dir, '.env'), 'pass'))
+        // Raw file line, not zx's $'admin911!' quoting
+        expect(await envOf(dir)).to.match(new RegExp(`^${NC_ADMIN_PASSWORD_VAR}=${NC_ADMIN_PASSWORD_DEFAULT}$`, 'm'))
     })
 
     it('restart: keeps the value on every later start', async () => {
@@ -128,7 +119,7 @@ describe('IDEA_NC_ADMIN_PASSWORD (idea#202)', () => {
         expect(await valueOf(dir)).to.equal('operatorChosen123')
     })
 
-    it('older instance (pass, no value): generates none, so ${pass} stays the admin password', async () => {
+    it('older instance (pass, no value): generates none, so the already-installed admin stays in effect', async () => {
         const dir = await makeInstance('wh', NC_COMPOSE, 'pass=legacyPass\nport=51000\n')
         expect(await start(dir)).to.equal('legacy-fallback')
         expect(await valueOf(dir)).to.equal(null)
