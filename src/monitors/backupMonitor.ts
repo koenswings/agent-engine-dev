@@ -859,6 +859,9 @@ export const extractLatestArchive = async (backupRoot: string, instanceId: strin
 
 // ── restoreApp ────────────────────────────────────────────────────────────────
 
+/** engine#413: cause of the start after an in-place restore of a Running instance (not a user cause). */
+export const RESTORE_POST_START_CAUSE: OperationCause = 'backup-post-start'
+
 /**
  * Restore the latest archive for instanceId from any docked Backup Disk
  * onto targetDisk.
@@ -915,9 +918,12 @@ export const restoreApp = async (
         const repoPath = backupDir(backupDevice, instanceId)
         const instancesDir = `${await diskMountRoot(targetDisk)}/instances`
 
-        // Stop instance if currently running
+        // Stop instance if currently running. engine#413: remember that it was
+        // Running, because the stop writes status Stopped and processInstance then
+        // skips the auto-start (shouldAutoStart: 'status is Stopped').
         const instance = getInstance(store, instanceId)
-        if (instance?.status === 'Running') {
+        const wasRunning = instance?.status === 'Running'
+        if (wasRunning) {
             const currentDisk = instance.storedOn ? store.diskDB[instance.storedOn] : null
             if (currentDisk) await backupLifecycle.stopInstance(storeHandle, instance, currentDisk, 'backup-pre-stop')
         }
@@ -943,6 +949,17 @@ export const restoreApp = async (
         const { processInstance } = await import('../data/Disk.js')
         await processInstance(storeHandle, targetDisk, instanceId)
         await quarantinePreRestore(storeHandle.doc(), instanceId, targetDisk, prevDisk)
+
+        // engine#413: running in, running out (same as moveApp, idea#474). An
+        // instance that was Stopped before the restore stays Stopped. The cause is
+        // an Engine cause, not an operator one, so it never counts as a user start.
+        if (wasRunning) {
+            const restored = getInstance(storeHandle.doc(), instanceId)
+            if (restored) {
+                log(`Starting restored instance ${instanceId} on disk ${targetDisk.name} (it was Running before the restore)`)
+                await backupLifecycle.startInstance(storeHandle, restored, targetDisk, RESTORE_POST_START_CAUSE)
+            }
+        }
 
         updateOperation(storeHandle, opId, {
             status: 'Done',
