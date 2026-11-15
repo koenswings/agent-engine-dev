@@ -207,8 +207,9 @@ describe('Engine sudoers asset (idea#80)', () => {
             expect(text, f).not.toMatch(/rm -rf --? \$\{/)
         }
         const engine = src('src/data/Engine.ts')
-        expect(engine).toContain('sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-app-data ${APP_DATA_HELPER}')
-        expect(engine).toContain('sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-peer-gate ${PEER_GATE}')
+        // idea#284 part 2: root-owned 0755 COPIES through installManagedFile (sudo install -o root -g root)
+        expect(engine).toContain("installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-app-data`, APP_DATA_HELPER, '0755')")
+        expect(engine).toContain("installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-peer-gate`, PEER_GATE, '0755')")
         expect(fs.statSync(path.join(ROOT, 'script/build_image_assets/idea-app-data')).mode & 0o111).not.toBe(0)
         expect(fs.statSync(path.join(ROOT, 'script/build_image_assets/idea-peer-gate')).mode & 0o111).not.toBe(0)
     })

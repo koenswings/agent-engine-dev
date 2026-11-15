@@ -592,6 +592,32 @@ export const clearKnownHost = async (machine: string) => {
   }
 }
 
+/**
+ * idea#284 part 2: install-root-helpers runs on every update, so a managed root file is
+ * only (re)installed when it differs. True when `dst` already has `src`'s content and
+ * the wanted mode and owner (`sudo cmp -s` plus `stat`, read-only); then nothing is
+ * written, so its mtime does not move (Atlas's 1dbaf27 proof: same sha, new mtime).
+ */
+export const managedFileCurrent = async (exec: any, src: string, dst: string, mode: string, owner: string = 'root:root'): Promise<boolean> => {
+  const want = `${mode.replace(/^0+(?=[0-7])/, '')} ${owner}`
+  const r = await exec`if sudo cmp -s ${src} ${dst} && [ "$(sudo stat -c '%a %U:%G' ${dst})" = ${want} ]; then echo same; fi`
+  return String(r?.stdout ?? '').trim() === 'same'
+}
+
+/**
+ * idea#284 part 2: `sudo install -o <owner> -g <group> -m <mode> src dst` only when dst
+ * differs (content, mode or owner). Returns true when it installed, false when the
+ * file was already current (nothing written).
+ */
+export const installManagedFile = async (exec: any, src: string, dst: string, mode: string, owner: string = 'root', group: string = 'root'): Promise<boolean> => {
+  if (await managedFileCurrent(exec, src, dst, mode, `${owner}:${group}`)) {
+    print(chalk.green(`  - ${dst} unchanged`))
+    return false
+  }
+  await exec`sudo install -o ${owner} -g ${group} -m ${mode} ${src} ${dst}`
+  return true
+}
+
 export const copyAsset = async (exec: any, enginePath: string, asset: string, destination: string, executable: boolean = false, chmod: string | null = "0644", chown: string | null = "0:0", destName: string = asset) => {
   print(chalk.blue(`Copying asset ${asset} to ${destination}/${destName}`));
   try {
@@ -807,8 +833,7 @@ export const DHCP_VENDOR_CLASS = 'idea-engine'
 export const installDhcpVendorClass = async (exec: any, enginePath: string) => {
   print(chalk.blue(`Setting DHCP vendor class (option 60) to ${DHCP_VENDOR_CLASS}...`));
   try {
-    const asset = `${enginePath}/script/build_image_assets/idea-dhcp-vendor-class`
-    await exec`if ! cmp -s ${asset} ${DHCP_VENDOR_CLASS_HELPER}; then sudo install -o root -g root -m 0755 ${asset} ${DHCP_VENDOR_CLASS_HELPER}; fi`;
+    await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-dhcp-vendor-class`, DHCP_VENDOR_CLASS_HELPER, '0755')
     const out = String((await exec`sudo ${DHCP_VENDOR_CLASS_HELPER}`)?.stdout ?? '')
     if (dhcpVendorClassNmChanged(out)) {
       // Reload NM's config files only (like SIGHUP); never restart NM or dhcpcd.
@@ -841,11 +866,21 @@ export const IGMP_MAX_MEMBERSHIPS = 1024
  */
 export const installIgmpSysctl = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing /etc/sysctl.d/90-idea-igmp.conf...'))
-  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/${IGMP_SYSCTL_ASSET} ${IGMP_SYSCTL_CONF}`
+  const changed = await installManagedFile(exec, `${enginePath}/script/build_image_assets/${IGMP_SYSCTL_ASSET}`, IGMP_SYSCTL_CONF, '0644')
   if (process.env.IDEA_IMAGE_BUILD === '1') {
     print(chalk.blue('  - Skipping sysctl -p (image build; the file is applied at first boot)'))
     print(chalk.green(`  - ${IGMP_SYSCTL_CONF} installed`))
     return
+  }
+  // idea#284 part 2: apply only when the file changed or the live value is below it
+  // (read-only `sysctl -n`), so a no-change update touches nothing.
+  if (!changed) {
+    let live = NaN
+    try { live = Number(String((await exec`sysctl -n net.ipv4.igmp_max_memberships`)?.stdout ?? '').trim()) } catch { live = NaN }
+    if (Number.isFinite(live) && live >= IGMP_MAX_MEMBERSHIPS) {
+      print(chalk.green(`  - ${IGMP_SYSCTL_CONF} unchanged and in effect (igmp_max_memberships=${live}); no sysctl -p`))
+      return
+    }
   }
   await exec`sudo sysctl -p ${IGMP_SYSCTL_CONF}`
   print(chalk.green(`  - ${IGMP_SYSCTL_CONF} installed and applied (igmp_max_memberships=${IGMP_MAX_MEMBERSHIPS})`))
@@ -1001,26 +1036,26 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   await installEngineSudoers(exec, enginePath)
   // idea-erase-disk: root-owned COPY in /usr/local/sbin (never a symlink) (idea#134)
   print(chalk.blue('  - Installing idea-erase-disk...'))
-  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-erase-disk /usr/local/sbin/idea-erase-disk`
+  await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-erase-disk`, '/usr/local/sbin/idea-erase-disk', '0755')
   print(chalk.green('  - /usr/local/sbin/idea-erase-disk installed'))
   // idea-write-home-engine (idea#203): called only by the flash-card root helper after a verified
   // write; root-owned COPY like idea-erase-disk, no sudoers entry (the Engine never calls it).
   print(chalk.blue('  - Installing idea-write-home-engine...'))
-  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-home-engine /usr/local/sbin/idea-write-home-engine`
+  await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-write-home-engine`, '/usr/local/sbin/idea-write-home-engine', '0755')
   print(chalk.green('  - /usr/local/sbin/idea-write-home-engine installed'))
   // idea-write-card-timezone (idea#208): called only by idea-flash-card --timezone after a verified
   // write; root-owned COPY, no sudoers entry (the Engine never calls it).
   print(chalk.blue('  - Installing idea-write-card-timezone...'))
-  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-write-card-timezone /usr/local/sbin/idea-write-card-timezone`
+  await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-write-card-timezone`, '/usr/local/sbin/idea-write-card-timezone', '0755')
   print(chalk.green('  - /usr/local/sbin/idea-write-card-timezone installed'))
   // idea-engine-identity (idea#322): applies the flash-time identity from the boot partition.
   // Run as root by boot.sh on every boot; root-owned COPY, no sudoers entry (the Engine never calls it).
   print(chalk.blue('  - Installing idea-engine-identity...'))
-  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-engine-identity ${ENGINE_IDENTITY_HELPER}`
+  await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-engine-identity`, ENGINE_IDENTITY_HELPER, '0755')
   print(chalk.green(`  - ${ENGINE_IDENTITY_HELPER} installed`))
   // idea-flash-card: client-card flash helper (idea#201 §10), root-owned COPY, 0755
   print(chalk.blue('  - Installing idea-flash-card...'))
-  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-flash-card ${FLASH_HELPER_PATH}`
+  await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-flash-card`, FLASH_HELPER_PATH, '0755')
   // Client images (idea#202 layout): written by the Engine (pi), read by the helper (root)
   await exec`sudo install -d -o pi -g pi -m 0755 /var/lib/idea /var/lib/idea/client-images`
   await exec`sudo install -d -o pi -g pi -m 0750 /var/lib/idea/usage`
@@ -1029,21 +1064,23 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   // 0755, in /usr/local/sbin; its sudoers line is in 11-engine-files (visudo -cf above).
   // It runs rsync/rrsync, borg, runuser and ssh by absolute path.
   print(chalk.blue('  - Installing idea-app-data...'))
-  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-app-data ${APP_DATA_HELPER}`
+  await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-app-data`, APP_DATA_HELPER, '0755')
   print(chalk.green(`  - ${APP_DATA_HELPER} installed`))
   // Teacher USB sticks (idea#193): /run/idea-usb (pi:pi 0755) at every boot via tmpfiles.d
   print(chalk.blue('  - Installing /etc/tmpfiles.d/idea-usb.conf...'))
-  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/idea-usb.tmpfiles.conf ${USB_TMPFILES_CONF}`
-  await exec`sudo systemd-tmpfiles --create ${USB_TMPFILES_CONF}`
+  if (await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-usb.tmpfiles.conf`, USB_TMPFILES_CONF, '0644')) {
+    await exec`sudo systemd-tmpfiles --create ${USB_TMPFILES_CONF}`
+  }
   // idea-usage (idea#411): /run/idea skip flags and /var/lib/idea/usage owned by pi
   print(chalk.blue('  - Installing /etc/tmpfiles.d/idea-usage.conf...'))
-  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/idea-usage.tmpfiles.conf ${USAGE_TMPFILES_CONF}`
-  await exec`sudo systemd-tmpfiles --create ${USAGE_TMPFILES_CONF}`
+  if (await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-usage.tmpfiles.conf`, USAGE_TMPFILES_CONF, '0644')) {
+    await exec`sudo systemd-tmpfiles --create ${USAGE_TMPFILES_CONF}`
+  }
   // idea-usage-settings: operator toggle for usageMonitoring (idea#411). Root-owned
   // COPY, 0755. Not in sudoers: the Engine never calls it; operators and
   // tools/fleet/usage-monitoring.sh run it as pi. /var/lib/idea/usage is pi:pi.
   print(chalk.blue('  - Installing idea-usage-settings...'))
-  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-usage-settings ${USAGE_SETTINGS}`
+  await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-usage-settings`, USAGE_SETTINGS, '0755')
   print(chalk.green(`  - ${USAGE_SETTINGS} installed`))
   // Per-Pi Engine keys: the forced command for peer keys and the sshd drop-in
   await installPeerAccess(exec, enginePath)
@@ -1106,16 +1143,19 @@ export const USAGE_AUTHORIZED_KEYS = '/etc/ssh/idea_usage_keys/pi'
  */
 export const installPeerAccess = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing idea-peer-gate, idea-usage-export and the sshd drop-in for peer and usage keys...'))
-  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-peer-gate ${PEER_GATE}`
-  await exec`sudo install -o root -g root -m 0755 ${enginePath}/script/build_image_assets/idea-usage-export ${USAGE_EXPORT}`
+  await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-peer-gate`, PEER_GATE, '0755')
+  await installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-usage-export`, USAGE_EXPORT, '0755')
   await exec`sudo install -d -o root -g root -m 0755 ${path.dirname(PEER_AUTHORIZED_KEYS)} ${path.dirname(PEER_KNOWN_HOSTS)} ${USAGE_AUTH_DIR}`
   await exec`sudo install -d -o root -g root -m 0700 ${PEER_LEDGER_DIR}`
-  await exec`sudo install -o root -g root -m 0644 ${enginePath}/script/build_image_assets/10-idea-peer.conf ${PEER_SSHD_DROPIN}`
-  try {
-    await exec`sudo /usr/sbin/sshd -t`
-  } catch (e) {
-    await exec`sudo rm -f ${PEER_SSHD_DROPIN}`
-    throw new Error(`sshd -t rejected the configuration with ${PEER_SSHD_DROPIN}; removed it again (peer Engine keys will not work): ${e}`)
+  // idea#284 part 2: sshd -t and the reload only when the drop-in actually changed
+  const dropinChanged = await installManagedFile(exec, `${enginePath}/script/build_image_assets/10-idea-peer.conf`, PEER_SSHD_DROPIN, '0644')
+  if (dropinChanged) {
+    try {
+      await exec`sudo /usr/sbin/sshd -t`
+    } catch (e) {
+      await exec`sudo rm -f ${PEER_SSHD_DROPIN}`
+      throw new Error(`sshd -t rejected the configuration with ${PEER_SSHD_DROPIN}; removed it again (peer Engine keys will not work): ${e}`)
+    }
   }
   const effective = await exec`sudo /usr/sbin/sshd -T -C user=pi,host=localhost,addr=127.0.0.1`
   const akf = String(effective?.stdout ?? '')
@@ -1124,6 +1164,10 @@ export const installPeerAccess = async (exec: any, enginePath: string) => {
   }
   if (!/^authorizedkeysfile .*\/etc\/ssh\/idea_usage_keys\/%u/m.test(akf)) {
     print(chalk.red(`  - WARNING: sshd does not use /etc/ssh/idea_usage_keys/%u: an earlier drop-in or sshd_config sets AuthorizedKeysFile first. Usage export keys will not work until it is fixed.`))
+  }
+  if (!dropinChanged) {
+    print(chalk.green(`  - ${PEER_SSHD_DROPIN} unchanged; sshd not reloaded`))
+    return
   }
   try {
     await exec`sudo systemctl reload ssh`
@@ -1165,7 +1209,8 @@ export const installEngineSudoers = async (exec: any, enginePath: string) => {
       console.error(e)
       process.exit(1)
     }
-    await copyAsset(exec, enginePath, asset, path.dirname(installed), false, '0440', '0:0', path.basename(installed))
+    // idea#284 part 2: copy (and re-check) only when the installed file differs
+    if (!await installManagedFile(exec, `${enginePath}/script/build_image_assets/${asset}`, installed, '0440')) continue
     try {
       await exec`sudo visudo -c`
     } catch (e) {
