@@ -28,10 +28,10 @@ export DURATION_CONSOLE_INTENTS=/home/walker/agent-console-dev/e2e/intents
 export DURATION_STAGE=2
 export DURATION_EXPECTED_CONSOLE_SHA=$CONSOLE_PIN
 # Product pin = intents pin = 6e359bdda538e5b9fc4b9a90c1be9b5d52544b96 (console#221 on main).
-# Asset md5: box `pnpm build` of that commit; main script from dist/index.html (see PR).
+# Asset name + md5 come from the dist the pool Pis serve, not a box build (547714 bytes).
 export DURATION_CONSOLE_PRODUCT_SHA=6e359bdda538e5b9fc4b9a90c1be9b5d52544b96
-export DURATION_CONSOLE_PRODUCT_ASSET=index-CZcx48Dc.js
-export DURATION_CONSOLE_PRODUCT_ASSET_MD5=231b08c72f0f5928e3b273bdf9d508a5
+export DURATION_CONSOLE_PRODUCT_ASSET=index-Bwu51kAy.js
+export DURATION_CONSOLE_PRODUCT_ASSET_MD5=ac3fe8b3177214eecdbdf0441e298a73
 export DURATION_EXPECTED_STORE_ID=2VroE
 export DURATION_POST_OP_SETTLE_MS=\${DURATION_POST_OP_SETTLE_MS:-300000}
 export DURATION_DOC_WAIT_MS=\${DURATION_DOC_WAIT_MS:-45000}
