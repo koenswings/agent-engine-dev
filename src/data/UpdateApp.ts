@@ -56,6 +56,7 @@ import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
     parseHealthCheck, healthBodyOk, estimateUpdateMinutes, fallbackUp, fallbackHealthTimeoutSeconds,
     HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange, backupIsDue,
+    declaredUpdateStages,
 } from './UpdateAppPolicy.js'
 import { parseAppId } from './App.js'
 import { stampComposeInstanceIdentity } from './InstanceCopy.js'
@@ -481,13 +482,15 @@ export const updateApp = async (
         // NEEDS_BACKUP / MAJOR / NO_SUMS keep their order; a malformed spec refuses BAD_BACKUP_SPEC below.
         const liveBackupMethod = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live').then(r => r.method, () => undefined)
         const backupDisk = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs) ? linkedBackupDisk(store, engineId, inst) : null
+        const xapp = bundle ? await readXApp(path.join(bundle.dir, 'compose.yaml')) : {}
         const facts = {
             diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,
             sourcePresent: !!bundle, sumsValid: bundle ? await d.verifySums(bundle.dir) : false,
             allowMajor: !!opts.allowMajor,
             backupAgeMs,
             shortDisks: [] as string[],
-            updatesFrom: bundle ? (await readXApp(path.join(bundle.dir, 'compose.yaml'))).updatesFrom : undefined,
+            updatesFrom: xapp.updatesFrom,
+            xAppUpdate: xapp.update,
             backupPlanned: !!backupDisk,
             backupMethod: liveBackupMethod,
         }
@@ -815,6 +818,8 @@ export const bundleInfo = (appId: string, sums: string | null, sizeBytes: number
     const t = Number(xapp.healthTimeout)
     if (xapp.healthTimeout != null && Number.isFinite(t) && t > 0) b.healthTimeout = t
     if (typeof xapp.migrationNote === 'string' && xapp.migrationNote.trim()) b.migrationNote = xapp.migrationNote.trim()
+    const stages = declaredUpdateStages(xapp.update)
+    if (stages.length) b.updateStages = [...stages]
     return b
 }
 
@@ -852,7 +857,11 @@ export const publishAppBundles = async (storeHandle: DocHandle<Store>, disk: Dis
     if (!cur || JSON.stringify(cur.appBundles ?? null) === JSON.stringify(list)) return false
     storeHandle.change(doc => {
         const x = doc.diskDB[disk.id as DiskID]
-        if (x) x.appBundles = list.map(b => ({ ...b, ...(b.updatesFrom ? { updatesFrom: [...b.updatesFrom] } : {}) }))
+        if (x) x.appBundles = list.map(b => ({
+            ...b,
+            ...(b.updatesFrom ? { updatesFrom: [...b.updatesFrom] } : {}),
+            ...(b.updateStages ? { updateStages: [...b.updateStages] } : {}),
+        }))
     })
     return true
 }
@@ -868,7 +877,12 @@ export const remoteBundles = (store: Store, engineId: string): { disk: Disk, app
         if (!Array.isArray(caps) || !caps.includes('updateAppFetch')) return []
         return disk.appBundles.filter(b => b && b.sumsListed).map(b => ({
             disk, appId: String(b.appId), sizeBytes: Number(b.sizeBytes) || 0,
-            xapp: { updatesFrom: b.updatesFrom ? [...b.updatesFrom] : undefined, healthTimeout: b.healthTimeout, migrationNote: b.migrationNote },
+            xapp: {
+                updatesFrom: b.updatesFrom ? [...b.updatesFrom] : undefined,
+                healthTimeout: b.healthTimeout,
+                migrationNote: b.migrationNote,
+                update: b.updateStages?.length ? Object.fromEntries(b.updateStages.map(k => [k, true])) : undefined,
+            },
         }))
     })
 
@@ -898,7 +912,7 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
         }
         let best: (typeof bundles)[number] | null = null
         for (const b of bundles) {
-            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true, updatesFrom: b.xapp.updatesFrom })) continue
+            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true, updatesFrom: b.xapp.updatesFrom, xAppUpdate: b.xapp.update })) continue
             const c = best ? compareVersions(parseAppId(b.appId).version, parseAppId(best.appId).version) : 1
             if (c !== null && (c > 0 || (c === 0 && String(b.disk.id) === String(inst.storedOn)))) best = b
         }

@@ -130,6 +130,8 @@ export interface AppBundleInfo {
     updatesFrom?: number[];
     healthTimeout?: number;
     migrationNote?: string;
+    /** engine#456: x-app.update stages declared on this bundle (interim offer filter). */
+    updateStages?: string[];
 }
 
 export interface PreUpdateSnapshot {
