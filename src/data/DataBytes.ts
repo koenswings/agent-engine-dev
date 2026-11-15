@@ -129,6 +129,16 @@ export class DataBytesQueue {
         this.waiting.clear()
     }
 
+    /**
+     * Test teardown: wait for the in-flight measurement, then drop queued work
+     * and the retry timer. Production does not call this; idle() and stop() are
+     * unchanged (engine#430 follow-up).
+     */
+    async reset(): Promise<void> {
+        await this.idle()
+        this.stop()
+    }
+
     private async drain(): Promise<void> {
         while (this.queue.length && this.storeHandle) {
             const id = this.queue.shift() as InstanceID

@@ -27,6 +27,7 @@ import { resourceLock, instanceKey, diskKey } from '../../src/utils/ResourceLock
 import { borgPresence } from '../../src/utils/appDataHelper.js'
 import { dataBytesQueue } from '../../src/data/DataBytes.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
+import { drainDataBytesQueue } from '../harness/drainDataBytes.js'
 
 const INST = 'inst-borg-1' as InstanceID
 
@@ -103,9 +104,9 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
-    // engine#430: a successful backup queues a background `size` measurement; let it
-    // finish under this test's fake sudo, so it never lands in the next test's log
-    await dataBytesQueue.idle()
+    // engine#430 follow-up: wait for the background size measurement before
+    // removing the fake sudo dir (it appends to calls.log in binDir).
+    await drainDataBytesQueue()
     borgPresence.exists = (p) => fs.existsSync(p)
     vi.restoreAllMocks()
     config.settings.testMode = saved.testMode

@@ -18,6 +18,7 @@ import { config } from '../../src/data/Config.js'
 import { backupInstance } from '../../src/monitors/backupMonitor.js'
 import { borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
+import { drainDataBytesQueue } from '../harness/drainDataBytes.js'
 import {
     parseBorgListJson, eligibleArchives, pickRoundRobinDeletion, estimateNextBackupBytes,
     backupCleanupIO, BACKUP_KEEP_MIN, BackupArchiveInfo,
@@ -184,6 +185,9 @@ describe('backupInstance cleanup (idea#401)', () => {
     })
 
     afterEach(async () => {
+        // engine#430 follow-up: wait for the background size measurement before
+        // removing the fake sudo dir (it appends to calls.log in binDir).
+        await drainDataBytesQueue()
         borgPresence.exists = (p) => fs.existsSync(p)
         vi.restoreAllMocks()
         config.settings.testMode = saved.testMode
