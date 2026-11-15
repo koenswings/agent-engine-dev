@@ -19,9 +19,9 @@
  *    `scheduled-backup`), with the same locks as a manual backupApp.
  *  - A held lock gives SKIPPED_LOCKED (recorded by backupInstance) and one catch-up
  *    as soon as the lock frees, inside the same window (Steve, Q3).
- *  - A FAILED attempt is retried once, after RETRY_DELAY_MS. A stale lock is never
- *    retried: the instance is left to the idea#446 flow (Steve, Q2), and its
- *    INTERRUPTED result (recorded at dock) stands.
+ *  - A FAILED attempt is retried once, after RETRY_DELAY_MS. A stale lock is
+ *    cleared and the backup then runs (engine#429). A live lock is left in place
+ *    and checked again on the next tick; INTERRUPTED recorded at dock stands.
  *  - lastRun is written at the start of the run, so a crash or restart mid-run never
  *    starts the same window again; crash recovery does not retry a scheduled op either.
  *
@@ -34,9 +34,8 @@
 import { performance } from 'node:perf_hooks'
 import { statfs } from 'node:fs/promises'
 import { DocHandle } from '@automerge/automerge-repo'
-import { chalk, fs } from 'zx'
+import { chalk } from 'zx'
 import { log } from '../utils/utils.js'
-import { disksRoot } from '../data/Config.js'
 import { Disk, diskMountRoot, joinMountRoot, syncBackupOrphanLinks } from '../data/Disk.js'
 import { localEngineId } from '../data/Engine.js'
 import { peerClockViews } from '../data/Liveness.js'
@@ -55,7 +54,7 @@ import {
     skippedCatchUpDue, testClockOffsetMs, windowIdFor, TEST_CLOCK_OFFSET_ENV,
 } from '../utils/backupSchedule.js'
 import {
-    BACKUP_IN_PROGRESS, backupInstance, backupLockKeysFor, hasBackupStaleLock, isBackupActive,
+    backupInstance, backupLockKeysFor, isBackupActive, autoBackupBlockedByLock, sweepAbandonedBackupLocks,
 } from './backupMonitor.js'
 
 /** The tick interval (proposal §3.1). */
@@ -310,6 +309,9 @@ export class BackupScheduler {
             nowMs: now, clockTrusted: trust.clockTrusted, schedule: effectiveSchedule(yaml.schedule),
             lastRun: yaml.lastRun, uptimeCounter: counter,
         })
+        // engine#429: a lock left because borg was still running is cleared once it exits,
+        // even when no run is due this tick.
+        await sweepAbandonedBackupLocks(this.storeHandle, this.storeHandle.doc().diskDB[disk.id] as Disk ?? disk)
         if (due.due) {
             this.launch(disk.id, () => this.runDisk(disk.id, yaml, due, now, bootId, uptime))
             return
@@ -409,9 +411,8 @@ export class BackupScheduler {
             log(`Backup scheduler: ${instanceId} is a demo instance — skipped (engine#369)`)
             return null
         }
-        const lockFile = `${disksRoot()}/${disk.device}/backups/${instanceId}/${BACKUP_IN_PROGRESS}`
-        if (hasBackupStaleLock(disk, instanceId) || await fs.pathExists(lockFile)) {
-            log(`Backup scheduler: ${instanceId} has a stale lock — not run; use clearBackupLock, then backupApp (idea#446, Q2)`)
+        if (await autoBackupBlockedByLock(this.storeHandle, disk, instanceId as InstanceID)) {
+            log(`Backup scheduler: ${instanceId} has a backup lock still in use — not run (engine#429)`)
             return null
         }
         if (isBackupActive(instanceId)) {

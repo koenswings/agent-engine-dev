@@ -14,7 +14,7 @@ import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/dat
 import { Disk } from '../../src/data/Disk.js'
 import { config } from '../../src/data/Config.js'
 import { commands } from '../../src/data/Commands.js'
-import { processBackupDisk, backupInstance, isBackupActive } from '../../src/monitors/backupMonitor.js'
+import { backupInstance, isBackupActive } from '../../src/monitors/backupMonitor.js'
 import {
     listBackup, verifyBackup, clearBackupLock, removeBackupRole,
     parseBorgListInventory, parseBorgMemberList, instanceRelativeMember,
@@ -659,7 +659,11 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         const startedAt = Date.now() - 60000
         const lockPath = `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
         await fs.writeFile(lockPath, JSON.stringify({ instanceId: INST, startedAt }))
-        await processBackupDisk(h, backupDisk)
+        h.change(doc => {
+            doc.diskDB[backupDisk.id].backupStaleLocks = [
+                { instanceId: INST, startedAt: startedAt as any, detectedAt: Date.now() as any },
+            ]
+        })
         expect((h.doc()!.diskDB[backupDisk.id].backupStaleLocks ?? []).map(l => l.instanceId)).toEqual([INST])
 
         const result = await clearBackupLock(h, INST, 'ver-bd') as any
@@ -688,7 +692,11 @@ describe('listBackup / verifyBackup / clearBackupLock / removeBackupRole (mocked
         const startedAt = Date.now() - 60000
         const lockPath = `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
         await fs.writeFile(lockPath, JSON.stringify({ instanceId: INST, startedAt }))
-        await processBackupDisk(h, backupDisk)
+        h.change(doc => {
+            doc.diskDB[backupDisk.id].backupStaleLocks = [
+                { instanceId: INST, startedAt: startedAt as any, detectedAt: Date.now() as any },
+            ]
+        })
         const staleBefore = JSON.parse(JSON.stringify(h.doc()!.diskDB[backupDisk.id].backupStaleLocks ?? []))
         expect(staleBefore.map((l: any) => l.instanceId)).toEqual([INST])
 
@@ -770,11 +778,16 @@ exit 0
     it('removeBackupRole refuses while a stale lock is still present', async () => {
         await seedRepo()
         const { h, backupDisk } = await storeWithDisks()
+        const startedAt = Date.now()
         await fs.writeFile(
             `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`,
-            JSON.stringify({ instanceId: INST, startedAt: Date.now() }),
+            JSON.stringify({ instanceId: INST, startedAt }),
         )
-        await processBackupDisk(h, backupDisk)
+        h.change(doc => {
+            doc.diskDB[backupDisk.id].backupStaleLocks = [
+                { instanceId: INST, startedAt: startedAt as any, detectedAt: Date.now() as any },
+            ]
+        })
         await expect(removeBackupRole(h, 'ver-bd')).rejects.toThrow(/lock is still present|stale backup locks/)
         expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/BACKUP.yaml`)).toBe(true)
         expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/${INST}/config`)).toBe(true)
@@ -786,7 +799,11 @@ exit 0
         const startedAt = Date.now() - 60000
         const lockPath = `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
         await fs.writeFile(lockPath, JSON.stringify({ instanceId: INST, startedAt }))
-        await processBackupDisk(h, backupDisk)
+        h.change(doc => {
+            doc.diskDB[backupDisk.id].backupStaleLocks = [
+                { instanceId: INST, startedAt: startedAt as any, detectedAt: Date.now() as any },
+            ]
+        })
         // The lock file goes (an older Engine's backup, or by hand); the store entry stays
         await fs.remove(lockPath)
         expect((h.doc()!.diskDB[backupDisk.id].backupStaleLocks ?? []).map(l => l.instanceId)).toEqual([INST])
@@ -822,7 +839,11 @@ exit 0
         const { h, backupDisk } = await storeWithDisks()
         const lockPath = `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
         await fs.writeFile(lockPath, JSON.stringify({ instanceId: INST, startedAt: Date.now() - 60000 }))
-        await processBackupDisk(h, backupDisk)
+        h.change(doc => {
+            doc.diskDB[backupDisk.id].backupStaleLocks = [
+                { instanceId: INST, startedAt: (Date.now() - 60000) as any, detectedAt: Date.now() as any },
+            ]
+        })
         expect((h.doc()!.diskDB[backupDisk.id].backupStaleLocks ?? []).map(l => l.instanceId)).toEqual([INST])
         config.settings.skipBorg = true
         h.change(doc => { doc.instanceDB[INST as InstanceID].status = 'Stopped' as any })

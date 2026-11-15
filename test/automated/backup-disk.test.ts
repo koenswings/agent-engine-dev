@@ -14,10 +14,12 @@ import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 import { Disk } from '../../src/data/Disk.js'
-import { backupInstance, processBackupDisk, checkPendingBackups } from '../../src/monitors/backupMonitor.js'
+import { backupInstance, processBackupDisk, checkPendingBackups, staleBackupLock, BACKUP_IN_PROGRESS } from '../../src/monitors/backupMonitor.js'
 import { fs } from 'zx'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
+import { drainDataBytesQueue } from '../harness/drainDataBytes.js'
 import { config } from '../../src/data/Config.js'
+import { resourceLock, instanceKey, diskKey } from '../../src/utils/ResourceLock.js'
 
 // These tests exercise the Engine side of a backup (store, BACKUP.yaml, lock file) with
 // borg skipped. Pin skipBorg rather than inherit it from the machine's config.yaml: in a
@@ -105,6 +107,9 @@ beforeEach(async () => {
 })
 
 afterEach(async () => {
+    vi.restoreAllMocks()
+    await drainDataBytesQueue()
+    resourceLock.releaseAll([diskKey('bd1'), instanceKey('inst-1'), instanceKey('inst-2')])
     await fs.remove(`${DISKS_ROOT}/${appDevice}`)
     await fs.remove(`${DISKS_ROOT}/${backupDevice}`)
 })
@@ -199,7 +204,7 @@ describe('backupInstance', () => {
 // ── boot-resume ───────────────────────────────────────────────────────────────
 
 describe('boot-resume (stale lock detection)', () => {
-    it('records stale locks on Disk.backupStaleLocks and does not re-trigger backup (idea#446)', async () => {
+    it('on-demand dock: a stale lock is quarantined, the store entry is dropped, INTERRUPTED is recorded, and no backup starts (engine#429)', async () => {
         const { storeHandle } = await createMinimalStore()
         const appDisk = makeDisk('ad1', 'AppDisk', appDevice)
         const backupDisk = makeDisk('bd1', 'BackupDisk', backupDevice, true)
@@ -208,27 +213,22 @@ describe('boot-resume (stale lock detection)', () => {
         addInstanceToStore(storeHandle, 'inst-1' as InstanceID, 'ad1' as DiskID, 'Stopped')
 
         const startedAt = Date.now() - 60000
-        await fs.writeFile(
-            `${DISKS_ROOT}/${backupDevice}/backups/inst-1/.backup-in-progress`,
-            JSON.stringify({ instanceId: 'inst-1', startedAt })
-        )
+        const repo = `${DISKS_ROOT}/${backupDevice}/backups/inst-1`
+        await fs.writeFile(`${repo}/${BACKUP_IN_PROGRESS}`, JSON.stringify({ instanceId: 'inst-1', startedAt }))
 
         const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
         await processBackupDisk(storeHandle, backupDisk)
         logSpy.mockRestore()
 
-        // Lock file is left in place; the backup is not auto-retried
-        expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/inst-1/.backup-in-progress`)).to.be.true
+        expect(await fs.pathExists(`${repo}/${BACKUP_IN_PROGRESS}`)).to.be.false
+        const quarantined = (await fs.readdir(repo)).filter(f => f.startsWith(`${BACKUP_IN_PROGRESS}.stale-`))
+        expect(quarantined).to.have.lengthOf(1)
         expect(storeHandle.doc()!.instanceDB['inst-1' as any]?.lastBackup).to.be.null
-
-        const stale = storeHandle.doc()!.diskDB['bd1' as any]?.backupStaleLocks ?? []
-        expect(stale).to.be.an('array').with.lengthOf(1)
-        expect(stale[0].instanceId).to.equal('inst-1')
-        expect(stale[0].startedAt).to.equal(startedAt)
-        expect(stale[0].detectedAt).to.be.a('number').that.is.greaterThan(startedAt)
+        expect(storeHandle.doc()!.instanceDB['inst-1' as any]?.lastResult?.result).to.equal('INTERRUPTED')
+        expect(storeHandle.doc()!.diskDB['bd1' as any]?.backupStaleLocks ?? []).to.deep.equal([])
     })
 
-    it('immediate mode does not auto-backup a linked instance that still has a stale lock', async () => {
+    it('immediate mode clears a stale lock and auto-backups the linked instance (engine#429)', async () => {
         const { storeHandle } = await createMinimalStore()
         await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/BACKUP.yaml`,
             'mode: immediate\nlinks:\n  - instanceId: inst-1\n    lastBackup: 0\n')
@@ -237,15 +237,18 @@ describe('boot-resume (stale lock detection)', () => {
         addDiskToStore(storeHandle, appDisk)
         addDiskToStore(storeHandle, backupDisk)
         addInstanceToStore(storeHandle, 'inst-1' as InstanceID, 'ad1' as DiskID, 'Stopped')
+        const repo = `${DISKS_ROOT}/${backupDevice}/backups/inst-1`
         await fs.writeFile(
-            `${DISKS_ROOT}/${backupDevice}/backups/inst-1/.backup-in-progress`,
+            `${repo}/${BACKUP_IN_PROGRESS}`,
             JSON.stringify({ instanceId: 'inst-1', startedAt: Date.now() - 60000 })
         )
         const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
         await processBackupDisk(storeHandle, backupDisk)
         logSpy.mockRestore()
-        expect(storeHandle.doc()!.instanceDB['inst-1' as any]?.lastBackup).to.be.null
-        expect(await fs.pathExists(`${DISKS_ROOT}/${backupDevice}/backups/inst-1/.backup-in-progress`)).to.be.true
+        expect(await fs.pathExists(`${repo}/${BACKUP_IN_PROGRESS}`)).to.be.false
+        expect((await fs.readdir(repo)).some(f => f.startsWith(`${BACKUP_IN_PROGRESS}.stale-`))).to.be.true
+        expect(storeHandle.doc()!.instanceDB['inst-1' as any]?.lastBackup).to.be.a('number').that.is.greaterThan(0)
+        expect(storeHandle.doc()!.diskDB['bd1' as any]?.backupStaleLocks ?? []).to.deep.equal([])
         expect(storeHandle.doc()!.diskDB['bd1' as any]?.backupConfig?.mode).to.equal('immediate')
     })
 
@@ -261,9 +264,12 @@ describe('boot-resume (stale lock detection)', () => {
         const lockPath = `${DISKS_ROOT}/${backupDevice}/backups/inst-1/.backup-in-progress`
         await fs.writeFile(lockPath, JSON.stringify({ instanceId: 'inst-1', startedAt: Date.now() - 60000 }))
         const logSpy = vi.spyOn(console, 'info').mockImplementation(() => {})
+        const prev = staleBackupLock.borgPidUsingRepo
+        staleBackupLock.borgPidUsingRepo = async () => 4242
         try {
             await processBackupDisk(storeHandle, backupDisk)
             expect((storeHandle.doc()!.diskDB['bd1' as any]?.backupStaleLocks ?? []).map((l: any) => l.instanceId)).to.deep.equal(['inst-1'])
+            staleBackupLock.borgPidUsingRepo = prev
 
             // Console backupApp (default cause 'console-command') over the stale lock
             await backupInstance(storeHandle, 'inst-1' as InstanceID, storeHandle.doc()!.diskDB['bd1' as any] as Disk)
@@ -279,6 +285,7 @@ describe('boot-resume (stale lock detection)', () => {
             expect(ops.filter(o => o.kind === 'backupApp' && o.cause === 'backup-app-docked' && o.status === 'Done')).to.have.lengthOf(1)
             expect(storeHandle.doc()!.instanceDB['inst-1' as any]?.lastBackup).to.be.greaterThan(first as number)
         } finally {
+            staleBackupLock.borgPidUsingRepo = prev
             logSpy.mockRestore()
         }
     })

@@ -16,7 +16,7 @@ import { BackupResultCode, DiskID, DiskName, EngineID, InstanceID, Timestamp } f
 import { Disk } from '../../src/data/Disk.js'
 import { recordBackupResult } from '../../src/data/BackupResults.js'
 import { createOperation, recoverInterruptedOperations } from '../../src/data/Operations.js'
-import { backupInstance, runCleanupTracked } from '../../src/monitors/backupMonitor.js'
+import { backupInstance, runCleanupTracked, staleBackupLock, BACKUP_IN_PROGRESS } from '../../src/monitors/backupMonitor.js'
 import {
     BackupScheduler, SchedulerDeps, freePctOf, newestBackupTimeFor, isScheduledHere, scheduledTargets, RETRY_DELAY_MS, SCHEDULED_BACKUP_CAUSE,
 } from '../../src/monitors/backupScheduler.js'
@@ -145,8 +145,10 @@ beforeEach(async () => {
     logHandle = repo.create<CommandLogStore>({ traces: {}, recentTraceIds: [] })
     setCommandLogHandle(logHandle)
 })
+const defaultBorgPid = staleBackupLock.borgPidUsingRepo
 afterEach(async () => {
     config.settings.skipBorg = prevSkipBorg
+    staleBackupLock.borgPidUsingRepo = defaultBorgPid
     vi.restoreAllMocks()
     setCommandLogHandle(null)
     resourceLock.releaseAll([diskKey(BD), instanceKey(A), instanceKey(B)])
@@ -424,16 +426,45 @@ describe('locks, retry and catch-up (Steve, Q2 / Q3)', () => {
         expect(sleeps).toEqual([])
     })
 
-    it('a stale lock is never retried: that instance is left to clearBackupLock + backupApp (idea#446), the others run', async () => {
+    it('a stale lock is cleared and that instance is backed up with the others (engine#429)', async () => {
         await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1) }))
-        await fs.writeFile(`${DISKS_ROOT}/${backupDevice}/backups/${A}/.backup-in-progress`, JSON.stringify({ instanceId: A, startedAt: 1 }))
+        const repo = `${DISKS_ROOT}/${backupDevice}/backups/${A}`
+        await fs.writeFile(`${repo}/${BACKUP_IN_PROGRESS}`, JSON.stringify({ instanceId: A, startedAt: 1 }))
         const h = await setup()
         clock.advance(MIN)
         const s = new BackupScheduler(h, deps(), localEngineId)
         await tick(s)
-        expect(runs.map(r => r.id)).toEqual([B])
+        expect(runs.map(r => r.id).sort()).toEqual([A, B].sort())
+        expect(await fs.pathExists(`${repo}/${BACKUP_IN_PROGRESS}`)).toBe(false)
+        expect((await fs.readdir(repo)).some(f => f.startsWith(`${BACKUP_IN_PROGRESS}.stale-`))).toBe(true)
         clock.advance(MIN); await tick(s)
-        expect(runs.map(r => r.id)).toEqual([B])
+        expect(runs.map(r => r.id).sort()).toEqual([A, B].sort())
+    })
+
+    it('a lock with a live borg is left, then cleared on the tick after borg exits (engine#429)', async () => {
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(0) })) // window already claimed
+        const repo = `${DISKS_ROOT}/${backupDevice}/backups/${A}`
+        await fs.writeFile(`${repo}/${BACKUP_IN_PROGRESS}`, JSON.stringify({ instanceId: A, startedAt: 1 }))
+        const h = await setup()
+        h.change(doc => {
+            doc.diskDB[BD].backupStaleLocks = [
+                { instanceId: A, startedAt: 1 as any, detectedAt: 2 as any },
+            ]
+        })
+        staleBackupLock.borgPidUsingRepo = async () => 4242
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        clock.advance(MIN)
+        await tick(s)
+        expect(await fs.pathExists(`${repo}/${BACKUP_IN_PROGRESS}`)).toBe(true)
+        expect((h.doc()!.diskDB[BD].backupStaleLocks ?? []).map((l: any) => l.instanceId)).toEqual([A])
+        expect(runs).toEqual([])
+        staleBackupLock.borgPidUsingRepo = async () => null
+        clock.advance(MIN)
+        await tick(s)
+        expect(await fs.pathExists(`${repo}/${BACKUP_IN_PROGRESS}`)).toBe(false)
+        expect((await fs.readdir(repo)).some(f => f.startsWith(`${BACKUP_IN_PROGRESS}.stale-`))).toBe(true)
+        expect(h.doc()!.diskDB[BD].backupStaleLocks ?? []).toEqual([])
+        expect(runs).toEqual([]) // not due; lock is cleared, backup waits for the next slot
     })
 
     it('a manual backupApp while a scheduled backup holds the locks is refused with BUSY naming the scheduled run (Q4)', async () => {

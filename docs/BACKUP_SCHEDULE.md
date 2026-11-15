@@ -79,7 +79,7 @@ uptimeCounter:              # uptime since lastRun, across reboots
 - After the links, one store change (only the values that changed): `lastAttempt`, `missedRuns`, and `freePct` (statfs of the disk, rounded).
 
 **Skipped instances:**
-- An instance with a stale `.backup-in-progress` (on disk or in `backupStaleLocks`) is not run, and its `INTERRUPTED` result stands.
+- An instance with a stale `.backup-in-progress` has the lock cleared (engine#429) and is then backed up. A lock that still belongs to a running backup is left in place and checked again on the next tick. The `INTERRUPTED` result of the interrupted attempt stands until the new backup records its own result.
 - An instance whose own backup is still running records `SKIPPED_LOCKED` without a second backup.
 - An instance that left the store, or a disk that was undocked during the run, is skipped with a log line.
 
@@ -93,7 +93,7 @@ uptimeCounter:              # uptime since lastRun, across reboots
 - **FAILED:** retried once, 60 s after the pass over the links. A second failure waits for the next slot. `BACKUP_DISK_FULL`, `HELPER_OUTDATED`, `APP_DISK_NOT_DOCKED`, `INTERRUPTED` and `SKIPPED_LOCKED` are never retried.
 - **SKIPPED_LOCKED:** the instance is remembered with the run's window, which is the slot on the clock basis and the run start on the uptime basis. At the first tick where the instance lock, the Backup Disk lock and the in-memory mutex are all free, inside the same window, it runs once more. That catch-up is used even if it is skipped again. A new window drops the entry.
 
-**Crash recovery:** `recoverInterruptedOperations` never retries a `backupApp` operation with cause `scheduled-backup`. It marks it `Failed` with `INTERRUPTED: …`. The lock file stays and is recorded as `INTERRUPTED` at dock, for the idea#446 flow (`clearBackupLock`, then `backupApp`).
+**Crash recovery:** `recoverInterruptedOperations` never retries a `backupApp` operation with cause `scheduled-backup`. It marks it `Failed` with `INTERRUPTED: …`. The lock file is recorded as `INTERRUPTED` at dock and, if stale, is cleared so the next backup can run (engine#429). `clearBackupLock` remains as a manual tool.
 
 **Cleaning** (`Disk.cleaning` / `cleaningStartedAt`): set when fullness cleanup starts deleting archives, and cleared when it ends. This holds for any backup, manual or scheduled. Two store changes, and only when cleanup deletes something. `cleaningStartedAt` stays as the time of the last cleanup.
 
@@ -123,7 +123,7 @@ A jump is a wall-clock step of more than 2 min between two ticks, compared with 
 - Each instance runs through `backupInstance` and takes the same instance lock and Backup Disk lock as a manual `backupApp`. Instances on one disk run one after another.
 - **A manual `backupApp` (Console or CLI) while a scheduled run holds the lock is refused with `BUSY`.**
 - **A scheduled run that finds a lock held records `SKIPPED_LOCKED`**, then catches up **once, as soon as the lock frees, inside the same day's window**. Otherwise it waits for the next slot.
-- **Retry once on a transient failure, never on a stale lock.** A stale `.backup-in-progress` is reported (`Disk.backupStaleLocks`, `INTERRUPTED`) and left to the idea#446 flow (`clearBackupLock`, then `backupApp`).
+- **Retry once on a transient failure.** A stale `.backup-in-progress` is recorded as `INTERRUPTED` and then cleared if no backup is still running, so the next automatic backup resumes (engine#429). A live lock is never cleared.
 - A manual `backupApp` writes `lastResult` / `backupHistory` but never moves the schedule's `lastRun`.
 
 ## Store summary (types in PR A; mirror and results in PR B; run summary in PR C)
