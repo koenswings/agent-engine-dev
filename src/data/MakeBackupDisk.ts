@@ -46,6 +46,7 @@ export interface MakeBackupDiskOps {
         targetId: string,
         summaryTraceId: string,
         confirmName: string,
+        onRedock?: () => void,
     ) => Promise<{ diskId: DiskID; removedInstances: { id: string; name: string; dataBytes: number }[] }>
 }
 
@@ -68,7 +69,7 @@ const defaultOps: MakeBackupDiskOps = {
     ensureBackupRoot: defaultEnsureBackupRoot,
     isSystemDevice: (d) => isSystemDevice(d),
     now: () => Date.now(),
-    runErase: (h, targetId, summaryTraceId, confirmName) => eraseDisk(h, targetId, summaryTraceId, confirmName),
+    runErase: (h, targetId, summaryTraceId, confirmName, onRedock) => eraseDisk(h, targetId, summaryTraceId, confirmName, { onRedock }),
 }
 
 let ops: MakeBackupDiskOps = defaultOps
@@ -273,14 +274,18 @@ export const makeBackupDisk = async (
             step(1, 'Erase')
             const dev = deviceOf(target)
             let erased: { diskId: DiskID }
+            // engine#432: eraseDisk re-docks the disk itself, so it tells us when that starts;
+            // Re-dock is then visible while the disk is mounted and registered again.
+            let redockShown = false
+            const onRedock = () => { if (!redockShown) { redockShown = true; step(2, 'Re-dock') } }
             try {
-                erased = await ops.runErase(storeHandle, targetId, summaryTraceId!, confirmName!)
+                erased = await ops.runErase(storeHandle, targetId, summaryTraceId!, confirmName!, onRedock)
             } catch (e) {
                 const mapped = await mapEraseOrRedockError(e, dev)
                 return fail(storeHandle, opId, mapped.code, mapped.text)
             }
             diskId = erased.diskId
-            step(2, 'Re-dock')
+            onRedock()   // an erase path that never called the hook still shows the step
             const published = storeHandle.doc()!.diskDB[diskId]
             if (!published || String(published.dockedTo) !== String(localEngineId) || !published.device) {
                 const mapped = await mapEraseOrRedockError(
