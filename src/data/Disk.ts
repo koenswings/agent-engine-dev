@@ -712,13 +712,25 @@ export const processSystemInstance = async (storeHandle: DocHandle<Store>, disk:
     return instance
 }
 
+/**
+ * An App Disk holds `apps/` or at least one `instances/<id>` folder. engine#427: a
+ * disk with instances but no `apps/` (a restore target, or a Backup Disk that also
+ * hosts an instance) must still get the dock pass, or its instances are never
+ * processed and a restarted Engine leaves them `Starting` for good.
+ */
 export const isAppDisk = async (disk: Disk): Promise<boolean> => {
-    // Check if the disk has an apps folder
+    const root = await diskMountRoot(disk)
+    if (await fs.stat(`${root}/apps`).then(st => st.isDirectory()).catch(() => false)) return true
+    return hasInstanceFolders(`${root}/instances`)
+}
+
+/** engine#427: true when `<dir>` has at least one non-hidden sub-folder. */
+export const hasInstanceFolders = async (dir: string): Promise<boolean> => {
     try {
-        await $`test -d ${await diskMountRoot(disk)}/apps`;
-        return true;
+        const entries = await fs.readdir(dir, { withFileTypes: true })
+        return entries.some(e => e.isDirectory() && !e.name.startsWith('.'))
     } catch {
-        return false;
+        return false
     }
 }
 
