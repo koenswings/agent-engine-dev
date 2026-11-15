@@ -4,9 +4,9 @@
  * (A) Fetch→Check refuses a bundle that declares any x-app.update stage
  *     (prepare, verify, work, settle) with UPDATE_STAGES_UNSUPPORTED, before
  *     Snapshot or Swap. `update: null` is absent; `update: {}` has no stages.
- * (B) An unversioned instance (SHA / date) is never offered or allowed a major
- *     whose updatesFrom lists a major the source cannot satisfy. SHA → 1.x
- *     without updatesFrom keeps today's behaviour.
+ * (B) An unversioned instance (SHA / date) may be offered and allowed only the
+ *     first tagged major (1.x, including Nextcloud 1.7-31.0.1 / idea#374), and
+ *     is never offered or allowed 2.0+. SHA → 1.7 stays classified as a major.
  *
  * This slice does not run the stages, add a reboot wrapper, clean images, or
  * treat 1.7 as step 0.
@@ -19,8 +19,9 @@ import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { updateApp, UpdateDeps, UpdateProgress, refreshUpdateAvailable, bundleInfo } from '../../src/data/UpdateApp.js'
 import {
     checkUpdate, offerable, majorAllowedByUpdatesFrom, declaredUpdateStages,
-    CheckFacts,
+    unversionedMayTakeTarget, backupIsDue, CheckFacts,
 } from '../../src/data/UpdateAppPolicy.js'
+import { isMajorChange } from '../../src/data/Version.js'
 
 const ME = String(localEngineId)
 const facts = (over: Partial<CheckFacts> = {}): CheckFacts => ({
@@ -90,36 +91,46 @@ describe('UPDATE_STAGES_UNSUPPORTED at Check (engine#456 A)', () => {
 })
 
 describe('SHA-source majors (engine#456 B)', () => {
-    it('majorAllowedByUpdatesFrom: a SHA or date source cannot satisfy a listed major', () => {
-        expect(majorAllowedByUpdatesFrom('5ab9f64', [1])).toBe(false)
-        expect(majorAllowedByUpdatesFrom('b8ad438', [1])).toBe(false)
-        expect(majorAllowedByUpdatesFrom('1.0-2024.12.03', [1])).toBe(false)
-        expect(majorAllowedByUpdatesFrom('5ab9f64', undefined)).toBe(true)
-        expect(majorAllowedByUpdatesFrom('1.0', [1])).toBe(true)
-    })
+    const sha17 = { currentAppId: 'nextcloud-b8ad438', newAppId: 'nextcloud-1.7-31.0.1' }
+    const sha20 = { currentAppId: 'nextcloud-b8ad438', newAppId: 'nextcloud-2.0-32.0.15' }
 
-    it('execute: SHA → 2.0 with updatesFrom: [1] is MAJOR_NOT_ALLOWED even with --allow-major', () => {
-        const err = checkUpdate(facts({
-            currentAppId: 'nextcloud-5ab9f64', newAppId: 'nextcloud-2.0-32.0.15',
-            updatesFrom: [1], allowMajor: true,
-        }))
+    it('SHA → 1.7-31.0.1 is offered and allowed (idea#374); SHA → 2.0 is refused', () => {
+        expect(unversionedMayTakeTarget('b8ad438', '1.7-31.0.1')).toBe(true)
+        expect(unversionedMayTakeTarget('5ab9f64', '1.7-31.0.1')).toBe(true)
+        expect(unversionedMayTakeTarget('b8ad438', '2.0-32.0.15')).toBe(false)
+        expect(unversionedMayTakeTarget('1.0-2024.12.03', '2.0')).toBe(false)
+        expect(unversionedMayTakeTarget('1.8-31.0.14', '2.0-32.0.15')).toBe(true) // versioned source unchanged
+
+        expect(offerable({ ...sha17, sumsValid: true })).toBe(true)
+        expect(offerable({ ...sha17, sumsValid: true, updatesFrom: [1] })).toBe(true)
+        expect(checkUpdate(facts({ ...sha17, allowMajor: true, backupAgeMs: 1000 }))).toBeNull()
+        expect(checkUpdate(facts({ ...sha17, allowMajor: true, updatesFrom: [1], backupAgeMs: 1000 }))).toBeNull()
+
+        expect(offerable({ ...sha20, sumsValid: true })).toBe(false)
+        expect(offerable({ ...sha20, sumsValid: true, updatesFrom: [1] })).toBe(false)
+        const err = checkUpdate(facts({ ...sha20, allowMajor: true, updatesFrom: [1] }))
         expect(err?.code).toBe('MAJOR_NOT_ALLOWED')
-        expect(err?.message).toBe('MAJOR_NOT_ALLOWED: version 2.0-32.0.15 cannot update directly from unversioned 5ab9f64; supported: 1')
+        expect(err?.message).toBe('MAJOR_NOT_ALLOWED: unversioned b8ad438 can only update to the first tagged major (1.x), not 2.0-32.0.15')
+        expect(checkUpdate(facts({ ...sha20, allowMajor: true }))?.code).toBe('MAJOR_NOT_ALLOWED')
     })
 
-    it('execute: SHA → 1.x without updatesFrom keeps today’s path (major, so --allow-major + backup)', () => {
-        const sha = { currentAppId: 'nextcloud-b8ad438', newAppId: 'nextcloud-1.0-31.0.1' }
-        expect(checkUpdate(facts({ ...sha, allowMajor: false }))?.code).toBe('MAJOR_NOT_ALLOWED')
-        expect(checkUpdate(facts({ ...sha, allowMajor: true, backupAgeMs: 1000 }))).toBeNull()
-        expect(offerable({ ...sha, sumsValid: true })).toBe(true)
+    it('SHA → 1.7 stays classified as a major (NEEDS_BACKUP path); classification is unchanged', () => {
+        expect(isMajorChange('b8ad438', '1.7-31.0.1')).toBe(true)
+        expect(backupIsDue('nextcloud-b8ad438', 'nextcloud-1.7-31.0.1', null)).toBe(true)
+        expect(backupIsDue('nextcloud-b8ad438', 'nextcloud-1.7-31.0.1', 60_000)).toBe(false)
+        expect(checkUpdate(facts({ ...sha17, allowMajor: false }))?.message).toMatch(/pass --allow-major$/)
+        expect(checkUpdate(facts({ ...sha17, allowMajor: true, backupAgeMs: null }))?.code).toBe('NEEDS_BACKUP')
+        expect(checkUpdate(facts({ ...sha17, allowMajor: true, backupPlanned: true, backupAgeMs: null }))).toBeNull()
     })
 
-    it('offer: SHA is not offered 2.0–5.0 when those bundles list updatesFrom', () => {
-        for (const [to, from] of [['nextcloud-2.0', [1]], ['nextcloud-3.0', [2]], ['nextcloud-4.0', [3]], ['nextcloud-5.0', [4]]] as const) {
-            expect(offerable({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, sumsValid: true, updatesFrom: from })).toBe(false)
-            expect(checkUpdate(facts({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, updatesFrom: from, allowMajor: true }))?.code).toBe('MAJOR_NOT_ALLOWED')
+    it('offer and execute: SHA is never offered or allowed 2.0–5.0, even without updatesFrom', () => {
+        for (const to of ['nextcloud-2.0', 'nextcloud-3.0', 'nextcloud-4.0', 'nextcloud-5.0']) {
+            expect(offerable({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, sumsValid: true })).toBe(false)
+            expect(offerable({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, sumsValid: true, updatesFrom: [1] })).toBe(false)
+            expect(checkUpdate(facts({ currentAppId: 'nextcloud-5ab9f64', newAppId: to, allowMajor: true }))?.code).toBe('MAJOR_NOT_ALLOWED')
         }
         expect(offerable({ currentAppId: 'nextcloud-1.8-31.0.14', newAppId: 'nextcloud-2.0', sumsValid: true, updatesFrom: [1] })).toBe(true)
+        expect(majorAllowedByUpdatesFrom('5ab9f64', [1])).toBe(true) // idea#76: SHA is not restricted by updatesFrom; 2.0+ is refused by unversionedMayTakeTarget
     })
 })
 

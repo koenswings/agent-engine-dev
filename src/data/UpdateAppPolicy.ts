@@ -14,7 +14,7 @@
  */
 import { parseAppId } from './App.js'
 import { APP_HEALTH_TIMEOUT_S } from './AppHealthTimeout.js'
-import { isUpgrade, isMajorChange, parseVersion } from './Version.js'
+import { isUpgrade, isMajorChange, isUnversioned, parseVersion } from './Version.js'
 
 export type UpdateStep = 'Fetch' | 'Check' | 'Snapshot' | 'Swap' | 'Start' | 'Health'
 export const UPDATE_STEPS: readonly UpdateStep[] = ['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health']
@@ -91,16 +91,29 @@ export interface CheckFacts {
 
 /**
  * x-app.updatesFrom (idea#76, idea#351 §4.4): when the new bundle declares it, a major update is
- * only allowed from a listed major. Absent or not a list: no extra rule.
- * An unversioned current version (kit SHA/date, #301) has no major, so it cannot satisfy a
- * listed major (engine#456): 2.0+ with updatesFrom: [1] is not offered or allowed from a SHA.
- * A first tagged release that omits updatesFrom is still allowed (today's SHA → 1.x path).
+ * only allowed from a listed major. Absent or not a list: no extra rule. An unversioned current
+ * version (kit SHA/date, #301) has no major and is not restricted by it — so a SHA kit can still
+ * take tagged 1.7 (idea#374). engine#456 separately refuses an unversioned source to 2.0+
+ * (unversionedMayTakeTarget), regardless of updatesFrom.
  */
 export const majorAllowedByUpdatesFrom = (fromVersion: string, updatesFrom: unknown): boolean => {
     if (!Array.isArray(updatesFrom)) return true
     const x = parseVersion(fromVersion)
-    if (!x) return false
+    if (!x) return true
     return updatesFrom.some(m => Number(m) === (x[0] ?? 0))
+}
+
+/**
+ * engine#456: an unversioned (SHA or date) instance may be offered and allowed only the
+ * first tagged major (0.x or 1.x, including Nextcloud 1.7-31.0.1). Never 2.0+.
+ * Versioned sources are unchanged. This does not recategorise SHA → 1.x: it stays a
+ * major (isMajorChange), so --allow-major and the NEEDS_BACKUP path still apply.
+ */
+export const unversionedMayTakeTarget = (fromVersion: string, toVersion: string): boolean => {
+    if (!isUnversioned(fromVersion)) return true
+    const y = parseVersion(toVersion)
+    if (!y) return false
+    return (y[0] ?? 0) < 2
 }
 
 /** Stages the NC35 contract names. The interim Check refuses a hop that declares any of these. */
@@ -173,13 +186,16 @@ export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
             `this Engine does not yet run x-app.update stages: ${stages.join(', ')} (nothing was changed)`,
         )
     }
+    if (!unversionedMayTakeTarget(cur.version, nxt.version)) {
+        return new UpdateAppError(
+            'MAJOR_NOT_ALLOWED',
+            `unversioned ${cur.version} can only update to the first tagged major (1.x), not ${nxt.version}`,
+        )
+    }
     const major = isMajorChange(cur.version, nxt.version)
     if (major && !f.allowMajor) return new UpdateAppError('MAJOR_NOT_ALLOWED', `${cur.version} -> ${nxt.version} is a major update; pass --allow-major`)
     if (major && !majorAllowedByUpdatesFrom(cur.version, f.updatesFrom)) {
-        const fromMajor = parseVersion(cur.version)?.[0]
-        const supported = (f.updatesFrom as unknown[]).join(', ') || 'none'
-        const from = fromMajor == null ? `unversioned ${cur.version}` : `major ${fromMajor}`
-        return new UpdateAppError('MAJOR_NOT_ALLOWED', `version ${nxt.version} cannot update directly from ${from}; supported: ${supported}`)
+        return new UpdateAppError('MAJOR_NOT_ALLOWED', `version ${nxt.version} cannot update directly from major ${parseVersion(cur.version)?.[0]}; supported: ${(f.updatesFrom as unknown[]).join(', ') || 'none'}`)
     }
     if (major && f.backupMethod !== 'none' && (f.backupAgeMs === null || f.backupAgeMs > BACKUP_MAX_AGE_MS) && !f.backupPlanned)
         return new UpdateAppError('NEEDS_BACKUP', 'Dock a Backup Disk linked to this instance (updateApp then takes the backup itself), or make a backup first')
@@ -194,6 +210,7 @@ export const offerable = (f: Pick<CheckFacts, 'currentAppId' | 'newAppId' | 'sum
     if (cur.name !== nxt.name) return false
     if (!isUpgrade(cur.version, nxt.version)) return false
     if (declaredUpdateStages(f.xAppUpdate).length) return false
+    if (!unversionedMayTakeTarget(cur.version, nxt.version)) return false
     return !isMajorChange(cur.version, nxt.version) || majorAllowedByUpdatesFrom(cur.version, f.updatesFrom)
 }
 
