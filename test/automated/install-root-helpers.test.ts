@@ -8,7 +8,7 @@
  *   - borgProblem / reportBorgAtStartup name the missing binary and the fix
  */
 import { describe, it, expect, vi, afterEach } from 'vitest'
-import { installRootHelpers, ensureAptPackages, ROOT_HELPER_PACKAGES, IGMP_SYSCTL_CONF, IGMP_SYSCTL_ASSET } from '../../src/data/Engine.js'
+import { installRootHelpers, ensureAptPackages, ROOT_HELPER_PACKAGES, IGMP_SYSCTL_CONF, IGMP_SYSCTL_ASSET, SYSCTL } from '../../src/data/Engine.js'
 import { borgProblem, BORG_PATH, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
 
 const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: string, dhcpOut?: string, current?: boolean, igmpLive?: string } = {}) => {
@@ -25,7 +25,7 @@ const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: 
         if (/sshd -T/.test(cmd)) return { stdout: 'authorizedkeysfile .ssh/authorized_keys /etc/ssh/idea_authorized_keys/%u /etc/ssh/idea_usage_keys/%u\n' }
         // idea#284 part 2: installManagedFile's read-only check; 'same' = already current
         if (opts.current && /^if sudo cmp -s /.test(cmd)) return { stdout: 'same\n' }
-        if (cmd === 'sysctl -n net.ipv4.igmp_max_memberships') return { stdout: `${opts.igmpLive ?? ''}\n` }
+        if (cmd === `${SYSCTL} -n net.ipv4.igmp_max_memberships`) return { stdout: `${opts.igmpLive ?? ''}\n` }
         if (cmd === 'sudo /usr/local/sbin/idea-dhcp-vendor-class') return { stdout: opts.dhcpOut ?? 'nm unchanged\ndhcpcd absent\n' }
         if (/idea-app-data version$/.test(cmd)) return { stdout: `${opts.version ?? `idea-app-data ${APP_DATA_HELPER_VERSION}`}\n` }
         return { stdout: '' }
@@ -132,7 +132,7 @@ describe('installRootHelpers applies the DHCP vendor class on every update (idea
 
 describe('installRootHelpers applies the IGMP sysctl drop-in on every update (idea#467)', () => {
     const inst = `sudo install -o root -g root -m 0644 /e/script/build_image_assets/${IGMP_SYSCTL_ASSET} ${IGMP_SYSCTL_CONF}`
-    const apply = `sudo sysctl -p ${IGMP_SYSCTL_CONF}`
+    const apply = `sudo ${SYSCTL} -p ${IGMP_SYSCTL_CONF}`
     const imageBuild = process.env.IDEA_IMAGE_BUILD
     afterEach(() => {
         if (imageBuild === undefined) delete process.env.IDEA_IMAGE_BUILD
@@ -165,9 +165,22 @@ describe('installRootHelpers applies the IGMP sysctl drop-in on every update (id
         expect(cmds.slice(-2)).toEqual([`test -x ${BORG_PATH}`, 'sudo -n /usr/local/sbin/idea-app-data version'])
     })
     it('a failing sysctl -p aborts the update so the default of 20 is not left unnoticed', async () => {
-        const { exec } = recordingExec({ installed: ['rsync', 'borgbackup'], fail: [/^sudo sysctl -p \/etc\/sysctl\.d\/90-idea-igmp\.conf$/] })
+        const { exec } = recordingExec({ installed: ['rsync', 'borgbackup'], fail: [/^sudo \/usr\/sbin\/sysctl -p \/etc\/sysctl\.d\/90-idea-igmp\.conf$/] })
         const q = quiet()
         try { await expect(installRootHelpers(exec, '/e')).rejects.toThrow(/sysctl -p/) } finally { q.mockRestore() }
+    })
+    it('fails the update when /usr/sbin/sysctl is missing, instead of reporting applied (engine#443)', async () => {
+        const { exec: base, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'], current: true })
+        const exec = async (strings: TemplateStringsArray, ...vals: unknown[]) => {
+            const cmd = strings.reduce((acc, s, i) => acc + s + (i < vals.length ? (Array.isArray(vals[i]) ? (vals[i] as string[]).join(' ') : String(vals[i])) : ''), '')
+            if (cmd === `${SYSCTL} -n net.ipv4.igmp_max_memberships`) throw new Error(`${SYSCTL}: command not found`)
+            return base(strings, ...vals)
+        }
+        const q = quiet()
+        try {
+            await expect(installRootHelpers(exec, '/e')).rejects.toThrow(/\/usr\/sbin\/sysctl is missing/)
+        } finally { q.mockRestore() }
+        expect(cmds.some(c => /sysctl -p/.test(c))).toBe(false)
     })
 })
 
@@ -195,7 +208,7 @@ describe('idea#284 part 2: a no-change install-root-helpers run writes nothing a
         const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'], current: true, igmpLive: '20' })
         const q = quiet()
         try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
-        expect(cmds).toContain(`sudo sysctl -p ${IGMP_SYSCTL_CONF}`)
+        expect(cmds).toContain(`sudo ${SYSCTL} -p ${IGMP_SYSCTL_CONF}`)
         expect(cmds.filter(c => /^sudo install -o /.test(c))).toEqual([])
     })
     it('a changed sudoers file is installed and re-checked with visudo -c; the unchanged one is not', async () => {
