@@ -13,8 +13,9 @@
  *   2. source docked here, Running: stop, claim, then the #413 start on the target
  *   3. source undocked (lost disk): claimed, and started on the target only after the claim
  *   4. source docked to another Engine: SOURCE_ON_OTHER_ENGINE before any extract
- *   5. no claim (source Starting here): RESTORE_NOT_CLAIMED, op Failed, target copy
- *      quarantined, no start
+ *   5. no claim (the stop on the source did not take): RESTORE_NOT_CLAIMED, op Failed,
+ *      target copy quarantined, no start
+ *   5b. source Starting here: INSTANCE_STARTING up front, no stop, no extract
  *   6. #381 regression: a plain dock of a leftover folder whose storedOn is another
  *      disk is neither claimed nor started
  */
@@ -233,8 +234,10 @@ describe('restoreApp onto another disk re-homes the instance (engine#418)', () =
         expect(restoreOp(w.h)?.error).toMatch(/SOURCE_ON_OTHER_ENGINE/)
     })
 
-    it('5. no claim (source Starting here): RESTORE_NOT_CLAIMED, op Failed, target copy quarantined, no start', async () => {
-        const w = await setup({ status: 'Starting', source: 'local' })
+    it('5. no claim (the stop on the source did not take): RESTORE_NOT_CLAIMED, op Failed, target copy quarantined, no start', async () => {
+        const w = await setup({ status: 'Running', source: 'local' })
+        // the stop returns but the instance is still Running on the source, so the reclaim is refused
+        backupLifecycle.stopInstance = vi.fn(async (_h: any, _inst: any, disk: any) => { events.push(`stop:${disk.id}`) }) as any
         await expect(restoreApp(w.h, INST, w.target)).rejects.toThrow(/^RESTORE_NOT_CLAIMED: .* remains on r418-a; the restored copy is quarantined at /)
         expect(String(w.h.doc()!.instanceDB[INST].storedOn)).toBe(String(w.source.id))
         expect(quarantined.map(q => q.disk)).toEqual([String(w.target.id)])
@@ -244,6 +247,21 @@ describe('restoreApp onto another disk re-homes the instance (engine#418)', () =
         expect(start).not.toHaveBeenCalled()
         expect(restoreOp(w.h)?.status).toBe('Failed')
         expect(restoreOp(w.h)?.error).toMatch(/RESTORE_NOT_CLAIMED/)
+    })
+
+    it('5b. source Starting here: INSTANCE_STARTING before any stop or extract, nothing changed', async () => {
+        const w = await setup({ status: 'Starting', source: 'local', extracted: false })
+        await expect(restoreApp(w.h, INST, w.target)).rejects.toThrow(/^INSTANCE_STARTING: /)
+        expect(await fs.pathExists(`${DISKS_ROOT}/${w.targetDevice}/instances`)).toBe(false)
+        expect(await fs.pathExists(instDir(w.sourceDevice!))).toBe(true)
+        expect(stop).not.toHaveBeenCalled()
+        expect(events).toEqual([])
+        expect(quarantined).toEqual([])
+        const rec = w.h.doc()!.instanceDB[INST] as any
+        expect(String(rec.storedOn)).toBe(String(w.source.id))
+        expect(rec.status).toBe('Starting')
+        expect(restoreOp(w.h)?.status).toBe('Failed')
+        expect(restoreOp(w.h)?.error).toMatch(/INSTANCE_STARTING/)
     })
 })
 

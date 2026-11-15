@@ -18,7 +18,8 @@
  * guards live here: SOURCE_ON_OTHER_ENGINE refuses before any extract when the
  * storedOn disk is docked to another Engine, and when the reclaim still did not
  * happen the restored copy on the target is quarantined (never deleted) and the
- * restore fails with RESTORE_NOT_CLAIMED.
+ * restore fails with RESTORE_NOT_CLAIMED. INSTANCE_STARTING refuses up front while
+ * the instance is Starting on its storedOn disk here.
  */
 import { fs } from 'zx'
 import type { Store } from './Store.js'
@@ -107,6 +108,19 @@ export const sourceOnOtherEngine = (store: Store, instanceId: InstanceID, target
     if (!prev?.device || String(prev.dockedTo) === String(localEngineId)) return null
     const engine = store.engineDB?.[prev.dockedTo as any]
     return `SOURCE_ON_OTHER_ENGINE: instance ${instanceId} is stored on disk ${prev.name ?? prev.id} (${prev.id}), docked to Engine ${engine?.hostname ?? prev.dockedTo}; restore it on that Engine, or undock that disk first`
+}
+
+/**
+ * engine#418 (Steve 13:55): before any stop or extract, the refusal message when the
+ * instance is Starting on its storedOn disk, docked to this Engine (a start is in
+ * flight there: stopping or replacing it mid-start is not safe), or null.
+ */
+export const instanceStartingHere = (store: Store, instanceId: InstanceID, localEngineId: string): string | null => {
+    const inst = store.instanceDB?.[instanceId]
+    if (!inst?.storedOn || String(inst.status) !== 'Starting') return null
+    const disk = store.diskDB?.[inst.storedOn] as Disk | undefined
+    if (!disk?.device || String(disk.dockedTo) !== String(localEngineId)) return null
+    return `INSTANCE_STARTING: instance ${instanceId} is starting on disk ${disk.name ?? disk.id} (${disk.id}); retry the restore when it is Running or Stopped`
 }
 
 /**

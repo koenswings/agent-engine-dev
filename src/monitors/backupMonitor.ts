@@ -30,7 +30,7 @@ import { parseBackupSpec, assertHookServicesExist, backupHookRunner, defaultBack
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
-import { assertPreQuarantineHelper, quarantinePreRestore, sourceOnOtherEngine, quarantineUnclaimedTarget } from '../data/RestorePreQuarantine.js'
+import { assertPreQuarantineHelper, quarantinePreRestore, sourceOnOtherEngine, instanceStartingHere, quarantineUnclaimedTarget } from '../data/RestorePreQuarantine.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { readBackupYamlState, setLinkLastBackup, editBackupYaml } from '../data/BackupYamlDoc.js'
 import { applyBackupResult, recordBackupResult, successResultCode, failureResultCode, isManualBackupCause } from '../data/BackupResults.js'
@@ -915,6 +915,9 @@ export const restoreApp = async (
         // engine#418: a storedOn disk docked to another Engine is refused before any extract
         const otherEngine = sourceOnOtherEngine(store, instanceId, targetDisk, String(localEngineId))
         if (otherEngine) throw new Error(otherEngine)
+        // engine#418: never stop or replace an instance in the middle of its start
+        const starting = instanceStartingHere(store, instanceId, String(localEngineId))
+        if (starting) throw new Error(starting)
 
         // #190: restoring to another disk quarantines the old folder afterwards (helper v4)
         const prevDisk = await assertPreQuarantineHelper(store, instanceId, targetDisk, String(localEngineId))
