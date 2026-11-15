@@ -356,6 +356,15 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
         log(`healStartingOnDisk after processDisk ${disk.id}: ${e.message ?? e}`)
     }
 
+    // engine#430: queue the App data size of each instance on this disk (background, one
+    // at a time, low priority; skipped while locked and retried later)
+    try {
+        const { requestDataBytesForDisk } = await import('./DataBytes.js')
+        requestDataBytesForDisk(storeHandle, disk.id)
+    } catch (e: any) {
+        log(`dataBytes after processDisk ${disk.id}: ${e.message ?? e}`)
+    }
+
     // Size and free space of every docked disk, on dock (idea#131)
     try {
         await updateDiskSize(storeHandle, disk.id, await diskFsRoot(disk), true)
