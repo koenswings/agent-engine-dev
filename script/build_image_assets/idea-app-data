@@ -88,6 +88,14 @@
 #   idea-app-data borg-delete  <bdev> <id> <archive> [keepMin]               (v9, idea#401; keepMin default 3)
 #   idea-app-data borg-compact <bdev> <id>                                   (v9, idea#401)
 #   idea-app-data quarantine-backups <bdev>                                 (v9, idea#446: move backups/ to .idea-quarantine/backups-<UTC stamp>/; never rm)
+#   idea-app-data clean-verify <bdev> <id> <stamp>                          (v17, engine#415: keep-latest. <stamp> is the copy just verified;
+#                                                                           remove every OTHER complete verify copy of <id> under .idea-verify/)
+#   v17 (engine#415, Koen's decision (b)): borg-extract-verify marks a complete extract with
+#        .idea-verify/<id>-<stamp>.extract-ok (root, next to the tree, never inside it). clean-verify
+#        removes only marked copies of that one instance, only under <bdev>/.idea-verify/, and keeps
+#        <stamp>. A copy without the marker (a failed or running extract, or one made by a helper
+#        older than v17) is never touched. A deliberate exception to quarantine-not-delete, limited
+#        to .idea-verify scratch copies.
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
 # excludes may hold '/'):
@@ -182,7 +190,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=16
+readonly IDEA_APP_DATA_VERSION=17
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -1872,6 +1880,7 @@ case "$SUB" in
             "$R_DIR/instances"|"$R_DIR/instances"/*) refuse "internal error: verify path would write under instances/" ;;
         esac
         if [[ -e "$DEST" || -L "$DEST" ]]; then refuse "verify folder $DEST already exists"; fi
+        if [[ -e "$DEST.extract-ok" || -L "$DEST.extract-ok" ]]; then refuse "marker $DEST.extract-ok already exists"; fi
         root_dir "$VDIR" 0700 "verify folder"
         $CHMOD 0700 -- "$VDIR" || refuse "cannot set mode 0700 on $VDIR"
         take_locks "repo.$2.$3"
@@ -1892,12 +1901,73 @@ case "$SUB" in
         if (( EC != 0 )); then
             exit "$EC"
         fi
+        # engine#415 / helper v17: mark the extract complete, next to the tree (never
+        # inside it, so path checks never see it). clean-verify only removes marked
+        # copies, so a failed extract (no marker) is kept for diagnosis.
+        : > "$DEST.extract-ok" || refuse "cannot write the complete-extract marker $DEST.extract-ok"
         OUT=$($DU -sb -x -- "$DEST") || OUT=""
         BYTES=${OUT%%[[:space:]]*}
         if [[ "$BYTES" =~ ^[0-9]+$ ]]; then
             echo "scratchBytes=$BYTES"
         fi
         exit 0
+        ;;
+
+    clean-verify)
+        # engine#415 / helper v17 (Koen's decision (b), keep-latest): <stamp> is the
+        # verify copy the Engine just checked. Every OTHER copy of <id> under
+        # <bdev>/.idea-verify/ that carries the complete-extract marker is removed
+        # (rm -rf --one-file-system). Kept, never touched: <stamp> itself, copies
+        # without the marker (failed or running extracts, kept for diagnosis; copies
+        # made by a helper older than v17), symlinks, anything not owned by root, other
+        # instances' copies, and everything outside .idea-verify/. Refuses the system
+        # disk, a bad id or stamp, and a <stamp> copy that is missing, a symlink or not
+        # a complete extract (then nothing is removed).
+        need 3 $(($# - 1)) "<bdev> <id> <stamp>"
+        check_id "$3"
+        check_stamp "$4"
+        resolve_root "$2" backup
+        VDIR="$R_DIR/.idea-verify"
+        if [[ -L "$VDIR" ]]; then refuse "$VDIR is a symlink"; fi
+        exact_path "$VDIR" && [[ -d "$VDIR" ]] || refuse "$VDIR is not a folder (missing, or a symlink in its path)"
+        read -r V_UID _ V_MODE <<<"$(stat_fields "$VDIR")"
+        [[ "$V_UID" == "$ROOT_UID" ]] && no_group_other_write "$V_MODE" \
+            || refuse "$VDIR must be owned by root and not group/other writable"
+        KEEP="$VDIR/$3-$4"
+        if [[ -L "$KEEP" ]]; then refuse "verify folder $KEEP is a symlink"; fi
+        exact_path "$KEEP" && [[ -d "$KEEP" ]] || refuse "verify folder $KEEP is missing"
+        [[ -f "$KEEP.extract-ok" && ! -L "$KEEP.extract-ok" ]] \
+            || refuse "verify folder $KEEP has no complete-extract marker (a failed extract, or made by a helper older than v17); nothing removed"
+        take_locks "repo.$2.$3"
+        CV_FAIL=0
+        shopt -s nullglob dotglob
+        for CAND in "$VDIR/$3-"*; do
+            CNAME=${CAND##*/}
+            CSTAMP=${CNAME#"$3-"}
+            # another instance whose id starts with '<id>-', or a marker file: not ours
+            [[ "$CSTAMP" =~ $RE_STAMP ]] || continue
+            [[ "$CAND" != "$KEEP" ]] || continue
+            if [[ -L "$CAND" ]]; then echo "skipped $CAND: a symlink (never followed)" >&2; continue; fi
+            [[ -d "$CAND" ]] || continue
+            if [[ ! -f "$CAND.extract-ok" || -L "$CAND.extract-ok" ]]; then
+                echo "kept $CAND: no complete-extract marker (failed extract, kept for diagnosis)" >&2
+                continue
+            fi
+            exact_path "$CAND" || { echo "skipped $CAND: does not resolve to itself" >&2; continue; }
+            read -r C_UID _ _ <<<"$(stat_fields "$CAND")"
+            [[ "$C_UID" == "$ROOT_UID" ]] || { echo "skipped $CAND: not owned by root" >&2; continue; }
+            if $RM -rf --one-file-system -- "$CAND"; then
+                $RM -f -- "$CAND.extract-ok" || true
+                journal "clean-verify: removed $CAND (kept $KEEP)"
+                echo "removed $CAND"
+            else
+                echo "could not remove $CAND (left with its marker; the next clean-verify retries)" >&2
+                CV_FAIL=1
+            fi
+        done
+        shopt -u nullglob dotglob
+        echo "kept $KEEP"
+        exit "$CV_FAIL"
         ;;
 
     quarantine-backups)
@@ -2022,7 +2092,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, clear-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, clear-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"
