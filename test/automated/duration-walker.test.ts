@@ -1056,7 +1056,7 @@ describe('Phase 3 UI Intent dispatch (StubUiDriver)', () => {
             expect(r.message).not.toMatch(/deferred|Pixel-missing/)
         }
         expect(DEFERRED_UI_INTENTS).toHaveLength(0)
-        expect(PIXEL_REGISTERED_INTENTS).toHaveLength(85)
+        expect(PIXEL_REGISTERED_INTENTS).toHaveLength(87)
         expect(PIXEL_MISSING_INTENTS).toHaveLength(0)
     })
 
@@ -2834,7 +2834,7 @@ describe('r30: real backup_instance before restore_from_backup (op Done + archiv
             'restore_from_backup',
         ])
         expect(walk.steps[firstRestore - 2]).toMatchObject({ from: 'op_instance', to: 'op_instance', action: 'backup_instance' })
-        expect(walk.steps.length).toBe(128)
+        expect(walk.steps.length).toBe(133)
         // backup_instance is the existing op_instance self-loop — no new state/edge.
         const g = unifiedScenario()
         const opInst = (g.states as any).op_instance.transitions as { to: string; action: string }[]
@@ -3498,8 +3498,8 @@ describe('r30: reboot_engine must really reboot (lastBooted advances, queue drai
         fixtureInstances: { ...KID_FIXTURES },
     })
 
-    it('walks: reboot_engine stays the last step (cover-all @128, cover-registered-intents @102)', () => {
-        for (const [name, n] of [['cover-all', 128], ['cover-registered-intents', 102]] as const) {
+    it('walks: reboot_engine stays the last step (cover-all @133, cover-registered-intents @102)', () => {
+        for (const [name, n] of [['cover-all', 133], ['cover-registered-intents', 102]] as const) {
             const acts = loadWalk(name).steps.map(st => st.action)
             expect(acts.length, name).toBe(n)
             expect(acts.flatMap((a, i) => (a === 'reboot_engine' ? [i + 1] : [])), name).toEqual([n])
@@ -3609,7 +3609,7 @@ describe('idea#168 cover-all-skip-copy SHAKE-OUT walk', () => {
         const w = loadWalk('cover-all-skip-copy')
         expect(w.name).toBe('cover-all-skip-copy')
         expect(w.graph).toBe('unified')
-        expect(w.steps).toHaveLength(125)
+        expect(w.steps).toHaveLength(130)
     })
 
     it('every step is an EXISTING unified.yaml edge, continuous from start (independent check)', () => {
@@ -3644,13 +3644,13 @@ describe('idea#168 cover-all-skip-copy SHAKE-OUT walk', () => {
         expect(at('copy_app')).toEqual([])
         expect(at('open_copied_instance')).toEqual([])
         expect(at('done_redistribute')).toEqual([])
-        expect([81, 97, 99, 101, 111, 116, 125].map(n => parentStepFor(v, n))).toEqual([82, 98, 100, 102, 112, 119, 128])
+        expect([81, 97, 99, 101, 111, 116, 130].map(n => parentStepFor(v, n))).toEqual([82, 98, 100, 102, 112, 119, 133])
         expect(parentStepFor(v, 42)).toBe(42)
         expect(parentStepFor(v, 43)).toBeNull()
         expect(parentStepFor(v, 44)).toBe(45)
         expect(parentStepFor(v, 114)).toBe(115)
         expect(parentStepFor(v, 115)).toBe(118)
-        for (let n = 1; n <= 125; n++) {
+        for (let n = 1; n <= 130; n++) {
             const p = parentStepFor(v, n)
             if (p !== null) expect(v.steps[n - 1]!.action, `@${n}↔${p}`).toBe(ca[p - 1]!.action)
         }
@@ -3660,7 +3660,7 @@ describe('idea#168 cover-all-skip-copy SHAKE-OUT walk', () => {
     it('shakeOut: notCovered uses cover-all numbers; cover-all itself is not a shake-out', () => {
         const v = loadWalk('cover-all-skip-copy')
         expect(v.shakeOut?.variantOf).toBe('cover-all')
-        expect(v.shakeOut?.parentSteps).toBe(128)
+        expect(v.shakeOut?.parentSteps).toBe(133)
         expect(v.shakeOut?.notCovered).toEqual([
             { step: 43, action: 'copy_app' },
             { step: 44, action: 'done_redistribute' },
@@ -3753,12 +3753,13 @@ describe('idea#168 run summary: shake-out labelling + keep_editing recovery coun
             { step: 117, action: 'open_copied_instance' },
         ])
         expect(s.stepNumbering).toEqual({
-            variantSteps: 125,
-            parentSteps: 128,
+            variantSteps: 130,
+            parentSteps: 133,
             map: [
                 { variant: '1-42', parent: '1-42' },
                 { variant: '44-114', parent: '45-115' },
-                { variant: '115-125', parent: '118-128' },
+                { variant: '115-122', parent: '118-125' },
+                { variant: '123-130', parent: '126-133' },
             ],
             substitutes: [{ variant: 43, action: 'back_to_overview', replacesParent: [43, 44] }],
         })
@@ -3779,16 +3780,16 @@ describe('idea#168 run summary: shake-out labelling + keep_editing recovery coun
         const walk = loadWalk('cover-all')
         const s = buildRunSummary({
             walk,
-            result: { steps: 128, failures: 0, aborted: false, logs: okLogs(128, walk.steps.map(x => x.action)) },
+            result: { steps: 133, failures: 0, aborted: false, logs: okLogs(133, walk.steps.map(x => x.action)) },
             recoveries: { total: 0, failed: 0, byKind: {} },
         })
         expect(s.shakeOut).toBe(false)
         expect(s.notCovered).toBeUndefined()
         expect(s.stepNumbering).toBeUndefined()
-        expect(s.lastStep).toEqual({ step: 128, action: 'reboot_engine' })
+        expect(s.lastStep).toEqual({ step: 133, action: 'reboot_engine' })
         expect(shakeOutSummary(walk)).toBeNull()
         expect(shakeOutSummary(null)).toBeNull()
-        expect(formatRunSummaryLine(s)).toBe('[duration] summary: cover-all steps=128 failures=0 | last step @128 reboot_engine | keep_editing recoveries: 0 | stale-view reconnects: 0')
+        expect(formatRunSummaryLine(s)).toBe('[duration] summary: cover-all steps=133 failures=0 | last step @133 reboot_engine | keep_editing recoveries: 0 | stale-view reconnects: 0')
     })
 
     // Exact lines the Console keep_editing Intent prints (agent-console d637b83 nextcloudDeep.ts).

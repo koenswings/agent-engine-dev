@@ -388,22 +388,9 @@ steps:
   - from: op_entry
     to: op_overview
     action: sign_in
-  - from: op_overview
-    to: op_settings
-    action: open_settings
-  - from: op_settings
-    to: op_settings
-    action: switch_engine
-  - from: op_settings
-    to: op_settings
-    action: reboot_engine
-  # console#212 / #171: after the existing 128-step Path A sequence so historic
-  # @95 / @104 fixture-disk numbers stay aligned. close_settings + instance/disk
-  # hubs re-enter so live --ui is on the right panel. Size-gate refusal, update,
-  # remove-app, and update_restart_failed stay out of this walk.
-  - from: op_settings
-    to: op_overview
-    action: close_settings
+  # console#212 / #171: after sign_in so historic @95 / @104 fixture-disk numbers
+  # stay aligned and reboot_engine remains the last step. Size-gate refusal,
+  # update, remove-app, and update_restart_failed stay out of this walk.
   - from: op_overview
     to: op_instance
     action: open_instance_controls
@@ -416,3 +403,15 @@ steps:
   - from: op_disk
     to: op_backup
     action: backup_schedule
+  - from: op_backup
+    to: op_overview
+    action: back_to_overview
+  - from: op_overview
+    to: op_settings
+    action: open_settings
+  - from: op_settings
+    to: op_settings
+    action: switch_engine
+  - from: op_settings
+    to: op_settings
+    action: reboot_engine

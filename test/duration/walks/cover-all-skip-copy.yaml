@@ -6,8 +6,9 @@
 #   variant @43      = op_instance --back_to_overview--> op_overview (replaces cover-all
 #                      @43 copy_app + @44 done_redistribute)
 #   variant @44-114  = cover-all @45-115
-#   variant @115-125 = cover-all @118-128 (cover-all @116 copy_app + @117
+#   variant @115-122 = cover-all @118-125 (cover-all @116 copy_app + @117
 #                      open_copied_instance dropped; @115 start_after_install → back_to_disk)
+#   variant @123-130 = cover-all @126-133 (rename_instance + backup_schedule + hubs)
 # Each step carries a "# @N = cover-all @M" comment. The machine-readable mapping is the
 # shake_out block below; loadWalk checks it step-by-step against cover-all.yaml.
 # done_redistribute only exists at cover-all @44, so it is NOT covered either.
@@ -20,7 +21,8 @@ shake_out:
   step_map:
     - { variant: [1, 42], parent: [1, 42] }
     - { variant: [44, 114], parent: [45, 115] }
-    - { variant: [115, 125], parent: [118, 128] }
+    - { variant: [115, 122], parent: [118, 125] }
+    - { variant: [123, 130], parent: [126, 133] }
   substitutes:
     - { variant: 43, action: back_to_overview, replaces_parent: [43, 44] }
   not_covered:
@@ -519,13 +521,33 @@ steps:
     action: sign_in
   # @123 = cover-all @126
   - from: op_overview
+    to: op_instance
+    action: open_instance_controls
+  # @124 = cover-all @127
+  - from: op_instance
+    to: op_instance
+    action: rename_instance
+  # @125 = cover-all @128
+  - from: op_instance
+    to: op_disk
+    action: back_to_disk
+  # @126 = cover-all @129
+  - from: op_disk
+    to: op_backup
+    action: backup_schedule
+  # @127 = cover-all @130
+  - from: op_backup
+    to: op_overview
+    action: back_to_overview
+  # @128 = cover-all @131
+  - from: op_overview
     to: op_settings
     action: open_settings
-  # @124 = cover-all @127
+  # @129 = cover-all @132
   - from: op_settings
     to: op_settings
     action: switch_engine
-  # @125 = cover-all @128
+  # @130 = cover-all @133
   - from: op_settings
     to: op_settings
     action: reboot_engine
