@@ -809,7 +809,41 @@ export const applyBackupMethod = (instance: Instance, compose: any): void => {
   else if ('backupMethod' in instance) delete instance.backupMethod
 }
 
-export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, instanceId: InstanceID, disk: Disk): Promise<Instance | undefined> => {
+/**
+ * engine#418: options for createOrUpdateInstance / processInstance. `reclaim:
+ * 'restore'` is passed only by restoreApp: it may take the id over from a
+ * different storedOn when restoreReclaimDecision allows it. Every other caller
+ * (dock, boot, keep-id moves) keeps the engine#381 guard unchanged.
+ */
+export interface InstanceRegisterOptions {
+  reclaim?: 'restore'
+}
+
+const RECLAIM_BLOCKING_STATES = new Set(['Running', 'Starting'])
+
+/**
+ * engine#418: may restoreApp take `instance` over onto `disk` although its
+ * storedOn is another disk? Only when
+ *   (a) the storedOn disk is not docked anywhere (no record, or device null: the
+ *       lost-disk case), or
+ *   (b) it is docked to this Engine and the instance is not Running or Starting
+ *       there (restoreApp has already stopped a Running instance).
+ * A storedOn disk docked to another Engine is never taken over (restoreApp
+ * refuses that up front with SOURCE_ON_OTHER_ENGINE). Pure, on the store.
+ */
+export const restoreReclaimDecision = (
+  store: Store, instance: Pick<Instance, 'id' | 'storedOn' | 'status'>, disk: Pick<Disk, 'id'>, engineId: string = String(localEngineId),
+): { allowed: boolean, reason: string } => {
+  const from = instance.storedOn
+  if (!from || String(from) === String(disk.id)) return { allowed: true, reason: 'storedOn is already this disk' }
+  const source = store.diskDB?.[from] as Disk | undefined
+  if (!source || source.device == null) return { allowed: true, reason: `storedOn disk ${from} is not docked anywhere` }
+  if (String(source.dockedTo) !== String(engineId)) return { allowed: false, reason: `storedOn disk ${from} is docked to another Engine (${source.dockedTo})` }
+  if (RECLAIM_BLOCKING_STATES.has(String(instance.status))) return { allowed: false, reason: `instance is ${instance.status} on storedOn disk ${from}` }
+  return { allowed: true, reason: `storedOn disk ${from} is docked here and the instance is ${instance.status}` }
+}
+
+export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, instanceId: InstanceID, disk: Disk, opts: InstanceRegisterOptions = {}): Promise<Instance | undefined> => {
   let instance: Instance
   try {
     const composeFile = await $`cat ${await diskMountRoot(disk)}/instances/${instanceId}/compose.yaml`
@@ -847,10 +881,15 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
       } else {
         // engine#381: never claim an id whose storedOn is already a different disk
         // (in-flight keep-id move, or a leftover source folder after storedOn flipped).
+        // engine#418: restoreApp's explicit restore-reclaim is the only exception.
         if (storedInstance.storedOn && String(storedInstance.storedOn) !== String(disk.id)) {
-          log(`createOrUpdateInstance: not claiming ${instanceId} on ${disk.id}; storedOn is already ${storedInstance.storedOn}`)
-          instance = storedInstance
-          return
+          const reclaim = opts.reclaim === 'restore' ? restoreReclaimDecision(doc, storedInstance, disk) : null
+          if (!reclaim?.allowed) {
+            log(`createOrUpdateInstance: not claiming ${instanceId} on ${disk.id}; storedOn is already ${storedInstance.storedOn}${reclaim ? ` (restore-reclaim refused: ${reclaim.reason})` : ''}`)
+            instance = storedInstance
+            return
+          }
+          log(`createOrUpdateInstance: restore-reclaim of ${instanceId} from ${storedInstance.storedOn} onto ${disk.id} (${reclaim.reason}) (engine#418)`)
         }
         // Granularly update the existing instance object
         log(`Updating existing instance object ${instanceId} on disk ${disk.id}`)
