@@ -6,7 +6,6 @@ import http from 'http';
 import crypto from 'crypto';
 import { redactSecrets, redactString } from './redact.js'
 
-
 // Dummy key
 export const dummyKey = "_dummy"
 
@@ -71,8 +70,6 @@ export const addOrUpdateEnvVariable = async (path: string, variable: string, val
     //await $`echo "${variable}=${value}" >> ${path}`
   }
 }
-
-
 
 // Read verbosityLevel from the environmnet
 const verbosity = process.env.VERBOSITY || ""
@@ -182,32 +179,8 @@ export const isHttpPortReady = (hostname: string, port: number, timeoutMs = 2000
 //     }
 // }
 
-
-
-
-
-
-// Write a function that uses zx to test if a path exists
-// export const dirExists = async (path: string) => {
-//     try {
-//         await $`test -d ${path}`
-//         return true
-//     } catch (e) {
-//         return false
-//     }
-// }
-
 // export const dirExists = async (path: string) => {
 //   return await $`test -d ${path}`.then(() => true).catch(() => false)
-// }
-
-// export const fileExists = async (path: string) => {
-//   try {
-//       await $`test -f ${path}`
-//       return true
-//   } catch (e) {
-//       return false
-//   }
 // }
 
 // export const fileExists = async (path: string) => {
@@ -223,9 +196,6 @@ export const fileExists = (path: string):boolean => {
 // export const firstBoot: boolean = fs.existsSync('../yjs-db') ? false : true 
 // export const firstBoot: boolean = !(await fileExists('./yjs-db'))
 // log(`First boot: ${firstBoot}`)
-
-
-
 
 // Write a function that checks if a given yarray contains a specific value
 // Use the Y.Array API of the Yjs library (which does not have a built-in method for this)
@@ -246,7 +216,6 @@ export const deepPrint = (obj, depth:(number | null)=null) => {
     // Alternative: return console.dir(obj, {depth: null, colors: true})
 }
 
-
 // Write a function that tests if a string is a valid IP4 address
 export const isIP4 = (str: string): boolean => {
   const ip4Regex = /^(\d{1,3}\.){3}\d{1,3}$/
@@ -256,34 +225,6 @@ export const isIP4 = (str: string): boolean => {
 export const isNetmask = isIP4
 
 // See https://stackoverflow.com/questions/503052/how-to-check-if-ip-is-in-one-of-these-subnets
-
-
-// const ip2long = (ip) => {
-//   var components;
-//   if(components = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/))
-//   {
-//       var iplong = 0;
-//       var power  = 1;
-//       for(var i=4; i>=1; i-=1)
-//       {
-//           iplong += power * parseInt(components[i]);
-//           power  *= 256;
-//       }
-//       return iplong;
-//   }
-//   else return -1;
-// };
-
-// THIS FUNCTION IS WRONG
-// export const inSubNet = (ip, subnet) => {   
-//   var mask, base_ip, long_ip = ip2long(ip);
-//   if( (mask = subnet.match(/^(.*?)\/(\d{1,2})$/)) && ((base_ip=ip2long(mask[1])) >= 0) )
-//   {
-//       var freedom = Math.pow(2, 32 - parseInt(mask[2]));
-//       return (long_ip > base_ip) && (long_ip < base_ip + freedom - 1);
-//   }
-//   else return false;
-// }
 
 export const IPnumber = (ip:IPAddress):number => {
 //  var ip = IPaddress.match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)$/);
@@ -400,7 +341,6 @@ export const uuid = ():string => {
 export const uuidLight = ():string => {
   return uuid().substring(0, 8)
 }
-
 
 // A function to strip the trailing partition number from a device name
 export const stripPartition = (device: string):string => {

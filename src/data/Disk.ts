@@ -19,8 +19,6 @@ import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 import { shouldAutoStart } from './AutoStart.js';
 import { isLegacyDottedInstanceId, LEGACY_DOTTED_INSTANCE_MESSAGE } from '../utils/instanceIds.js';
 
-
-
 // Disks are multi-purpose  - they can be used for engines, apps, backups, etc.
 
 export interface BackupConfig {
@@ -155,29 +153,13 @@ export interface UnmountError {
     message: string;            // why the unmount failed
 }
 
-
 // export const getApps = (store: Store, disk: Disk): App[] => {
 //     const appIds = getKeys(disk.apps) as AppID[]
 //     return appIds.map(appId => getApp(store, appId))
 // }
 
-
 // export const findApp = (store: Store, disk: Disk, appId: AppID): App | undefined => {
 //     return getApps(store, disk).find(app => app.id === appId)
-// }
-
-// Function findApp that searches for an app with the specified name and version on the specified disk
-// export const findAppByNameAndVersion = (store: Store, disk: Disk, appName: AppName, version: Version): App | undefined => {
-//     const appIds = Object.keys(disk.apps) as AppID[]
-//     const appId = appIds.find(appId => {
-//         const app = store.appDB[appId]
-//         app.name === appName && app.version === version
-//     })
-//     if (appId) {
-//         return store.appDB[appId]
-//     } else {
-//         return undefined
-//     }
 // }
 
 // export const getInstances = (store: Store, disk: Disk): Instance[] => {
@@ -188,35 +170,6 @@ export interface UnmountError {
 // export const findInstance = (store: Store, disk: Disk, instanceId: InstanceID): Instance | undefined => {
 //     return getInstances(store, disk).find(instance => instance.id === instanceId)
 // }
-
-// export const findInstanceOfApp = (store: Store, disk: Disk, appId: AppID): Instance | undefined => {
-//     return getInstances(store, disk).find(instance => instance.instanceOf === appId)
-// }
-// export const findInstanceByName = (store: Store, disk: Disk, instanceName: InstanceName): Instance | undefined => {
-//     const instanceIds = Object.keys(disk.instances) as InstanceID[]
-//     const instanceId = instanceIds.find(instanceId => store.instanceDB[instanceId].name === instanceName)
-//     if (instanceId) {
-//         return store.instanceDB[instanceId]
-//     } else {
-//         return undefined
-//     }
-// }
-
-// export const addInstance = (store: Store, disk: Disk, instance: Instance): void => {
-//     log(`Updating instance ${instance.name} of disk ${disk.name}:`)
-//     const existingInstance = findInstanceByName(store, disk, instance.name)
-//     if (existingInstance) {
-//         log(`Disk ${disk.name} already has an instance ${instance.name}. Merging the new instance with the existing instance.`)
-//         Object.assign(existingInstance, instance)
-//     } else {
-//         //log(deepPrint(disk))
-//         log(`Pushing a new instance ${instance.name} to engine ${disk.name}`)
-//         disk.instances[instance.id] = true
-//     }
-// }
-
-
-
 
 /**
  * idea#152: undock, in the store only, every other disk record that claims
@@ -321,7 +274,6 @@ export const OLDcreateOrUpdateDisk = (storeHandle: DocHandle<Store>, engineId: E
         return store.diskDB[diskId]
     }
 }   
-
 
 export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Promise<void> => {
     log(`Processing disk ${disk.id} on engine ${disk.dockedTo}`)
@@ -862,7 +814,6 @@ export const processApp = async (storeHandle: DocHandle<Store>, disk: Disk, appI
     return app
 }
 
-
 export const removeApp = async (store: Store, disk: Disk, appId: AppID): Promise<void> => {
     log(`App ${appId} no longer found on disk ${disk.id}`)
     // There is nothing that we need to do as we do not record on which disks Apps are stored
@@ -994,8 +945,4 @@ export const removeInstance = (storeHandle: DocHandle<Store>, disk: Disk, instan
         }
     })
 }
-
-
-
-
 

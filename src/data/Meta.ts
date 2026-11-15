@@ -455,8 +455,6 @@ export const readHardwareIdIntenso = async (
   }
 }
 
-
-
 export const createMeta = async (device: DeviceName, engineVersion: Version | undefined = undefined): Promise<DiskMeta> => {
   // Find the hardware id
   let isHardwareId
@@ -622,51 +620,3 @@ export const addMeta = async (exec: any, hostname: string, version: string, opti
   return id
 }
 
-// export const readRemoteDiskId = async (exec: any): Promise<DiskID | undefined> => {
-//   log(`Reading disk id remotely`)
-//   try {
-//     const rootDevice = (await exec`findmnt / -no SOURCE`).stdout.split('/')[2].trim();
-//     // First, find the full path to hdparm
-//     const hdparmPath = (await exec`which hdparm`).stdout.trim();
-//     if (!hdparmPath) {
-//       log('hdparm command not found on remote machine.');
-//       return undefined;
-//     }
-//     const sn = (await exec`${hdparmPath} -I /dev/${rootDevice} | grep 'Serial\\ Number'`).stdout;
-//     const id = sn.trim().split(':');
-//     if (id.length === 2) {
-//       const diskId = id[1].trim();
-//       log(`Remote disk id is ${diskId}`);
-//       return diskId as DiskID;
-//     } else {
-//       log(`Cannot read disk id for device ${rootDevice}`);
-//       return undefined;
-//     }
-//   } catch (e) {
-//     log(`Error reading disk id of the root device: ${e}`);
-//     return undefined;
-//   }
-// }
-
-// export const addMeta = async (exec: any, hostname: string, version: string) => {
-//   let id = await readRemoteDiskId(exec)
-//   if (id === undefined) {
-//     was-console-log(chalk.yellow(`Disk id is ${id}`));
-//     was-console-log(chalk.red('Remote disk has no disk id.  Generating one.'))
-//     id = uuid() as DiskID
-//   }
-//   was-console-log(chalk.blue('Adding metadata...'));
-//   try {
-//     await exec`sudo rm -f /META.yaml`;
-//     await exec`echo 'diskId: ${id}' | sudo tee -a /META.yaml`;
-//     await exec`echo 'diskName: ${id}' | sudo tee -a /META.yaml`;
-//     await exec`echo 'hostname: ${hostname}' | sudo tee -a /META.yaml`;
-//     await exec`echo 'created: ${new Date().getTime()}' | sudo tee -a /META.yaml`;
-//     await exec`echo 'version: ${version}' | sudo tee -a /META.yaml`;
-//     await exec`echo 'lastDocked: ${new Date().getTime()}' | sudo tee -a /META.yaml`;
-//   } catch (e) {
-//     was-console-log(chalk.red('Error adding metadata'));
-//     console.error(e);
-//     process.exit(1);
-//   }
-// }
