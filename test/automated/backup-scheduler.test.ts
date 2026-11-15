@@ -18,7 +18,7 @@ import { recordBackupResult } from '../../src/data/BackupResults.js'
 import { createOperation, recoverInterruptedOperations } from '../../src/data/Operations.js'
 import { backupInstance, runCleanupTracked } from '../../src/monitors/backupMonitor.js'
 import {
-    BackupScheduler, SchedulerDeps, freePctOf, newestBackupTimeFor, isScheduledHere, RETRY_DELAY_MS, SCHEDULED_BACKUP_CAUSE,
+    BackupScheduler, SchedulerDeps, freePctOf, newestBackupTimeFor, isScheduledHere, scheduledTargets, RETRY_DELAY_MS, SCHEDULED_BACKUP_CAUSE,
 } from '../../src/monitors/backupScheduler.js'
 import { backupCleanupRunner } from '../../src/utils/backupCleanup.js'
 import { parseBuildInfo, readBuildInfo } from '../../src/utils/buildInfo.js'
@@ -54,12 +54,10 @@ const slot = (dayOffset: number, h = 2, m = 30) => {
     const d = new Date(2026, 10, 13 + dayOffset, h, m, 0, 0)
     return d.getTime()
 }
-const yamlText = (o: { mode?: string, daily?: string | null, lastRun?: number | null, extra?: string } = {}) => [
+const yamlText = (o: { mode?: string, daily?: string | null, lastRun?: number | null, extra?: string, links?: string[] } = {}) => [
     `mode: ${o.mode ?? 'scheduled'}`,
     ...(o.daily === null ? [] : [`schedule:`, `  daily: "${o.daily ?? '02:30'}"`]),
-    'links:',
-    `  - instanceId: ${A}`, '    lastBackup: 0',
-    `  - instanceId: ${B}`, '    lastBackup: 0',
+    ...((o.links ?? [A, B]).length === 0 ? ['links: []'] : ['links:', ...(o.links ?? [A, B]).flatMap(id => [`  - instanceId: ${id}`, '    lastBackup: 0'])]),
     ...(o.lastRun != null ? ['lastRun:', `  time: ${o.lastRun}`, '  uptimeS: 100', `  bootId: ${clock.bootId}`] : []),
     o.extra ?? '',
 ].join('\n') + '\n'
@@ -273,6 +271,88 @@ describe('scheduled run on a trusted clock', () => {
         const s = new BackupScheduler(h, deps(), localEngineId)
         for (let i = 0; i < 3; i++) { await tick(s); clock.advance(MIN) }
         expect(runs.length).toBe(runsBefore)
+    })
+})
+
+describe('empty links = every App on the Engine (engine#424)', () => {
+    const C = 'sched-c' as InstanceID
+    const D = 'sched-d' as InstanceID
+    const addInstance = (h: DocHandle<Store>, id: InstanceID, storedOn: DiskID, extra: Record<string, unknown> = {}) => h.change(doc => {
+        doc.instanceDB[id] = {
+            id, instanceOf: 'sample-app' as any, name: id as any, status: 'Stopped' as any, port: 8080 as any,
+            serviceImages: [], created: 1 as Timestamp, lastBackup: null, lastStarted: 1 as Timestamp, statusCondition: null,
+            storedOn, currentStep: null, totalSteps: null, stepLabel: null, metrics: null, ...extra,
+        } as any
+    })
+    /** A Backup Disk as makeBackupDisk leaves it: scheduled, no links. */
+    const setupNoLinks = async () => {
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1), links: [] }))
+        const h = await setup()
+        h.change(doc => { doc.diskDB[BD].backupConfig!.links = [] })
+        return h
+    }
+
+    it('backs up every local instance at each run, including one added after the disk was made', async () => {
+        const h = await setupNoLinks()
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        clock.advance(MIN); await tick(s)                 // 02:30 day 0
+        expect(runs.map(r => `${r.id}:${r.cause}`)).toEqual([`${A}:${SCHEDULED_BACKUP_CAUSE}`, `${B}:${SCHEDULED_BACKUP_CAUSE}`])
+        addInstance(h, C, AD)                             // a new App installed after the disk was made
+        clock.advance(DAY); await tick(s)                 // 02:30 day 1: worked out again
+        expect(runs.slice(2).map(r => r.id)).toEqual([A, B, C])
+        expect(h.doc()!.instanceDB[C].lastResult?.result).toBe('OK')
+        expect((await readYaml()).links).toEqual([])      // BACKUP.yaml is not rewritten with links
+        expect(disk(h).backupConfig?.links).toEqual([])
+        expect(newestBackupTimeFor(h.doc()!, disk(h))).toBe(slot(1))
+    })
+
+    it('explicit links still narrow the set', async () => {
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1), links: [B] }))
+        const h = await setup()
+        h.change(doc => { doc.diskDB[BD].backupConfig!.links = [B] })
+        addInstance(h, C, AD)
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        clock.advance(MIN); await tick(s)
+        expect(runs.map(r => r.id)).toEqual([B])
+        expect(scheduledTargets(h.doc()!, { id: BD }, String(localEngineId), [B])).toEqual({ basis: 'links', ids: [B], excludedOnBackupDisk: [] })
+    })
+
+    it('an instance stored on the Backup Disk itself is left out; linked explicitly it still runs', async () => {
+        const h = await setupNoLinks()
+        addInstance(h, D, BD)
+        expect(scheduledTargets(h.doc()!, disk(h), String(localEngineId), [])).toEqual({ basis: 'all', ids: [A, B], excludedOnBackupDisk: [D] })
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        clock.advance(MIN); await tick(s)
+        expect(runs.map(r => r.id)).toEqual([A, B])
+        expect(h.doc()!.instanceDB[D].lastResult ?? null).toBeNull()   // no result code: logged only
+        expect(scheduledTargets(h.doc()!, disk(h), String(localEngineId), [D]).ids).toEqual([D])
+    })
+
+    it('instances on an undocked disk, a disk docked to another Engine, or demo instances are skipped without a result', async () => {
+        const UD = 'ud-sched' as DiskID
+        const RD = 'rd-sched' as DiskID
+        const h = await setupNoLinks()
+        h.change(doc => {
+            doc.diskDB[UD] = makeDisk(UD, null, false)
+            doc.diskDB[RD] = makeDisk(RD, 'sdz9', false, 'some-other-engine')
+        })
+        const U = 'sched-undocked' as InstanceID
+        const R = 'sched-remote' as InstanceID
+        const M = 'sched-demo' as InstanceID
+        addInstance(h, U, UD)
+        addInstance(h, R, RD)
+        addInstance(h, M, AD, { demo: true })
+        const s = new BackupScheduler(h, deps(), localEngineId)
+        clock.advance(MIN); await tick(s)
+        expect(runs.map(r => r.id)).toEqual([A, B])
+        for (const id of [U, R, M]) expect(h.doc()!.instanceDB[id].lastResult ?? null).toBeNull()
+    })
+
+    it('explicit links still list an instance whose App Disk is undocked, so backupInstance records APP_DISK_NOT_DOCKED as before', async () => {
+        await fs.writeFile(yamlPath(), yamlText({ lastRun: slot(-1), links: [A] }))
+        const h = await setup()
+        h.change(doc => { doc.diskDB[BD].backupConfig!.links = [A]; doc.diskDB[AD].device = null as any })
+        expect(scheduledTargets(h.doc()!, disk(h), String(localEngineId), [A]).ids).toEqual([A])
     })
 })
 

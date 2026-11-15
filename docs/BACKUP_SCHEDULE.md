@@ -9,7 +9,13 @@
 
 ## What it does
 
-A Backup Disk in `scheduled` mode, docked to an Engine, backs up its linked instances once a day at a Pi-local time (default **02:30**). The schedule runs **inside the Engine** under pm2, as a 60 s tick; it is never a host cron job. Only the Engine the disk is docked to runs it (`dockedTo === localEngineId`), so there are no double runs across Engines.
+A Backup Disk in `scheduled` mode, docked to an Engine, backs up its instances once a day at a Pi-local time (default **02:30**). The schedule runs **inside the Engine** under pm2, as a 60 s tick; it is never a host cron job. Only the Engine the disk is docked to runs it (`dockedTo === localEngineId`), so there are no double runs across Engines.
+
+**Which instances a run backs up (engine#424, Koen 15 Nov 2026):** worked out at the start of each run, never stored.
+- **No links** (`links: []`, as `makeBackupDisk` and `initialiseDisk … backup` write it): every App instance stored on a disk docked to this Engine, so Apps installed after the disk was made are included. Left out: demo instances (engine#369); instances on disks that are undocked or docked to another Engine (not "on this Pi", so no result is recorded for them); and instances stored **on the Backup Disk itself**, because a backup onto the same disk protects nothing if that disk fails. The last case is logged once per run (no result code: none of the codes means "not a target"). The run log line reads `no links, so every App instance on this Engine: <n> instance(s)`.
+- **Links listed:** exactly those instances, as before. An undocked App Disk still records `APP_DISK_NOT_DOCKED`, and an instance on the Backup Disk itself that is linked explicitly is still backed up.
+- Consequence: removing the last link of a scheduled disk (`removeBackupLink`) makes it back up every App on the Pi. The empty list is not rewritten in BACKUP.yaml or in `Disk.backupConfig.links`; a Console shows "all Apps" for a `scheduled` disk whose `backupConfig.links` is empty.
+- `immediate` and `on-demand` are unchanged: with no links, `immediate` backs up nothing on dock, and `on-demand` only runs `backupApp`.
 
 ## Pieces and PRs
 
@@ -29,7 +35,7 @@ The 05:00 reboot wrapper (it waits while `/run/idea/backup-running` exists, with
 mode: scheduled
 schedule:
   daily: "02:30"            # Pi-local, 24 h; absent means 02:30
-links:
+links:                      # empty ([]) in scheduled mode: every App on this Engine (engine#424)
   - instanceId: <id>
     lastBackup: <unix ms>
 lastRun:                    # the last scheduled run
@@ -94,7 +100,7 @@ uptimeCounter:              # uptime since lastRun, across reboots
 **Clock inputs:**
 - `ntpSynced` latches once `timedatectl NTPSynchronized` has said `yes` since the Engine started. After a jump, a reading of `yes` counts as the sync that brings trust back.
 - The build floor is `dist/build-info.json`, written by `pnpm build` (`script/write-build-info.mjs`): the git commit time, Q12. A missing file skips the check.
-- The "newest store timestamp" is the newest of the disk's `lastAttempt` and its linked instances' `lastBackup` / `lastResult.time`.
+- The "newest store timestamp" is the newest of the disk's `lastAttempt` and the `lastBackup` / `lastResult.time` of the instances it backs up (its links, or with no links the instances a run would back up, engine#424).
 - Peer clocks come from the ephemeral heartbeat (`idea/hb`), in memory only: `now`, plus `ntpSynced` and `clockTrusted` on engine#352 Engines. An old Engine's hb without those fields is not a time source. Estimated peer time is `hb.now + elapsed since receive`; a peer silent for 60 s is dropped. `Engine.lastRun` is not used, and nothing is written to the store for this.
 - A peer is a time source only if it reports `ntpSynced` or `clockTrusted` (trust from earlier NTP or an NTP-backed chain). Two never-synced Pis must not vouch for each other. `AHEAD_OF_PEER` and the `BEFORE_STORE` exception need an `ntpSynced` peer. If usable peers disagree with each other by more than 5 min, all peer input is ignored for that tick. The system clock is never stepped.
 
