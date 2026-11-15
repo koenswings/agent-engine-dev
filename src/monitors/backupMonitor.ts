@@ -1082,7 +1082,9 @@ export const restoreRunningState = (store: Store, instance: Pick<Instance, 'stor
 
 /**
  * Restore the latest archive for instanceId from any docked Backup Disk
- * onto targetDisk.
+ * onto targetDisk. Always onto that same instance id: replaces
+ * instances/<id> with the latest backups/<id> archive. Not a restore to
+ * a new id (engine#457).
  */
 export const restoreApp = async (
     storeHandle: DocHandle<Store>,

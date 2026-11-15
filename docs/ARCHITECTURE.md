@@ -139,6 +139,10 @@ Each started instance is a Docker Compose project named after the instance id (t
 
 `moveApp` takes the source compose project down after a successful copy and before `processInstance` on the target (`docker compose -p <id> down`, never `-v`). The same instance id is the compose project name on both disks, so a down after register would stop the moved instance. If it was running before the move, `moveApp` starts it on the target after register (idea#474); a Stopped instance stays Stopped. Named volumes are kept so a later rollback can still restart the source. A down failure is logged and does not fail the move. Helper: `src/utils/instanceNetworks.ts`.
 
+#### Backup and restore (engine#457)
+
+`restoreApp` always restores the latest archive of an instance onto the **same** instance id: it replaces `instances/<id>` with the latest archive from `backups/<id>`. That is the correct rollback after a failed or unwanted update hop (same id, path, ports and backup repo). Restoring an older App version is a downgrade (for example 2.0→1.8). A restore to a new id is not offered: it would collide on the store record, disk path, ports, display name and repo identity. A second copy of the live tree is `copyApp`. Command reference: [COMMANDS.md](COMMANDS.md#restoreapp).
+
 ### **4. Summary of Data Flow**
 
 

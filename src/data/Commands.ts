@@ -335,9 +335,11 @@ const backupAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceAr
 }
 
 /**
- * restoreApp <instanceIdOrName> <targetDiskIdOrName> (idea#168 r29@97). The
- * instance goes through resolveInstanceArg, the disk through resolveDiskArg:
- * an id, or a unique name (a disk name with a warning).
+ * restoreApp <instanceIdOrName> <targetDiskIdOrName> (idea#168 r29@97).
+ * Always restores the latest archive of that instance id onto that same id,
+ * replacing instances/<id> — a rollback of that instance, not a second copy
+ * (engine#457). The instance goes through resolveInstanceArg, the disk through
+ * resolveDiskArg: an id, or a unique name (a disk name with a warning).
  */
 const restoreAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg: string, targetDiskId: string) => {
     // Refusals throw so the command-log trace closes as error (idea#122).
