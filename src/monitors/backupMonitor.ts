@@ -36,6 +36,7 @@ import { readBackupYamlState, setLinkLastBackup, editBackupYaml } from '../data/
 import { applyBackupResult, recordBackupResult, successResultCode, failureResultCode, isManualBackupCause } from '../data/BackupResults.js'
 import { DEFAULT_BACKUP_TIME } from '../utils/backupSchedule.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
+import { requestDataBytes } from '../data/DataBytes.js'
 import { stopInstance as stopInstanceImpl, startInstance as startInstanceImpl, BACKUP_STEPS, type Instance, type Status } from '../data/Instance.js'
 
 /** Tests replace stop/start. Production uses Instance.ts. */
@@ -624,6 +625,9 @@ export const backupInstance = async (
         resourceLock.releaseAll(backupLockKeys)
         endUsageSkip('backup')
     }
+    // engine#430: only reached after a successful backup (failures rethrow above). The
+    // locks are released, so the queued measurement can run.
+    requestDataBytes(storeHandle, [instanceId])
 }
 
 /**

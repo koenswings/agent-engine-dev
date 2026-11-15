@@ -21,6 +21,7 @@ import { assertStoreIdentityMatchesData, prepareStoreIdentity, refuseFleetStoreI
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
 import { startBackupScheduler } from './monitors/backupScheduler.js'
+import { startDataBytesMonitor } from './data/DataBytes.js'
 import { startPreUpdateQuarantine } from './monitors/preUpdateQuarantine.js'
 import { enableDockerMetricsMonitor } from './monitors/dockerMetricsMonitor.js'
 import { enableDiskSizeMonitor } from './data/DiskSize.js'
@@ -318,6 +319,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     const scheduler = startBackupScheduler(storeHandle)
     startLiveness(storeHandle, String(localEngineId), { clockStatus: () => scheduler.clockStatus() })
     startPreUpdateQuarantine(storeHandle)
+    // engine#430: App data size per instance, every 24 h (also after each dock pass and backup)
+    startDataBytesMonitor(storeHandle)
     // The heartbeat timer still repairs this Engine's peerAccess, expires stale
     // peers and archives old operations; it no longer writes to the store itself
 

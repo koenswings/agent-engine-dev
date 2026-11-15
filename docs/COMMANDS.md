@@ -32,6 +32,7 @@ These commands are used to view the current state of the system. They can be run
 - **Description:** Lists all application instances known to the network.
 - **Usage:** `instances`
 - **Scope:** `any`
+- **App data size (engine#430):** each instance record carries `dataBytes` (bytes used by `instances/<id>`, rounded to whole MB; `null`/absent when never measured) and `dataBytesAt` (when that value was written). No command sets them: the Engine the disk is docked to measures them in the background with `nice -n 19 ionice -c3 sudo -n idea-app-data size <root> <id>`, one instance at a time, after the dock pass, after each successful `backupApp` and every 24 h, never while the instance or its disk is locked, and writes only a change of more than 5% or 100 MB. A failed measurement keeps the old value. See ARCHITECTURE.md (App data size per instance).
 
 ---
 
