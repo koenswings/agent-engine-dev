@@ -6,9 +6,11 @@
  * Key design points:
  *  - BorgBackup for deduplicating, atomic, resumable archives
  *  - activeBackups Set prevents double-backup on reboot race
- *  - Lock file (.backup-in-progress) marks an interrupted backup; idea#446 records
- *    it on Disk.backupStaleLocks at dock/boot and does not auto-retry (clearBackupLock
- *    then an explicit backupApp resumes it)
+ *  - Lock file (.backup-in-progress) marks an interrupted backup; at dock/boot and
+ *    before an automatic backup, a stale lock is cleared (engine#429) and the next
+ *    backup resumes. A lock that belongs to a running backup (resourceLock,
+ *    activeBackups, a Pending/Running backup or restore Operation, or a live borg
+ *    in /proc) is never cleared. clearBackupLock stays as a manual tool.
  *  - skipBorg() (settings.skipBorg / IDEA_SKIP_BORG, default testMode): skips borg commands but
  *    exercises all other logic (store updates, YAML, lock files)
  *  - Borg runs as root through the app-data helper (idea#168):
@@ -30,6 +32,7 @@ import { parseBackupSpec, assertHookServicesExist, backupHookRunner, defaultBack
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
+import { defaultReadBootId } from '../usage/sampler.js'
 import { assertPreQuarantineHelper, quarantinePreRestore, sourceOnOtherEngine, instanceStartingHere, quarantineUnclaimedTarget } from '../data/RestorePreQuarantine.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { readBackupYamlState, setLinkLastBackup, editBackupYaml } from '../data/BackupYamlDoc.js'
@@ -73,6 +76,173 @@ const LOCK_FILE = BACKUP_IN_PROGRESS
 /** True while backupInstance holds the in-memory mutex for this instance. */
 export const isBackupActive = (instanceId: string): boolean => activeBackups.has(instanceId as InstanceID)
 
+/**
+ * Look through /proc for a live borg (or idea-app-data borg-*) process whose
+ * cmdline names this repository. A pm2 restart can leave borg running as root
+ * through sudo, so this check is what stops us clearing a live lock (engine#429).
+ * Returns the pid, or null if none is found. Throws if /proc itself is unreadable
+ * (treat as unknown: do not clear).
+ */
+export const findBorgPidUsingRepo = async (repoPath: string): Promise<number | null> => {
+    const raw = String(repoPath ?? '').replace(/\/+$/, '')
+    if (!raw) return null
+    const needles = Array.from(new Set([raw, raw.replace(/^\/+/, '')].filter(Boolean)))
+    let ents: string[]
+    try {
+        ents = await fs.readdir('/proc')
+    } catch (e: any) {
+        throw new Error(`/proc is unreadable: ${e?.message ?? e}`)
+    }
+    for (const pid of ents) {
+        if (!/^\d+$/.test(pid)) continue
+        let text = ''
+        try {
+            const buf = await fs.readFile(`/proc/${pid}/cmdline`)
+            text = (Buffer.isBuffer(buf) ? buf.toString('utf8') : String(buf)).replace(/\0/g, ' ')
+        } catch {
+            continue
+        }
+        if (!/\bborg\b|borg-/.test(text)) continue
+        if (needles.some(n => text.includes(n))) return Number(pid)
+    }
+    return null
+}
+
+/** Injectable hooks for stale-lock auto-clear (engine#429). Tests replace these. */
+export const staleBackupLock = {
+    borgPidUsingRepo: findBorgPidUsingRepo,
+    readBootId: defaultReadBootId,
+}
+
+/** Body written to a new .backup-in-progress file (engine#429: also engineId and bootId). */
+export const backupLockContents = (instanceId: string, extra: Record<string, unknown> = {}): Record<string, unknown> => ({
+    instanceId,
+    startedAt: Date.now(),
+    engineId: localEngineId,
+    bootId: staleBackupLock.readBootId(),
+    ...extra,
+})
+
+const hasActiveBackupOrRestoreOp = (store: Store, instanceId: string): boolean =>
+    Object.values(store.operationDB ?? {}).some(op =>
+        !!op &&
+        (op.kind === 'backupApp' || op.kind === 'restoreApp') &&
+        (op.status === 'Pending' || op.status === 'Running') &&
+        String(op.engineId) === String(localEngineId) &&
+        String(op.args?.instanceId) === String(instanceId))
+
+/**
+ * engine#429: if the lock is stale, quarantine it and drop the store entry.
+ * All of these must hold: the Backup Disk is docked here; no in-memory
+ * resourceLock or activeBackups entry for the instance or disk; no Pending or
+ * Running backup or restore Operation for the instance on this Engine; and no
+ * live borg process uses this repository. Returns true when the lock file was
+ * cleared. A live backup is never cleared.
+ */
+export const clearAbandonedBackupLock = async (
+    storeHandle: DocHandle<Store>,
+    backupDisk: Disk,
+    instanceId: InstanceID,
+): Promise<boolean> => {
+    const store = storeHandle.doc()
+    const disk = (store?.diskDB?.[backupDisk.id] ?? backupDisk) as Disk
+    if (!isDockedOnEngine(disk, String(localEngineId)) || !disk.device) return false
+    const repoPath = backupDir(disk.device, instanceId)
+    const lockPath = `${repoPath}/${LOCK_FILE}`
+    if (!await fs.pathExists(lockPath)) return false
+    if (isBackupActive(instanceId)) return false
+    if (resourceLock.isLocked(instanceKey(instanceId)) || resourceLock.isLocked(diskKey(disk.id))) return false
+    if (hasActiveBackupOrRestoreOp(store, instanceId)) return false
+    let livePid: number | null = null
+    try {
+        livePid = await staleBackupLock.borgPidUsingRepo(repoPath)
+    } catch (e: any) {
+        log(`Backup lock for ${instanceId} on ${disk.id} not cleared; could not check for a live borg: ${e?.message ?? e}`)
+        return false
+    }
+    if (livePid != null) {
+        log(`Backup lock for ${instanceId} on ${disk.id} still running (pid ${livePid})`)
+        return false
+    }
+    if (!resourceLock.acquireAll([diskKey(disk.id)], 'clearStaleBackupLock')) return false
+    try {
+        const again = storeHandle.doc()
+        const diskNow = (again?.diskDB?.[disk.id] ?? disk) as Disk
+        if (!isDockedOnEngine(diskNow, String(localEngineId)) || !diskNow.device) return false
+        if (!await fs.pathExists(lockPath)) return false
+        if (isBackupActive(instanceId)) return false
+        if (resourceLock.isLocked(instanceKey(instanceId))) return false
+        if (hasActiveBackupOrRestoreOp(again, instanceId)) return false
+        try {
+            livePid = await staleBackupLock.borgPidUsingRepo(repoPath)
+        } catch (e: any) {
+            log(`Backup lock for ${instanceId} on ${disk.id} not cleared; could not check for a live borg: ${e?.message ?? e}`)
+            return false
+        }
+        if (livePid != null) {
+            log(`Backup lock for ${instanceId} on ${disk.id} still running (pid ${livePid})`)
+            return false
+        }
+        const startedAt = await readLockStartedAt(lockPath)
+        const ts = Date.now()
+        const dest = `${repoPath}/${LOCK_FILE}.stale-${ts}`
+        await fs.rename(lockPath, dest)
+        clearBackupStaleLock(storeHandle, disk.id, instanceId)
+        const started = startedAt != null ? new Date(startedAt).toISOString() : 'at an unknown time'
+        log(`Backup lock for ${instanceId} on ${disk.id} is from an interrupted backup started ${started}; no backup is running, so it is cleared and the next backup resumes (engine#429)`)
+        return true
+    } catch (e: any) {
+        log(`Backup lock for ${instanceId} on ${disk.id} was not cleared: ${e?.message ?? e}`)
+        return false
+    } finally {
+        resourceLock.releaseAll([diskKey(disk.id)])
+    }
+}
+
+/**
+ * True when an automatic backup should skip this instance because a lock is
+ * still in use. Tries to clear a stale lock first (engine#429).
+ */
+export const autoBackupBlockedByLock = async (
+    storeHandle: DocHandle<Store>,
+    backupDisk: Disk,
+    instanceId: InstanceID,
+): Promise<boolean> => {
+    const disk = (storeHandle.doc()?.diskDB?.[backupDisk.id] ?? backupDisk) as Disk
+    const lockPath = disk.device ? lockFilePath(disk.device, instanceId) : ''
+    const hasFile = !!(lockPath && await fs.pathExists(lockPath))
+    const hasEntry = hasBackupStaleLock(disk, instanceId)
+    if (!hasFile && !hasEntry) return false
+    if (await clearAbandonedBackupLock(storeHandle, disk, instanceId)) return false
+    const after = (storeHandle.doc()?.diskDB?.[disk.id] ?? disk) as Disk
+    return !!(lockPath && await fs.pathExists(lockPath)) || hasBackupStaleLock(after, instanceId)
+}
+
+/**
+ * Try to clear every leftover lock on this Backup Disk (store entries and
+ * lock files). No store write unless a lock is actually cleared. Used on
+ * each scheduler tick so a lock left for a live borg is cleared once borg
+ * exits (engine#429).
+ */
+export const sweepAbandonedBackupLocks = async (
+    storeHandle: DocHandle<Store>,
+    backupDisk: Disk,
+): Promise<void> => {
+    const disk = (storeHandle.doc()?.diskDB?.[backupDisk.id] ?? backupDisk) as Disk
+    const ids = new Set((disk.backupStaleLocks ?? []).map(l => String(l.instanceId)))
+    if (disk.device) {
+        const base = `${disksRoot()}/${disk.device}/backups`
+        if (await fs.pathExists(base)) {
+            for (const entry of await fs.readdir(base)) {
+                if (await fs.pathExists(`${base}/${entry}/${LOCK_FILE}`)) ids.add(entry)
+            }
+        }
+    }
+    for (const id of ids) {
+        await clearAbandonedBackupLock(storeHandle, disk, id as InstanceID)
+    }
+}
+
 const readLockStartedAt = async (lockPath: string): Promise<Timestamp | null> => {
     try {
         const raw = JSON.parse(await fs.readFile(lockPath, 'utf-8'))
@@ -84,8 +254,9 @@ const readLockStartedAt = async (lockPath: string): Promise<Timestamp | null> =>
 }
 
 /**
- * Scan backups/ for leftover .backup-in-progress files and record them on
- * Disk.backupStaleLocks. Does not start a backup (idea#446).
+ * Scan backups/ for leftover .backup-in-progress files, record them on
+ * Disk.backupStaleLocks, and record INTERRUPTED once. Then clear each lock that
+ * is stale (engine#429). Does not start a backup.
  */
 export const recordBackupStaleLocks = async (storeHandle: DocHandle<Store>, backupDisk: Disk): Promise<void> => {
     if (!backupDisk.device) return
@@ -97,7 +268,7 @@ export const recordBackupStaleLocks = async (storeHandle: DocHandle<Store>, back
             const lockPath = `${backupsBase}/${entry}/${LOCK_FILE}`
             if (await fs.pathExists(lockPath)) {
                 found.push({ instanceId: entry as InstanceID, startedAt: await readLockStartedAt(lockPath), detectedAt })
-                log(`Stale lock file found for instance ${entry} on Backup Disk ${backupDisk.id} — recorded, not retried (idea#446)`)
+                log(`Lock file found for instance ${entry} on Backup Disk ${backupDisk.id} (engine#429)`)
             }
         }
     }
@@ -114,6 +285,9 @@ export const recordBackupStaleLocks = async (storeHandle: DocHandle<Store>, back
             applyBackupResult(inst, { time: detectedAt, method: 'stop', result: 'INTERRUPTED' })
         }
     })
+    for (const l of found) {
+        await clearAbandonedBackupLock(storeHandle, backupDisk, l.instanceId)
+    }
 }
 
 /**
@@ -163,7 +337,7 @@ const writeBackupYaml = async (backupDevice: string, yaml: BackupYaml): Promise<
  *  - `instanceStopped`: updateApp stopped the instance for its Snapshot (stop-mode current
  *    compose, or an instance that was not running): Borg runs directly, no hook, no
  *    stop and no start (one stop for backup and snapshot).
- *  - A `.backup-in-progress` left by an earlier backup refuses (no auto-retry, #446).
+ *  - A `.backup-in-progress` left by an earlier backup still refuses the pre-update backup (BACKUP_STALE_LOCK).
  * Errors are thrown to updateApp (no own trace).
  */
 export interface PreUpdateBackupOptions {
@@ -402,7 +576,7 @@ export const backupInstance = async (
         if (preUpdate && await fs.pathExists(lockPath)) {
             throw new Error(`${BACKUP_STALE_LOCK}: ${lockPath} is left from an earlier backup of ${instanceId}; it is not retried here (idea#446)`)
         }
-        await fs.writeFile(lockPath, JSON.stringify({ instanceId, startedAt: Date.now(), ...(preUpdate ? { reason: 'pre-update' } : {}) }))
+        await fs.writeFile(lockPath, JSON.stringify(backupLockContents(instanceId, preUpdate ? { reason: 'pre-update' } : {})))
         wroteLock = lockPath
 
         const wasRunningAtStart = instance.status === 'Running' && !preUpdate?.instanceStopped
@@ -693,8 +867,8 @@ const triggerBackup = async (
 /**
  * Called by processDisk when a Backup Disk is detected.
  * - Reads BACKUP.yaml and sets backupConfig in the store
- * - Scans for stale lock files and records them on Disk.backupStaleLocks (no auto-retry, idea#446)
- * - Triggers backupInstance for immediate mode (linked instances without a stale lock)
+ * - Scans for leftover lock files, records INTERRUPTED, and clears stale ones (engine#429)
+ * - Triggers backupInstance for immediate mode (linked instances; a stale lock is cleared first)
  */
 export const processBackupDisk = async (
     storeHandle: DocHandle<Store>,
@@ -737,19 +911,18 @@ export const processBackupDisk = async (
     // Phase 2: index any app bundles on this disk into appDB for installApp / Console
     await indexBackupDiskApps(storeHandle, backupDisk)
 
-    // Scan for stale lock files (interrupted backups). Record only; do not re-run backupApp (idea#446).
+    // Scan for leftover lock files, record INTERRUPTED, and clear stale ones (engine#429).
     await recordBackupStaleLocks(storeHandle, backupDisk)
 
-    // Trigger immediate backups for linked instances whose App Disk is docked and that have no stale lock
+    // Trigger immediate backups for linked instances whose App Disk is docked.
     if (mode === 'immediate') {
         const store = storeHandle.doc()
-        const staleIds = new Set((store.diskDB[backupDisk.id]?.backupStaleLocks ?? []).map(l => String(l.instanceId)))
         for (const instanceId of links) {
-            if (staleIds.has(String(instanceId))) {
-                log(`Instance ${instanceId}: stale lock present — not auto-backing up; use clearBackupLock then backupApp (idea#446)`)
+            if (await autoBackupBlockedByLock(storeHandle, backupDisk, instanceId)) {
+                log(`Instance ${instanceId}: backup lock still in use — not auto-backing up (engine#429)`)
                 continue
             }
-            const instance = getInstance(store, instanceId)
+            const instance = getInstance(storeHandle.doc(), instanceId)
             if (!instance) {
                 log(`Instance ${instanceId}: not in the store; skipped (orphanLinks)`)
                 continue
@@ -797,22 +970,16 @@ export const checkPendingBackups = async (
         const instancesOnAppDisk = Object.values(store.instanceDB)
             .filter(inst => String(inst.storedOn) === String(appDisk.id))
 
-        const staleIds = new Set((candidate.backupStaleLocks ?? []).map(l => String(l.instanceId)))
         for (const instance of instancesOnAppDisk) {
             if ((instance as any).demo === true) continue
             if (!candidate.backupConfig.links.includes(instance.id)) continue
-            const lockPath = candidate.device
-                ? `${disksRoot()}/${candidate.device}/backups/${instance.id}/${LOCK_FILE}`
-                : ''
-            if (staleIds.has(String(instance.id)) || (lockPath && await fs.pathExists(lockPath))) {
-                log(`checkPendingBackups: stale lock for ${instance.id} — not auto-backing up; use clearBackupLock then backupApp (idea#446)`)
+            if (await autoBackupBlockedByLock(storeHandle, candidate as Disk, instance.id)) {
+                log(`checkPendingBackups: backup lock for ${instance.id} still in use — not auto-backing up (engine#429)`)
                 continue
             }
             log(`checkPendingBackups: triggering backup for instance ${instance.id}`)
             await triggerBackup(storeHandle, instance.id, candidate as Disk, 'backup-app-docked')
         }
-        // Stale .backup-in-progress locks are recorded on Disk.backupStaleLocks at
-        // Backup Disk dock (processBackupDisk) and are not retried here (idea#446).
     }
 }
 

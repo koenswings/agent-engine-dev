@@ -362,9 +362,9 @@ export const recoverInterruptedOperations = async (
             updateOperation(storeHandle, op.id, { status: verified ? 'Done' : 'Failed', error: text, completedAt: Date.now() as Timestamp })
             continue
         }
-        // idea#400 (Steve, Q2): a scheduled backup is never retried after a restart. Its
-        // .backup-in-progress stays as a stale lock (INTERRUPTED at dock) for the idea#446
-        // flow (clearBackupLock, then backupApp); the next slot runs as usual.
+        // idea#400 (Steve, Q2): a scheduled backup is never retried after a restart.
+        // The .backup-in-progress is recorded as INTERRUPTED at dock and cleared if
+        // stale (engine#429); the next slot, or an immediate dock backup, then runs.
         const scheduledBackup = op.kind === 'backupApp' && op.cause === 'scheduled-backup'
         const strategy = scheduledBackup ? 'fail' : (RECOVERY_STRATEGY[op.kind] ?? 'fail')
         const handler = retryHandlers[op.kind]
@@ -401,7 +401,7 @@ export const recoverInterruptedOperations = async (
             const isCardOp = op.kind === 'flashCard' || op.kind === 'initialiseDisk'
             const isDemoOp = op.kind === 'setupDemo' || op.kind === 'removeDemo'
             const message = scheduledBackup
-                ? 'INTERRUPTED: Engine restarted during a scheduled backup — not retried; the stale lock is left for clearBackupLock, then backupApp (idea#446)'
+                ? 'INTERRUPTED: Engine restarted during a scheduled backup — not retried; a stale lock is cleared at dock or the next scheduled run (engine#429)'
                 : (isCardOp || isDemoOp) ? `INTERRUPTED: ${base}` : base
             if (cmdLogHandle) {
                 addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
