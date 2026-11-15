@@ -15,6 +15,7 @@ import { fs, path, os, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { updateApp, UpdateDeps, recoverInterruptedUpdates, UPDATE_HELPER_MIN, readComposeBackup, linkedBackupDisk, bundleExcludedPaths } from '../../src/data/UpdateApp.js'
+import { UpdateAppError } from '../../src/data/UpdateAppPolicy.js'
 import { snapshotArgs, restoreSnapshotArgs, estimateArgs, quarantineSnapshotArgs } from '../../src/utils/appDataHelper.js'
 import { createOperation, updateOperation } from '../../src/data/Operations.js'
 
@@ -74,6 +75,12 @@ const deps = (over: Partial<UpdateDeps> = {}): Partial<UpdateDeps> => ({
     ...over,
 })
 const codeOf = async (p: Promise<unknown>) => { try { await p; return 'ok' } catch (e) { return String((e as Error).message) } }
+const thrown = async (p: Promise<unknown>): Promise<UpdateAppError> => {
+    try { await p; throw new Error('expected updateApp to throw') } catch (e) {
+        if (e instanceof UpdateAppError) return e
+        throw e
+    }
+}
 const linkBackupDisk = () => h.change(doc => {
     doc.diskDB['bd1' as any] = { id: 'bd1', name: 'Disk B', device: 'idea-test-2', dockedTo: ME, diskTypes: ['backup'], backupConfig: { mode: 'on-demand', links: [ID] } } as any
 })
@@ -192,11 +199,87 @@ describe('updateApp identity (idea#448)', () => {
     it('a failed in-stop backup: BACKUP_FAILED, no snapshot, the old version is started again', async () => {
         linkBackupDisk()
         await fs.writeFile(newCompose(), composeYaml('1.1', {}))
-        const m = await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({
+        const err = await thrown(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({
             backup: async () => { calls.push('backup:in-stop'); throw new Error('BACKUP_STALE_LOCK: left from an earlier backup') },
         })))
-        expect(m).toMatch(/^BACKUP_FAILED: the pre-update backup to Disk B failed: BACKUP_STALE_LOCK/)
+        expect(err.message).toBe('BACKUP_FAILED: the pre-update backup to Disk B failed: BACKUP_STALE_LOCK: left from an earlier backup')
+        expect(err.code).toBe('BACKUP_FAILED')
+        expect(err.restartFailed).toBeUndefined()
+        expect(err.traceResult).toBeUndefined()
         expect(calls).toEqual(['stop', 'backup:in-stop', 'start'])
+        expect(inst().status).toBe('Running')
+        expect(inst().statusCondition).toBeNull()
+        const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
+        expect(op.status).toBe('Failed')
+        expect(op.error).toBe(err.message)
+        expect(op.restartFailed).toBeUndefined()
+    })
+
+    it('engine#442 a failed in-stop backup whose restart throws: Error, restartFailed on the error, the op and the command result', async () => {
+        linkBackupDisk()
+        await fs.writeFile(newCompose(), composeYaml('1.1', {}))
+        const err = await thrown(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({
+            backup: async () => { calls.push('backup:in-stop'); throw new Error('BACKUP_STALE_LOCK: left from an earlier backup') },
+            start: async () => { calls.push('start'); throw new Error('docker start refused') },
+        })))
+        expect(err.code).toBe('BACKUP_FAILED')
+        expect(err.restartFailed).toBe(true)
+        expect(err.traceResult).toEqual({ restartFailed: true })
+        expect(err.message).toBe('BACKUP_FAILED: the pre-update backup to Disk B failed: BACKUP_STALE_LOCK: left from an earlier backup; the update failed and the old version could not be restarted: docker start refused')
+        expect(err.message).not.toMatch(/nothing was changed/)
+        expect(calls).toEqual(['stop', 'backup:in-stop', 'start'])
+        expect(inst().status).toBe('Error')
+        expect(inst().statusCondition).toBe('the update failed and the old version could not be restarted: docker start refused')
+        const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
+        expect(op.status).toBe('Failed')
+        expect(op.error).toBe(err.message)
+        expect(op.restartFailed).toBe(true)
+    })
+
+    it('engine#442 a failed in-stop backup whose restart leaves the App Stopped: Error, restartFailed everywhere, same wording', async () => {
+        linkBackupDisk()
+        await fs.writeFile(newCompose(), composeYaml('1.1', {}))
+        const err = await thrown(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({
+            backup: async () => { calls.push('backup:in-stop'); throw new Error('BACKUP_STALE_LOCK: left from an earlier backup') },
+            start: async () => { calls.push('start') },   // stop() already left status Stopped; do not start it
+        })))
+        expect(err.code).toBe('BACKUP_FAILED')
+        expect(err.restartFailed).toBe(true)
+        expect(err.traceResult).toEqual({ restartFailed: true })
+        expect(err.message).toBe('BACKUP_FAILED: the pre-update backup to Disk B failed: BACKUP_STALE_LOCK: left from an earlier backup; the update failed and the old version could not be restarted: instance status is Stopped')
+        expect(err.message).not.toMatch(/nothing was changed/)
+        expect(inst().status).toBe('Error')
+        expect(inst().statusCondition).toBe('the update failed and the old version could not be restarted: instance status is Stopped')
+        const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
+        expect(op.status).toBe('Failed')
+        expect(op.error).toBe(err.message)
+        expect(op.restartFailed).toBe(true)
+    })
+
+    it('engine#442 if start already set Error, the existing statusCondition is kept; restartFailed is still reported', async () => {
+        linkBackupDisk()
+        await fs.writeFile(newCompose(), composeYaml('1.1', {}))
+        const err = await thrown(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({
+            backup: async () => { calls.push('backup:in-stop'); throw new Error('BACKUP_STALE_LOCK: left from an earlier backup') },
+            start: async () => {
+                calls.push('start')
+                h.change(d => {
+                    const i = d.instanceDB[ID as any] as any
+                    i.status = 'Error'
+                    i.statusCondition = 'start failed: compose missing'
+                })
+                throw new Error('start failed: compose missing')
+            },
+        })))
+        expect(err.code).toBe('BACKUP_FAILED')
+        expect(err.restartFailed).toBe(true)
+        expect(err.traceResult).toEqual({ restartFailed: true })
+        expect(err.message).toMatch(/the update failed and the old version could not be restarted: start failed: compose missing$/)
+        expect(inst().status).toBe('Error')
+        expect(inst().statusCondition).toBe('start failed: compose missing')
+        const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
+        expect(op.restartFailed).toBe(true)
+        expect(op.error).toBe(err.message)
     })
 
     it('a minor update or a fresh backup takes no backup; the snapshot still leaves the excludes out', async () => {

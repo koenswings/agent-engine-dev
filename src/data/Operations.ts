@@ -83,7 +83,7 @@ export const createOperation = (
 export const updateOperation = (
     storeHandle: DocHandle<Store>,
     id: string,
-    patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'currentStep' | 'totalSteps' | 'stepLabel' | 'completedAt' | 'error' | 'safeToRemove'>>
+    patch: Partial<Pick<Operation, 'status' | 'progressPercent' | 'currentStep' | 'totalSteps' | 'stepLabel' | 'completedAt' | 'error' | 'safeToRemove' | 'restartFailed'>>
 ): void => {
     // Log a step-advance marker before mutating the store.
     // Uses console.log directly (not log()) so it always lands in the CommandLog trace
@@ -116,6 +116,7 @@ export const updateOperation = (
         if (patch.completedAt !== undefined) op.completedAt = patch.completedAt
         if (patch.error !== undefined) op.error = patch.error
         if (patch.safeToRemove !== undefined) op.safeToRemove = patch.safeToRemove
+        if (patch.restartFailed !== undefined) op.restartFailed = patch.restartFailed
         // Clear step progress when operation reaches a terminal state
         if (patch.status === 'Done' || patch.status === 'Failed' || patch.status === 'Cancelled') {
             op.currentStep = null
