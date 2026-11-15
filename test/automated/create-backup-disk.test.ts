@@ -24,6 +24,7 @@ import { CommandLogStore } from '../../src/data/CommandLogStore.js'
 import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 import { fs, YAML } from 'zx'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
+import { MAKE_BACKUP_DISK_MIN_BYTES } from '../../src/data/MakeBackupDisk.js'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -42,7 +43,10 @@ const createMinimalStore = async (): Promise<{ repo: Repo; storeHandle: DocHandl
     return { repo, storeHandle }
 }
 
-const addDockedDisk = (storeHandle: DocHandle<Store>, diskId: DiskID, diskName: DiskName, device: string): void => {
+const EIGHT_GIB = MAKE_BACKUP_DISK_MIN_BYTES
+const BIG = 32 * 1024 * 1024 * 1024
+
+const addDockedDisk = (storeHandle: DocHandle<Store>, diskId: DiskID, diskName: DiskName, device: string, sizeBytes: number | null | 'omit' = BIG): void => {
     storeHandle.change(doc => {
         doc.diskDB[diskId] = {
             id: diskId,
@@ -53,6 +57,7 @@ const addDockedDisk = (storeHandle: DocHandle<Store>, diskId: DiskID, diskName: 
             lastDocked: Date.now() as Timestamp,
             diskTypes: [],
             backupConfig: null,
+            ...(sizeBytes !== 'omit' ? { sizeBytes } : {}),
         }
     })
 }
@@ -315,6 +320,73 @@ describe('createBackupDisk command', () => {
     it('rejects an unknown disk', async () => {
         await handleCommand(commands, storeHandle, 'engine', 'createBackupDisk no-such-disk on-demand kolibri nextcloud')
         expect(errorSpy).toHaveBeenCalledWith(expect.stringContaining("Disk 'no-such-disk' not found."))
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
+    })
+})
+
+describe('createBackupDisk 8 GiB minimum (engine#452)', () => {
+    let storeHandle: DocHandle<Store>
+    let repo: Repo
+    let device: string
+    let errorSpy: ReturnType<typeof vi.spyOn>
+    const diskId = 'DISK_backup_test' as DiskID
+    const diskName = 'backup-disk' as DiskName
+
+    const lastError = (logHandle: DocHandle<CommandLogStore>) => {
+        const traces = Object.values(logHandle.doc()!.traces)
+        return traces[traces.length - 1]
+    }
+
+    beforeEach(async () => {
+        const ctx = await createMinimalStore()
+        storeHandle = ctx.storeHandle
+        repo = ctx.repo
+        device = uniqueTestDevice()
+        await fs.ensureDir(`${DISKS_ROOT}/${device}`)
+        addInstance(storeHandle, 'INST_kolibri' as InstanceID, 'kolibri', diskId)
+        errorSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+    })
+
+    afterEach(async () => {
+        errorSpy.mockRestore()
+        await fs.remove(`${DISKS_ROOT}/${device}`)
+    })
+
+    it('TOO_SMALL when the disk is under 8 GiB; BACKUP.yaml is not written; the trace is error', async () => {
+        addDockedDisk(storeHandle, diskId, diskName, device, EIGHT_GIB - 1)
+        const logHandle = await createCommandLog(repo)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri`, logHandle)
+        const t = lastError(logHandle)
+        expect(t.status).toBe('error')
+        expect(t.errorMessage).toBe(`TOO_SMALL: this disk is ${EIGHT_GIB - 1} bytes; a Backup Disk must be at least ${EIGHT_GIB} bytes (8 GiB).`)
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
+        expect(storeHandle.doc()!.diskDB[diskId].backupConfig).toBeNull()
+    })
+
+    it('allows a disk that is exactly 8 GiB', async () => {
+        addDockedDisk(storeHandle, diskId, diskName, device, EIGHT_GIB)
+        const logHandle = await createCommandLog(repo)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri`, logHandle)
+        expect(lastError(logHandle).status).toBe('ok')
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(true)
+        expect(storeHandle.doc()!.diskDB[diskId].backupConfig?.mode).toBe('on-demand')
+    })
+
+    it('TOO_SMALL when Disk.sizeBytes cannot be read; BACKUP.yaml is not written', async () => {
+        addDockedDisk(storeHandle, diskId, diskName, device, 'omit')
+        const logHandle = await createCommandLog(repo)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri`, logHandle)
+        const t = lastError(logHandle)
+        expect(t.status).toBe('error')
+        expect(t.errorMessage).toBe(`TOO_SMALL: could not read the size of '${diskId}', so it was not turned into a Backup Disk.`)
+        expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
+    })
+
+    it('TOO_SMALL when Disk.sizeBytes is null (undocked-style unread size)', async () => {
+        addDockedDisk(storeHandle, diskId, diskName, device, null)
+        const logHandle = await createCommandLog(repo)
+        await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri`, logHandle)
+        expect(lastError(logHandle).errorMessage).toMatch(/^TOO_SMALL: could not read the size of /)
         expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 })

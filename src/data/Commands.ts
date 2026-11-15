@@ -31,7 +31,7 @@ import { pickLocalBackupDisk, localBackupDisks, localEngineName, noLocalBackupDi
 import { createFilesDisk } from './CreateFilesDisk.js';
 import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
-import { makeBackupDisk } from './MakeBackupDisk.js';
+import { makeBackupDisk, assertBackupDiskMinSize } from './MakeBackupDisk.js';
 import { ForgetDiskError, WITH_INSTANCES_FLAG, forgetDisk, forgetDiskWithInstances } from './ForgetDisk.js';
 import { pruneUnusedInstanceNetworksForIds } from '../utils/instanceNetworks.js';
 import { removeInstance } from './RemoveInstance.js';
@@ -363,6 +363,8 @@ const createBackupDiskWrapper = async (storeHandle: DocHandle<Store> | null, dis
     if (!validModes.includes(mode)) throw new Error(`Invalid mode '${mode}'. Valid modes: ${validModes.join(', ')}`)
     const store = storeHandle.doc()
     const disk = resolveDiskArg(store, getLocalEngine(store)?.id, diskId, 'createBackupDisk')
+    // engine#452: same 8 GiB floor as makeBackupDisk Check, before BACKUP.yaml is written.
+    assertBackupDiskMinSize(disk.id, disk.sizeBytes)
 
     // Names resolve only among instances on this Engine (kit Engines share one store and
     // have identical instance names); an instance id is accepted too. An unknown or

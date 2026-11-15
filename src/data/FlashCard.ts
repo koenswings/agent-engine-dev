@@ -36,6 +36,7 @@ import { forgetMetaLook } from '../monitors/metaLookCache.js'
 import { log, print, uuid } from '../utils/utils.js'
 import { hostIdentity } from './HostIdentity.js'
 import { readEngineTimezone, validateClientTimezone, ZONEINFO_DIR } from './ClientTimezone.js'
+import { MakeBackupDiskError, assertBackupDiskMinSize } from './MakeBackupDisk.js'
 
 export const FLASH_HELPER = '/usr/local/sbin/idea-flash-card'
 export const FLASH_LOG = path.join(ENGINE_STATE_DIR, 'flash.log')
@@ -49,6 +50,9 @@ export interface FlashInProgress { operationId: string; candidateId: string; ver
 export class CardError extends Error {
     constructor(public code: string, text: string) { super(`${code}: ${text}`) }
 }
+
+const textOf = (e: MakeBackupDiskError): string =>
+    e.message.startsWith(`${e.code}: `) ? e.message.slice(e.code.length + 2) : e.message
 
 export interface FlashHelperArgs {
     byId: string; device: string; sizeBytes: number; image: string; sha256: string
@@ -78,7 +82,7 @@ export interface FlashCardOps {
     /** Unmount the rw mount this command made and remove the mount point (never rm -fr) */
     unmount: (partition: string) => Promise<{ ok: boolean; message?: string }>
     createFilesDisk: (h: DocHandle<Store>, diskId: string) => Promise<unknown>
-    createBackupDisk: (h: DocHandle<Store>, diskId: string) => Promise<unknown>
+    createBackupDisk: (h: DocHandle<Store>, diskId: string, sizeBytesFallback?: unknown) => Promise<unknown>
     now: () => number
     /** idea#208: the Engine's own time zone (timedatectl, as pi) */
     engineTimezone: () => Promise<string>
@@ -113,11 +117,12 @@ const defaultOps: FlashCardOps = {
     addDevice: async (p) => { if (!addDeviceImpl) throw new Error('usb monitor not running'); await addDeviceImpl(`/dev/engine/${p}`) },
     unmount: (p) => unmountAndRemove(p),
     createFilesDisk: async (h, id) => (await import('./CreateFilesDisk.js')).createFilesDisk(h, id),
-    createBackupDisk: async (h, id) => {
+    createBackupDisk: async (h, id, sizeBytesFallback) => {
         const disk = h.doc()?.diskDB?.[id as DiskID]
         if (!disk) throw new Error(`disk ${id} is not in the store`)
         // idea#404 Q3: same Create defaults as makeBackupDisk (scheduled / 02:30, backups/ root)
-        return (await import('./MakeBackupDisk.js')).applyMakeBackupDiskCreate(h, disk)
+        // engine#452: sizeBytesFallback is the candidate size when the new record has none
+        return (await import('./MakeBackupDisk.js')).applyMakeBackupDiskCreate(h, disk, sizeBytesFallback)
     },
     now: () => Date.now(),
     engineTimezone: () => readEngineTimezone(),
@@ -431,7 +436,20 @@ export const initialiseDisk = async (
         registered = !!storeHandle.doc()?.diskDB?.[diskId]
         if (!registered) fail('WRITE_FAILED', `${target.name} got META.yaml but did not dock as ${diskId}`)
         if (role === 'files') await ops.createFilesDisk(storeHandle, diskId)
-        if (role === 'backup') await ops.createBackupDisk(storeHandle, diskId)
+        if (role === 'backup') {
+            // engine#452: same 8 GiB floor as makeBackupDisk Check, before Create writes BACKUP.yaml.
+            // Prefer the newly registered disk's sizeBytes; fall back to the candidate size.
+            const registered = storeHandle.doc()?.diskDB?.[diskId]
+            try {
+                assertBackupDiskMinSize(diskId, registered?.sizeBytes, disk.sizeBytes)
+            } catch (e) {
+                if (e instanceof MakeBackupDiskError) {
+                    fail(e.code, textOf(e))
+                }
+                throw e
+            }
+            await ops.createBackupDisk(storeHandle, diskId, disk.sizeBytes)
+        }
         updateOperation(storeHandle, opId, { status: 'Done', completedAt: ops.now() as Timestamp })
         attachTraceResult({ candidateId, diskId, role, partition: target.name })
         print(`Initialised ${target.name} (${candidateId}) as IDEA disk ${diskId} (${role})`)
@@ -442,6 +460,8 @@ export const initialiseDisk = async (
         // partition. META.yaml stays on the disk, so a re-plug or Engine restart docks it.
         if (mountedHere && !registered) await releaseRwMount(storeHandle, target.name)
         if (e instanceof CardError) throw e
+        // engine#452: keep TOO_SMALL (and other MakeBackupDiskError codes) off WRITE_FAILED.
+        if (e instanceof MakeBackupDiskError) fail(e.code, textOf(e))
         const msg = e instanceof Error ? e.message : String(e)
         return fail('WRITE_FAILED', msg)
     } finally {

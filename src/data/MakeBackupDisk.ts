@@ -28,6 +28,39 @@ import { DEFAULT_BACKUP_TIME } from '../utils/backupSchedule.js'
 /** 8 GiB. Engine-owned eligibility threshold (Steve, idea#404); documented in COMMANDS.md. */
 export const MAKE_BACKUP_DISK_MIN_BYTES = 8 * 1024 * 1024 * 1024
 
+/** A positive finite total size, otherwise null (missing, 0, or unreadable). */
+export const readableBackupDiskBytes = (sizeBytes: unknown): number | null =>
+    typeof sizeBytes === 'number' && Number.isFinite(sizeBytes) && sizeBytes > 0 ? sizeBytes : null
+
+/** Shared TOO_SMALL wording for makeBackupDisk, createBackupDisk and initialiseDisk … backup (engine#452). */
+export const backupDiskMinSizeRefusal = (targetId: string, bytes: number | null): { code: 'TOO_SMALL', text: string } => {
+    if (bytes == null) {
+        return { code: 'TOO_SMALL', text: `could not read the size of '${targetId}', so it was not turned into a Backup Disk.` }
+    }
+    return {
+        code: 'TOO_SMALL',
+        text: `this disk is ${bytes} bytes; a Backup Disk must be at least ${MAKE_BACKUP_DISK_MIN_BYTES} bytes (8 GiB).`,
+    }
+}
+
+/**
+ * First readable size from the arguments wins (disk.sizeBytes, then a candidate
+ * or summary fallback). Throws MakeBackupDiskError TOO_SMALL when the size cannot
+ * be read or is under 8 GiB. Exactly 8 GiB is allowed.
+ */
+export const assertBackupDiskMinSize = (targetId: string, ...sizes: unknown[]): number => {
+    let bytes: number | null = null
+    for (const size of sizes) {
+        bytes = readableBackupDiskBytes(size)
+        if (bytes != null) break
+    }
+    if (bytes == null || bytes < MAKE_BACKUP_DISK_MIN_BYTES) {
+        const { code, text } = backupDiskMinSizeRefusal(targetId, bytes)
+        throw new MakeBackupDiskError(code, text)
+    }
+    return bytes
+}
+
 export const MAKE_BACKUP_DISK_STEPS = ['Check', 'Erase', 'Re-dock', 'Create'] as const
 
 export class MakeBackupDiskError extends Error {
@@ -145,13 +178,10 @@ const sizeOf = (
     target: NonNullable<ReturnType<typeof resolveSummaryTarget>>,
     summarySize?: number | null,
 ): number | null => {
-    if (typeof summarySize === 'number' && Number.isFinite(summarySize) && summarySize > 0) return summarySize
-    if (target.kind === 'disk') {
-        const n = target.disk!.sizeBytes
-        return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : null
-    }
-    const n = target.candidate?.sizeBytes
-    return typeof n === 'number' && Number.isFinite(n) && n > 0 ? n : null
+    return readableBackupDiskBytes(summarySize)
+        ?? (target.kind === 'disk'
+            ? readableBackupDiskBytes(target.disk!.sizeBytes)
+            : readableBackupDiskBytes(target.candidate?.sizeBytes))
 }
 
 const deviceOf = (target: NonNullable<ReturnType<typeof resolveSummaryTarget>>): string | null => {
@@ -163,10 +193,16 @@ const deviceOf = (target: NonNullable<ReturnType<typeof resolveSummaryTarget>>):
  * Create step, also used by initialiseDisk <candidateId> backup so that path
  * is not a weaker on-demand second route (Steve, idea#404 Q3).
  */
-export const applyMakeBackupDiskCreate = async (storeHandle: DocHandle<Store>, disk: Disk): Promise<void> => {
+export const applyMakeBackupDiskCreate = async (
+    storeHandle: DocHandle<Store>,
+    disk: Disk,
+    sizeBytesFallback?: unknown,
+): Promise<void> => {
     if (!disk.device) {
         throw new MakeBackupDiskError('NOT_DOCKED', `Disk '${disk.name}' (${disk.id}) is not currently docked.`)
     }
+    // engine#452: same 8 GiB floor as makeBackupDisk Check, shared helper.
+    assertBackupDiskMinSize(disk.id, disk.sizeBytes, sizeBytesFallback)
     await createBackupDiskConfig(storeHandle, disk, 'scheduled', [])
     await ops.ensureBackupRoot(disk.device)
 }
@@ -257,16 +293,9 @@ export const makeBackupDisk = async (
         }
 
         const bytes = sizeOf(target, summary?.sizeBytes)
-        if (bytes == null) {
-            return fail(storeHandle, opId, 'TOO_SMALL', `could not read the size of '${targetId}', so it was not turned into a Backup Disk.`)
-        }
-        if (bytes < MAKE_BACKUP_DISK_MIN_BYTES) {
-            return fail(
-                storeHandle,
-                opId,
-                'TOO_SMALL',
-                `this disk is ${bytes} bytes; a Backup Disk must be at least ${MAKE_BACKUP_DISK_MIN_BYTES} bytes (8 GiB).`,
-            )
+        if (bytes == null || bytes < MAKE_BACKUP_DISK_MIN_BYTES) {
+            const refusal = backupDiskMinSizeRefusal(targetId, bytes)
+            return fail(storeHandle, opId, refusal.code, refusal.text)
         }
 
         let diskId: DiskID
