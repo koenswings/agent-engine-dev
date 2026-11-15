@@ -116,7 +116,8 @@ const defaultOps: FlashCardOps = {
     createBackupDisk: async (h, id) => {
         const disk = h.doc()?.diskDB?.[id as DiskID]
         if (!disk) throw new Error(`disk ${id} is not in the store`)
-        return (await import('../monitors/backupMonitor.js')).createBackupDiskConfig(h, disk as any, 'on-demand' as any, [])
+        // idea#404 Q3: same Create defaults as makeBackupDisk (scheduled / 02:30, backups/ root)
+        return (await import('./MakeBackupDisk.js')).applyMakeBackupDiskCreate(h, disk)
     },
     now: () => Date.now(),
     engineTimezone: () => readEngineTimezone(),
