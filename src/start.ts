@@ -8,6 +8,7 @@ import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
 import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
+import { warnIfTestFailUpdateRestartIgnored } from './data/UpdateAppTestHook.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
@@ -72,6 +73,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await assertAppDataHelper()
     // borg: loud but not fatal (only Backup Disks need it)
     reportBorgAtStartup()
+
+    // engine#449: IDEA_TEST_FAIL_UPDATE_RESTART is ignored when testMode is off.
+    warnIfTestFailUpdateRestartIgnored(msg => log(chalk.yellow(msg)))
 
     // Process the config
     const settings = config.settings

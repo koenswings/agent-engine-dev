@@ -17,6 +17,8 @@ import { createOperation, updateOperation } from '../../src/data/Operations.js'
 import { resourceLock, instanceKey } from '../../src/utils/ResourceLock.js'
 import { commands } from '../../src/data/Commands.js'
 import { isIdeaDiskPath } from '../../src/data/SummariseDisk.js'
+import { config } from '../../src/data/Config.js'
+import { TEST_FAIL_UPDATE_RESTART_ENV, TEST_FAIL_UPDATE_RESTART_MESSAGE } from '../../src/data/UpdateAppTestHook.js'
 
 const ME = String(localEngineId)
 let h: DocHandle<Store>, tmp: string, calls: string[], msgs: UpdateProgress[]
@@ -625,5 +627,59 @@ describe('updateApp Swap relative symlinks (engine#447)', () => {
         expect(await fs.readlink(dest)).toBe('../post-installation/20-x.sh')
         expect(await fs.readFile(`${precious}/keep-me`, 'utf8')).toBe('safe')
         expect(await fs.readdir(precious)).toEqual(['keep-me'])
+    })
+})
+
+describe('updateApp restart test hook (engine#449)', () => {
+    const prevEnv = process.env[TEST_FAIL_UPDATE_RESTART_ENV]
+    const prevTestMode = config.settings.testMode
+
+    afterEach(() => {
+        if (prevEnv === undefined) delete process.env[TEST_FAIL_UPDATE_RESTART_ENV]
+        else process.env[TEST_FAIL_UPDATE_RESTART_ENV] = prevEnv
+        config.settings.testMode = prevTestMode
+    })
+
+    it('with testMode and the hook armed for i1: Failed, restartFailed, Error with the forced restart message', async () => {
+        config.settings.testMode = true
+        process.env[TEST_FAIL_UPDATE_RESTART_ENV] = 'i1'
+        let err: any
+        try { await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps()) }
+        catch (e) { err = e }
+        expect(err).toBeTruthy()
+        expect(err.restartFailed).toBe(true)
+        expect(err.traceResult).toEqual({ restartFailed: true })
+        expect(err.message).toMatch(TEST_FAIL_UPDATE_RESTART_MESSAGE)
+        expect(inst().status).toBe('Error')
+        expect(inst().statusCondition).toBe(`the update failed and the old version could not be restarted: ${TEST_FAIL_UPDATE_RESTART_MESSAGE}`)
+        const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
+        expect(op.status).toBe('Failed')
+        expect(op.restartFailed).toBe(true)
+        expect(op.error).toBe(err.message)
+    })
+
+    it('does not affect a different instance id', async () => {
+        config.settings.testMode = true
+        process.env[TEST_FAIL_UPDATE_RESTART_ENV] = 'other-id'
+        health = ['healthy']
+        const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
+        expect(r.toAppId).toBe('kolibri-1.1')
+        expect(inst().status).toBe('Running')
+        const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
+        expect(op.status).toBe('Done')
+        expect(op.restartFailed).toBeUndefined()
+    })
+
+    it('with testMode off the hook is ignored and updateApp succeeds', async () => {
+        config.settings.testMode = false
+        process.env[TEST_FAIL_UPDATE_RESTART_ENV] = 'i1'
+        health = ['healthy']
+        const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
+        expect(r.toAppId).toBe('kolibri-1.1')
+        expect(inst().status).toBe('Running')
+        expect(inst().statusCondition).toBeNull()
+        const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
+        expect(op.status).toBe('Done')
+        expect(op.restartFailed).toBeUndefined()
     })
 })
