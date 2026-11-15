@@ -11,7 +11,7 @@ import { describe, it, expect, vi, afterEach } from 'vitest'
 import { installRootHelpers, ensureAptPackages, ROOT_HELPER_PACKAGES, IGMP_SYSCTL_CONF, IGMP_SYSCTL_ASSET } from '../../src/data/Engine.js'
 import { borgProblem, BORG_PATH, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
 
-const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: string, dhcpOut?: string } = {}) => {
+const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: string, dhcpOut?: string, current?: boolean, igmpLive?: string } = {}) => {
     const cmds: string[] = []
     const exec = async (strings: TemplateStringsArray, ...vals: unknown[]) => {
         const cmd = strings.reduce((acc, s, i) => acc + s + (i < vals.length ? (Array.isArray(vals[i]) ? (vals[i] as string[]).join(' ') : String(vals[i])) : ''), '')
@@ -23,6 +23,9 @@ const recordingExec = (opts: { installed?: string[], fail?: RegExp[], version?: 
             throw new Error(`dpkg-query: no packages found matching ${m[1]}`)
         }
         if (/sshd -T/.test(cmd)) return { stdout: 'authorizedkeysfile .ssh/authorized_keys /etc/ssh/idea_authorized_keys/%u /etc/ssh/idea_usage_keys/%u\n' }
+        // idea#284 part 2: installManagedFile's read-only check; 'same' = already current
+        if (opts.current && /^if sudo cmp -s /.test(cmd)) return { stdout: 'same\n' }
+        if (cmd === 'sysctl -n net.ipv4.igmp_max_memberships') return { stdout: `${opts.igmpLive ?? ''}\n` }
         if (cmd === 'sudo /usr/local/sbin/idea-dhcp-vendor-class') return { stdout: opts.dhcpOut ?? 'nm unchanged\ndhcpcd absent\n' }
         if (/idea-app-data version$/.test(cmd)) return { stdout: `${opts.version ?? `idea-app-data ${APP_DATA_HELPER_VERSION}`}\n` }
         return { stdout: '' }
@@ -95,7 +98,7 @@ describe('installRootHelpers applies the DHCP vendor class on every update (idea
         const q = quiet()
         try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
         const idx = (c: string) => cmds.indexOf(c)
-        const inst = idx(`if ! cmp -s /e/script/build_image_assets/idea-dhcp-vendor-class ${helper}; then sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-dhcp-vendor-class ${helper}; fi`)
+        const inst = idx(`sudo install -o root -g root -m 0755 /e/script/build_image_assets/idea-dhcp-vendor-class ${helper}`)
         const run = idx(`sudo ${helper}`)
         const reload = idx(reloadCmd)
         expect(inst).toBeGreaterThanOrEqual(0)
@@ -165,6 +168,47 @@ describe('installRootHelpers applies the IGMP sysctl drop-in on every update (id
         const { exec } = recordingExec({ installed: ['rsync', 'borgbackup'], fail: [/^sudo sysctl -p \/etc\/sysctl\.d\/90-idea-igmp\.conf$/] })
         const q = quiet()
         try { await expect(installRootHelpers(exec, '/e')).rejects.toThrow(/sysctl -p/) } finally { q.mockRestore() }
+    })
+})
+
+describe('idea#284 part 2: a no-change install-root-helpers run writes nothing and reloads nothing', () => {
+    const WRITES = /^sudo (install -o |cp |chmod |chown |rm |tee )|systemctl (reload|restart)|nmcli|sysctl -p|systemd-tmpfiles --create|^sudo visudo -c$|sshd -t$/
+    it('every managed file is checked; none is reinstalled; no sshd/NM reload, no sysctl -p, no tmpfiles, no visudo -c', async () => {
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'], current: true, igmpLive: '1024', dhcpOut: 'nm unchanged\ndhcpcd unchanged\n' })
+        const q = quiet()
+        try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
+        expect(cmds.filter(c => WRITES.test(c))).toEqual([])
+        const checked = cmds.filter(c => /^if sudo cmp -s /.test(c)).map(c => c.split(' ')[5])
+        expect(checked).toEqual([
+            '/etc/sudoers.d/10-engine', '/etc/sudoers.d/11-engine-files',
+            '/usr/local/sbin/idea-erase-disk', '/usr/local/sbin/idea-write-home-engine', '/usr/local/sbin/idea-write-card-timezone',
+            '/usr/local/sbin/idea-engine-identity', '/usr/local/sbin/idea-flash-card', '/usr/local/sbin/idea-app-data',
+            '/etc/tmpfiles.d/idea-usb.conf', '/etc/tmpfiles.d/idea-usage.conf', '/usr/local/sbin/idea-usage-settings',
+            '/usr/local/sbin/idea-peer-gate', '/usr/local/sbin/idea-usage-export', '/etc/ssh/sshd_config.d/10-idea-peer.conf',
+            '/usr/local/sbin/idea-dhcp-vendor-class', '/etc/sysctl.d/90-idea-igmp.conf',
+        ])
+        // the read-only checks still run
+        expect(cmds).toContain('sudo /usr/local/sbin/idea-dhcp-vendor-class')
+        expect(cmds.slice(-2)).toEqual([`test -x ${BORG_PATH}`, 'sudo -n /usr/local/sbin/idea-app-data version'])
+    })
+    it('an unchanged IGMP file whose value is not in effect is applied again', async () => {
+        const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'], current: true, igmpLive: '20' })
+        const q = quiet()
+        try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
+        expect(cmds).toContain(`sudo sysctl -p ${IGMP_SYSCTL_CONF}`)
+        expect(cmds.filter(c => /^sudo install -o /.test(c))).toEqual([])
+    })
+    it('a changed sudoers file is installed and re-checked with visudo -c; the unchanged one is not', async () => {
+        const { exec: base, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'], current: true, igmpLive: '1024' })
+        const exec = async (strings: TemplateStringsArray, ...vals: unknown[]) => {
+            const r = await base(strings, ...vals)
+            const cmd = cmds[cmds.length - 1]
+            return /^if sudo cmp -s .*11-engine-files\.sudoers /.test(cmd) ? { stdout: '' } : r
+        }
+        const q = quiet()
+        try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
+        expect(cmds.filter(c => /^sudo install -o /.test(c))).toEqual(['sudo install -o root -g root -m 0440 /e/script/build_image_assets/11-engine-files.sudoers /etc/sudoers.d/11-engine-files'])
+        expect(cmds.filter(c => c === 'sudo visudo -c')).toHaveLength(1)
     })
 })
 

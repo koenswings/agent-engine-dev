@@ -12,12 +12,14 @@ import { describe, it, expect, vi } from 'vitest'
 import { fs, path } from 'zx'
 import { installPeerAccess, PEER_SSHD_DROPIN, PEER_LEDGER_DIR } from '../../src/data/Engine.js'
 
-const recordingExec = (opts: { fail?: RegExp[], sshdT?: string } = {}) => {
+const check = (src: string, dst: string, want: string) => `if sudo cmp -s ${src} ${dst} && [ "$(sudo stat -c '%a %U:%G' ${dst})" = ${want} ]; then echo same; fi`
+const recordingExec = (opts: { fail?: RegExp[], sshdT?: string, current?: boolean } = {}) => {
     const cmds: string[] = []
     const exec = async (strings: TemplateStringsArray, ...vals: unknown[]) => {
         const cmd = strings.reduce((acc, s, i) => acc + s + (i < vals.length ? String(vals[i]) : ''), '')
         cmds.push(cmd)
         if ((opts.fail ?? []).some(re => re.test(cmd))) throw new Error(`${cmd}: exit 1`)
+        if (opts.current && /^if sudo cmp -s /.test(cmd)) return { stdout: 'same\n' }
         if (/sshd -T/.test(cmd)) return { stdout: opts.sshdT ?? 'port 22\nauthorizedkeysfile .ssh/authorized_keys .ssh/authorized_keys2 /etc/ssh/idea_authorized_keys/%u /etc/ssh/idea_usage_keys/%u\n' }
         return { stdout: '' }
     }
@@ -28,18 +30,30 @@ describe('installPeerAccess (build-engine)', () => {
     it('installs the gate, folders and drop-in, checks sshd, then reloads it', async () => {
         const { exec, cmds } = recordingExec()
         await installPeerAccess(exec, '/home/pi/idea/engine')
+        const A = '/home/pi/idea/engine/script/build_image_assets'
         expect(cmds).toEqual([
-            'sudo install -o root -g root -m 0755 /home/pi/idea/engine/script/build_image_assets/idea-peer-gate /usr/local/sbin/idea-peer-gate',
-            'sudo install -o root -g root -m 0755 /home/pi/idea/engine/script/build_image_assets/idea-usage-export /usr/local/sbin/idea-usage-export',
+            check(`${A}/idea-peer-gate`, '/usr/local/sbin/idea-peer-gate', '755 root:root'),
+            `sudo install -o root -g root -m 0755 ${A}/idea-peer-gate /usr/local/sbin/idea-peer-gate`,
+            check(`${A}/idea-usage-export`, '/usr/local/sbin/idea-usage-export', '755 root:root'),
+            `sudo install -o root -g root -m 0755 ${A}/idea-usage-export /usr/local/sbin/idea-usage-export`,
             'sudo install -d -o root -g root -m 0755 /etc/ssh/idea_authorized_keys /etc/idea /etc/ssh/idea_usage_keys',
             `sudo install -d -o root -g root -m 0700 ${PEER_LEDGER_DIR}`,
-            `sudo install -o root -g root -m 0644 /home/pi/idea/engine/script/build_image_assets/10-idea-peer.conf ${PEER_SSHD_DROPIN}`,
+            check(`${A}/10-idea-peer.conf`, PEER_SSHD_DROPIN, '644 root:root'),
+            `sudo install -o root -g root -m 0644 ${A}/10-idea-peer.conf ${PEER_SSHD_DROPIN}`,
             'sudo /usr/sbin/sshd -t',
             'sudo /usr/sbin/sshd -T -C user=pi,host=localhost,addr=127.0.0.1',
             'sudo systemctl reload ssh',
         ])
         expect(PEER_SSHD_DROPIN).toBe('/etc/ssh/sshd_config.d/10-idea-peer.conf')
         expect(cmds.some(c => /restart/.test(c))).toBe(false)
+    })
+
+    it('idea#284 part 2: nothing differs: no file is written, no sshd -t, sshd is not reloaded', async () => {
+        const { exec, cmds } = recordingExec({ current: true })
+        await installPeerAccess(exec, '/e')
+        expect(cmds.filter(c => /^sudo install -o /.test(c))).toEqual([])
+        expect(cmds.some(c => /sshd -t$|reload|restart|rm -f/.test(c))).toBe(false)
+        expect(cmds.filter(c => /^if sudo cmp -s /.test(c))).toHaveLength(3)
     })
 
     it('sshd -t fails: the drop-in is removed again and the step throws (no reload)', async () => {
@@ -70,7 +84,7 @@ describe('installPeerAccess (build-engine)', () => {
 
     it('installUdev runs installPeerAccess right after the app-data helper', async () => {
         const src = await fs.readFile(path.resolve('src/data/Engine.ts'), 'utf8')
-        const helper = src.indexOf('script/build_image_assets/idea-app-data ${APP_DATA_HELPER}')
+        const helper = src.indexOf('script/build_image_assets/idea-app-data`, APP_DATA_HELPER')
         const peer = src.indexOf('await installPeerAccess(exec, enginePath)')
         expect(helper).toBeGreaterThan(0)
         expect(peer).toBeGreaterThan(helper)

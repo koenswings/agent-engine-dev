@@ -338,7 +338,8 @@ describe('idea-engine-identity (idea#322)', () => {
         it('installRootHelpers installs it as a root-owned copy', () => {
             const t = fs.readFileSync(path.join(process.cwd(), 'src/data/Engine.ts'), 'utf8')
             expect(t).toContain("ENGINE_IDENTITY_HELPER = '/usr/local/sbin/idea-engine-identity'")
-            expect(t).toMatch(/sudo install -o root -g root -m 0755 \$\{enginePath\}\/script\/build_image_assets\/idea-engine-identity \$\{ENGINE_IDENTITY_HELPER\}/)
+            expect(t).toContain("installManagedFile(exec, `${enginePath}/script/build_image_assets/idea-engine-identity`, ENGINE_IDENTITY_HELPER, '0755')")
+            expect(t).toMatch(/await exec`sudo install -o \$\{owner\} -g \$\{group\} -m \$\{mode\} \$\{src\} \$\{dst\}`/)
         })
         it('never touches store identity', () => {
             const t = fs.readFileSync(SRC, 'utf8')
