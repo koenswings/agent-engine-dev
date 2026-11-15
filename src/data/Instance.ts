@@ -1611,7 +1611,7 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     } catch (e) {
       log(`No .env file found for instance ${instance.id}`)
     }
-    // A new instance: no pass before this start (idea#202 keys on this)
+    // A new instance: no pass before this start (agent-engine-dev#202 keys on this)
     const newInstance = !(pass && !(pass == ""))
     // Check if port is undefined or NaN
     if (pass && !(pass == "")) {
@@ -1623,7 +1623,7 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
       // Write the password to the .env file
       await addOrUpdateEnvVariable(`${mountRoot}/instances/${instance.id}/.env`, 'pass', pass)
     }
-    // Separate Nextcloud admin secret, once, for apps whose compose reads it (idea#202)
+    // Separate Nextcloud admin secret, once, for apps whose compose reads it (agent-engine-dev#202, #450)
     await ensureNcAdminPassword(`${mountRoot}/instances/${instance.id}`, newInstance)
 
     // **************************
