@@ -106,11 +106,50 @@ export const defaultSchedulerDeps = (): SchedulerDeps => ({
 export const freePctOf = (u: { totalBytes: number, freeBytes: number }): number | null =>
     u.totalBytes > 0 ? Math.round((u.freeBytes / u.totalBytes) * 100) : null
 
-/** The newest backup timestamp the store holds for this disk: its lastAttempt and its linked instances' lastBackup / lastResult. */
+/** What a scheduled run backs up (engine#424). */
+export interface ScheduledTargets {
+    /** 'links': BACKUP.yaml lists instances; 'all': no links, so every App instance on this Engine */
+    basis: 'links' | 'all'
+    ids: string[]
+    /** basis 'all' only: instances stored on the Backup Disk itself, left out (a backup onto the same disk protects nothing) */
+    excludedOnBackupDisk: string[]
+}
+
+/**
+ * engine#424 (Koen, 15 Nov 2026): the instances a scheduled run backs up, worked out at each run.
+ *  - Non-empty `links`: exactly those, as before (an undocked App Disk still records APP_DISK_NOT_DOCKED).
+ *  - Empty `links`: every instance stored on a disk docked to `engineId` (so Apps added later are
+ *    included), except demo instances (engine#369) and instances stored on the Backup Disk itself.
+ *    Instances on undocked disks or on disks docked to another Engine are not listed. Sorted by id.
+ * Pure, on the store.
+ */
+export const scheduledTargets = (store: Store, backupDisk: Pick<Disk, 'id'>, engineId: string, links: string[]): ScheduledTargets => {
+    if (links.length > 0) return { basis: 'links', ids: [...links], excludedOnBackupDisk: [] }
+    const ids: string[] = []
+    const excludedOnBackupDisk: string[] = []
+    for (const inst of Object.values(store.instanceDB ?? {}) as any[]) {
+        if (!inst?.id || !inst.storedOn) continue
+        const disk = store.diskDB?.[inst.storedOn] as Disk | undefined
+        if (!disk?.device || String(disk.dockedTo) !== String(engineId)) continue
+        if (inst.demo === true) continue
+        if (String(inst.storedOn) === String(backupDisk.id)) { excludedOnBackupDisk.push(String(inst.id)); continue }
+        ids.push(String(inst.id))
+    }
+    ids.sort(); excludedOnBackupDisk.sort()
+    return { basis: 'all', ids, excludedOnBackupDisk }
+}
+
+/**
+ * The newest backup timestamp the store holds for this disk: its lastAttempt and the lastBackup /
+ * lastResult of the instances it backs up (its links, or with no links every instance a run would
+ * back up on the Engine the disk is docked to, engine#424).
+ */
 export const newestBackupTimeFor = (store: Store, disk: Disk): number | null => {
     const times: number[] = []
     if (disk.lastAttempt != null) times.push(Number(disk.lastAttempt))
-    for (const id of disk.backupConfig?.links ?? []) {
+    const links = (disk.backupConfig?.links ?? []).map(String)
+    const ids = links.length || !disk.dockedTo ? links : scheduledTargets(store, disk, String(disk.dockedTo), []).ids
+    for (const id of ids) {
         const inst = store.instanceDB?.[id]
         if (!inst) continue
         if (inst.lastBackup != null) times.push(Number(inst.lastBackup))
@@ -302,7 +341,7 @@ export class BackupScheduler {
         return !isBackupActive(instanceId) && !backupLockKeysFor(instanceId, diskId).some(k => resourceLock.isLocked(k))
     }
 
-    /** A scheduled run: claim the window on the disk, back up each link in turn, retry FAILED once, one summary change. */
+    /** A scheduled run: claim the window on the disk, back up each target in turn (links, or all local Apps, engine#424), retry FAILED once, one summary change. */
     private async runDisk(diskId: string, yaml: BackupYamlState, due: BackupDue, now: number, bootId: string, uptime: number): Promise<void> {
         const device = this.storeHandle.doc().diskDB[diskId]?.device
         if (!device) return
@@ -316,8 +355,16 @@ export class BackupScheduler {
             uptimeCounter: resetUptimeCounter(bootId, uptime),
         })
         if (!claimed) throw new Error(`BACKUP.yaml missing on ${device}; run not started`)
-        const ids = yaml.links.map(l => l.instanceId)
-        log(chalk.blue(`Backup scheduler: scheduled run on disk ${diskId} (${due.basis}${due.missedRuns ? `, ${due.missedRuns} missed` : ''}): ${ids.length} linked instance(s)`))
+        // engine#424: no links = every App instance on this Engine, worked out now (Apps added later included)
+        const targets = scheduledTargets(this.storeHandle.doc(), { id: diskId as DiskID }, String(this.engineId), yaml.links.map(l => String(l.instanceId)))
+        const ids = targets.ids
+        const what = targets.basis === 'links'
+            ? `${ids.length} linked instance(s)`
+            : `no links, so every App instance on this Engine: ${ids.length} instance(s)`
+        log(chalk.blue(`Backup scheduler: scheduled run on disk ${diskId} (${due.basis}${due.missedRuns ? `, ${due.missedRuns} missed` : ''}): ${what}`))
+        if (targets.excludedOnBackupDisk.length) {
+            log(chalk.yellow(`Backup scheduler: not backing up ${targets.excludedOnBackupDisk.join(', ')}: stored on this Backup Disk ${diskId} itself, and a backup onto the same disk protects nothing (engine#424); move the App to another disk, or link it explicitly to back it up anyway`))
+        }
         const windowId = windowIdFor(due, now)
         const skipped = new Map<string, SkippedRun>()
         this.skipped.set(diskId, skipped)
