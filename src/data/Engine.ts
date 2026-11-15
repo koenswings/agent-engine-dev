@@ -860,14 +860,19 @@ export const dhcpVendorClassNmChanged = (helperStdout: string): boolean => /^nm 
 export const IGMP_SYSCTL_CONF = '/etc/sysctl.d/90-idea-igmp.conf'
 export const IGMP_SYSCTL_ASSET = '90-idea-igmp.conf'
 export const IGMP_MAX_MEMBERSHIPS = 1024
+/** Absolute path: a non-login SSH shell does not have /usr/sbin on PATH (engine#443). */
+export const SYSCTL = '/usr/sbin/sysctl'
 
 /**
  * idea#467: write /etc/sysctl.d/90-idea-igmp.conf (net.ipv4.igmp_max_memberships=1024)
- * and apply it with `sysctl -p` on that file. Idempotent. Root install step only
- * (no sudoers change; the Engine process never applies sysctl at runtime).
- * In an image-build chroot (IDEA_IMAGE_BUILD=1) the file is still installed, but
- * `sysctl -p` is skipped so the bind-mounted /proc cannot change the build host;
- * systemd-sysctl applies the file at first boot.
+ * and apply it with `/usr/sbin/sysctl -p` on that file (engine#443: never a bare
+ * `sysctl`; a non-login SSH shell does not have /usr/sbin on PATH). Idempotent.
+ * Root install step only (no sudoers change; the Engine process never applies
+ * sysctl at runtime). In an image-build chroot (IDEA_IMAGE_BUILD=1) the file is
+ * still installed, but `sysctl -p` is skipped so the bind-mounted /proc cannot
+ * change the build host; systemd-sysctl applies the file at first boot.
+ * A missing /usr/sbin/sysctl or a failed apply fails the install (does not
+ * report "applied" and exit 0).
  */
 export const installIgmpSysctl = async (exec: any, enginePath: string) => {
   print(chalk.blue('  - Installing /etc/sysctl.d/90-idea-igmp.conf...'))
@@ -878,16 +883,24 @@ export const installIgmpSysctl = async (exec: any, enginePath: string) => {
     return
   }
   // idea#284 part 2: apply only when the file changed or the live value is below it
-  // (read-only `sysctl -n`), so a no-change update touches nothing.
+  // (read-only `/usr/sbin/sysctl -n`), so a no-change update touches nothing.
   if (!changed) {
     let live = NaN
-    try { live = Number(String((await exec`sysctl -n net.ipv4.igmp_max_memberships`)?.stdout ?? '').trim()) } catch { live = NaN }
+    try {
+      live = Number(String((await exec`${SYSCTL} -n net.ipv4.igmp_max_memberships`)?.stdout ?? '').trim())
+    } catch (e: any) {
+      const msg = String(e?.message ?? e)
+      if (/ENOENT|not found|No such file|exit code 127|127/i.test(msg)) {
+        throw new Error(`${SYSCTL} is missing or not executable; cannot read or apply ${IGMP_SYSCTL_CONF}: ${msg}`)
+      }
+      live = NaN
+    }
     if (Number.isFinite(live) && live >= IGMP_MAX_MEMBERSHIPS) {
       print(chalk.green(`  - ${IGMP_SYSCTL_CONF} unchanged and in effect (igmp_max_memberships=${live}); no sysctl -p`))
       return
     }
   }
-  await exec`sudo sysctl -p ${IGMP_SYSCTL_CONF}`
+  await exec`sudo ${SYSCTL} -p ${IGMP_SYSCTL_CONF}`
   print(chalk.green(`  - ${IGMP_SYSCTL_CONF} installed and applied (igmp_max_memberships=${IGMP_MAX_MEMBERSHIPS})`))
 }
 

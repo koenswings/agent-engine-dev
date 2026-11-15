@@ -544,3 +544,85 @@ describe('updateApp excludes and preUpdateGate (idea#396)', () => {
         expect(inst().preUpdateGate).toEqual({ at: null, bootId: 'boot-a', uptimeS: 40 })
     })
 })
+
+
+describe('updateApp Swap relative symlinks (engine#447)', () => {
+    const hookLink = (root: string, name = '20-x.sh') =>
+        path.join(root, 'docker-entrypoint-hooks.d/before-starting', name)
+
+    const writeRelLink = async (root: string, name: string, relTarget: string, body: string) => {
+        const link = hookLink(root, name)
+        const target = path.resolve(path.dirname(link), relTarget)
+        await fs.ensureDir(path.dirname(target))
+        await fs.ensureDir(path.dirname(link))
+        await fs.outputFile(target, body)
+        const st = await fs.lstat(link).catch(() => null)
+        if (st?.isSymbolicLink()) await fs.unlink(link)
+        else if (st) await fs.remove(link)
+        await fs.symlink(relTarget, link)
+    }
+
+    it('replaces relative symlinks (same target and changed target) and leaves data/ and .env untouched', async () => {
+        // Live failure (Kid idea04 trace c6fd92b7, Atlas idea03): fs.copy overwrite of an
+        // existing relative hook symlink throws "Cannot copy '../pre-installation/…' to a
+        // subdirectory of itself" and Swap rolls back.
+        const instDir = `${tmp}/instances/i1`
+        const bundle = `${tmp}/apps/kolibri-1.1`
+        await fs.outputFile(`${instDir}/data/user.db`, 'keep-me')
+        await writeRelLink(instDir, '05-idea-skeleton-config.sh', '../pre-installation/05-idea-skeleton-config.sh', 'old-05')
+        await writeRelLink(instDir, '20-x.sh', '../post-installation/20-x.sh', 'old-20')
+        await writeRelLink(bundle, '05-idea-skeleton-config.sh', '../pre-installation/05-idea-skeleton-config.sh', 'new-05')
+        await writeRelLink(bundle, '20-x.sh', '../pre-installation/20-x.sh', 'new-20')
+        health = ['healthy']
+        const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
+        expect(r.toAppId).toBe('kolibri-1.1')
+        const five = hookLink(instDir, '05-idea-skeleton-config.sh')
+        const twenty = hookLink(instDir, '20-x.sh')
+        expect((await fs.lstat(five)).isSymbolicLink()).toBe(true)
+        expect(await fs.readlink(five)).toBe('../pre-installation/05-idea-skeleton-config.sh')
+        expect((await fs.lstat(twenty)).isSymbolicLink()).toBe(true)
+        expect(await fs.readlink(twenty)).toBe('../pre-installation/20-x.sh')
+        expect(await fs.readFile(path.resolve(path.dirname(five), '../pre-installation/05-idea-skeleton-config.sh'), 'utf8')).toBe('new-05')
+        expect(await fs.readFile(path.resolve(path.dirname(twenty), '../pre-installation/20-x.sh'), 'utf8')).toBe('new-20')
+        expect(await fs.readFile(`${instDir}/.env`, 'utf8')).toBe('port=50001\n')
+        expect(await fs.readFile(`${instDir}/data/user.db`, 'utf8')).toBe('keep-me')
+    })
+
+    it('a symlink becomes a regular file, and a regular file becomes a symlink', async () => {
+        const instDir = `${tmp}/instances/i1`
+        const bundle = `${tmp}/apps/kolibri-1.1`
+        await writeRelLink(instDir, '20-x.sh', '../post-installation/20-x.sh', 'old-link')
+        await fs.outputFile(hookLink(instDir, 'plain.sh'), 'old-file')
+        await fs.ensureDir(path.dirname(hookLink(bundle, '20-x.sh')))
+        await fs.outputFile(hookLink(bundle, '20-x.sh'), 'now a file')
+        await fs.ensureDir(`${bundle}/docker-entrypoint-hooks.d/post-installation`)
+        await fs.outputFile(`${bundle}/docker-entrypoint-hooks.d/post-installation/20-x.sh`, 'bundle-post')
+        await fs.symlink('../post-installation/20-x.sh', hookLink(bundle, 'plain.sh'))
+        health = ['healthy']
+        await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
+        const becameFile = hookLink(instDir, '20-x.sh')
+        const becameLink = hookLink(instDir, 'plain.sh')
+        expect((await fs.lstat(becameFile)).isSymbolicLink()).toBe(false)
+        expect((await fs.lstat(becameFile)).isFile()).toBe(true)
+        expect(await fs.readFile(becameFile, 'utf8')).toBe('now a file')
+        expect((await fs.lstat(becameLink)).isSymbolicLink()).toBe(true)
+        expect(await fs.readlink(becameLink)).toBe('../post-installation/20-x.sh')
+    })
+
+    it('unlinks a dest symlink to a directory and does not empty the target', async () => {
+        const instDir = `${tmp}/instances/i1`
+        const bundle = `${tmp}/apps/kolibri-1.1`
+        const precious = path.join(tmp, 'precious-dir')
+        await fs.outputFile(`${precious}/keep-me`, 'safe')
+        await fs.ensureDir(path.dirname(hookLink(instDir)))
+        await fs.symlink(precious, hookLink(instDir, '20-x.sh'))
+        await writeRelLink(bundle, '20-x.sh', '../post-installation/20-x.sh', 'new-20')
+        health = ['healthy']
+        await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
+        const dest = hookLink(instDir, '20-x.sh')
+        expect((await fs.lstat(dest)).isSymbolicLink()).toBe(true)
+        expect(await fs.readlink(dest)).toBe('../post-installation/20-x.sh')
+        expect(await fs.readFile(`${precious}/keep-me`, 'utf8')).toBe('safe')
+        expect(await fs.readdir(precious)).toEqual(['keep-me'])
+    })
+})
