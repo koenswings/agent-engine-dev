@@ -30,7 +30,7 @@ import { parseBackupSpec, assertHookServicesExist, backupHookRunner, defaultBack
 import { indexBackupDiskApps } from '../data/InstallApp.js'
 import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
-import { assertPreQuarantineHelper, quarantinePreRestore } from '../data/RestorePreQuarantine.js'
+import { assertPreQuarantineHelper, quarantinePreRestore, sourceOnOtherEngine, quarantineUnclaimedTarget } from '../data/RestorePreQuarantine.js'
 import { createOperation, updateOperation } from '../data/Operations.js'
 import { readBackupYamlState, setLinkLastBackup, editBackupYaml } from '../data/BackupYamlDoc.js'
 import { applyBackupResult, recordBackupResult, successResultCode, failureResultCode, isManualBackupCause } from '../data/BackupResults.js'
@@ -912,6 +912,10 @@ export const restoreApp = async (
             throw new Error(`Target disk ${targetDisk.id} is not docked`)
         }
 
+        // engine#418: a storedOn disk docked to another Engine is refused before any extract
+        const otherEngine = sourceOnOtherEngine(store, instanceId, targetDisk, String(localEngineId))
+        if (otherEngine) throw new Error(otherEngine)
+
         // #190: restoring to another disk quarantines the old folder afterwards (helper v4)
         const prevDisk = await assertPreQuarantineHelper(store, instanceId, targetDisk, String(localEngineId))
 
@@ -946,8 +950,17 @@ export const restoreApp = async (
             await ensureAppFilesOnTarget(String(instance.instanceOf), (instance.serviceImages ?? []).map(String), targetDisk, candidates)
         }
 
+        // engine#418: explicit restore-reclaim, so the instance is re-homed onto the
+        // target when its storedOn disk is lost, or docked here and stopped.
         const { processInstance } = await import('../data/Disk.js')
-        await processInstance(storeHandle, targetDisk, instanceId)
+        await processInstance(storeHandle, targetDisk, instanceId, { reclaim: 'restore' })
+        // engine#418: fail closed. Never report ok while the record names another disk.
+        const registeredOn = getInstance(storeHandle.doc(), instanceId)?.storedOn
+        if (String(registeredOn) !== String(targetDisk.id)) {
+            const q = await quarantineUnclaimedTarget(targetDisk, instanceId)
+            const where = q ? `the restored copy is quarantined at ${q}` : `the restored copy could not be quarantined and is still in instances/${instanceId}`
+            throw new Error(`RESTORE_NOT_CLAIMED: restored files to ${targetDisk.name} but the instance remains on ${registeredOn ?? 'no disk'}; ${where}`)
+        }
         await quarantinePreRestore(storeHandle.doc(), instanceId, targetDisk, prevDisk)
 
         // engine#413: running in, running out (same as moveApp, idea#474). An
@@ -955,7 +968,10 @@ export const restoreApp = async (
         // an Engine cause, not an operator one, so it never counts as a user start.
         if (wasRunning) {
             const restored = getInstance(storeHandle.doc(), instanceId)
-            if (restored) {
+            // engine#418: never start an instance on a disk that is not its storedOn
+            if (restored && String(restored.storedOn) !== String(targetDisk.id)) {
+                log(`restoreApp: not restarting ${instanceId} on ${targetDisk.name}; it is stored on ${restored.storedOn ?? 'no disk'} (engine#418)`)
+            } else if (restored) {
                 log(`Starting restored instance ${instanceId} on disk ${targetDisk.name} (it was Running before the restore)`)
                 await backupLifecycle.startInstance(storeHandle, restored, targetDisk, RESTORE_POST_START_CAUSE)
             }

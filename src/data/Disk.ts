@@ -4,7 +4,7 @@ import { $, YAML, chalk, fs, os } from 'zx';
 import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
 import { App, appTitleFromXapp, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
-import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance, applyDemoFlag, applyBackupMethod } from './Instance.js'
+import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance, applyDemoFlag, applyBackupMethod, type InstanceRegisterOptions } from './Instance.js'
 import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
@@ -855,13 +855,24 @@ export const removeApp = async (store: Store, disk: Disk, appId: AppID): Promise
     }
 }
 
-export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID): Promise<Instance | undefined> => {
-    const instance = await createOrUpdateInstance(storeHandle, instanceId, disk)
+export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID, opts: InstanceRegisterOptions = {}): Promise<Instance | undefined> => {
+    const instance = await createOrUpdateInstance(storeHandle, instanceId, disk, opts)
     if (instance) {
+        // engine#418: never start an instance on a disk that is not its storedOn
+        // (a leftover folder, or a restore that did not claim the id).
+        const storedOn = storeHandle.doc()?.instanceDB?.[instanceId]?.storedOn
+        if (!isStoredOn(storedOn, disk)) {
+            log(`processInstance: not starting ${instanceId} on disk ${disk.id}; it is stored on ${storedOn ?? 'no disk'} (engine#418)`)
+            return instance
+        }
         await tracedStartInstance(storeHandle, instance, disk)
     }
     return instance
 }
+
+/** engine#418: true when storedOn names this disk. */
+export const isStoredOn = (storedOn: DiskID | null | undefined, disk: Pick<Disk, 'id'>): boolean =>
+    !!storedOn && String(storedOn) === String(disk.id)
 
 /**
  * Wraps startInstance with a commandLog trace so that auto-starts triggered
