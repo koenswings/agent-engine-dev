@@ -176,6 +176,12 @@ export interface Operation {
   move?: import('./MoveAppShapes.js').MoveProgress
   /** setupDemo / removeDemo only (engine#369): per-app steps and codes. See DemoApps.ts. */
   demo?: import('./DemoApps.js').DemoProgress
+  /**
+   * updateApp only (engine#442): the update failed before a swap and the old version
+   * could not be restarted. The Console should say the App is stopped, not "Nothing changed".
+   * Absent otherwise.
+   */
+  restartFailed?: true
 }
 
 // References to top-level YMaps and YArrays in the Yjs document

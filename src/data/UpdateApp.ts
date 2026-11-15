@@ -608,11 +608,52 @@ export const updateApp = async (
             if (!why || !snap) {
                 // Before a complete snapshot nothing was swapped: the old version is intact.
                 // It may have been stopped for the snapshot: start the old version again.
+                // engine#442: if that restart fails, the App must not stay stopped with no Error
+                // and with a "nothing was changed" message.
+                let restartWhy: string | null = null
                 if (stopped) {
-                    try { await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk) } catch (se) { log(`updateApp: restarting ${inst.id} failed: ${(se as Error).message}`) }
+                    try {
+                        await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk)
+                        const after = storeHandle.doc().instanceDB[inst.id]
+                        if (!after || (after.status !== 'Running' && after.status !== 'Starting')) {
+                            restartWhy = after?.statusCondition || (after ? `instance status is ${after.status}` : 'instance record missing')
+                        }
+                    } catch (se) {
+                        restartWhy = (se as Error).message
+                        log(`updateApp: restarting ${inst.id} failed: ${restartWhy}`)
+                    }
+                    if (restartWhy) {
+                        storeHandle.change(doc => {
+                            const i = doc.instanceDB[inst.id]
+                            // Leave an Error (or Undocked, hw180) that start already set.
+                            if (!i || i.status === 'Error' || i.status === 'Undocked') return
+                            i.status = 'Error' as any
+                            i.statusCondition = `the update failed and the old version could not be restarted: ${restartWhy}`
+                        })
+                    }
                 }
-                const err = e instanceof UpdateAppError ? e : new UpdateAppError('ROLLED_BACK', `${step} failed: ${why}; nothing was changed`)
-                updateOperation(storeHandle, opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
+                const restartOpts = restartWhy ? { restartFailed: true as const } : undefined
+                const restartClause = restartWhy
+                    ? `the update failed and the old version could not be restarted: ${restartWhy}`
+                    : 'nothing was changed'
+                let err: UpdateAppError
+                if (e instanceof UpdateAppError) {
+                    if (!restartWhy) err = e
+                    else {
+                        const prefix = `${e.code}: `
+                        const text = (e.message.startsWith(prefix) ? e.message.slice(prefix.length) : e.message)
+                            .replace(/; nothing was changed$/, '')
+                        err = new UpdateAppError(e.code, `${text}; ${restartClause}`, restartOpts)
+                    }
+                } else {
+                    err = new UpdateAppError('ROLLED_BACK', `${step} failed: ${why}; ${restartClause}`, restartOpts)
+                }
+                updateOperation(storeHandle, opId, {
+                    status: 'Failed',
+                    error: err.message,
+                    completedAt: d.now() as Timestamp,
+                    ...(err.restartFailed ? { restartFailed: true as const } : {}),
+                })
                 throw err
             }
             let restoreExcludes = liveBackupExcludes

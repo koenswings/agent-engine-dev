@@ -37,8 +37,16 @@ export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
 export const ROLLBACK_FAILED_PREFIX = 'ROLLBACK FAILED:'
 
 export class UpdateAppError extends Error {
-    constructor(public code: UpdateRefusal | 'ROLLED_BACK' | 'ROLLBACK_FAILED', text: string) {
+    /** engine#442: the old version could not be restarted after a pre-swap failure. */
+    restartFailed?: true
+    /** Published on the command-log trace so the Console can pick its wording. */
+    traceResult?: { restartFailed: true }
+    constructor(public code: UpdateRefusal | 'ROLLED_BACK' | 'ROLLBACK_FAILED', text: string, opts?: { restartFailed?: true }) {
         super(code === 'ROLLED_BACK' ? `${ROLLED_BACK_PREFIX} ${text}` : code === 'ROLLBACK_FAILED' ? `${ROLLBACK_FAILED_PREFIX} ${text}` : `${code}: ${text}`)
+        if (opts?.restartFailed) {
+            this.restartFailed = true
+            this.traceResult = { restartFailed: true }
+        }
     }
 }
 

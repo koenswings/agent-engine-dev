@@ -473,6 +473,25 @@ describe('updateAvailable after updateApp (idea#459)', () => {
         expect(inst().updateAvailable).toMatchObject({ appId: 'kolibri-1.1', fromVersion: '1.0' })
 
     })
+    it('engine#442 a pre-swap failure whose restart throws replaces "nothing was changed" and sets restartFailed', async () => {
+        let err: any
+        try {
+            await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps({
+                snapshot: async () => { throw new Error('helper crashed') },
+                start: async () => { calls.push('start'); throw new Error('compose up failed') },
+            }))
+        } catch (e) { err = e }
+        expect(err.message).toBe('ROLLED BACK: Snapshot failed: helper crashed; the update failed and the old version could not be restarted: compose up failed')
+        expect(err.message).not.toMatch(/nothing was changed/)
+        expect(err.code).toBe('ROLLED_BACK')
+        expect(err.restartFailed).toBe(true)
+        expect(err.traceResult).toEqual({ restartFailed: true })
+        expect(inst().status).toBe('Error')
+        expect(inst().statusCondition).toBe('the update failed and the old version could not be restarted: compose up failed')
+        const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
+        expect(op.error).toBe(err.message)
+        expect(op.restartFailed).toBe(true)
+    })
 })
 
 describe('updateApp excludes and preUpdateGate (idea#396)', () => {
