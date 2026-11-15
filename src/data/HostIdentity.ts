@@ -108,25 +108,45 @@ export const setEnvLines = async (envPath: string, vars: Record<string, string>)
  *   1. a Nextcloud instance on a disk docked to this Engine that is Running or Starting
  *      (Starting: at boot it may come up after the app that asks), http://<this host>.local:<port>
  *   2. otherwise a Running one on another Engine of this fleet, http://<its host>.local:<port>
- * Never the asking instance itself. No trailing slash.
+ * A Nextcloud that asks gets '' (it is the Nextcloud; engine#426), and never itself.
+ * Several candidates (engine#426): one on the asking app's own disk first, then Running
+ * before Starting, then the oldest `created`, then the id. More than one local candidate
+ * is logged with the choice. No trailing slash.
  */
 export const nextcloudUrl = (store: Store, localEngineId: string, selfId?: string): string => {
     const isNc = (i: any) => /^nextcloud(-|$)/i.test(String(i?.instanceOf ?? '')) || String(i?.name ?? '').toLowerCase() === 'nextcloud'
-    const pick = (engineId: string, ok: (status: string) => boolean): string => {
+    const self: any = selfId ? (store.instanceDB as any)?.[selfId] : undefined
+    if (self && isNc(self)) return ''
+    const selfDisk = self?.storedOn ? String(self.storedOn) : null
+    const rank = (i: any): number[] => [
+        selfDisk && String(i.storedOn) === selfDisk ? 0 : 1,
+        String(i.status) === 'Running' ? 0 : 1,
+        Number(i.created) > 0 ? Number(i.created) : Number.MAX_SAFE_INTEGER,
+    ]
+    const byRank = (a: any, b: any): number => {
+        const ra = rank(a), rb = rank(b)
+        for (let k = 0; k < ra.length; k++) if (ra[k] !== rb[k]) return ra[k] - rb[k]
+        return String(a.id).localeCompare(String(b.id))
+    }
+    const pick = (engineId: string, ok: (status: string) => boolean, logMany: boolean): string => {
         const engine: any = (store.engineDB as any)?.[engineId]
         const host = String(engine?.hostname ?? '').replace(/\.local$/, '')
         if (!host) return ''
         const disks = new Set(Object.values(store.diskDB ?? {}).filter((d: any) => d?.dockedTo === engineId).map((d: any) => String(d.id)))
-        const nc = Object.values(store.instanceDB ?? {})
+        const all = Object.values(store.instanceDB ?? {})
             .filter((i: any) => i && i.id !== selfId && isNc(i) && disks.has(String(i.storedOn)) && ok(String(i.status)) && Number(i.port) > 0)
-            .sort((a: any, b: any) => String(a.id).localeCompare(String(b.id)))[0] as any
+            .sort(byRank) as any[]
+        const nc = all[0]
+        if (logMany && all.length > 1) {
+            log(`IDEA_NEXTCLOUD_URL for ${selfId ?? '(no instance)'}: ${all.length} Nextclouds on this Engine (${all.map(i => `${i.id} ${i.status} :${i.port} on ${i.storedOn}`).join(', ')}); chose ${nc.id} (same disk, then Running, then oldest; engine#426)`)
+        }
         return nc ? `http://${host}.local:${Number(nc.port)}` : ''
     }
-    const local = pick(localEngineId, s => s === 'Running' || s === 'Starting')
+    const local = pick(localEngineId, s => s === 'Running' || s === 'Starting', true)
     if (local) return local
     for (const id of Object.keys(store.engineDB ?? {}).sort()) {
         if (id === localEngineId) continue
-        const url = pick(id, s => s === 'Running')
+        const url = pick(id, s => s === 'Running', false)
         if (url) return url
     }
     return ''

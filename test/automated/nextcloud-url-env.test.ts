@@ -41,6 +41,37 @@ describe('nextcloudUrl (#169)', () => {
     })
 })
 
+describe('nextcloudUrl choice (engine#426)', () => {
+    const app = (id: string, storedOn: string) => inst(id, storedOn, 'Running', 50000, 'kolibri-1.0')
+    const two = (over: any = {}) => store({
+        diskDB: { dA: { id: 'dA', dockedTo: 'E1' }, dB: { id: 'dB', dockedTo: 'E1' } },
+        instanceDB: {
+            'nc-a': { ...inst('nc-a', 'dA', 'Running', 56233), created: 2 },
+            'nc-b': { ...inst('nc-b', 'dB', 'Running', 18080), created: 1 },
+            kA: app('kA', 'dA'), kB: app('kB', 'dB'), kX: app('kX', 'dX'),
+            ...over,
+        },
+    })
+    it('a Nextcloud asking gets empty, even with another Nextcloud on the Pi (the idea03 swap)', () => {
+        expect(nextcloudUrl(two(), 'E1', 'nc-a')).toBe('')
+        expect(nextcloudUrl(two(), 'E1', 'nc-b')).toBe('')
+    })
+    it('an app gets the Nextcloud on its own disk', () => {
+        expect(nextcloudUrl(two(), 'E1', 'kA')).toBe('http://idea03.local:56233')
+        expect(nextcloudUrl(two(), 'E1', 'kB')).toBe('http://idea03.local:18080')
+    })
+    it('otherwise Running before Starting, then the oldest created', () => {
+        expect(nextcloudUrl(two(), 'E1', 'kX')).toBe('http://idea03.local:18080')
+        const s = two({ 'nc-b': { ...inst('nc-b', 'dB', 'Starting', 18080), created: 1 } })
+        expect(nextcloudUrl(s, 'E1', 'kX')).toBe('http://idea03.local:56233')
+        expect(nextcloudUrl(s, 'E1', 'kB')).toBe('http://idea03.local:18080')
+    })
+    it('without created, the id decides (stable)', () => {
+        const s = two({ 'nc-a': inst('nc-a', 'dA', 'Running', 56233), 'nc-b': inst('nc-b', 'dB', 'Running', 18080) })
+        expect(nextcloudUrl(s, 'E1', 'kX')).toBe('http://idea03.local:56233')
+    })
+})
+
 describe('writeNextcloudUrlEnv (#169)', () => {
     it('adds the line, replaces it on the next start, keeps other lines', async () => {
         const dir = mkdtempSync(path.join(os.tmpdir(), 'idea-169-'))
