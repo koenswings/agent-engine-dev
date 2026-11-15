@@ -556,7 +556,8 @@ export const buildEngine = async (args: any) => {
   await installTailscale(exec, enginePath)
   if (zerotier) await installZerotier(exec, enginePath);
 
-  await addMeta(exec, hostname, version);
+  // A rebuild over an installed Engine keeps its id (idea#524)
+  await addMeta(exec, hostname, version, { keepExistingId: true });
 
   //await installEngineNode(exec);
   await installBaseNpm(exec);

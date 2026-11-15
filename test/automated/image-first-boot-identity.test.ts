@@ -8,8 +8,8 @@
  * META.yaml, read through readMetaUpdateId() as the system disk (IDEA_SYSTEM_META,
  * honoured only under NODE_ENV=test) with the hardware serial lookup mocked.
  *
- * The id derivation itself is NOT changed here (the id freeze waits for Koen);
- * this only pins what it does today for a sanitised image. Never touches /META.yaml.
+ * The id freeze (once set, the Engine id never changes) is in engine-id-freeze.test.ts;
+ * this pins the first boot of a sanitised image. Never touches /META.yaml.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import os from 'os'

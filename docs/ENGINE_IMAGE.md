@@ -53,7 +53,7 @@ No SSH, nothing started, no device identity. Inside `chroot <MNT>`:
    earlier peer files `/etc/idea/.peer-quarantine/` (the whole folder), which a Pi that has run would otherwise copy into
    every card (peers distrust a shared key; sync-peers refuses PEER_OWNER_MISMATCH). Verify's `identity` check also
    refuses an Engine `config.yaml` that sets `settings.skipHardwareId` to any value (`imageConfigProblems`; sanitise
-   never edits config.yaml; same rule as idea `verify-sanitised.sh`; the Engine id policy is open in idea#524). Adding or rotating an operator key = edit the list, new image, reflash.
+   never edits config.yaml; same rule as idea `verify-sanitised.sh`; the Engine id is frozen once set, idea#524). Adding or rotating an operator key = edit the list, new image, reflash.
 4. Docker from the pinned debs, enabled, not started; pi in the docker group; `daemon.json`.
 5. Tailscale from the pinned tarball (`tailscale` in /usr/bin, `tailscaled` in /usr/sbin, as the Debian package) + unit, NOT enabled, no key, no state
    (idea-engine-identity enables it on first boot when the card carries a key, engine#291).
@@ -133,8 +133,9 @@ path, which imports `store-template.json` under the shipped store-url document. 
 part of the image; if one is added, it must already contain that document, or the Engine refuses with
 `STORE_IDENTITY_MISMATCH`. The first-boot unit and `pm2.config.cjs` must not set `--allow-new-store` or
 `IDEA_ALLOW_NEW_STORE`. The Engine creates `/META.yaml` itself
-at its first start (`ensureSystemMeta`: root drive serial, else a UUID); a `/META.yaml` without a diskId also gets a
-UUID (`diskIdWithoutHardware`), never `ENGINE_undefined`.
+at its first start (`ensureSystemMeta`: root drive serial, else a UUID); a `/META.yaml` without a diskId also gets the
+root drive serial, else a UUID (`diskIdWithoutHardware`), never `ENGINE_undefined`. After that first boot the id is
+frozen (idea#524): no later serial read changes it.
 
 ## Other modes
 

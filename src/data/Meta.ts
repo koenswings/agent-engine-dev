@@ -197,6 +197,15 @@ export interface MetaIdDeps {
   readHardwareId: (device: DeviceName) => Promise<DiskID | undefined>
 }
 
+/**
+ * The system disk's diskId (hence the Engine id, ENGINE_<diskId>) is frozen once it is set
+ * (idea#524, Koen 15 Nov 2026). Only a first boot whose /META.yaml has no diskId (a sanitised
+ * image, or no /META.yaml at all: ensureSystemMeta) takes the root drive serial or a random id.
+ * App Disk partitions (deviceSpec set) keep their own hardware-id rules (idea#168 D4).
+ */
+export const systemDiskIdFrozen = (meta: Partial<DiskMeta> | null | undefined, deviceSpec?: DeviceName): boolean =>
+  !deviceSpec && hasDiskId(meta)
+
 export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<MetaIdDeps> = {}): Promise<DiskMeta> => {
   const deps: MetaIdDeps = {
     readIdentity: depsIn.readIdentity ?? ((d) => readHardwareIdentity(d)),
@@ -230,7 +239,7 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
 
     // The system disk's /META.yaml: create it when it is missing (idea#145)
     if (!deviceSpec) {
-      await ensureSystemMeta(device, { allowCreate: allowSystemMetaCreate() })
+      await ensureSystemMeta(device, { allowCreate: allowSystemMetaCreate(), deps: { readHardwareId: deps.readHardwareId } })
     }
 
     //log(`Our current dir is ${await $`pwd`} with content ${await $`ls`} and path ${path}`)
@@ -255,7 +264,12 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
       // from the META file as-is. Fixture disks have isHardwareId: false and a stable generated
       // id — with the lookup on, they find no serial and keep it.
       let diskId: DiskID
-      if (skipHardwareId()) {
+      if (systemDiskIdFrozen(meta, deviceSpec)) {
+        // idea#524 id freeze: an Engine that has an id keeps it. Redeploys and updates never
+        // overwrite it with a newly readable serial (engine#361 flipped golden and production).
+        log(`Engine id frozen: keeping diskId ${meta.diskId} from ${path}, no hardware id lookup (idea#524)`)
+        diskId = meta.diskId
+      } else if (skipHardwareId()) {
         log(`skipHardwareId: using diskId from META file (${meta.diskId}), skipping hardware id lookup`)
         diskId = meta.diskId
         // An image's /META.yaml carries no diskId (idea#322): generate one, never ENGINE_undefined
@@ -271,6 +285,8 @@ export const readMetaUpdateId = async (deviceSpec?: DeviceName, depsIn: Partial<
           if (String(meta.diskId) !== String(diskId)) meta.isHardwareId = r.isHardwareId
         } else {
           diskId = (deviceSpec ? undefined : await deps.readHardwareId(device)) as DiskID
+          // First boot of the system disk (no diskId yet, idea#524): ENGINE_<serial>
+          if (diskId) meta.isHardwareId = true
         }
         if (!diskId) {
           log(`No hardware id found for device ${device}`)
@@ -555,7 +571,34 @@ export const readRemoteDiskId = async (exec: any): Promise<DiskID | undefined> =
   }
 }
 
-export const addMeta = async (exec: any, hostname: string, version: string) => {
+/**
+ * The diskId of an existing /META.yaml on the target, or undefined when there is none (idea#524).
+ */
+export const readRemoteSystemDiskId = async (exec: any): Promise<DiskID | undefined> => {
+  try {
+    const content = (await exec`sudo cat /META.yaml`).stdout
+    const meta = YAML.parse(content) as Partial<DiskMeta> | null
+    return hasDiskId(meta) ? String(meta!.diskId) as DiskID : undefined
+  } catch (e) {
+    return undefined
+  }
+}
+
+/**
+ * Write /META.yaml on the target. With keepExistingId (a full build-engine run over an
+ * installed Engine, i.e. a redeploy), an existing /META.yaml with a diskId is left as it is,
+ * so the Engine id stays frozen (idea#524). --personalize on a MASTER clone and
+ * reset-engine --meta regenerate it on purpose.
+ * Returns the id that /META.yaml carries afterwards.
+ */
+export const addMeta = async (exec: any, hostname: string, version: string, options: { keepExistingId?: boolean } = {}): Promise<DiskID> => {
+  if (options.keepExistingId) {
+    const existing = await readRemoteSystemDiskId(exec)
+    if (existing) {
+      print(chalk.blue(`/META.yaml already has diskId ${existing}: keeping it, the Engine id is frozen (idea#524)`))
+      return existing
+    }
+  }
   let id = await readRemoteDiskId(exec)
   if (id === undefined) {
     print(chalk.yellow(`Disk id is ${id}`));
@@ -576,6 +619,7 @@ export const addMeta = async (exec: any, hostname: string, version: string) => {
     console.error(e);
     process.exit(1);
   }
+  return id
 }
 
 // export const readRemoteDiskId = async (exec: any): Promise<DiskID | undefined> => {
