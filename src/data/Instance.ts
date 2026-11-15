@@ -313,6 +313,17 @@ export interface Instance {
    * on records written before idea#403. Optional: do not add to store-template.json.
    */
   backupMethod?: BackupMethod;
+  /**
+   * engine#430: bytes used by the instance folder (instances/<id>: data, database and
+   * volumes; not the shared App master), measured as root by `idea-app-data size` on the
+   * Engine the disk is docked to, rounded to whole MB (1 MB = 1,000,000 bytes, as
+   * DiskSize.ts). Stored, so an undocked instance keeps its last size. Null/absent when
+   * never measured (or the helper cannot size it). Written only on a change of more than
+   * 5% or 100 MB (DataBytes.ts). Optional: do not add to store-template.json.
+   */
+  dataBytes?: number | null;
+  /** engine#430: Unix ms of the measurement that last wrote dataBytes; null/absent when never. */
+  dataBytesAt?: Timestamp | null;
 }
 
 /** engine#369 addendum decision 5 / contract: warning only, no auto-download. */

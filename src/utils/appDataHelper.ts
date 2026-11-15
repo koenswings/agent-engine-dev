@@ -286,20 +286,38 @@ export const appDataErrorMessage = (sub: string, code: number | null, signal: st
     return `idea-app-data ${sub} ${what}${missing ? ` — ${APP_DATA_HELPER_UPDATE}` : ''}`
 }
 
-/** Default runner: `sudo -n /usr/local/sbin/idea-app-data <args…>` (no shell). */
-export const runAppData: AppDataRunner = (args) => new Promise((resolve, reject) => {
-    log(`sudo -n ${APP_DATA_HELPER} ${args.join(' ')}`)
-    const proc = spawn('sudo', appDataSudoArgv(args), { stdio: ['ignore', 'pipe', 'pipe'] })
+/**
+ * engine#430: the argv for `nice` in a low-priority helper run: nice -n 19 ionice -c3 sudo -n
+ * /usr/local/sbin/idea-app-data <args…>. nice and ionice wrap sudo from the outside and
+ * the helper inherits both, so the words sudo receives (and the sudoers match on the
+ * helper path) are exactly those of runAppData. The helper and sudoers stay unchanged.
+ */
+export const lowPriorityAppDataArgv = (args: string[]): string[] =>
+    ['-n', '19', 'ionice', '-c3', 'sudo', ...appDataSudoArgv(args)]
+
+const spawnAppData = (cmd: string, argv: string[], args: string[]): Promise<string> => new Promise((resolve, reject) => {
+    log(`${cmd} ${argv.join(' ')}`)
+    const proc = spawn(cmd, argv, { stdio: ['ignore', 'pipe', 'pipe'] })
     let stdout = ''
     let stderr = ''
     proc.stdout.on('data', (c: Buffer) => { stdout += c.toString() })
     proc.stderr.on('data', (c: Buffer) => { stderr += c.toString() })
-    proc.on('error', (err) => reject(new Error(`idea-app-data ${args[0]}: could not start sudo: ${err.message}`)))
+    proc.on('error', (err) => reject(new Error(`idea-app-data ${args[0]}: could not start ${cmd}: ${err.message}`)))
     proc.on('close', (code, signal) => {
         if (code === 0) resolve(stdout)
         else reject(new Error(appDataErrorMessage(args[0], code, signal, stderr)))
     })
 })
+
+/** Default runner: `sudo -n /usr/local/sbin/idea-app-data <args…>` (no shell). */
+export const runAppData: AppDataRunner = (args) => spawnAppData('sudo', appDataSudoArgv(args), args)
+
+/**
+ * engine#430: the same helper run at the lowest CPU and idle I/O priority
+ * (`nice -n 19 ionice -c3 sudo -n …`), for background measurements that must never
+ * slow the Apps down. copyApp/moveApp space checks keep runAppData.
+ */
+export const runAppDataLowPriority: AppDataRunner = (args) => spawnAppData('nice', lowPriorityAppDataArgv(args), args)
 
 /** Bytes used by an instance folder (du -sk -x as root). */
 export const instanceDataBytes = async (root: string, id: string, run: AppDataRunner = runAppData): Promise<number> => {
