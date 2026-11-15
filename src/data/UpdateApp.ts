@@ -67,6 +67,7 @@ import { defaultReadBootId, defaultReadUptimeS } from '../usage/sampler.js'
 import { engineClockTrusted } from '../utils/engineClockStatus.js'
 import { parseBackupSpec, BackupMethod } from '../utils/backupMethod.js'
 import type { PreUpdateBackupOptions } from '../monitors/backupMonitor.js'
+import { shouldFailUpdateRestart, TEST_FAIL_UPDATE_FAILURE_MESSAGE, TEST_FAIL_UPDATE_RESTART_MESSAGE } from './UpdateAppTestHook.js'
 
 /** v14 (idea#396): snapshot/estimate excludes under data/, 24 h pre-update quarantine. */
 export const UPDATE_HELPER_MIN = 14
@@ -565,6 +566,9 @@ export const updateApp = async (
             setStep('Snapshot'); progress('Snapshot', 0, dataBytes)
             if (wasUp) { stopped = true; await d.stop(inst, disk) }
             await waitContainersGone(d, inst.id)
+            // engine#449: env-gated test hook, read per call. Fail pre-swap after
+            // the Snapshot stop so the old-version restart path runs.
+            if (shouldFailUpdateRestart(inst.id)) throw new Error(TEST_FAIL_UPDATE_FAILURE_MESSAGE)
             if (backupDisk && !hookFirst) await takeBackup(true)
             try { snap = await d.snapshot(disk, inst.id, snapExcludes) } catch (e) {
                 const m = String((e as Error).message)
@@ -646,6 +650,7 @@ export const updateApp = async (
                 let restartWhy: string | null = null
                 if (stopped) {
                     try {
+                        if (shouldFailUpdateRestart(inst.id)) throw new Error(TEST_FAIL_UPDATE_RESTART_MESSAGE)
                         await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk)
                         const after = storeHandle.doc().instanceDB[inst.id]
                         if (!after || (after.status !== 'Running' && after.status !== 'Starting')) {
