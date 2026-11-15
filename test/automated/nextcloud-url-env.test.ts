@@ -1,11 +1,17 @@
 /**
  * nextcloud-url-env.test.ts (agent-engine-dev#169): IDEA_NEXTCLOUD_URL for every app's .env.
  */
-import { describe, it, expect } from 'vitest'
+import { describe, it, expect, vi } from 'vitest'
 import os from 'os'
 import path from 'path'
 import { mkdtempSync, readFileSync, writeFileSync, rmSync } from 'fs'
 import { nextcloudUrl, writeNextcloudUrlEnv } from '../../src/data/HostIdentity.js'
+import { log } from '../../src/utils/utils.js'
+
+vi.mock('../../src/utils/utils.js', async (importOriginal) => {
+    const orig = await importOriginal<typeof import('../../src/utils/utils.js')>()
+    return { ...orig, log: vi.fn() }
+})
 
 const store = (over: any = {}): any => ({
     engineDB: { E1: { id: 'E1', hostname: 'idea03' }, E2: { id: 'E2', hostname: 'idea04.local' } },
@@ -69,6 +75,23 @@ describe('nextcloudUrl choice (engine#426)', () => {
     it('without created, the id decides (stable)', () => {
         const s = two({ 'nc-a': inst('nc-a', 'dA', 'Running', 56233), 'nc-b': inst('nc-b', 'dB', 'Running', 18080) })
         expect(nextcloudUrl(s, 'E1', 'kX')).toBe('http://idea03.local:56233')
+    })
+    it('logs every local candidate and the choice when there is more than one', () => {
+        vi.mocked(log).mockClear()
+        expect(nextcloudUrl(two(), 'E1', 'kX')).toBe('http://idea03.local:18080')
+        const lines = vi.mocked(log).mock.calls.map(c => String(c[0])).filter(l => l.startsWith('IDEA_NEXTCLOUD_URL for kX'))
+        expect(lines).toHaveLength(1)
+        expect(lines[0]).toContain('2 Nextclouds on this Engine')
+        expect(lines[0]).toContain('nc-a Running :56233 on dA')
+        expect(lines[0]).toContain('nc-b Running :18080 on dB')
+        expect(lines[0]).toContain('chose nc-b')
+        expect(lines[0]).toContain('then oldest created, then id')
+    })
+    it('does not log when there is only one local candidate', () => {
+        vi.mocked(log).mockClear()
+        const s = store({ instanceDB: { nc: inst('nc', 'd1', 'Running'), k: inst('k', 'd1', 'Running', 50000, 'kolibri-1.0') } })
+        expect(nextcloudUrl(s, 'E1', 'k')).toBe('http://idea03.local:61820')
+        expect(vi.mocked(log).mock.calls.some(c => String(c[0]).startsWith('IDEA_NEXTCLOUD_URL for'))).toBe(false)
     })
 })
 

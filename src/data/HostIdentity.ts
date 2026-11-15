@@ -108,7 +108,7 @@ export const setEnvLines = async (envPath: string, vars: Record<string, string>)
  *   1. a Nextcloud instance on a disk docked to this Engine that is Running or Starting
  *      (Starting: at boot it may come up after the app that asks), http://<this host>.local:<port>
  *   2. otherwise a Running one on another Engine of this fleet, http://<its host>.local:<port>
- * A Nextcloud that asks gets '' (it is the Nextcloud; engine#426), and never itself.
+ * A Nextcloud that asks gets '' (engine#426): a Nextcloud never gets its own or another Nextcloud's URL.
  * Several candidates (engine#426): one on the asking app's own disk first, then Running
  * before Starting, then the oldest `created`, then the id. More than one local candidate
  * is logged with the choice. No trailing slash.
@@ -138,7 +138,7 @@ export const nextcloudUrl = (store: Store, localEngineId: string, selfId?: strin
             .sort(byRank) as any[]
         const nc = all[0]
         if (logMany && all.length > 1) {
-            log(`IDEA_NEXTCLOUD_URL for ${selfId ?? '(no instance)'}: ${all.length} Nextclouds on this Engine (${all.map(i => `${i.id} ${i.status} :${i.port} on ${i.storedOn}`).join(', ')}); chose ${nc.id} (same disk, then Running, then oldest; engine#426)`)
+            log(`IDEA_NEXTCLOUD_URL for ${selfId ?? '(no instance)'}: ${all.length} Nextclouds on this Engine (${all.map(i => `${i.id} ${i.status} :${i.port} on ${i.storedOn}`).join(', ')}); chose ${nc.id} (same disk, then Running, then oldest created, then id; engine#426)`)
         }
         return nc ? `http://${host}.local:${Number(nc.port)}` : ''
     }
