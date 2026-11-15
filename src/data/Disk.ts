@@ -153,15 +153,6 @@ export interface UnmountError {
     message: string;            // why the unmount failed
 }
 
-// export const getApps = (store: Store, disk: Disk): App[] => {
-//     const appIds = getKeys(disk.apps) as AppID[]
-//     return appIds.map(appId => getApp(store, appId))
-// }
-
-// export const findApp = (store: Store, disk: Disk, appId: AppID): App | undefined => {
-//     return getApps(store, disk).find(app => app.id === appId)
-// }
-
 // export const getInstances = (store: Store, disk: Disk): Instance[] => {
 //     const instanceIds = getKeys(disk.instances) as InstanceID[]
 //     return instanceIds.map(instanceId => getInstance(store, instanceId))
