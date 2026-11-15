@@ -12,6 +12,9 @@
  *   1. source docked here, Stopped: re-homed onto the target, old folder quarantined, op Done
  *   2. source docked here, Running: stop, claim, then the #413 start on the target
  *   3. source undocked (lost disk): claimed, and started on the target only after the claim
+ *   3b-3d. engine#422: lost disk (or no disk record) but the record still says Running or
+ *      Starting: stale, so no stop, no engine#413 restart; claimed, and started once by the
+ *      normal dock gate (or kept stopped by an operator stop)
  *   4. source docked to another Engine: SOURCE_ON_OTHER_ENGINE before any extract
  *   5. no claim (the stop on the source did not take): RESTORE_NOT_CLAIMED, op Failed,
  *      target copy quarantined, no start
@@ -49,7 +52,7 @@ import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/dat
 import { Disk, processInstance } from '../../src/data/Disk.js'
 import { createOrUpdateInstance, restoreReclaimDecision } from '../../src/data/Instance.js'
 import { config } from '../../src/data/Config.js'
-import { restoreApp, backupLifecycle, RESTORE_POST_START_CAUSE } from '../../src/monitors/backupMonitor.js'
+import { restoreApp, backupLifecycle, RESTORE_POST_START_CAUSE, restoreRunningState } from '../../src/monitors/backupMonitor.js'
 import { defaultPreQuarantineDeps } from '../../src/data/RestorePreQuarantine.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 
@@ -223,6 +226,62 @@ describe('restoreApp onto another disk re-homes the instance (engine#418)', () =
         expect(restoreOp(w.h)?.status).toBe('Done')
     })
 
+    it('3b. engine#422: lost disk, record still Running: stale, no stop, claimed, one dock-gate start, no #413 restart', async () => {
+        const w = await setup({ status: 'Running', source: 'undocked' })
+        await restoreApp(w.h, INST, w.target)
+        const rec = w.h.doc()!.instanceDB[INST] as any
+        expect(stop).not.toHaveBeenCalled()
+        expect(start).not.toHaveBeenCalled()
+        expect(events).toEqual([`autostart:${w.target.id}`])
+        expect(startSeen).toEqual([{ diskId: String(w.target.id), storedOn: String(w.target.id) }])
+        expect(String(rec.storedOn)).toBe(String(w.target.id))
+        expect(rec.status).toBe('Docked')
+        expect(quarantined).toEqual([])
+        expect(restoreOp(w.h)?.status).toBe('Done')
+    })
+
+    it('3c. engine#422: storedOn disk has no record at all, record Running: same as a lost disk', async () => {
+        const w = await setup({ status: 'Running', source: 'undocked' })
+        w.h.change(doc => { delete (doc.diskDB as any)[w.source.id] })
+        await restoreApp(w.h, INST, w.target)
+        expect(stop).not.toHaveBeenCalled()
+        expect(start).not.toHaveBeenCalled()
+        expect(events).toEqual([`autostart:${w.target.id}`])
+        expect(String(w.h.doc()!.instanceDB[INST].storedOn)).toBe(String(w.target.id))
+        expect(restoreOp(w.h)?.status).toBe('Done')
+    })
+
+    it('3d. engine#422: lost disk, record still Starting: not refused (INSTANCE_STARTING is for a disk docked here), no stop, claimed', async () => {
+        const w = await setup({ status: 'Starting', source: 'undocked' })
+        await restoreApp(w.h, INST, w.target)
+        expect(stop).not.toHaveBeenCalled()
+        expect(start).not.toHaveBeenCalled()
+        expect(events).toEqual([`autostart:${w.target.id}`])
+        expect(String(w.h.doc()!.instanceDB[INST].storedOn)).toBe(String(w.target.id))
+        expect(restoreOp(w.h)?.status).toBe('Done')
+    })
+
+    it('3e. engine#422: lost disk, record Running, operator stop in force: no stop, claimed, the dock gate keeps it Stopped', async () => {
+        const w = await setup({ status: 'Running', source: 'undocked' })
+        const stoppedAt = Date.now()
+        w.h.change(doc => {
+            (doc.instanceDB as any)[INST].lastStarted = Date.now() - 60_000;
+            (doc.operationDB as any)['op-user-stop-422'] = {
+                id: 'op-user-stop-422', kind: 'stopApp', status: 'Done', cause: 'console-command',
+                args: { instanceId: INST }, target: { type: 'instance', id: INST },
+                startedAt: stoppedAt, completedAt: stoppedAt,
+            }
+        })
+        await restoreApp(w.h, INST, w.target)
+        const rec = w.h.doc()!.instanceDB[INST] as any
+        expect(stop).not.toHaveBeenCalled()
+        expect(start).not.toHaveBeenCalled()
+        expect(startSeen).toEqual([])
+        expect(String(rec.storedOn)).toBe(String(w.target.id))
+        expect(rec.status).toBe('Stopped')
+        expect(restoreOp(w.h)?.status).toBe('Done')
+    })
+
     it('4. source docked to another Engine: SOURCE_ON_OTHER_ENGINE before any extract, target untouched', async () => {
         const w = await setup({ status: 'Running', source: 'other', extracted: false })
         await expect(restoreApp(w.h, INST, w.target)).rejects.toThrow(/^SOURCE_ON_OTHER_ENGINE: /)
@@ -299,5 +358,25 @@ describe('engine#381 guard unchanged outside restoreApp (engine#418 regression)'
         expect(restoreReclaimDecision(s, rec('Running', 'no-such-disk'), local.target).allowed).toBe(true)
         expect(restoreReclaimDecision(s, rec('Stopped'), local.target, 'some-other-engine').allowed).toBe(false)
         expect(restoreReclaimDecision(s, rec('Running', 'r418-b'), local.target).allowed).toBe(true)
+    })
+
+    it('restoreRunningState (engine#422): Running is real only on a storedOn disk docked here; never stop on another Engine', async () => {
+        const w = await setup({ status: 'Stopped', source: 'local' })
+        const s = w.h.doc()!
+        const me = String(localEngineId)
+        const rec = (status: string, storedOn: string | null = 'r418-a') => ({ storedOn: storedOn as any, status: status as any })
+        expect(restoreRunningState(s, undefined, me).kind).toBe('not-running')
+        expect(restoreRunningState(s, rec('Stopped'), me).kind).toBe('not-running')
+        expect(restoreRunningState(s, rec('Docked'), me).kind).toBe('not-running')
+        expect(restoreRunningState(s, rec('Undocked', 'no-such-disk'), me).kind).toBe('not-running')
+        const here = restoreRunningState(s, rec('Running'), me)
+        expect(here.kind).toBe('running-here')
+        expect(here.kind === 'running-here' && String(here.disk.id)).toBe('r418-a')
+        expect(restoreRunningState(s, rec('Running', 'no-such-disk'), me).kind).toBe('stale')
+        expect(restoreRunningState(s, rec('Running', null), me).kind).toBe('stale')
+        expect(restoreRunningState(s, rec('Starting', 'no-such-disk'), me).kind).toBe('stale')
+        expect(restoreRunningState(s, rec('Running'), 'some-other-engine')).toEqual({ kind: 'other-engine', dockedTo: me })
+        const lost = await setup({ status: 'Running', source: 'undocked' })
+        expect(restoreRunningState(lost.h.doc()!, rec('Running'), me).kind).toBe('stale')
     })
 })
