@@ -17,7 +17,7 @@
  * first, so even that is undoable), re-read the record, start the old version. Result text:
  * "ROLLED BACK: <why>"; when the rollback itself fails the instance is left Stopped with
  * statusCondition "ROLLBACK FAILED: ...".
- * Nothing is ever deleted; snapshots are kept (cleanup is a backlog item, quarantine only).
+ * Nothing is ever deleted except the engine#469 temporary backup below; snapshots are kept (quarantine only).
  * updateAvailable (idea#459): recomputed when an update that started its operation ends
  * (done, failed or rolled back), so the record never keeps offering the version now running.
  *
@@ -31,6 +31,16 @@
  * preHook refuses, HOOK_FAILED; it never falls back to a stop); method stop, no x-app.backup
  * (an old version without a hook) or an instance that is not running runs Borg inside the
  * one Snapshot stop.
+ *
+ * engine#469 (Koen's decision on idea#374): when that backup is due but no linked Backup Disk is
+ * docked here, updateApp makes a TEMPORARY backup on the system disk instead (helper v18,
+ * <system>/.idea-temp-backups/<id>/<stamp>/, a verified Borg repo, inside the one Snapshot stop).
+ * It satisfies NEEDS_BACKUP for this operation only (no lastBackup, no backup result, no
+ * BACKUP.yaml). Space is checked at Check (TEMP_BACKUP_NO_SPACE; the snapshot counts too when
+ * it lands on the same filesystem). After the Health gate passes it is really deleted (rm -rf,
+ * Koen's exception, only inside that subtree); on any failure it is kept, its path goes in the
+ * error and the operation, and a failed snapshot restore falls back to it. Boot recovery never
+ * deletes it.
  *
  * Named Docker volumes of the instance are exported into the snapshot too (helper v5, offline host
  * tar, verified before COMPLETE) and restored on rollback; a previous snapshot is renamed into
@@ -49,8 +59,10 @@ import { resourceLock, instanceKey } from '../utils/ResourceLock.js'
 import {
     runAppData, snapshotArgs, restoreSnapshotArgs, snapshotsArgs, parseSnapshotResult, parseSnapshotsList,
     helperAtLeast, lastLine, SnapshotResult, estimateArgs, parseEstimate,
+    TEMP_BACKUP_HELPER_MIN, borgProblem, tempBackupEstimateArgs, parseTempBackupEstimate, tempBackupCreateArgs,
+    parseTempBackupCreate, tempBackupDeleteArgs, tempBackupRestoreArgs, TempBackupEstimate, verifyStampNow,
 } from '../utils/appDataHelper.js'
-import { createOperation, updateOperation } from './Operations.js'
+import { createOperation, updateOperation, dropInterruptedCommand } from './Operations.js'
 import { log } from '../utils/utils.js'
 import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
@@ -67,6 +79,7 @@ import { defaultReadBootId, defaultReadUptimeS } from '../usage/sampler.js'
 import { engineClockTrusted } from '../utils/engineClockStatus.js'
 import { parseBackupSpec, BackupMethod } from '../utils/backupMethod.js'
 import type { PreUpdateBackupOptions } from '../monitors/backupMonitor.js'
+import { backupArchiveName } from '../utils/backupArchiveName.js'
 import { shouldFailUpdateRestart, TEST_FAIL_UPDATE_FAILURE_MESSAGE, TEST_FAIL_UPDATE_RESTART_MESSAGE } from './UpdateAppTestHook.js'
 
 /** v14 (idea#396): snapshot/estimate excludes under data/, 24 h pre-update quarantine. */
@@ -95,6 +108,8 @@ export interface UpdateResult {
     snapshotExcludes: string[]
     /** idea#448: the backup updateApp took itself (null when none was due) */
     preUpdateBackup: { backupDiskId: string, method: BackupMethod, duringStop: boolean } | null
+    /** engine#469: the temporary backup on the system disk (null when none was made); deleted after Health */
+    tempBackup: { path: string, sizeBytes: number, deleted: boolean } | null
 }
 export interface SnapshotsInfo { snapshots: PreUpdateSnapshot[], preUpdateBytes: number | null, quarantineBytes: number | null }
 
@@ -120,6 +135,16 @@ export interface UpdateDeps {
     /** idea#448: backupInstance in its pre-update mode (only the Backup Disk lock; errors thrown) */
     backup: (inst: Instance, backupDisk: Disk, opts: PreUpdateBackupOptions) => Promise<void>
     listSnapshots: (disk: Disk) => Promise<SnapshotsInfo>
+    /** engine#469: why no temporary backup can be made here (helper below v18, or no borg), or null */
+    tempBackupProblem: () => Promise<{ code: 'HELPER_OUTDATED' | 'TEMP_BACKUP_FAILED', text: string } | null>
+    /** engine#469: read-only net size (backup excludes out), system-disk free space, same filesystem */
+    tempBackupEstimate: (disk: Disk, id: InstanceID, excludes: string[]) => Promise<TempBackupEstimate>
+    /** engine#469: helper temp-backup-create (containers stopped); resolves when borg check passed */
+    tempBackupCreate: (disk: Disk, id: InstanceID, stamp: string, archive: string, excludes: string[]) => Promise<{ path: string, sizeBytes: number }>
+    /** engine#469: helper temp-backup-delete (rm -rf inside <system>/.idea-temp-backups/ only) */
+    tempBackupDelete: (id: InstanceID, stamp: string) => Promise<void>
+    /** engine#469: helper temp-backup-restore; resolves with the quarantined replaced folder (or 'none') */
+    tempBackupRestore: (disk: Disk, id: InstanceID, stamp: string) => Promise<string>
     reread: (disk: Disk, id: InstanceID) => Promise<void>
     start: (inst: Instance, disk: Disk) => Promise<void>
     health: (id: InstanceID) => Promise<Omit<HealthSample, 'elapsedMs'>>
@@ -231,6 +256,17 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
     backup: async (inst, backupDisk, opts) =>
         (await import('../monitors/backupMonitor.js')).backupInstance(storeHandle, inst.id, backupDisk, undefined, 'console-command', opts),
     listSnapshots: async (disk) => parseSnapshotsList(await runAppData(snapshotsArgs(await appDataRoot(disk)))) as SnapshotsInfo,
+    tempBackupProblem: async () => {
+        const helper = await helperAtLeast(TEMP_BACKUP_HELPER_MIN, 'the temporary pre-update backup on the system disk (engine#469)')
+        if (helper) return { code: 'HELPER_OUTDATED', text: helper }
+        const borg = borgProblem()
+        return borg ? { code: 'TEMP_BACKUP_FAILED', text: borg } : null
+    },
+    tempBackupEstimate: async (disk, id, excludes) => parseTempBackupEstimate(await runAppData(tempBackupEstimateArgs(await appDataRoot(disk), String(id), excludes))),
+    tempBackupCreate: async (disk, id, stamp, archive, excludes) =>
+        parseTempBackupCreate(await runAppData(tempBackupCreateArgs(await appDataRoot(disk), String(id), stamp, archive, excludes))),
+    tempBackupDelete: async (id, stamp) => { await runAppData(tempBackupDeleteArgs(String(id), stamp)) },
+    tempBackupRestore: async (disk, id, stamp) => lastLine(await runAppData(tempBackupRestoreArgs(await appDataRoot(disk), String(id), stamp))),
     reread: async (disk, id) => { await (await import('./Instance.js')).createOrUpdateInstance(storeHandle, id, disk) },
     start: async (inst, disk) => (await import('./Instance.js')).startInstance(storeHandle, inst, disk),
     health: async (id) => {
@@ -472,6 +508,7 @@ export const updateApp = async (
         const instDir = joinMountRoot(instRoot, 'instances', String(inst.id))
         let shortDisks: string[] = []
         let dataBytes = 0
+        let snapshotNeed = 0
         let snapExcludes: string[] = []
         let liveBackupExcludes: string[] = []
         let backupExcludes: string[] = []
@@ -482,7 +519,12 @@ export const updateApp = async (
         // idea#403: method none has nothing to back up (no NEEDS_BACKUP). Read best-effort here so
         // NEEDS_BACKUP / MAJOR / NO_SUMS keep their order; a malformed spec refuses BAD_BACKUP_SPEC below.
         const liveBackupMethod = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live').then(r => r.method, () => undefined)
-        const backupDisk = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs) ? linkedBackupDisk(store, engineId, inst) : null
+        const backupDue = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs)
+        const backupDisk = backupDue ? linkedBackupDisk(store, engineId, inst) : null
+        // engine#469: due, nothing to back up to, and something to back up: a temporary backup on
+        // the system disk satisfies the gate for this operation (a malformed spec still refuses
+        // BAD_BACKUP_SPEC below, before anything changes).
+        const tempBackupPlanned = backupDue && !backupDisk && liveBackupMethod !== 'none'
         const xapp = bundle ? await readXApp(path.join(bundle.dir, 'compose.yaml')) : {}
         const facts = {
             diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,
@@ -492,7 +534,7 @@ export const updateApp = async (
             shortDisks: [] as string[],
             updatesFrom: xapp.updatesFrom,
             xAppUpdate: xapp.update,
-            backupPlanned: !!backupDisk,
+            backupPlanned: !!backupDisk || tempBackupPlanned,
             backupMethod: liveBackupMethod,
         }
         // NEEDS_BACKUP / MAJOR / NO_SUMS still win over exclude parsing (existing agreed order).
@@ -525,11 +567,22 @@ export const updateApp = async (
             }
             dataBytes = est.folderBytes + est.volumeBytes
             const bundleBytes = String(bundle.disk.id) === String(disk.id) ? 0 : await d.dirBytes(bundle.dir)
-            const need = dataBytes + snapshotMarginBytes(dataBytes) + bundleBytes
-            if (est.freeBytes < need) shortDisks = [`${disk.name} (snapshot needs ${need}, free ${est.freeBytes})`]
+            snapshotNeed = dataBytes + snapshotMarginBytes(dataBytes) + bundleBytes
+            if (est.freeBytes < snapshotNeed) shortDisks = [`${disk.name} (snapshot needs ${snapshotNeed}, free ${est.freeBytes})`]
         }
         if (shortDisks.length) {
             const space = checkUpdate({ ...facts, shortDisks })
+            if (space) throw space
+        }
+        if (bundle && gotLock && tempBackupPlanned) {
+            // engine#469: refuse before anything stops when the temporary backup cannot be made or will not fit.
+            const problem = await d.tempBackupProblem()
+            if (problem) throw new UpdateAppError(problem.code, `${problem.text} Dock a Backup Disk linked to this instance instead; nothing was stopped or changed`)
+            let tb: TempBackupEstimate
+            try { tb = await d.tempBackupEstimate(disk, inst.id, liveBackupExcludes) } catch (e) {
+                throw new UpdateAppError('TEMP_BACKUP_FAILED', `cannot size the temporary pre-update backup: ${(e as Error).message}; nothing was stopped or changed`)
+            }
+            const space = tempBackupSpace(tb, snapshotNeed)
             if (space) throw space
         }
         // idea#458: the pre-update backup method comes from the LIVE compose (a backup of the
@@ -545,6 +598,7 @@ export const updateApp = async (
         let snap: SnapshotResult | null = null
         let stopped = false
         let preUpdateBackup: UpdateResult['preUpdateBackup'] = null
+        let tempBackup: TempBackupRef | null = null
         const done: UpdateStep[] = ['Fetch', 'Check']
         const wasUp = inst.status === 'Running' || inst.status === 'Starting'
         // hook: before anything stops; stop (or not running): inside the one Snapshot stop (Steve Q3)
@@ -560,6 +614,23 @@ export const updateApp = async (
             preUpdateBackup = { backupDiskId: String(backupDisk!.id), method: live?.method === 'none' ? 'none' : (instanceStopped ? 'stop' : 'hook'), duringStop: instanceStopped }
             log(`updateApp: ${inst.id}: pre-update backup to ${backupDisk!.id} done (${instanceStopped ? 'inside the snapshot stop' : 'hook, no stop'})`)
         }
+        const takeTempBackup = async () => {
+            updateOperation(storeHandle, opId, { stepLabel: 'Temporary pre-update backup on the system disk (no Backup Disk linked; inside the snapshot stop)' })
+            const stamp = verifyStampNow(new Date(d.now()))
+            try {
+                const r = await d.tempBackupCreate(disk, inst.id, stamp, backupArchiveName(new Date(d.now()), 'stop'), liveBackupExcludes)
+                tempBackup = { stamp, path: r.path, sizeBytes: r.sizeBytes }
+            } catch (e) {
+                const m = String((e as Error).message)
+                // A failed create never wrote COMPLETE, so it can never be restored: remove its folder.
+                await d.tempBackupDelete(inst.id, stamp).catch(de => log(`updateApp: ${inst.id}: removing the failed temporary backup ${stamp} failed: ${(de as Error).message}`))
+                const ns = m.match(/TEMP_BACKUP_NO_SPACE: [^\n]*/)
+                if (ns) throw new UpdateAppError('TEMP_BACKUP_NO_SPACE', ns[0].replace(/^TEMP_BACKUP_NO_SPACE: /, ''))
+                throw new UpdateAppError('TEMP_BACKUP_FAILED', `the temporary pre-update backup on the system disk failed: ${m}`)
+            }
+            setTempBackupOpArgs(storeHandle, opId, tempBackup, 'created')
+            log(`updateApp: ${inst.id}: temporary pre-update backup ${tempBackup.path} done (${tempBackup.sizeBytes} bytes, inside the snapshot stop)`)
+        }
         try {
             if (hookFirst) await takeBackup(false)
             // ── Snapshot
@@ -570,6 +641,7 @@ export const updateApp = async (
             // the Snapshot stop so the old-version restart path runs.
             if (shouldFailUpdateRestart(inst.id)) throw new Error(TEST_FAIL_UPDATE_FAILURE_MESSAGE)
             if (backupDisk && !hookFirst) await takeBackup(true)
+            if (tempBackupPlanned) await takeTempBackup()
             try { snap = await d.snapshot(disk, inst.id, snapExcludes) } catch (e) {
                 const m = String((e as Error).message)
                 const ns = m.match(/NO_SPACE: [^\n]*/)
@@ -625,6 +697,24 @@ export const updateApp = async (
                 await d.sleep(d.pollMs)
             }
             done.push('Health')
+            // engine#469: past the health gate the temporary backup is really deleted (Koen's exception).
+            let tempDeleted = false
+            if (tempBackup) {
+                const tbr: TempBackupRef = tempBackup
+                try {
+                    await d.tempBackupDelete(inst.id, tbr.stamp)
+                    tempDeleted = true
+                    setTempBackupOpArgs(storeHandle, opId, tbr, 'deleted')
+                    log(`updateApp: ${inst.id}: temporary pre-update backup ${tbr.path} deleted after the health gate`)
+                } catch (e) {
+                    setTempBackupOpArgs(storeHandle, opId, tbr, 'delete-failed')
+                    // Like backupApp's args.postStartWarning (engine#468): the update stays Done, the operation
+                    // and the trace (console.warn lands in it) say the space was not given back.
+                    const warning = tempBackupWarningMessage(tbr.path, (e as Error).message)
+                    storeHandle.change(doc => { const o = doc.operationDB?.[opId]; if (o) o.args.tempBackupWarning = warning })
+                    console.warn(`updateApp: ${inst.id}: ${warning}`)
+                }
+            }
             storeHandle.change(doc => {
                 const i = doc.instanceDB[inst.id]
                 if (i) {
@@ -639,7 +729,7 @@ export const updateApp = async (
             })
             updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
             log(`updateApp: ${inst.id} ('${inst.name}') ${fromAppId} -> ${newAppId}; snapshot ${snap.path} (${snap.sizeBytes} bytes) kept`)
-            return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes, snapshotExcludes: snapExcludes, preUpdateBackup }
+            return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes, snapshotExcludes: snapExcludes, preUpdateBackup, tempBackup: tempBackupResult(tempBackup, tempDeleted) }
         } catch (e) {
             const why = e instanceof UpdateAppError && e.code === 'NO_SPACE' ? null : String((e as Error).message)
             if (!why || !snap) {
@@ -686,6 +776,7 @@ export const updateApp = async (
                 } else {
                     err = new UpdateAppError('ROLLED_BACK', `${step} failed: ${why}; ${restartClause}`, restartOpts)
                 }
+                keepTempBackup(storeHandle, opId, err, tempBackup)
                 updateOperation(storeHandle, opId, {
                     status: 'Failed',
                     error: err.message,
@@ -701,7 +792,8 @@ export const updateApp = async (
             } catch (e) {
                 log(`updateApp: ${inst.id}: ${(e as Error).message}; restore-snapshot will use the live backup.exclude list only`)
             }
-            const err = await rollBack(storeHandle, d, inst, disk, instDir, step, why, snap, restoreExcludes)
+            const err = await rollBack(storeHandle, d, inst, disk, instDir, step, why, snap, restoreExcludes, tempBackup)
+            keepTempBackup(storeHandle, opId, err, tempBackup)
             updateOperation(storeHandle, opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
             throw err
         }
@@ -714,31 +806,104 @@ export const updateApp = async (
     }
 }
 
+/** engine#469: the temporary backup of one updateApp operation. */
+export interface TempBackupRef { stamp: string, path: string, sizeBytes: number }
+export type TempBackupState = 'created' | 'deleted' | 'delete-failed' | 'kept'
+
+const gib = (b: number): string => `${(b / 1024 ** 3).toFixed(1)} GiB`
+
+/**
+ * engine#469: TEMP_BACKUP_NO_SPACE when the system disk cannot hold the temporary backup (net
+ * size + the snapshot margin) and, when the snapshot lands on the same filesystem, the snapshot too.
+ */
+export const tempBackupSpace = (tb: TempBackupEstimate, snapshotNeedBytes: number): UpdateAppError | null => {
+    const own = tb.netBytes + snapshotMarginBytes(tb.netBytes)
+    const total = own + (tb.sameFilesystem ? snapshotNeedBytes : 0)
+    if (tb.freeBytes >= total) return null
+    const snapTxt = tb.sameFilesystem && snapshotNeedBytes ? ` plus ${snapshotNeedBytes} bytes for the snapshot on the same disk` : ''
+    return new UpdateAppError('TEMP_BACKUP_NO_SPACE',
+        `the temporary pre-update backup on the system disk needs ${own} bytes (${gib(own)}: ${tb.netBytes} bytes of data + margin)${snapTxt}, ` +
+        `free ${tb.freeBytes} bytes (${gib(tb.freeBytes)}). Free space on the system disk or dock a Backup Disk linked to this instance; nothing was stopped or changed`)
+}
+
+export const setTempBackupOpArgs = (storeHandle: DocHandle<Store>, opId: string, tb: TempBackupRef, state: TempBackupState): void => {
+    storeHandle.change(doc => {
+        const op = doc.operationDB?.[opId]
+        if (!op) return
+        op.args.tempBackup = tb.path
+        op.args.tempBackupStamp = tb.stamp
+        op.args.tempBackupState = state
+    })
+}
+
+/** The temporary backup recorded on an updateApp operation (boot recovery), or null. */
+export const tempBackupFromOp = (op: { args: Record<string, string> }): TempBackupRef | null => {
+    const path = op.args?.tempBackup, stamp = op.args?.tempBackupStamp
+    if (!path || !stamp || op.args?.tempBackupState === 'deleted') return null
+    return { path: String(path), stamp: String(stamp), sizeBytes: 0 }
+}
+
+/** engine#469: a failed update keeps its temporary backup; the error says where it is. */
+const keepTempBackup = (storeHandle: DocHandle<Store>, opId: string, err: Error, tb: TempBackupRef | null): void => {
+    if (!tb) return
+    setTempBackupOpArgs(storeHandle, opId, tb, 'kept')
+    err.message = `${err.message}; the temporary pre-update backup is kept at ${tb.path}`
+    log(`updateApp: the temporary pre-update backup ${tb.path} is kept (the update failed)`)
+}
+
+const tempBackupResult = (tb: TempBackupRef | null, deleted: boolean): UpdateResult['tempBackup'] =>
+    tb ? { path: tb.path, sizeBytes: tb.sizeBytes, deleted } : null
+
 /** Restore the snapshot and start the old version. Returns the error to report. */
 const rollBack = async (
     storeHandle: DocHandle<Store>, d: UpdateDeps, inst: Instance, disk: Disk, instDir: string,
     failedAt: UpdateStep, why: string, snap: { path: string, sizeBytes: number }, excludes: string[],
+    tempBackup: TempBackupRef | null = null,
+    /** the version the rollback puts back (the op's fromAppId); at boot inst.instanceOf may already be the new one */
+    restoredAppId: string = String(inst.instanceOf),
 ): Promise<UpdateAppError> => {
     const plan = rollbackPlan(failedAt)
     log(`updateApp: ${failedAt} failed for ${inst.id} (${why}); rolling back from ${snap.path}`)
     writePreUpdateGate(storeHandle, inst.id, null)
+    const wasUp = inst.status === 'Running' || inst.status === 'Starting'
+    const startOld = async () => {
+        await d.reread(disk, inst.id)
+        if (plan.startOld && wasUp) {
+            await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk)
+            const after = storeHandle.doc().instanceDB[inst.id]
+            if (!after || after.status === 'Error') throw new Error(`the old version did not start: ${after?.statusCondition ?? 'record missing'}`)
+        }
+    }
+    let dataRestored = !plan.restoreData
     try {
         await d.composeDown(instDir, inst.id)
         await waitContainersGone(d, inst.id)
         if (plan.restoreData) {
             // In place (idea#448): excluded paths keep their inodes; replaced files go to `aside`.
             const aside = await d.restoreSnapshot(disk, inst.id, excludes)
+            dataRestored = true
             log(`updateApp: ${inst.id} restored in place from ${snap.path}; the replaced files are kept at ${aside}`)
         }
-        await d.reread(disk, inst.id)
-        if (plan.startOld && (inst.status === 'Running' || inst.status === 'Starting')) {
-            await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk)
-            const after = storeHandle.doc().instanceDB[inst.id]
-            if (!after || after.status === 'Error') throw new Error(`the old version did not start: ${after?.statusCondition ?? 'record missing'}`)
-        }
-        return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. ${inst.instanceOf} and its data were restored from ${snap.path}`)
+        await startOld()
+        return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. ${restoredAppId} and its data were restored from ${snap.path}`)
     } catch (e) {
-        const err = new UpdateAppError('ROLLBACK_FAILED', `${failedAt} failed: ${why}; then the rollback failed: ${(e as Error).message}. The snapshot is kept at ${snap.path}`)
+        const snapWhy = (e as Error).message
+        // engine#469: the snapshot could not be put back: restore from the temporary backup instead.
+        let tempWhy: string | null = null
+        if (tempBackup && !dataRestored) {
+            try {
+                log(`updateApp: ${inst.id}: the snapshot rollback failed (${snapWhy}); restoring from the temporary pre-update backup ${tempBackup.path}`)
+                await d.composeDown(instDir, inst.id).catch(ce => log(`updateApp: ${inst.id}: compose down before the temporary-backup restore: ${(ce as Error).message}`))
+                await waitContainersGone(d, inst.id)
+                const aside = await d.tempBackupRestore(disk, inst.id, tempBackup.stamp)
+                await startOld()
+                return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. The snapshot rollback failed (${snapWhy}), so ${restoredAppId} and its data were restored from the temporary pre-update backup ${tempBackup.path}${aside && aside !== 'none' ? ` (the replaced folder is at ${aside})` : ''}`)
+            } catch (te) {
+                tempWhy = (te as Error).message
+            }
+        }
+        const tempClause = tempWhy ? `; restoring from the temporary pre-update backup ${tempBackup!.path} failed too: ${tempWhy}` : ''
+        const err = new UpdateAppError('ROLLBACK_FAILED', `${failedAt} failed: ${why}; then the rollback failed: ${snapWhy}. The snapshot is kept at ${snap.path}${tempClause}`)
         storeHandle.change(doc => {
             const i = doc.instanceDB[inst.id]
             if (!i) return
@@ -748,6 +913,10 @@ const rollBack = async (
         return err
     }
 }
+
+/** engine#469: the warning a Done update carries when the temporary backup could not be removed. */
+export const tempBackupWarningMessage = (tbPath: string, why: string): string =>
+    `temporary backup ${tbPath} could not be removed: ${why}; free space by deleting it`
 
 /**
  * Startup (power-loss safety): an updateApp operation of this Engine left Running is
@@ -767,7 +936,13 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
         const snaps = (await d.listSnapshots(disk).catch(() => null))?.snapshots ?? []
         const complete = snaps.some(s => String(s.instanceId) === String(inst.id) && s.complete)
         const swapped = UPDATE_STEPS.indexOf(step) >= UPDATE_STEPS.indexOf('Swap')
-        if (!complete || !swapped) { out.push(`${inst.id}: interrupted at ${step}; old version untouched`); continue }
+        if (!complete || !swapped) {
+            // engine#469: never deleted on boot; a temporary backup of this op stays for a manual restore.
+            const tb = tempBackupFromOp(op)
+            if (tb) setTempBackupOpArgs(storeHandle, op.id, tb, 'kept')
+            out.push(`${inst.id}: interrupted at ${step}; old version untouched${tb ? `; the temporary pre-update backup is kept at ${tb.path}` : ''}`)
+            continue
+        }
         const root = await d.mountRoot(disk)
         const instDir = joinMountRoot(root, 'instances', String(inst.id))
         // idea#448: the snapshot's EXCLUDE already holds the live ∪ new list; the compose now in
@@ -776,8 +951,13 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
         try { excludes = (await readComposeBackup(path.join(instDir, 'compose.yaml'), 'current')).exclude } catch (e) {
             log(`updateApp: ${inst.id}: ${(e as Error).message}; restoring with the snapshot's own EXCLUDE list only`)
         }
-        const err = await rollBack(storeHandle, d, inst, disk, instDir, step, 'the Engine restarted during the update', { path: joinMountRoot(root, PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 }, excludes)
+        const err = await rollBack(storeHandle, d, inst, disk, instDir, step, 'the Engine restarted during the update', { path: joinMountRoot(root, PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 }, excludes, tempBackupFromOp(op),
+            op.args.fromAppId ? String(op.args.fromAppId) : String(inst.instanceOf))
+        keepTempBackup(storeHandle, op.id, err, tempBackupFromOp(op))
         updateOperation(storeHandle, op.id, { status: 'Failed', error: `INTERRUPTED: ${err.message}`, completedAt: d.now() as Timestamp })
+        // Pi proof step 8: the updateApp command is still queued (a command leaves the queue only
+        // when it finishes), so the startup replay would run the same update again on every boot.
+        dropInterruptedCommand(storeHandle, op)
         out.push(`${inst.id}: ${err.message}`)
     }
     if (out.length) await refreshOfferAfterUpdate(storeHandle, engineId, d)

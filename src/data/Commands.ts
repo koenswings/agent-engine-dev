@@ -486,6 +486,9 @@ const updateAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString
     const result = await updateApp(storeHandle, instanceArg, newAppId, engineId, opts)
     attachTraceResult(result)
     print(chalk.green(`Updated ${result.name} ${result.fromAppId} -> ${result.toAppId}; snapshot kept at ${result.snapshotPath} (${result.snapshotBytes} bytes)`))
+    if (result.tempBackup) print(result.tempBackup.deleted
+        ? `The temporary pre-update backup on the system disk (${result.tempBackup.sizeBytes} bytes) was deleted after the health gate`
+        : `The temporary pre-update backup ${result.tempBackup.path} could not be deleted and is still on the system disk`)
 }
 
 /** #263 source side: pushAppBundle <sourceDiskId> <appId> <targetEngineId> <targetRoot> <requestId> <instanceId> */
