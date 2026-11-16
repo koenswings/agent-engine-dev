@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '19'
+export const APP_DATA_HELPER_VERSION = '18'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -293,7 +293,7 @@ export const appDataErrorMessage = (sub: string, code: number | null, signal: st
  * helper path) are exactly those of runAppData. The helper and sudoers stay unchanged.
  */
 export const lowPriorityAppDataArgv = (args: string[]): string[] =>
-    ['-n', '19', 'ionice', '-c3', 'sudo', ...appDataSudoArgv(args)]
+    ['-n', '18', 'ionice', '-c3', 'sudo', ...appDataSudoArgv(args)]
 
 const spawnAppData = (cmd: string, argv: string[], args: string[]): Promise<string> => new Promise((resolve, reject) => {
     log(`${cmd} ${argv.join(' ')}`)
@@ -529,9 +529,9 @@ export const parseSnapshotsList = (out: string): { snapshots: { instanceId: stri
 }
 
 
-// ── Temporary pre-update backups on the system disk (helper v19, engine#469) ──
-/** engine#469: first helper with the temp-backup-* verbs. v18 is engine#468. */
-export const TEMP_BACKUP_HELPER_MIN = 19
+// ── Temporary pre-update backups on the system disk (helper v18, engine#469) ──
+/** engine#469: first helper with the temp-backup-* verbs. engine#468 also claims v18; whichever merges second renumbers. */
+export const TEMP_BACKUP_HELPER_MIN = 18
 /** Folder name under the system disk root (the helper's TEMP_BACKUPS_NAME). */
 export const TEMP_BACKUPS_DIR = '/.idea-temp-backups'
 

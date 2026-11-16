@@ -96,18 +96,18 @@
 #        <stamp>. A copy without the marker (a failed or running extract, or one made by a helper
 #        older than v17) is never touched. A deliberate exception to quarantine-not-delete, limited
 #        to .idea-verify scratch copies.
-#   idea-app-data temp-backup-estimate <root> <id> [exclude…]                (v19, engine#469: read-only "<net kb> <free kb> <same fs 0|1>")
-#   idea-app-data temp-backup-create   <root> <id> <stamp> <archive> [exclude…]  (v19: Borg repo at <system>/.idea-temp-backups/<id>/<stamp>/repo,
+#   idea-app-data temp-backup-estimate <root> <id> [exclude…]                (v18, engine#469: read-only "<net kb> <free kb> <same fs 0|1>")
+#   idea-app-data temp-backup-create   <root> <id> <stamp> <archive> [exclude…]  (v18: Borg repo at <system>/.idea-temp-backups/<id>/<stamp>/repo,
 #                                                                           containers stopped, TEMP_BACKUP_NO_SPACE exit 3, borg check, COMPLETE last)
-#   idea-app-data temp-backup-delete   <id> <stamp>                          (v19: rm -rf --one-file-system of that one folder only)
-#   idea-app-data temp-backup-restore  <root> <id> <stamp>                   (v19: extract into staging, carry excluded paths over,
+#   idea-app-data temp-backup-delete   <id> <stamp>                          (v18: rm -rf --one-file-system of that one folder only)
+#   idea-app-data temp-backup-restore  <root> <id> <stamp>                   (v18: extract into staging, carry excluded paths over,
 #                                                                           quarantine the current folder, put the restored one in place)
-#   idea-app-data temp-backups                                               (v19: "<id> <stamp> <kb> complete|incomplete" lines, then "TOTAL <kb>")
-#   v19 (engine#469, Koen's decision on idea#374): temporary pre-update backups on the SYSTEM disk when
+#   idea-app-data temp-backups                                               (v18: "<id> <stamp> <kb> complete|incomplete" lines, then "TOTAL <kb>")
+#   v18 (engine#469, Koen's decision on idea#374): temporary pre-update backups on the SYSTEM disk when
 #        no Backup Disk is linked. They live only under $SYSTEM_ROOT/.idea-temp-backups/ (root, 0700).
 #        temp-backup-delete is the second deliberate exception to quarantine-not-delete, limited to
 #        that subtree: the Engine calls it after an update passed its health gate (and for a failed,
-#        never-COMPLETE create). v18 is engine#468 (borg-extract keeps the replaced folder).
+#        never-COMPLETE create). engine#468 (borg-extract keeps the replaced folder) also claims v18; whichever merges second renumbers.
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
 # excludes may hold '/'):
@@ -202,7 +202,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=19
+readonly IDEA_APP_DATA_VERSION=18
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -256,7 +256,7 @@ DISKS_DIR=/disks
 # SYSTEM_ROOT=/ would produce //instances/<id> and fail exact_path (idea#237).
 # Verbs that pass the root itself to df must treat '' as / (avail_kb, free_floor; idea#427).
 SYSTEM_ROOT=
-# v19 (engine#469): temporary pre-update backups live in $SYSTEM_ROOT/$TEMP_BACKUPS_NAME (system disk only).
+# v18 (engine#469): temporary pre-update backups live in $SYSTEM_ROOT/$TEMP_BACKUPS_NAME (system disk only).
 TEMP_BACKUPS_NAME=.idea-temp-backups
 ROOTS_FILE=/etc/idea/app-data-roots
 LOCK_DIR=/run/lock/idea-app-data
@@ -1985,7 +1985,7 @@ case "$SUB" in
         ;;
 
     temp-backup-estimate)
-        # v19 (engine#469): read-only (no lock, nothing stopped or written). Prints
+        # v18 (engine#469): read-only (no lock, nothing stopped or written). Prints
         # "<net kb> <free kb> <same filesystem 0|1>": the instance folder net of the given
         # x-app.backup.exclude paths (the borg-create rules), the free space of the system
         # disk, and 1 when <root> is on that same filesystem (the snapshot then lands there too).
@@ -2009,7 +2009,7 @@ case "$SUB" in
         ;;
 
     temp-backup-create)
-        # v19 (engine#469, Koen's decision on idea#374): the temporary pre-update backup when
+        # v18 (engine#469, Koen's decision on idea#374): the temporary pre-update backup when
         # no Backup Disk is linked. A Borg repository (encryption none) of instances/<id> at
         # <system disk>/.idea-temp-backups/<id>/<stamp>/repo, archive <archive>, with the
         # given x-app.backup.exclude paths left out (borg-create rules). Only while the
@@ -2088,7 +2088,7 @@ case "$SUB" in
         ;;
 
     temp-backup-delete)
-        # v19 (engine#469): Koen's explicit exception to quarantine-not-delete, limited to
+        # v18 (engine#469): Koen's explicit exception to quarantine-not-delete, limited to
         # the temporary pre-update backups: rm -rf --one-file-system of
         # <system disk>/.idea-temp-backups/<id>/<stamp> only. The path is built from checked
         # tokens; the base, the instance folder and the backup must be real folders (no
@@ -2127,7 +2127,7 @@ case "$SUB" in
         ;;
 
     temp-backup-restore)
-        # v19 (engine#469): restore instances/<id> on <root> from a COMPLETE temporary backup
+        # v18 (engine#469): restore instances/<id> on <root> from a COMPLETE temporary backup
         # (failure path, or Ops by hand). Only while the containers are stopped. The archive
         # is extracted into a root-only staging folder on <root>; the paths the backup left
         # out (its EXCLUDE, e.g. data/tailscale) are moved over from the current folder so
@@ -2220,7 +2220,7 @@ case "$SUB" in
         ;;
 
     temp-backups)
-        # v19 (engine#469): read-only list "<id> <stamp> <kb> complete|incomplete" of the
+        # v18 (engine#469): read-only list "<id> <stamp> <kb> complete|incomplete" of the
         # temporary pre-update backups on the system disk, then "TOTAL <kb>".
         need 0 $(($# - 1)) ""
         TB_BASE="$SYSTEM_ROOT/$TEMP_BACKUPS_NAME"

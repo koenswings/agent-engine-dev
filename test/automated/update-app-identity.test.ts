@@ -124,9 +124,9 @@ describe('updateApp identity (idea#448)', () => {
         expect(calls).toEqual([])
     })
 
-    it('SHA -> 1.1 with --allow-major and no linked Backup Disk docked: a temporary backup is planned (engine#469); a helper below v19 refuses, nothing happens', async () => {
-        expect(await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({ tempBackupProblem: async () => ({ code: 'HELPER_OUTDATED', text: 'needs helper v19.' }) }))))
-            .toMatch(/^HELPER_OUTDATED: needs helper v19\. Dock a Backup Disk linked to this instance instead; nothing was stopped or changed$/)
+    it('SHA -> 1.1 with --allow-major and no linked Backup Disk docked: a temporary backup is planned (engine#469); a helper below v18 refuses, nothing happens', async () => {
+        expect(await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({ tempBackupProblem: async () => ({ code: 'HELPER_OUTDATED', text: 'needs helper v18.' }) }))))
+            .toMatch(/^HELPER_OUTDATED: needs helper v18\. Dock a Backup Disk linked to this instance instead; nothing was stopped or changed$/)
         expect(calls).toEqual([])
     })
 

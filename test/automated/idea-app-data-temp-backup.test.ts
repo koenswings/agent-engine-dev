@@ -1,5 +1,5 @@
 /**
- * idea-app-data-temp-backup.test.ts — helper v19 temp-backup-* verbs (engine#469).
+ * idea-app-data-temp-backup.test.ts — helper v18 temp-backup-* verbs (engine#469).
  *
  * The temporary pre-update backup lives only under <system>/.idea-temp-backups/<id>/<stamp>/.
  * temp-backup-delete is Koen's exception to quarantine-not-delete, so its refusals (symlinks,
@@ -25,7 +25,7 @@ const refused = (r: { exitCode: number | null, stderr: string }, re: RegExp) => 
 }
 const tb = (s: AppDataSandbox, id = 'inst-1', stamp = STAMP) => path.join(s.sys, '.idea-temp-backups', id, stamp)
 
-describe('idea-app-data v19 temp-backup verbs: argument checks', () => {
+describe('idea-app-data v18 temp-backup verbs: argument checks', () => {
     it('wrong argument counts and bad tokens are refused before anything is touched', async () => {
         const sb = await sandbox()
         refused(await sb.run(['temp-backup-delete', 'inst-1']), /temp-backup-delete takes exactly 2 argument/)
@@ -43,7 +43,7 @@ describe('idea-app-data v19 temp-backup verbs: argument checks', () => {
     })
 })
 
-describe('idea-app-data v19 temp-backup-create / estimate / list (fake borg)', () => {
+describe('idea-app-data v18 temp-backup-create / estimate / list (fake borg)', () => {
     it('creates a verified Borg repo on the system disk with SOURCE, ARCHIVE, EXCLUDE and COMPLETE last', async () => {
         const sb = await sandbox()
         const app = await sb.addDisk('sdb1')
@@ -120,7 +120,7 @@ describe('idea-app-data v19 temp-backup-create / estimate / list (fake borg)', (
     })
 })
 
-describe('idea-app-data v19 temp-backup-delete (rm -rf only inside .idea-temp-backups)', () => {
+describe('idea-app-data v18 temp-backup-delete (rm -rf only inside .idea-temp-backups)', () => {
     const make = async (sb: AppDataSandbox, id = 'inst-1', stamp = STAMP) => {
         const t = tb(sb, id, stamp)
         await fs.ensureDir(path.join(t, 'repo', 'data'))
@@ -183,7 +183,7 @@ describe('idea-app-data v19 temp-backup-delete (rm -rf only inside .idea-temp-ba
 const BORG = process.env.IDEA_TEST_BORG || '/usr/bin/borg'
 const borgVersion = (() => { try { return execFileSync(BORG, ['--version'], { encoding: 'utf8' }).trim() } catch { return '' } })()
 
-describe.skipIf(!borgVersion)(`idea-app-data v19 temp backup end to end with a real borg (${borgVersion || 'not installed'})`, () => {
+describe.skipIf(!borgVersion)(`idea-app-data v18 temp backup end to end with a real borg (${borgVersion || 'not installed'})`, () => {
     it('create → the update breaks the folder → restore (excluded identity kept, replaced folder quarantined) → delete', async () => {
         const sb = await sandbox({ realBorg: true, borgPath: BORG })
         const env = { BORG_BASE_DIR: path.join(sb.tmp, 'borg-base') }

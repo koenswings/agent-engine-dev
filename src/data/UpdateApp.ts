@@ -33,7 +33,7 @@
  * one Snapshot stop.
  *
  * engine#469 (Koen's decision on idea#374): when that backup is due but no linked Backup Disk is
- * docked here, updateApp makes a TEMPORARY backup on the system disk instead (helper v19,
+ * docked here, updateApp makes a TEMPORARY backup on the system disk instead (helper v18,
  * <system>/.idea-temp-backups/<id>/<stamp>/, a verified Borg repo, inside the one Snapshot stop).
  * It satisfies NEEDS_BACKUP for this operation only (no lastBackup, no backup result, no
  * BACKUP.yaml). Space is checked at Check (TEMP_BACKUP_NO_SPACE; the snapshot counts too when
@@ -135,7 +135,7 @@ export interface UpdateDeps {
     /** idea#448: backupInstance in its pre-update mode (only the Backup Disk lock; errors thrown) */
     backup: (inst: Instance, backupDisk: Disk, opts: PreUpdateBackupOptions) => Promise<void>
     listSnapshots: (disk: Disk) => Promise<SnapshotsInfo>
-    /** engine#469: why no temporary backup can be made here (helper below v19, or no borg), or null */
+    /** engine#469: why no temporary backup can be made here (helper below v18, or no borg), or null */
     tempBackupProblem: () => Promise<{ code: 'HELPER_OUTDATED' | 'TEMP_BACKUP_FAILED', text: string } | null>
     /** engine#469: read-only net size (backup excludes out), system-disk free space, same filesystem */
     tempBackupEstimate: (disk: Disk, id: InstanceID, excludes: string[]) => Promise<TempBackupEstimate>

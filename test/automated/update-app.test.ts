@@ -296,9 +296,9 @@ describe('idea#76 gaps', () => {
     it("idea#403: a major update of an App with backup method 'none' and no lastBackup is not refused NEEDS_BACKUP", async () => {
         await fs.outputFile(`${tmp}/apps/kolibri-2.0/compose.yaml`, compose('2.0'))
         await fs.outputFile(`${tmp}/apps/kolibri-2.0/.env`, 'port=1\n')
-        // engine#469: method stop and no Backup Disk now plan a temporary backup; with a helper below v19 it refuses before anything changes
-        const old = { tempBackupProblem: async () => ({ code: 'HELPER_OUTDATED' as const, text: 'needs helper v19.' }) }
-        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps(old)))).toMatch(/^HELPER_OUTDATED: needs helper v19\. Dock a Backup Disk linked/)
+        // engine#469: method stop and no Backup Disk now plan a temporary backup; with a helper below v18 it refuses before anything changes
+        const old = { tempBackupProblem: async () => ({ code: 'HELPER_OUTDATED' as const, text: 'needs helper v18.' }) }
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps(old)))).toMatch(/^HELPER_OUTDATED: needs helper v18\. Dock a Backup Disk linked/)
         expect(calls).toEqual([])
         await fs.outputFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0') + '  backup:\n    method: none\n')
         expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps(old)))).toBe('ok')   // method none: no temporary backup needed

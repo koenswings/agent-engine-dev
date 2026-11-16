@@ -156,14 +156,14 @@ describe('engine#469 refusals before anything stops', () => {
         expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps({ tempBackupEstimate: est(own + snapNeed) })))).toBe('ok')
         expect(tempBackupSpace({ netBytes: 2 * GiB, freeBytes: own, sameFilesystem: false }, snapNeed)).toBeNull()
     })
-    it('a helper below v19 or no borg refuses before anything stops', async () => {
-        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps({ tempBackupProblem: async () => ({ code: 'HELPER_OUTDATED', text: 'needs helper v19.' }) }))))
-            .toBe('HELPER_OUTDATED: needs helper v19. Dock a Backup Disk linked to this instance instead; nothing was stopped or changed')
+    it('a helper below v18 or no borg refuses before anything stops', async () => {
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps({ tempBackupProblem: async () => ({ code: 'HELPER_OUTDATED', text: 'needs helper v18.' }) }))))
+            .toBe('HELPER_OUTDATED: needs helper v18. Dock a Backup Disk linked to this instance instead; nothing was stopped or changed')
         expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps({ tempBackupProblem: async () => ({ code: 'TEMP_BACKUP_FAILED', text: '/usr/bin/borg is not installed.' }) }))))
             .toMatch(/^TEMP_BACKUP_FAILED: \/usr\/bin\/borg is not installed\./)
         expect(calls).toEqual([])
-        expect(TEMP_BACKUP_HELPER_MIN).toBe(19)
-        expect(APP_DATA_HELPER_VERSION).toBe('19')
+        expect(TEMP_BACKUP_HELPER_MIN).toBe(18)
+        expect(APP_DATA_HELPER_VERSION).toBe('18')
     })
 })
 
