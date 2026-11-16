@@ -33,6 +33,8 @@ export type UpdateRefusal =
     | 'INVALID_INSTANCE_ID'
     // engine#456 interim: a bundle declares x-app.update stages this Engine does not yet run
     | 'UPDATE_STAGES_UNSUPPORTED'
+    // engine#469: the temporary pre-update backup on the system disk (no Backup Disk linked)
+    | 'TEMP_BACKUP_NO_SPACE' | 'TEMP_BACKUP_FAILED'
 
 /** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
 export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
@@ -75,6 +77,8 @@ export interface CheckFacts {
     /**
      * idea#448: a Backup Disk linked to the instance is docked here, so updateApp takes the
      * required backup itself (hook before the stop, or Borg inside the Snapshot stop).
+     * engine#469: also true when no such disk is docked; updateApp then takes a temporary
+     * backup on the system disk (this operation only).
      */
     backupPlanned?: boolean
     /**

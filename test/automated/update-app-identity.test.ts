@@ -124,8 +124,9 @@ describe('updateApp identity (idea#448)', () => {
         expect(calls).toEqual([])
     })
 
-    it('SHA -> 1.1 with --allow-major and no linked Backup Disk docked: NEEDS_BACKUP, nothing happens', async () => {
-        expect(await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps()))).toMatch(/^NEEDS_BACKUP: Dock a Backup Disk linked to this instance/)
+    it('SHA -> 1.1 with --allow-major and no linked Backup Disk docked: a temporary backup is planned (engine#469); a helper below v19 refuses, nothing happens', async () => {
+        expect(await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({ tempBackupProblem: async () => ({ code: 'HELPER_OUTDATED', text: 'needs helper v19.' }) }))))
+            .toMatch(/^HELPER_OUTDATED: needs helper v19\. Dock a Backup Disk linked to this instance instead; nothing was stopped or changed$/)
         expect(calls).toEqual([])
     })
 
@@ -294,7 +295,7 @@ describe('updateApp identity (idea#448)', () => {
     it('an invalid exclude in the new or the live compose refuses BAD_BACKUP_SPEC before anything changes', async () => {
         await fs.writeFile(newCompose(), composeYaml('1.1', { exclude: ['../etc'] }))
         expect(await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps({ helperProblem: async () => null }))))
-            .toMatch(/^NEEDS_BACKUP/)   // NEEDS_BACKUP (no Backup Disk) comes first in the agreed order
+            .toMatch(/^BAD_BACKUP_SPEC: the new compose .* has an invalid x-app.backup/)   // engine#469: no Backup Disk plans a temporary backup, so NEEDS_BACKUP no longer comes first
         linkBackupDisk()
         expect(await codeOf(updateApp(h, ID, 'usage-dashboard-1.1', ME, { allowMajor: true }, deps()))).toMatch(/^BAD_BACKUP_SPEC: the new compose .* has an invalid x-app.backup/)
         await fs.writeFile(newCompose(), composeYaml('1.1', hook))

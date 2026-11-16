@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '17'
+export const APP_DATA_HELPER_VERSION = '19'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -528,3 +528,57 @@ export const parseSnapshotsList = (out: string): { snapshots: { instanceId: stri
     }
 }
 
+
+// ── Temporary pre-update backups on the system disk (helper v19, engine#469) ──
+/** engine#469: first helper with the temp-backup-* verbs. v18 is engine#468. */
+export const TEMP_BACKUP_HELPER_MIN = 19
+/** Folder name under the system disk root (the helper's TEMP_BACKUPS_NAME). */
+export const TEMP_BACKUPS_DIR = '/.idea-temp-backups'
+
+const backupExcludeTokens = (excludes: string[]): string[] => {
+    const out: string[] = []
+    for (const raw of excludes) {
+        const n = normalizeBackupExclude(raw)
+        if (!out.includes(n)) out.push(n)
+    }
+    return out
+}
+/** Read-only: "<net kb> <free kb> <same fs 0|1>" (net of the x-app.backup.exclude paths). */
+export const tempBackupEstimateArgs = (root: string, id: string, excludes: string[] = []): string[] =>
+    ['temp-backup-estimate', checkRoot(root), checkId(id), ...backupExcludeTokens(excludes)]
+/** Borg repo at <system>/.idea-temp-backups/<id>/<stamp>/repo; containers must be stopped. */
+export const tempBackupCreateArgs = (root: string, id: string, stamp: string, archive: string, excludes: string[] = []): string[] =>
+    ['temp-backup-create', checkRoot(root), checkId(id), checkStamp(stamp), checkArchive(archive), ...backupExcludeTokens(excludes)]
+/** rm -rf of <system>/.idea-temp-backups/<id>/<stamp> only (Koen's exception, engine#469). */
+export const tempBackupDeleteArgs = (id: string, stamp: string): string[] => ['temp-backup-delete', checkId(id), checkStamp(stamp)]
+/** Restore instances/<id> on <root> from a COMPLETE temporary backup; the replaced folder is quarantined. */
+export const tempBackupRestoreArgs = (root: string, id: string, stamp: string): string[] =>
+    ['temp-backup-restore', checkRoot(root), checkId(id), checkStamp(stamp)]
+export const tempBackupsArgs = (): string[] => ['temp-backups']
+
+/** The folder of one temporary backup (what the helper prints and builds). */
+export const tempBackupPath = (id: string, stamp: string): string => `${TEMP_BACKUPS_DIR}/${checkId(id)}/${checkStamp(stamp)}`
+
+export interface TempBackupEstimate { netBytes: number, freeBytes: number, sameFilesystem: boolean }
+export const parseTempBackupEstimate = (out: string): TempBackupEstimate => {
+    const m = lastLine(out).match(/^(\d+) (\d+) ([01])$/)
+    if (!m) throw new Error(`idea-app-data temp-backup-estimate gave no result line: ${lastLine(out) || '(empty)'}`)
+    return { netBytes: Number(m[1]) * 1024, freeBytes: Number(m[2]) * 1024, sameFilesystem: m[3] === '1' }
+}
+/** `temp-backup-create` result: "<folder> <kb>" last. */
+export const parseTempBackupCreate = (out: string): { path: string, sizeBytes: number } => {
+    const m = lastLine(out).match(/^(\/\S+) (\d+)$/)
+    if (!m) throw new Error(`idea-app-data temp-backup-create gave no result line: ${lastLine(out) || '(empty)'}`)
+    return { path: m[1], sizeBytes: Number(m[2]) * 1024 }
+}
+export interface TempBackupEntry { instanceId: string, stamp: string, sizeBytes: number, complete: boolean }
+/** `temp-backups`: "<id> <stamp> <kb> complete|incomplete" lines, then "TOTAL <kb>". */
+export const parseTempBackups = (out: string): { backups: TempBackupEntry[], totalBytes: number | null } => {
+    const t = out.match(/^TOTAL (\d+)$/m)
+    return {
+        backups: out.split('\n').map(l => l.trim().match(/^([a-z0-9][a-z0-9-]{0,63}) ([0-9]{8}T[0-9]{6,15}Z) (\d+) (complete|incomplete)$/))
+            .filter((m): m is RegExpMatchArray => !!m)
+            .map(m => ({ instanceId: m[1], stamp: m[2], sizeBytes: Number(m[3]) * 1024, complete: m[4] === 'complete' })),
+        totalBytes: t ? Number(t[1]) * 1024 : null,
+    }
+}

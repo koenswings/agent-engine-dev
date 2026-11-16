@@ -296,17 +296,19 @@ describe('idea#76 gaps', () => {
     it("idea#403: a major update of an App with backup method 'none' and no lastBackup is not refused NEEDS_BACKUP", async () => {
         await fs.outputFile(`${tmp}/apps/kolibri-2.0/compose.yaml`, compose('2.0'))
         await fs.outputFile(`${tmp}/apps/kolibri-2.0/.env`, 'port=1\n')
-        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps()))).toMatch(/^NEEDS_BACKUP: /)
+        // engine#469: method stop and no Backup Disk now plan a temporary backup; with a helper below v19 it refuses before anything changes
+        const old = { tempBackupProblem: async () => ({ code: 'HELPER_OUTDATED' as const, text: 'needs helper v19.' }) }
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps(old)))).toMatch(/^HELPER_OUTDATED: needs helper v19\. Dock a Backup Disk linked/)
         expect(calls).toEqual([])
         await fs.outputFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0') + '  backup:\n    method: none\n')
-        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps()))).toBe('ok')
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps(old)))).toBe('ok')   // method none: no temporary backup needed
         expect(calls).toContain('snapshot')
         expect(inst().instanceOf).toBe('kolibri-2.0')
     })
-    it('idea#403: a malformed live x-app.backup still refuses NEEDS_BACKUP first (agreed order)', async () => {
+    it('idea#403: a malformed live x-app.backup refuses before anything changes (engine#469: BAD_BACKUP_SPEC, no longer NEEDS_BACKUP)', async () => {
         await fs.outputFile(`${tmp}/apps/kolibri-2.0/compose.yaml`, compose('2.0'))
         await fs.outputFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0') + '  backup:\n    method: rsync\n')
-        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps()))).toMatch(/^NEEDS_BACKUP: /)
+        expect(await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps()))).toMatch(/^BAD_BACKUP_SPEC: /)
         expect(calls).toEqual([])
     })
     it('updateApp refuses a major the new bundle does not list in updatesFrom, before anything changes', async () => {
