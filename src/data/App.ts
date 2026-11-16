@@ -1,6 +1,6 @@
-import { splitAppId } from './AppIdParse.js'
+import { splitAppId, appIdentity } from './AppIdParse.js'
 import { parseVersion, isMajorChange } from './Version.js'
-import { $, YAML, chalk } from 'zx';
+import { $, YAML, chalk, fs, path } from 'zx';
 import { Version, URL, AppID, AppName, Hostname, DeviceName, DiskName, DiskID } from './CommonTypes.js';
 import { log } from '../utils/utils.js';
 import { Store } from './Store.js';
@@ -42,6 +42,19 @@ export const parseAppId = (appId: string): { name: AppName, version: Version } =
     return { name: name as AppName, version: version as Version }
 }
 
+/** engine#480: name and version of an apps/<appId> folder from its compose x-app (kiwix@release-1.0), else from the id. */
+export const appIdentityOfFolder = (appId: string, compose: unknown): { name: AppName, version: Version } => {
+    const { name, version } = appIdentity(appId, (compose as any)?.['x-app'])
+    return { name: name as AppName, version: version as Version }
+}
+
+/** engine#480: name and version of an apps/ or instances/ folder from its compose x-app, else from the id. */
+export const appIdentityOfDir = async (dir: string, appId: string): Promise<{ name: string, version: string }> => {
+    let xapp: unknown
+    try { xapp = YAML.parse(await fs.readFile(path.join(dir, 'compose.yaml'), 'utf8'))?.['x-app'] } catch { xapp = undefined }
+    return appIdentity(appId, xapp)
+}
+
 export const extractAppName = (appId: AppID): AppName => parseAppId(appId).name
 
 export const extractAppVersion = (appId: AppID): Version => parseAppId(appId).version
@@ -76,13 +89,11 @@ export const createOrUpdateApp = async (storeHandle: DocHandle<Store>, appId: Ap
     const diskID: DiskID = disk.id as DiskID;
     let app: App;
     try {
-        // The full name of the app is <appName>-<version>
-        const appName = extractAppName(appId)
-        const appVersion = extractAppVersion(appId)
-
         // Read the compose.yaml file in the app folder
         const appComposeFile = await $`cat ${await diskMountRoot(disk)}/apps/${appId}/compose.yaml`
         const appCompose = YAML.parse(appComposeFile.stdout)
+        // The full name of the app is <appName>-<version>; engine#480: its x-app says which part is which
+        const { name: appName, version: appVersion } = appIdentityOfFolder(appId, appCompose)
         storeHandle.change(doc => {
             const storedApp: App | undefined = doc.appDB[appId]
             // Automerge rejects undefined — use null for absent optional fields

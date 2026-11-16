@@ -3,7 +3,7 @@ import { isUnfinishedFetch } from './UpdateFetch.js'
 import { $, YAML, chalk, fs, os } from 'zx';
 import path from 'path';
 import { deepPrint, log } from '../utils/utils.js';
-import { App, appTitleFromXapp, createAppId, createOrUpdateApp, extractAppName, extractAppVersion } from './App.js'
+import { App, appIdentityOfFolder, appTitleFromXapp, createAppId, createOrUpdateApp } from './App.js'
 import { Instance, Status, createOrUpdateInstance, startInstance, markLegacyDottedInstance, applyDemoFlag, applyBackupMethod, type InstanceRegisterOptions } from './Instance.js'
 import { AppID, BackupMode, DeviceName, DiskID, DiskType, EngineID, DiskName, InstanceID, PortNumber, ServiceImage, Timestamp } from './CommonTypes.js';
 import { Store, getAppsOfDisk, getInstance, getInstancesOfDisk } from './Store.js';
@@ -556,13 +556,14 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
         storeHandle.change(doc => {
             const storedApp: App | undefined = doc.appDB[appId]
             const xapp = appCompose['x-app'] ?? {}
-            const appName = extractAppName(appId)
+            // engine#480: the x-app names the App (kiwix@release-1.0), not a split of the folder id
+            const { name: appName, version: appVersion } = appIdentityOfFolder(appId, appCompose)
             if (!storedApp) {
                 log(`Creating new system app ${appId}`)
                 app = {
                     id: appId,
                     name: appName,
-                    version: extractAppVersion(appId),
+                    version: appVersion,
                     title: appTitleFromXapp(xapp, appName),
                     description: xapp.description ?? null,
                     url: xapp.url ?? null,
@@ -578,7 +579,7 @@ export const processSystemApp = async (storeHandle: DocHandle<Store>, disk: Disk
                 // Same granular update as createOrUpdateApp (App.ts): every x-app field is refreshed
                 app = storedApp
                 app.name = appName
-                app.version = extractAppVersion(appId)
+                app.version = appVersion
                 app.title = appTitleFromXapp(xapp, appName)
                 app.description = xapp.description ?? null
                 app.url = xapp.url ?? null

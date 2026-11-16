@@ -14,7 +14,7 @@ import type { Instance } from './Instance.js'
 import type { Disk } from './Disk.js'
 import { diskMountRoot, isSystemDisk } from './Disk.js'
 import type { AppID, DiskID, EngineID, InstanceID, Timestamp } from './CommonTypes.js'
-import { parseAppId } from './App.js'
+import { parseAppId, appIdentityOfDir } from './App.js'
 import { compareVersions } from './Version.js'
 import { lookupDiskArg } from './DiskArg.js'
 import { lookupLocalInstanceArg } from './InstanceArg.js'
@@ -102,7 +102,13 @@ export class DemoError extends Error {
 export const isDemoAppName = (s: string): s is DemoAppName =>
     (DEMO_APP_NAMES as readonly string[]).includes(s)
 
-export const appNameOfInstance = (inst: Instance): string => {
+/**
+ * engine#480: the App name of an instance. The store's App record (named from its compose x-app,
+ * e.g. kiwix for instanceOf kiwix-release-1.0) wins when it built instanceOf; else the id is split.
+ */
+export const appNameOfInstance = (inst: Instance, store?: Store): string => {
+    const app = store?.appDB?.[inst.instanceOf]
+    if (app && app.name && app.version != null && `${app.name}-${app.version}` === String(inst.instanceOf)) return String(app.name)
     try { return String(parseAppId(String(inst.instanceOf)).name) } catch {
         const id = String(inst.instanceOf ?? '')
         const m = id.match(/^([a-z]+)-\d/i)
@@ -160,7 +166,7 @@ const bundleOnDockedDisk = async (store: Store, engineId: string, app: DemoAppNa
             if (!await fs.pathExists(appsDir)) continue
             for (const name of await fs.readdir(appsDir)) {
                 if (name.startsWith('.')) continue
-                try { if (parseAppId(name).name === app && await fs.pathExists(path.join(appsDir, name, 'app.yaml'))) return true } catch { /* not an app id */ }
+                try { if ((await appIdentityOfDir(path.join(appsDir, name), name)).name === app && await fs.pathExists(path.join(appsDir, name, 'app.yaml'))) return true } catch { /* not an app id */ }
             }
         } catch { /* skip */ }
     }
@@ -242,7 +248,7 @@ export const dockedDemoInstances = (store: Store, engineId: string, app?: DemoAp
     const out: Instance[] = []
     for (const inst of getInstances(store)) {
         if (!isDemoInstance(inst)) continue
-        if (app && appNameOfInstance(inst) !== app) continue
+        if (app && appNameOfInstance(inst, store) !== app) continue
         const disk = inst.storedOn ? getDisk(store, inst.storedOn) : undefined
         if (!disk || String(disk.dockedTo) !== String(engineId)) continue
         out.push(inst)
@@ -332,7 +338,7 @@ export const findDockedBundle = async (
             for (const name of await fs.readdir(appsDir)) {
                 if (name.startsWith('.')) continue
                 let parsed: { name: string, version: string }
-                try { parsed = parseAppId(name) } catch { continue }
+                try { parsed = await appIdentityOfDir(path.join(appsDir, name), name) } catch { continue }
                 if (parsed.name !== app) continue
                 const dir = path.join(appsDir, name)
                 const spec = await readAppDemoSpec(dir)
@@ -467,7 +473,7 @@ export const setupDemo = async (
 
     const lockKeys = [demoKey(eng), diskKey(String(disk.id))]
     for (const inst of dockedDemoInstances(store, eng)) {
-        if (apps.some(a => appNameOfInstance(inst) === a)) lockKeys.push(instanceKey(String(inst.id)))
+        if (apps.some(a => appNameOfInstance(inst, store) === a)) lockKeys.push(instanceKey(String(inst.id)))
     }
     if (!resourceLock.acquireAll(lockKeys, 'setupDemo')) {
         throw new DemoError('BUSY', 'another setupDemo or removeDemo is running on this Engine, or the target disk or a demo instance is locked')
@@ -606,7 +612,7 @@ export const setupDemo = async (
                 bump('install', 'done')
                 // If we skipped because it existed, mark done (already).
                 const instDir = path.join(await d.mountRoot(disk), 'instances', instanceId)
-                const appVersion = (() => { try { return String(parseAppId(String(inst!.instanceOf)).version) } catch { return undefined } })()
+                const appVersion = await appIdentityOfDir(instDir, String(inst!.instanceOf)).then(x => x.version, () => undefined)
 
                 // download
                 bump('download', 'running')
@@ -831,7 +837,7 @@ export const removeDemo = async (
     const args: Record<string, string> = { instanceIds: instanceIds.join(',') }
     const opId = createOperation(storeHandle, 'removeDemo', args, 'console-command', { type: 'engine', id: eng as EngineID })
     const appsProgress: DemoAppProgress[] = targets.map(t => ({
-        app: (isDemoAppName(appNameOfInstance(t)) ? appNameOfInstance(t) : 'kolibri') as DemoAppName,
+        app: (isDemoAppName(appNameOfInstance(t, store)) ? appNameOfInstance(t, store) : 'kolibri') as DemoAppName,
         instanceId: String(t.id),
         steps: [{ id: 'stop' as const, status: 'pending' as const }, { id: 'remove' as const, status: 'pending' as const }],
         source: null,
@@ -847,7 +853,7 @@ export const removeDemo = async (
     try {
         let step = 0
         for (const inst of targets) {
-            const app = (isDemoAppName(appNameOfInstance(inst)) ? appNameOfInstance(inst) : 'kolibri') as DemoAppName
+            const app = (isDemoAppName(appNameOfInstance(inst, storeHandle.doc())) ? appNameOfInstance(inst, storeHandle.doc()) : 'kolibri') as DemoAppName
             const disk = inst.storedOn ? getDisk(storeHandle.doc(), inst.storedOn) as Disk : undefined
             const bump = (id: DemoStepId, status: DemoStepStatus, extra?: Partial<DemoAppProgress> & { bytesTotal?: number | null }) => {
                 const cur = (storeHandle.doc().operationDB[opId] as any).demo as DemoProgress
