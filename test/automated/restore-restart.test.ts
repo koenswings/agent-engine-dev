@@ -95,7 +95,12 @@ beforeEach(async () => {
         order.push('stop')
         h.change(doc => { (doc.instanceDB as any)[inst.id].status = 'Stopped' })
     })
-    start = vi.fn(async () => { order.push('start') })
+    // the fake start writes Running, like a successful Instance.ts startInstance (engine#468:
+    // restoreApp now fails a post-restore start that leaves any other state)
+    start = vi.fn(async (h: DocHandle<Store>, inst: any) => {
+        order.push('start')
+        h.change(doc => { (doc.instanceDB as any)[inst.id].status = 'Running' })
+    })
     backupLifecycle.stopInstance = stop as any
     backupLifecycle.startInstance = start as any
     vi.spyOn(console, 'info').mockImplementation(() => {})
@@ -141,8 +146,15 @@ describe('restoreApp in place restarts an instance that was Running (engine#413)
 
     it('regression: the record the restore stop leaves behind is skipped by shouldAutoStart, so the explicit start is needed', async () => {
         const { h, appDisk } = await setup('Running')
+        // engine#468: the record as the explicit start finds it (the fake then writes Running)
+        const seen: any[] = []
+        start.mockImplementationOnce(async (hh: DocHandle<Store>, inst: any) => {
+            order.push('start')
+            seen.push({ ...(hh.doc()!.instanceDB as any)[inst.id] })
+            hh.change(doc => { (doc.instanceDB as any)[inst.id].status = 'Running' })
+        })
         await restoreApp(h, INST, appDisk)
-        const rec = h.doc()!.instanceDB[INST] as any
+        const rec = seen[0]
         expect(rec.status).toBe('Stopped')
         expect(shouldAutoStart(h.doc()!, rec)).toMatchObject({ start: false, reason: 'status is Stopped' })
         expect(start).toHaveBeenCalledTimes(1)
