@@ -2154,7 +2154,10 @@ case "$SUB" in
         IFS= read -r ARCH < "$T/ARCHIVE" || true
         [[ "${ARCH:-}" =~ $RE_ARCHIVE ]] || refuse "$T/ARCHIVE does not hold an archive name"
         IFS= read -r SRC_REC < "$T/SOURCE" || true
-        [[ "${SRC_REC:-}" == /*/instances/"$3" && "$SRC_REC" != *..* && "$SRC_REC" != *//* ]] \
+        # The system disk's SYSTEM_ROOT is '' (idea#237), so a kit's SOURCE is /instances/<id>
+        # with no component before 'instances' (engine#469 Pi proof step 6); a disk's is
+        # /disks/<dev>/instances/<id>. Both are allowed; '..', '//' and other ids are not.
+        [[ ( "${SRC_REC:-}" == /instances/"$3" || "${SRC_REC:-}" == /*/instances/"$3" ) && "$SRC_REC" != *..* && "$SRC_REC" != *//* ]] \
             || refuse "$T/SOURCE does not hold an instances/$3 path"
         REL=${SRC_REC#/}
         IFS=/ read -r -a PARTS <<<"$REL"

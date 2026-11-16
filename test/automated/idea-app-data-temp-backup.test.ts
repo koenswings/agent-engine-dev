@@ -120,6 +120,45 @@ describe('idea-app-data v18 temp-backup-create / estimate / list (fake borg)', (
     })
 })
 
+describe('idea-app-data v18 temp-backup-restore on the system disk (the kit case, engine#469 Pi proof step 6)', () => {
+    // On a Pi SYSTEM_ROOT is '' (idea#237), so a kit's create records SOURCE=/instances/<id>, with no
+    // component before 'instances'. The sandbox's SYSTEM_ROOT is a temp folder, so every other test
+    // records /tmp/.../sys/instances/<id> and never saw that shape; write the Pi's record by hand.
+    const kit = async () => {
+        const sb = await sandbox()
+        const inst = await sb.addInstance(sb.sys, 'inst-1')
+        const c = await sb.run(tempBackupCreateArgs('system', 'inst-1', STAMP, ARCH))
+        expect(c.exitCode, c.stderr).toBe(0)
+        return { sb, inst }
+    }
+    const setSource = (sb: AppDataSandbox, src: string) => fs.writeFile(path.join(tb(sb), 'SOURCE'), `${src}\n`)
+    it('restores instances/<id> on the system disk from a backup whose SOURCE is /instances/<id>', async () => {
+        const { sb, inst } = await kit()
+        await setSource(sb, '/instances/inst-1')
+        await fs.writeFile(path.join(inst, 'compose.yaml'), 'broken by 2.0\n')
+        const r = await sb.run(tempBackupRestoreArgs('system', 'inst-1', STAMP), { FAKE_BORG_EXTRACT: 'inst-1' })
+        expect(r.exitCode, r.stderr).toBe(0)
+        const extract = (await sb.calls('borg')).map(c => c.argv).find(a => a[0] === 'extract')!
+        expect(extract).toEqual(['extract', '--numeric-ids', '--strip-components', '1', '--', `${tb(sb)}/repo::${ARCH}`])
+        expect(await fs.readFile(path.join(inst, 'data.txt'), 'utf8')).toBe('restored\n')
+        const aside = r.stdout.trim().split('\n').pop()!
+        expect(aside).toMatch(new RegExp(`^${sb.sys}/\\.idea-quarantine/inst-1-before-temp-restore-\\d{8}T\\d+Z$`))
+        expect(await fs.readFile(path.join(aside, 'compose.yaml'), 'utf8')).toBe('broken by 2.0\n')
+        expect(await fs.pathExists(path.join(tb(sb), 'COMPLETE'))).toBe(true)
+        expect(await sb.journalText()).toMatch(/temp-backup-restore: .*instances\/inst-1 restored from /)
+    })
+    it('still refuses a SOURCE for another id, with .. or //, or not absolute; nothing is touched', async () => {
+        const { sb, inst } = await kit()
+        for (const bad of ['/instances/inst-2', '/../instances/inst-1', '//instances/inst-1', 'instances/inst-1', '/instances/inst-1/..', '/x/../instances/inst-1']) {
+            await setSource(sb, bad)
+            refused(await sb.run(tempBackupRestoreArgs('system', 'inst-1', STAMP), { FAKE_BORG_EXTRACT: 'inst-1' }), /SOURCE does not hold an instances\/inst-1 path/)
+        }
+        expect(await fs.pathExists(path.join(inst, 'data.txt'))).toBe(false)
+        expect(await fs.pathExists(path.join(sb.sys, '.idea-quarantine'))).toBe(false)
+        expect((await sb.calls('borg')).some(c => c.argv[0] === 'extract')).toBe(false)
+    })
+})
+
 describe('idea-app-data v18 temp-backup-delete (rm -rf only inside .idea-temp-backups)', () => {
     const make = async (sb: AppDataSandbox, id = 'inst-1', stamp = STAMP) => {
         const t = tb(sb, id, stamp)
@@ -211,5 +250,19 @@ describe.skipIf(!borgVersion)(`idea-app-data v18 temp backup end to end with a r
         expect(d.exitCode, d.stderr).toBe(0)
         expect(await fs.pathExists(tb(sb))).toBe(false)
         expect(await fs.pathExists(inst)).toBe(true)
+    }, 60_000)
+    it('the kit case: create and restore with root system (the instance on the system disk)', async () => {
+        const sb = await sandbox({ realBorg: true, borgPath: BORG })
+        const env = { BORG_BASE_DIR: path.join(sb.tmp, 'borg-base') }
+        const inst = path.join(sb.sys, 'instances', 'inst-1')
+        await fs.outputFile(path.join(inst, 'data', 'db.sql'), 'v1 data\n')
+        await fs.outputFile(path.join(inst, 'compose.yaml'), 'x-app: {version: "1.0"}\n')
+        const c = await sb.run(tempBackupCreateArgs('system', 'inst-1', STAMP, ARCH), env)
+        expect(c.exitCode, c.stderr).toBe(0)
+        await fs.writeFile(path.join(inst, 'data', 'db.sql'), 'broken by 2.0\n')
+        const r = await sb.run(tempBackupRestoreArgs('system', 'inst-1', STAMP), env)
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(await fs.readFile(path.join(inst, 'data', 'db.sql'), 'utf8')).toBe('v1 data\n')
+        expect(r.stdout.trim().split('\n').pop()).toMatch(new RegExp(`^${sb.sys}/\\.idea-quarantine/inst-1-before-temp-restore-`))
     }, 60_000)
 })

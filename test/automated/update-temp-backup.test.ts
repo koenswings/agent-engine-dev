@@ -282,6 +282,7 @@ describe('engine#469 helper argv and parsers', () => {
         expect(tempBackupCreateArgs('system', 'i1', '20261116T080000Z', '2026-11-16T08-00-00-000Z-stop', ['keys'])).toEqual(['temp-backup-create', 'system', 'i1', '20261116T080000Z', '2026-11-16T08-00-00-000Z-stop', 'data/keys'])
         expect(tempBackupDeleteArgs('i1', '20261116T080000Z')).toEqual(['temp-backup-delete', 'i1', '20261116T080000Z'])
         expect(tempBackupRestoreArgs('sda1', 'i1', '20261116T080000Z')).toEqual(['temp-backup-restore', 'sda1', 'i1', '20261116T080000Z'])
+        expect(tempBackupRestoreArgs('system', 'i1', '20261116T080000Z')).toEqual(['temp-backup-restore', 'system', 'i1', '20261116T080000Z'])
         expect(tempBackupsArgs()).toEqual(['temp-backups'])
         expect(() => tempBackupDeleteArgs('../x', '20261116T080000Z')).toThrow()
         expect(() => tempBackupDeleteArgs('i1', '../../etc')).toThrow()
