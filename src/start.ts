@@ -37,7 +37,8 @@ import { diskFsRoot } from './data/Disk.js'
 import { copyApp, moveApp } from './data/CopyMoveApp.js'
 import { backupInstance } from './monitors/backupMonitor.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
-import { createCommandLogStore, shutdownRepo, startCommandLogRotation } from './data/CommandLogStore.js'
+import { createCommandLogStore, getCommandLogHandle, shutdownRepo, startCommandLogRotation } from './data/CommandLogStore.js'
+import { startMemoryMonitor } from './monitors/memoryMonitor.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
 import { assertAppDataHelper, reportBorgAtStartup } from './utils/appDataHelper.js'
 import { startPeerAccess } from './data/PeerAccess.js'
@@ -213,6 +214,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     initCommandLogger(commandLogHandle)
     // idea#183: fresh CommandLog doc each local day, previous one archived
     startCommandLogRotation(repo)
+    // engine#471: hourly [memory] line (rss, heap, external = mostly Automerge wasm, loaded docs / command logs)
+    startMemoryMonitor(repo, { ownCommandLogId: () => getCommandLogHandle()?.documentId ?? null })
 
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
