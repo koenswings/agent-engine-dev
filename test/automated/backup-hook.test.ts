@@ -15,6 +15,8 @@ import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/dat
 import { Disk } from '../../src/data/Disk.js'
 import { config } from '../../src/data/Config.js'
 import { backupInstance, backupLifecycle, BACKUP_STALE_LOCK } from '../../src/monitors/backupMonitor.js'
+import { runWithTrace } from '../../src/utils/CommandLogger.js'
+import { takePendingTraceResult } from '../../src/data/CommandLogStore.js'
 import { resourceLock, instanceKey } from '../../src/utils/ResourceLock.js'
 import { borgPresence } from '../../src/utils/appDataHelper.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
@@ -833,6 +835,76 @@ describe('backupInstance method hook (idea#444)', () => {
         await writeCompose({ exclude: ['../etc'] })
         expect((await runPreUpdate(false)).error).toMatch(/invalid x-app.backup.exclude/)
         expect(hookCalls).toEqual([])
+    })
+
+    // engine#468: a backup's post-start that does not reach Running is a warning, not a failure
+    const DB_EXITED = 'Engine error: dependency nextcloud-db failed to start: container exited (1)'
+    const startLeaves = (status: string, condition: string | null) => {
+        backupLifecycle.startInstance = (async (handle: DocHandle<Store>, inst: any) => {
+            startCount += 1
+            handle.change(doc => {
+                const r = (doc.instanceDB as any)[inst.id]
+                r.status = status
+                r.statusCondition = condition
+            })
+        }) as typeof backupLifecycle.startInstance
+    }
+    const tracedBackup = async (traceId: string) => {
+        const h = await createMinimalStore()
+        const appDisk = makeDisk('hook-ad', appDevice, false)
+        const backupDisk = makeDisk('hook-bd', backupDevice, true)
+        h.change(doc => {
+            doc.diskDB[appDisk.id] = appDisk
+            doc.diskDB[backupDisk.id] = backupDisk
+            doc.instanceDB[INST] = {
+                id: INST, instanceOf: 'usage-dashboard' as any, name: INST as any, status: 'Running' as any,
+                port: 8080 as any, serviceImages: [], created: Date.now() as Timestamp, lastBackup: null,
+                lastStarted: Date.now() as Timestamp, statusCondition: null, storedOn: appDisk.id,
+                currentStep: null, totalSteps: null, stepLabel: null, metrics: null,
+            } as any
+        })
+        let error: string | null = null
+        await runWithTrace({ traceId, command: 'backupApp', args: '{}' }, async () => {
+            await backupInstance(h, INST, backupDisk)
+        }).catch((e: any) => { error = String(e?.message ?? e) })
+        return { h, error, result: takePendingTraceResult(traceId) }
+    }
+
+    it('engine#468 a stop backup whose post-start ends in Error still succeeds, with a POST_START_WARNING on the Operation and the trace', async () => {
+        await writeCompose({ method: 'stop' })
+        startLeaves('Error', DB_EXITED)
+        const { h, error, result } = await tracedBackup('tr-468-backup-warn')
+        expect(error).toBeNull()
+        const op = opOf(h)
+        expect(op?.status, op?.error).toBe('Done')
+        expect(startCount).toBe(1)
+        expect(op?.args?.postStartWarning).toBe(`POST_START_WARNING: the instance did not return to Running after backup: ${DB_EXITED}`)
+        expect(op?.args?.warning).toBeUndefined()
+        expect(JSON.parse(result!)).toEqual({ postStartWarning: op.args.postStartWarning })
+        expect(h.doc()!.instanceDB[INST].lastBackup).not.toBeNull()
+    })
+
+    it('engine#468 a stop backup whose post-start reaches Running has no warning', async () => {
+        await writeCompose({ method: 'stop' })
+        startLeaves('Running', null)
+        const { h, result } = await tracedBackup('tr-468-backup-ok')
+        expect(opOf(h)?.status).toBe('Done')
+        expect(opOf(h)?.args?.postStartWarning).toBeUndefined()
+        expect(result).toBeUndefined()
+    })
+
+    it('engine#468 a failed backup still fails with its own error; a restart that ends in Error adds the warning', async () => {
+        process.env.FAKE_BORG_CREATE_FAIL = '1'
+        await writeCompose({ method: 'stop' })
+        startLeaves('Error', DB_EXITED)
+        const { h, error, result } = await tracedBackup('tr-468-backup-fail')
+        const op = opOf(h)
+        expect(op?.status).toBe('Failed')
+        expect(error).toBe(op?.error)
+        expect(error).not.toMatch(/POST_START_WARNING/)
+        expect(startCount).toBe(1)
+        expect(op?.args?.postStartWarning).toBe(`POST_START_WARNING: the instance did not return to Running after failed backup: ${DB_EXITED}`)
+        expect(JSON.parse(result!)).toEqual({ postStartWarning: op.args.postStartWarning })
     })
 
 })

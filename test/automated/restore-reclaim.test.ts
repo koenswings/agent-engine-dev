@@ -163,6 +163,8 @@ beforeEach(() => {
     start = vi.fn(async (h: DocHandle<Store>, inst: any, disk: any) => {
         events.push(`restart:${disk.id}`)
         startSeen.push({ diskId: String(disk.id), storedOn: (h.doc() as any)?.instanceDB?.[inst.id]?.storedOn ?? null })
+        // a successful start writes Running (engine#468 fails any other post-restore state)
+        h.change(doc => { const r = (doc.instanceDB as any)[inst.id]; if (r) r.status = 'Running' })
     })
     backupLifecycle.stopInstance = stop as any
     backupLifecycle.startInstance = start as any
