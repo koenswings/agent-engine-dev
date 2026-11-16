@@ -238,6 +238,20 @@ describe('engine#469 failures keep the temporary backup', () => {
         expect(r.tempBackup?.deleted).toBe(false)
         expect(op().status).toBe('Done')
         expect(op().args.tempBackupState).toBe('delete-failed')
+        expect(op().args.tempBackupWarning).toBe(`temporary backup ${r.tempBackup!.path} could not be removed: rm exited 1; free space by deleting it`)
+    })
+    it('a successful delete leaves no tempBackupWarning; the warning also goes to console.warn (the trace)', async () => {
+        await updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps())
+        expect(op().args.tempBackupWarning).toBeUndefined()
+        const warns: string[] = []
+        const orig = console.warn
+        console.warn = (...a: unknown[]) => { warns.push(a.map(String).join(' ')) }
+        try {
+            h.change(d => { (d.instanceDB['i1' as any] as any).instanceOf = 'kolibri-1.0'; (d.operationDB as any) = {} })
+            await fs.writeFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0', '  backup:\n    exclude: [keys]\n'))
+            await updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps({ tempBackupDelete: async () => { throw new Error('rm exited 1') } }))
+        } finally { console.warn = orig }
+        expect(warns.some(w => /^updateApp: i1: temporary backup \/\.idea-temp-backups\/i1\/\S+ could not be removed: rm exited 1; free space by deleting it$/.test(w))).toBe(true)
     })
 })
 

@@ -708,7 +708,11 @@ export const updateApp = async (
                     log(`updateApp: ${inst.id}: temporary pre-update backup ${tbr.path} deleted after the health gate`)
                 } catch (e) {
                     setTempBackupOpArgs(storeHandle, opId, tbr, 'delete-failed')
-                    log(`updateApp: ${inst.id}: deleting the temporary pre-update backup ${tbr.path} failed (left in place): ${(e as Error).message}`)
+                    // Like backupApp's args.postStartWarning (engine#468): the update stays Done, the operation
+                    // and the trace (console.warn lands in it) say the space was not given back.
+                    const warning = tempBackupWarningMessage(tbr.path, (e as Error).message)
+                    storeHandle.change(doc => { const o = doc.operationDB?.[opId]; if (o) o.args.tempBackupWarning = warning })
+                    console.warn(`updateApp: ${inst.id}: ${warning}`)
                 }
             }
             storeHandle.change(doc => {
@@ -909,6 +913,10 @@ const rollBack = async (
         return err
     }
 }
+
+/** engine#469: the warning a Done update carries when the temporary backup could not be removed. */
+export const tempBackupWarningMessage = (tbPath: string, why: string): string =>
+    `temporary backup ${tbPath} could not be removed: ${why}; free space by deleting it`
 
 /**
  * Startup (power-loss safety): an updateApp operation of this Engine left Running is
