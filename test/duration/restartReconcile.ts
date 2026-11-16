@@ -6,7 +6,8 @@
  *       (kc7 FAIL@59) except the Pi's system disk (diskTypes 'system'): with Stage 2's
  *       settings.systemDiskSkip the Engine never re-registers it ("Device sda2 is the system disk —
  *       skipping registration") and keeps its record docked ("system disk is always present"), so its
- *       lastDocked never moves. Its instances are still checked under (3).
+ *       lastDocked never moves. Its instances are still checked under (3). A record without the marker
+ *       still counts as the system disk when its id is the Pi's Engine id (ENGINE_<diskId>, idea#524).
  *   (3) every Running instance on those disks has all its compose containers Up in `docker ps`.
  * Error on any of those instances fails at once; the timeout fails with a field dump. Nothing is retried.
  */
@@ -40,6 +41,10 @@ export interface ReconcileEval {
     fields: string[]
 }
 
+/** The Pi's own system disk: marked diskTypes 'system', or its id is the Engine id (ENGINE_<diskId>). */
+export const isPiSystemDisk = (d: SemanticStoreView['diskDB'][string], engineIds: Array<string | undefined>): boolean =>
+    (d.diskTypes ?? []).includes('system') || engineIds.some(e => !!e && e === `ENGINE_${d.id}`)
+
 export const evaluateRestartReconcile = (
     view: SemanticStoreView, engineId: string, restartAtMs: number, docker: DockerRow[],
 ): ReconcileEval => {
@@ -48,7 +53,7 @@ export const evaluateRestartReconcile = (
     const disks = Object.values(view.diskDB).filter(d => d.dockedTo === engineId)
     const diskIds = new Set(disks.map(d => d.id))
     for (const d of disks) {
-        if ((d.diskTypes ?? []).includes('system')) {
+        if (isPiSystemDisk(d, [engineId, view.liveEngineId])) {
             fields.push(`disk ${d.id} lastDocked=${d.lastDocked ?? 'absent'} restartAt=${restartAtMs} (system disk: not gated)`)
             continue
         }
