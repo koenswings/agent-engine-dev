@@ -12,7 +12,7 @@ EVID=/home/walker/duration-evidence/$RUN
 git -C "$REPO" diff --quiet || { echo "REFUSE: dirty harness tree"; exit 3; }
 SHA=$(git -C "$REPO" rev-parse HEAD)
 git -C "$REPO" branch -r --contains "$SHA" | grep -q origin/ || { echo "REFUSE: $SHA not pushed"; exit 3; }
-CONSOLE_PIN=bec792cb6de3c734dad7c2fe7443ab623bae1468  # Console main (console#228): #226 ImmutableString readers, #228 restartFailed post-reload
+CONSOLE_PIN=762f8052872a27542692ca72577ce8162a4a508e  # Console main (console#229): Engine-first major-update backup; plain temp-backup wording
 [ "$(git -C /home/walker/agent-console-dev rev-parse HEAD)" = "$CONSOLE_PIN" ] || { echo "REFUSE: console intents checkout is not $CONSOLE_PIN"; exit 3; }
 git -C /home/walker/agent-console-dev diff --quiet || { echo "REFUSE: dirty console intents tree"; exit 3; }
 mkdir -p "$EVID"; [ -f "$EVID/run.pid" ] && kill -0 "$(cat "$EVID/run.pid")" 2>/dev/null && { echo "REFUSE: already running"; exit 4; }
@@ -27,13 +27,13 @@ export DURATION_LAN_HOSTS=\${DURATION_LAN_HOSTS:-idea01=192.168.0.138,idea03=192
 export DURATION_CONSOLE_INTENTS=/home/walker/agent-console-dev/e2e/intents
 export DURATION_STAGE=2
 export DURATION_EXPECTED_CONSOLE_SHA=$CONSOLE_PIN
-# Product pin = intents pin = bec792cb6de3c734dad7c2fe7443ab623bae1468 (console#228 on main).
-# Asset name + md5 from a NODE_ENV=production box build of bec792c (console#222 forces
-# Vite production mode). Main script in dist/index.html: index-Baao2vRf.js, 551969 bytes.
+# Product pin = intents pin = 762f8052872a27542692ca72577ce8162a4a508e (console#229 on main).
+# Asset name + md5 from a NODE_ENV=production box build of 762f805 (console#222 forces
+# Vite production mode). Main script in dist/index.html: index-BlAamcPF.js, 554263 bytes.
 # Atlas should confirm the pool-served dist matches before the live walk (engine#462).
-export DURATION_CONSOLE_PRODUCT_SHA=bec792cb6de3c734dad7c2fe7443ab623bae1468
-export DURATION_CONSOLE_PRODUCT_ASSET=index-Baao2vRf.js
-export DURATION_CONSOLE_PRODUCT_ASSET_MD5=1a07783529d62b77663a5ee14d350af6
+export DURATION_CONSOLE_PRODUCT_SHA=762f8052872a27542692ca72577ce8162a4a508e
+export DURATION_CONSOLE_PRODUCT_ASSET=index-BlAamcPF.js
+export DURATION_CONSOLE_PRODUCT_ASSET_MD5=0beedcb75e74d01121a7f94858406b2f
 export DURATION_EXPECTED_STORE_ID=2VroE
 export DURATION_POST_OP_SETTLE_MS=\${DURATION_POST_OP_SETTLE_MS:-300000}
 export DURATION_DOC_WAIT_MS=\${DURATION_DOC_WAIT_MS:-45000}

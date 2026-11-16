@@ -57,7 +57,7 @@ describe('idea02 launcher contract (script/idea02-walker/launch.sh)', () => {
     })
     it('runs the store-check gate before launching and keeps the declared pins + deviation', () => {
         expect(sh).toMatch(/store-check\.ts/)
-        for (const v of ['DURATION_STAGE=2', 'bec792cb6de3c734dad7c2fe7443ab623bae1468', 'index-Baao2vRf.js', '1a07783529d62b77663a5ee14d350af6', 'DURATION_DOC_WAIT_MS', '--start-instances', '--console-url http://idea01:8080']) expect(sh).toContain(v)
+        for (const v of ['DURATION_STAGE=2', '762f8052872a27542692ca72577ce8162a4a508e', 'index-BlAamcPF.js', '0beedcb75e74d01121a7f94858406b2f', 'DURATION_DOC_WAIT_MS', '--start-instances', '--console-url http://idea01:8080']) expect(sh).toContain(v)
     })
     it('defaults FLEET_HOSTS to fleet-state Tailscale IPs and LAN_HOSTS to current pool LAN IPs', () => {
         expect(sh).toContain('idea01=100.99.231.94,idea03=100.126.117.80,idea04=100.108.39.45')
