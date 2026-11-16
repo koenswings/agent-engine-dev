@@ -70,7 +70,7 @@ import {
     HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange, backupIsDue,
     declaredUpdateStages,
 } from './UpdateAppPolicy.js'
-import { parseAppId } from './App.js'
+import { appIdentity } from './AppIdParse.js'
 import { stampComposeInstanceIdentity } from './InstanceCopy.js'
 import { isUnfinishedFetch } from './UpdateFetch.js'
 import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
@@ -519,15 +519,19 @@ export const updateApp = async (
         // idea#403: method none has nothing to back up (no NEEDS_BACKUP). Read best-effort here so
         // NEEDS_BACKUP / MAJOR / NO_SUMS keep their order; a malformed spec refuses BAD_BACKUP_SPEC below.
         const liveBackupMethod = await readComposeBackup(path.join(instDir, 'compose.yaml'), 'live').then(r => r.method, () => undefined)
-        const backupDue = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs)
+        // engine#480: the live compose's x-app (which built instanceOf) and the bundle's x-app name
+        // each App; splitting `kiwix-release-1.0` at a digit read the kit's kiwix@release-1.0 as kiwix-release@1.0.
+        const liveXApp = await readXApp(path.join(instDir, 'compose.yaml'))
+        const xapp = bundle ? await readXApp(path.join(bundle.dir, 'compose.yaml')) : {}
+        const backupDue = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs, liveXApp, xapp)
         const backupDisk = backupDue ? linkedBackupDisk(store, engineId, inst) : null
         // engine#469: due, nothing to back up to, and something to back up: a temporary backup on
         // the system disk satisfies the gate for this operation (a malformed spec still refuses
         // BAD_BACKUP_SPEC below, before anything changes).
         const tempBackupPlanned = backupDue && !backupDisk && liveBackupMethod !== 'none'
-        const xapp = bundle ? await readXApp(path.join(bundle.dir, 'compose.yaml')) : {}
         const facts = {
             diskDocked: true, busy: !gotLock, currentAppId: String(inst.instanceOf), newAppId,
+            currentXApp: liveXApp, newXApp: xapp,
             sourcePresent: !!bundle, sumsValid: bundle ? await d.verifySums(bundle.dir) : false,
             allowMajor: !!opts.allowMajor,
             backupAgeMs,
@@ -679,7 +683,7 @@ export const updateApp = async (
             const newX = await readXApp(composePath)
             const hc = parseHealthCheck(newX.healthCheck)
             // Declared healthCheck: agreed per-App timeout rule; fallback (main URL): healthTimeout, per-App default, else 300 s
-            const timeoutS = hc ? await readHealthTimeout(composePath, parseAppId(newAppId).name) : fallbackHealthTimeoutSeconds(parseAppId(newAppId).name, newX.healthTimeout)
+            const timeoutS = hc ? await readHealthTimeout(composePath, appIdentity(newAppId, newX).name) : fallbackHealthTimeoutSeconds(appIdentity(newAppId, newX).name, newX.healthTimeout)
             const t0 = d.now()
             for (;;) {
                 const elapsedMs = d.now() - t0
@@ -998,7 +1002,7 @@ export const sumsLookUsable = (sums: string | null): boolean =>
 
 /** Bundle info for Disk.appBundles from a bundle folder (idea#76 gap 1). Only the fields with a valid value are set. */
 export const bundleInfo = (appId: string, sums: string | null, sizeBytes: number, xapp: Record<string, any>): AppBundleInfo => {
-    const b: AppBundleInfo = { appId: appId as AppID, version: parseAppId(appId).version, sumsListed: sumsLookUsable(sums), sizeBytes }
+    const b: AppBundleInfo = { appId: appId as AppID, version: appIdentity(appId, xapp).version, sumsListed: sumsLookUsable(sums), sizeBytes }
     if (Array.isArray(xapp.updatesFrom)) b.updatesFrom = xapp.updatesFrom.map(Number).filter(n => Number.isFinite(n))
     const t = Number(xapp.healthTimeout)
     if (xapp.healthTimeout != null && Number.isFinite(t) && t > 0) b.healthTimeout = t
@@ -1063,6 +1067,8 @@ export const remoteBundles = (store: Store, engineId: string): { disk: Disk, app
         return disk.appBundles.filter(b => b && b.sumsListed).map(b => ({
             disk, appId: String(b.appId), sizeBytes: Number(b.sizeBytes) || 0,
             xapp: {
+                // engine#480: the published version (from the bundle's x-app) names a remote bundle's App too
+                ...remoteBundleIdentity(String(b.appId), b.version),
                 updatesFrom: b.updatesFrom ? [...b.updatesFrom] : undefined,
                 healthTimeout: b.healthTimeout,
                 migrationNote: b.migrationNote,
@@ -1070,6 +1076,12 @@ export const remoteBundles = (store: Store, engineId: string): { disk: Disk, app
             },
         }))
     })
+
+/** engine#480: x-app name/version of a remote bundle from its published appId and version, when the id ends in `-<version>`. */
+export const remoteBundleIdentity = (appId: string, version: unknown): { name?: string, version?: string } => {
+    const v = version == null ? '' : String(version)
+    return v && appId.endsWith(`-${v}`) && appId.length > v.length + 1 ? { name: appId.slice(0, -(v.length + 1)), version: v } : {}
+}
 
 export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engineId: string, deps: Partial<UpdateAvailableDeps> = {}): Promise<number> => {
     const d = { ...defaultAvailableDeps, ...deps }
@@ -1095,14 +1107,17 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
             if (inst.updateAvailable && (!own || !own.dockedTo)) updates[String(inst.id)] = null
             continue
         }
+        // engine#480: the instance's live compose x-app names its App (kiwix@release-1.0), not a split of instanceOf
+        const ownDisk = docked.find(x => String(x.id) === String(inst.storedOn))!
+        const liveXApp = await d.mountRoot(ownDisk).then(r => d.readXApp(joinMountRoot(r, 'instances', String(inst.id)))).catch(() => ({}))
         let best: (typeof bundles)[number] | null = null
         for (const b of bundles) {
-            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true, updatesFrom: b.xapp.updatesFrom, xAppUpdate: b.xapp.update })) continue
-            const c = best ? compareVersions(parseAppId(b.appId).version, parseAppId(best.appId).version) : 1
+            if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true, updatesFrom: b.xapp.updatesFrom, xAppUpdate: b.xapp.update, currentXApp: liveXApp, newXApp: b.xapp })) continue
+            const c = best ? compareVersions(appIdentity(b.appId, b.xapp).version, appIdentity(best.appId, best.xapp).version) : 1
             if (c !== null && (c > 0 || (c === 0 && String(b.disk.id) === String(inst.storedOn)))) best = b
         }
         if (!best) { updates[String(inst.id)] = null; continue }
-        const from = parseAppId(String(inst.instanceOf)).version, to = parseAppId(best.appId).version
+        const from = appIdentity(String(inst.instanceOf), liveXApp).version, to = appIdentity(best.appId, best.xapp).version
         const u: NonNullable<Instance['updateAvailable']> = {
             appId: best.appId as AppID, sourceDiskId: best.disk.id as DiskID, sourceEngineId: String(best.disk.dockedTo) as any,
             fromVersion: from, toVersion: to, major: isMajorChange(from, to),
@@ -1120,7 +1135,7 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
         const bytes = await d.dataBytes(disk, inst.id, hintExcludes).catch(() => null)
         const remote = String(best.disk.dockedTo) !== engineId
         if (remote) u.sizeBytes = best.sizeBytes ?? 0
-        if (bytes !== null) u.estimatedMinutes = estimateUpdateMinutes(bytes, healthTimeoutSeconds(parseAppId(best.appId).name, best.xapp.healthTimeout))
+        if (bytes !== null) u.estimatedMinutes = estimateUpdateMinutes(bytes, healthTimeoutSeconds(appIdentity(best.appId, best.xapp).name, best.xapp.healthTimeout))
             + (remote ? Math.ceil((best.sizeBytes ?? 0) / TRANSFER_BYTES_PER_MIN) : 0)
         if (typeof best.xapp.migrationNote === 'string' && best.xapp.migrationNote.trim()) u.migrationNote = best.xapp.migrationNote.trim()
         updates[String(inst.id)] = u

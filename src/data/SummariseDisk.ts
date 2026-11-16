@@ -7,7 +7,7 @@
  * Backups come from BACKUP.yaml + the store, never borg list.
  */
 
-import { parseAppId } from './App.js'
+import { appIdentityOfDir } from './App.js'
 import path from 'path'
 import { fs, YAML } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
@@ -184,7 +184,8 @@ export const summariseDisk = async (
     try {
         const appDirs = await fs.readdir(joinMountRoot(root, 'apps'))
         for (const id of appDirs) {
-            const { name, version } = parseAppId(id)
+            // engine#480: same name/version as the App record (from x-app), so kiwix@release-1.0 is not listed twice
+            const { name, version } = await appIdentityOfDir(joinMountRoot(root, 'apps', id), id)
             const key = `${name}@${version}`
             if (!seenAppKeys.has(key)) {
                 seenAppKeys.add(key)

@@ -12,7 +12,7 @@
  *    AppHealthTimeout.ts, shared with the start-time port-ready check, idea#437).
  *  - An App without valid SHA256SUMS is never offered an update (NO_SUMS).
  */
-import { parseAppId } from './App.js'
+import { appIdentity } from './AppIdParse.js'
 import { APP_HEALTH_TIMEOUT_S } from './AppHealthTimeout.js'
 import { isUpgrade, isMajorChange, isUnversioned, parseVersion } from './Version.js'
 
@@ -65,6 +65,13 @@ export interface CheckFacts {
     busy: boolean
     currentAppId: string
     newAppId: string
+    /**
+     * engine#480: the instance's live compose x-app. When it produced currentAppId, its name and
+     * version are the instance's identity (kiwix / release-1.0), not a split of the id.
+     */
+    currentXApp?: unknown
+    /** engine#480: the new bundle's compose x-app, same rule for newAppId. */
+    newXApp?: unknown
     sourcePresent: boolean
     sumsValid: boolean
     allowMajor: boolean
@@ -141,8 +148,8 @@ export const BACKUP_MAX_AGE_MS = 60 * 60 * 1000
  * idea#448: true when this update needs a fresh backup (a major upgrade, idea#76: an
  * unversioned SHA to a tag stays major, and no backup in the last hour).
  */
-export const backupIsDue = (currentAppId: string, newAppId: string, backupAgeMs: number | null): boolean => {
-    const cur = parseAppId(currentAppId).version, nxt = parseAppId(newAppId).version
+export const backupIsDue = (currentAppId: string, newAppId: string, backupAgeMs: number | null, currentXApp?: unknown, newXApp?: unknown): boolean => {
+    const cur = appIdentity(currentAppId, currentXApp).version, nxt = appIdentity(newAppId, newXApp).version
     if (!isUpgrade(cur, nxt) || !isMajorChange(cur, nxt)) return false
     return backupAgeMs === null || backupAgeMs > BACKUP_MAX_AGE_MS
 }
@@ -157,9 +164,10 @@ const showAppField = (value: string): string => isMissingAppField(value) ? '(mis
  * and/or x-app.version, with the instance's actual values and the bundle's expected ones.
  * createOrUpdateInstance sets instanceOf from those compose fields, so a bundle
  * without them becomes `undefined-undefined` (seen on idea04 during #311).
+ * engine#480: name and version come from the x-app that built each id when given (appIdentity).
  */
-export const appIdentityProblems = (currentAppId: string, newAppId: string): string | null => {
-    const cur = parseAppId(currentAppId), nxt = parseAppId(newAppId)
+export const appIdentityProblems = (currentAppId: string, newAppId: string, currentXApp?: unknown, newXApp?: unknown): string | null => {
+    const cur = appIdentity(currentAppId, currentXApp), nxt = appIdentity(newAppId, newXApp)
     const problems: string[] = []
     if (isMissingAppField(cur.name) || isMissingAppField(nxt.name)) {
         problems.push(`x-app.name is missing (actual: ${showAppField(cur.name)}, expected: ${showAppField(nxt.name)})`)
@@ -180,9 +188,9 @@ export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
     if (f.busy) return new UpdateAppError('BUSY', 'another operation is running on this instance')
     if (!f.sourcePresent) return new UpdateAppError('SOURCE_MISSING', `bundle ${f.newAppId} was not found on the source`)
     if (!f.sumsValid) return new UpdateAppError('NO_SUMS', `bundle ${f.newAppId} has no valid SHA256SUMS`)
-    const identity = appIdentityProblems(f.currentAppId, f.newAppId)
+    const identity = appIdentityProblems(f.currentAppId, f.newAppId, f.currentXApp, f.newXApp)
     if (identity) return new UpdateAppError('DIFFERENT_APP', identity)
-    const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
+    const cur = appIdentity(f.currentAppId, f.currentXApp), nxt = appIdentity(f.newAppId, f.newXApp)
     if (!isUpgrade(cur.version, nxt.version)) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
     const stages = declaredUpdateStages(f.xAppUpdate)
     if (stages.length) {
@@ -209,9 +217,9 @@ export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
 }
 
 /** True when the App may be offered an update at all (updateAvailable). */
-export const offerable = (f: Pick<CheckFacts, 'currentAppId' | 'newAppId' | 'sumsValid' | 'updatesFrom' | 'xAppUpdate'>): boolean => {
+export const offerable = (f: Pick<CheckFacts, 'currentAppId' | 'newAppId' | 'sumsValid' | 'updatesFrom' | 'xAppUpdate' | 'currentXApp' | 'newXApp'>): boolean => {
     if (!f.sumsValid) return false
-    const cur = parseAppId(f.currentAppId), nxt = parseAppId(f.newAppId)
+    const cur = appIdentity(f.currentAppId, f.currentXApp), nxt = appIdentity(f.newAppId, f.newXApp)
     if (cur.name !== nxt.name) return false
     if (!isUpgrade(cur.version, nxt.version)) return false
     if (declaredUpdateStages(f.xAppUpdate).length) return false

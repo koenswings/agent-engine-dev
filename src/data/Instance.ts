@@ -14,6 +14,7 @@ import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
 import { createAppId, parseAppId } from "./App.js";
+import { appIdentity } from "./AppIdParse.js";
 import { healthTimeoutSeconds, DEFAULT_HEALTH_TIMEOUT_S } from "./AppHealthTimeout.js";
 import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
@@ -1048,10 +1049,12 @@ export const portReadyTimeoutMs = (appName: string, declared?: unknown): number 
   Math.round(healthTimeoutSeconds(appName, declared) * 1000)
 
 /** Read `x-app.healthTimeout` from an instance compose.yaml; the per-App default if missing or unreadable. */
-export const readPortReadyTimeoutMs = async (composePath: string, appName: string): Promise<number> => {
+export const readPortReadyTimeoutMs = async (composePath: string, appName: string, appId?: string): Promise<number> => {
   try {
     const parsed = YAML.parse(await fs.readFile(composePath, 'utf8'))
-    return portReadyTimeoutMs(appName, parsed?.['x-app']?.healthTimeout)
+    // engine#480: with the instance's appId, its compose x-app names the App (kiwix@release-1.0 -> kiwix)
+    const name = appId === undefined ? appName : appIdentity(appId, parsed?.['x-app']).name
+    return portReadyTimeoutMs(name, parsed?.['x-app']?.healthTimeout)
   } catch {
     return portReadyTimeoutMs(appName)
   }
@@ -1963,7 +1966,7 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
       : (storeHandle.doc()?.instanceDB?.[instance.id]?.port
         ?? (port && !isNaN(parseInt(port)) ? parseInt(port) : 0))
     const instanceDir = `${mountRoot}/instances/${instance.id}`
-    const readyTimeoutMs = await readPortReadyTimeoutMs(`${instanceDir}/compose.yaml`, parseAppId(String(instance.instanceOf ?? "")).name)
+    const readyTimeoutMs = await readPortReadyTimeoutMs(`${instanceDir}/compose.yaml`, parseAppId(String(instance.instanceOf ?? "")).name, String(instance.instanceOf ?? ""))
     await assertInstancePortReady(
       instance.id,
       Number(readyPort) || 0,

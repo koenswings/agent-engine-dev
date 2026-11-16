@@ -37,5 +37,33 @@ export const splitAppId = (appId: string): { name: string, version: string } => 
     return { name: id.slice(0, dash), version: id.slice(dash + 1) }
 }
 
+/**
+ * engine#480: the name and version of an app id, read from the compose x-app that produced it.
+ * An id is built as `<x-app.name>-<x-app.version>` (createAppId), so when this x-app gives
+ * exactly `appId` back, its fields ARE the identity and nothing has to be guessed:
+ * x-app {name: kiwix, version: release-1.0} -> kiwix / release-1.0, where splitAppId reads
+ * kiwix-release / 1.0. Without a matching x-app (none, a field missing, or a different id)
+ * this falls back to splitAppId, so a genuinely different App is still told apart.
+ */
+export const appIdentity = (appId: string, xapp?: unknown): { name: string, version: string } => {
+    const x = xapp && typeof xapp === 'object' ? xapp as { name?: unknown, version?: unknown } : null
+    if (x && x.name != null && x.version != null) {
+        const name = String(x.name), version = String(x.version)
+        if (name && version && `${name}-${version}` === String(appId)) return { name, version }
+    }
+    return splitAppId(appId)
+}
+
+/**
+ * engine#480: `<name>@<version>` from appIdentity when the x-app matched, which splitAppId
+ * reads back exactly (rule 1); otherwise `appId` unchanged. For callers that pass ids on.
+ */
+export const explicitAppId = (appId: string, xapp?: unknown): string => {
+    const id = String(appId)
+    const { name, version } = appIdentity(id, xapp)
+    const split = splitAppId(id)
+    return name === split.name && version === split.version ? id : `${name}@${version}`
+}
+
 /** True for a git commit SHA (7–40 lowercase hex), which `git clone --branch` cannot take. */
 export const isCommitSha = (ref: string): boolean => /^[0-9a-f]{7,40}$/.test(ref)
