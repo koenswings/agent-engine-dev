@@ -669,6 +669,7 @@ export const backupInstance = async (
                 log(`Restarting instance ${instanceId} after backup`)
                 setBackupStep(3, BACKUP_STEPS[3])
                 await backupLifecycle.startInstance(storeHandle, instance, appDisk, 'backup-post-start')
+                warnIfPostStartNotRunning(storeHandle, opId, instanceId, 'after backup')
             }
         }
 
@@ -784,6 +785,7 @@ export const backupInstance = async (
                 if (instance && appDisk) {
                     log(`Restarting instance ${instanceId} after failed backup`)
                     await backupLifecycle.startInstance(storeHandle, instance, appDisk, 'backup-post-start')
+                    warnIfPostStartNotRunning(storeHandle, opId, instanceId, 'after failed backup')
                 }
             } catch (restartErr) {
                 log(chalk.red(`Failed to restart instance ${instanceId} after backup error: ${restartErr}`))
@@ -1055,6 +1057,47 @@ const recordRestoreStartPending = (instance: Instance): string => {
 }
 
 
+/**
+ * engine#468: the outcome of restoreApp's post-restore start. Running is ok. A
+ * PORT_NOT_READY Error is START_PENDING (engine#428: the heal sets Running once the
+ * app answers). Any other state, such as a container that exited, is a hard start
+ * failure: the files are restored (no rollback) but the restore fails with
+ * RESTORE_START_FAILED. Pure.
+ */
+export type RestoreStartOutcome = { kind: 'running' } | { kind: 'pending' } | { kind: 'failed', message: string }
+
+export const restoreStartOutcome = (instance: Pick<Instance, 'status' | 'statusCondition'> | undefined, diskName: string): RestoreStartOutcome => {
+    if (!instance) return { kind: 'failed', message: `RESTORE_START_FAILED: restored files to ${diskName}; the instance did not start: the instance record is gone` }
+    if (instance.status === 'Running') return { kind: 'running' }
+    const cond = String(instance.statusCondition ?? '')
+    if (instance.status === 'Error' && isPortNotReadyCondition(cond)) return { kind: 'pending' }
+    const why = cond || `status is ${instance.status}`
+    return { kind: 'failed', message: `RESTORE_START_FAILED: restored files to ${diskName}; the instance did not start: ${why}` }
+}
+
+/**
+ * engine#468: a backup's post-start (after the short stop, or after a failed backup)
+ * that did not reach Running. The backup result is unchanged; the Operation gets
+ * args.postStartWarning and a backupApp trace gets it as its result.
+ */
+export const postStartWarningMessage = (instance: Pick<Instance, 'status' | 'statusCondition'> | undefined, when: string): string | null => {
+    if (instance?.status === 'Running') return null
+    const why = !instance ? 'the instance record is gone' : (String(instance.statusCondition ?? '') || `status is ${instance.status}`)
+    return `POST_START_WARNING: the instance did not return to Running ${when}: ${why}`
+}
+
+const warnIfPostStartNotRunning = (storeHandle: DocHandle<Store>, opId: string, instanceId: InstanceID, when: string): void => {
+    const msg = postStartWarningMessage(getInstance(storeHandle.doc(), instanceId), when)
+    if (!msg) return
+    log(chalk.yellow(`Backup of ${instanceId}: ${msg}`))
+    storeHandle.change(doc => {
+        const op = doc.operationDB?.[opId]
+        if (op) op.args.postStartWarning = msg
+    })
+    // Only a backupApp trace: inside updateApp the trace result belongs to the update
+    if (getActiveTrace()?.command === 'backupApp') attachTraceResult({ postStartWarning: msg })
+}
+
 const RESTORE_RUNNING_STATES = new Set(['Running', 'Starting'])
 
 /** engine#422: what restoreApp's pre-stop should do with the instance's recorded status. */
@@ -1207,11 +1250,14 @@ export const restoreApp = async (
             } else if (restored) {
                 log(`Starting restored instance ${instanceId} on disk ${targetDisk.name} (it was Running before the restore)`)
                 await backupLifecycle.startInstance(storeHandle, restored, targetDisk, RESTORE_POST_START_CAUSE)
-                // engine#428: startInstance swallows a port-ready timeout into Error
-                // and does not throw. The files are restored, so the Operation stays
-                // Done, but the trace must not be a plain ok.
+                // startInstance records a failed start as Error and does not throw.
+                // engine#428: a port-ready timeout keeps the Operation Done with a
+                // START_PENDING trace. engine#468: any other failed start fails the
+                // restore (RESTORE_START_FAILED); the restored files stay in place.
                 const after = getInstance(storeHandle.doc(), instanceId)
-                if (after && after.status !== 'Running') recordRestoreStartPending(after)
+                const outcome = restoreStartOutcome(after, String(targetDisk.name))
+                if (outcome.kind === 'pending') recordRestoreStartPending(after!)
+                else if (outcome.kind === 'failed') throw new Error(outcome.message)
             }
         }
 
