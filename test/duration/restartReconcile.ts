@@ -3,6 +3,10 @@
  * Engine re-processes each disk (~26 s on idea03). The harness read that stale "Running" and probed
  * 1.5 s before the Engine got to the Nextcloud disk. For a restarted Pi we now wait, bounded, until
  *   (2) every disk docked on that Pi has lastDocked > the restart time (Pi clock), and
+ *       (kc7 FAIL@59) except the Pi's system disk (diskTypes 'system'): with Stage 2's
+ *       settings.systemDiskSkip the Engine never re-registers it ("Device sda2 is the system disk —
+ *       skipping registration") and keeps its record docked ("system disk is always present"), so its
+ *       lastDocked never moves. Its instances are still checked under (3).
  *   (3) every Running instance on those disks has all its compose containers Up in `docker ps`.
  * Error on any of those instances fails at once; the timeout fails with a field dump. Nothing is retried.
  */
@@ -44,6 +48,10 @@ export const evaluateRestartReconcile = (
     const disks = Object.values(view.diskDB).filter(d => d.dockedTo === engineId)
     const diskIds = new Set(disks.map(d => d.id))
     for (const d of disks) {
+        if ((d.diskTypes ?? []).includes('system')) {
+            fields.push(`disk ${d.id} lastDocked=${d.lastDocked ?? 'absent'} restartAt=${restartAtMs} (system disk: not gated)`)
+            continue
+        }
         const ok = (d.lastDocked ?? 0) > restartAtMs
         fields.push(`disk ${d.id} lastDocked=${d.lastDocked ?? 'absent'} restartAt=${restartAtMs}${ok ? '' : ' (not reconciled)'}`)
         if (!ok) pending.push(`disk ${d.id} not re-processed since restart`)
