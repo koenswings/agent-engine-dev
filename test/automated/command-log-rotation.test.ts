@@ -16,6 +16,7 @@ import {
     COMMAND_LOG_CARRY_GRACE_MS,
 } from '../../src/data/CommandLogStore.js'
 import { commandLogText } from '../../src/data/CommandLogStore.js'
+import { isOwnCommandLog } from '../../src/data/StoreScope.js'
 
 let dir = ''
 const urlFile = () => path.join(dir, 'store-identity', 'command-log-url.txt')
@@ -228,6 +229,28 @@ describe('CommandLog daily rotation (idea#183)', () => {
         const { commandLogArchiveMaxBytes, COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES } = await import('../../src/data/Config.js')
         expect(COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES).toBe(1_000_000_000)
         expect(commandLogArchiveMaxBytes()).toBe(1_000_000_000)
+    })
+
+    it('engine#471 (a): every log this Engine creates, loads or rotates to carries its engineId and is marked as its own', async () => {
+        const storageDir = path.join(dir, 'store-data')
+        const repo1 = new Repo({ network: [], storage: new NodeFSStorageAdapter(storageDir) })
+        // a log from before engine#471 (no engineId) named in the url file
+        const legacy = await createCommandLogStore(repo1, { urlFile: urlFile(), now: at('2026-10-13T10:00:00') })
+        expect(legacy.doc()!.engineId).toBeUndefined()
+        await shutdownRepo(repo1)
+        setCommandLogHandle(null)
+
+        const repo2 = new Repo({ network: [], storage: new NodeFSStorageAdapter(storageDir) })
+        const loaded = await createCommandLogStore(repo2, { urlFile: urlFile(), engineId: 'ENGINE_x', now: at('2026-10-13T11:00:00'), timeoutMs: 5_000 })
+        expect(loaded.url).toBe(legacy.url)
+        expect(loaded.doc()!.engineId).toBe('ENGINE_x')                      // backfilled
+        expect(isOwnCommandLog(repo2, loaded.documentId)).toBe(true)
+        expect(isOwnCommandLog(new Repo({ network: [] }), loaded.documentId)).toBe(false)   // per Repo
+        const fresh = await rotateCommandLog(repo2, { urlFile: urlFile(), archiveDir: archiveDir(), now: at('2026-10-14T00:01:00') })
+        expect(fresh.doc()!.engineId).toBe('ENGINE_x')
+        expect(isOwnCommandLog(repo2, fresh.documentId)).toBe(true)
+        expect(fs.readFileSync(path.join(process.cwd(), 'src/start.ts'), 'utf-8')).toContain('engineId: String(localEngineId)')
+        await shutdownRepo(repo2)
     })
 
     it('start.ts starts the rotation timer', () => {
