@@ -692,7 +692,69 @@ export const STAGE2_GAPS: readonly Stage2Gap[] = [
         semantics: 'network copy: source partition exported (stage2-dock.sh export) and imported into the move-only target duration-empty-003 (idea04 p2, IDEA-EMPTY003); the SSD itself never changes hosts',
         reason: 'no hands to move a real SSD between Pis (PLAN §3 / D7); physical move = Stage 3 (USB switch)',
     },
+    {
+        action: 'confirm_erase',
+        semantics: 'expected refusal: the Erase partition (duration-empty-001, idea03 p2) shares its SSD with the mounted Nextcloud App Disk (p1); the Engine shared-disk guard (#188) must refuse with "shares its physical disk … nothing was erased" and change nothing; no real whole-disk erase',
+        reason: 'every Stage 2 fixture is a partition on a two-partition SSD: a real erase wipes the whole SSD (the mounted sibling too) and drops the PARTLABEL stage2-dock.sh finds fixtures by; real erase = unit tests + a single-partition disk (Stage 3 / separate hw round-trip)',
+    },
 ]
+
+/** Short label per gap for the one-line run summary. */
+export const STAGE2_GAP_SHORT: Readonly<Record<string, string>> = {
+    infra_move_disk: 'network copy',
+    confirm_erase: 'expected shared-SSD refusal',
+}
+
+// ── kc9 FAIL@105: confirm_erase on a partition that shares its SSD ──────────
+
+/**
+ * Engine EraseDisk.ts (#188, 323accd 2026-10-16): erase wipes the WHOLE physical disk, so a target
+ * whose disk also carries another mounted partition is refused before anything is unmounted.
+ */
+export const ERASE_SHARED_DISK_REFUSAL = /shares its physical disk \(\/dev\/([a-z0-9]+)\) with (.+?)\. Erasing wipes the whole disk, so nothing was erased\./
+
+/**
+ * Mounted fixture partitions on the same physical disk as `diskId` (live `stage2-dock.sh status`).
+ * Throws when the target itself is not present (fail loud: the walker cannot tell what an erase would hit).
+ */
+export const stage2MountedSiblings = (st: Stage2Status, diskId: string): { parent: string; target: Stage2StatusFixture; siblings: Stage2StatusFixture[] } => {
+    const f = stage2Fixture(diskId)
+    const me = st.fixtures.find(x => x.partLabel === f.partLabel)
+    if (!me || !me.present || !me.parent) {
+        throw new Error(`Stage 2 confirm_erase: ${diskId} (${f.partLabel}) is not present on ${st.host} (stage2-dock status), so the walker cannot tell which disk an erase would wipe`)
+    }
+    const siblings = st.fixtures.filter(x => x.partLabel !== f.partLabel && x.present && x.parent === me.parent && !!x.mounted)
+    return { parent: me.parent, target: me, siblings }
+}
+
+export type Stage2ConfirmEraseVerdict =
+    | { kind: 'expected_refusal'; note: string }
+    | { kind: 'fail'; note: string }
+
+/**
+ * Judge a Stage 2 confirm_erase Intent result when the target shares its SSD with mounted siblings.
+ * Pass only on the Engine's exact shared-disk refusal naming this parent and every mounted sibling.
+ * An "ok" here is a failure: either the guard did not refuse (the sibling was wiped) or the Intent
+ * counted a closed dialog as success (r86t on Engine f194fb5, before the guard existed).
+ */
+export const stage2ConfirmEraseVerdict = (
+    result: { ok: boolean; message?: string },
+    diskId: string,
+    parent: string,
+    siblings: readonly Stage2StatusFixture[],
+): Stage2ConfirmEraseVerdict => {
+    const sib = siblings.map(s => `${s.kname} (${s.partLabel}) at ${s.mounted}`).join(', ')
+    if (result.ok) {
+        return { kind: 'fail', note: `confirm_erase: Intent reported ok, but ${diskId} shares /dev/${parent} with mounted ${sib}. The Engine must refuse (shared-disk guard #188); an ok means the guard did not fire or the Intent counted a closed dialog as success. Fail loud.` }
+    }
+    const msg = result.message ?? ''
+    const m = ERASE_SHARED_DISK_REFUSAL.exec(msg)
+    if (!m) return { kind: 'fail', note: `confirm_erase: expected the shared-disk refusal for ${diskId} on /dev/${parent} (mounted ${sib}), got: ${msg.slice(0, 300)}` }
+    if (m[1] !== parent) return { kind: 'fail', note: `confirm_erase: refusal names /dev/${m[1]}, but stage2-dock status puts ${diskId} on /dev/${parent}` }
+    const missing = siblings.filter(s => !new RegExp(`\\b${s.kname}\\b`).test(m[2]!))
+    if (missing.length) return { kind: 'fail', note: `confirm_erase: refusal does not name mounted sibling(s) ${missing.map(s => s.kname).join(', ')}: ${m[0]}` }
+    return { kind: 'expected_refusal', note: `confirm_erase: Engine refused as expected (shared SSD /dev/${parent} with mounted ${sib}): "${m[0]}"` }
+}
 
 /** Steps of the walk whose semantics change under Stage 2 → notCovered-style list for duration_start/summary. */
 export const stage2NotCovered = (steps: readonly { action: string }[]): { step: number; action: string; semantics: string }[] =>

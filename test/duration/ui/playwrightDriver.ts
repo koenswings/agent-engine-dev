@@ -96,7 +96,7 @@ type PwLocator = {
     first: () => PwLocator
     isVisible: () => Promise<boolean>
     click: () => Promise<void>
-    waitFor: (o: { state: 'visible'; timeout: number }) => Promise<void>
+    waitFor: (o: { state: 'visible' | 'hidden'; timeout: number }) => Promise<void>
     isDisabled: () => Promise<boolean>
     getAttribute: (name: string) => Promise<string | null>
 }
@@ -497,6 +497,24 @@ export class PlaywrightUiDriver implements UiDriver {
             `selectDisk: ${rowSel} ${clicked ? 'clicked but EmptyDiskPanel never visible' : 'never visible in NetworkTree'} ` +
                 `within ${budget}ms. Prefer A — refuse to act on another Empty Disk.`,
         )
+    }
+
+    /** kc9 FAIL@105: see UiDriver.dismissEraseError. */
+    async dismissEraseError(): Promise<string> {
+        await this.ensureReady()
+        const page = this.page as PwPage
+        const dialog = page.locator('[data-testid="erase-dialog"]').first()
+        if (!(await dialog.isVisible().catch(() => false))) return 'erase dialog already closed'
+        // Console EraseDialog 'error' phase: the alert plus one Close button (no testid).
+        const close = page.locator('[data-testid="erase-dialog"] button:has-text("Close")').first()
+        await close.waitFor({ state: 'visible', timeout: 10_000 })
+        await close.click()
+        try {
+            await dialog.waitFor({ state: 'hidden', timeout: 10_000 })
+        } catch {
+            throw new Error('dismissEraseError: clicked Close but erase-dialog is still visible')
+        }
+        return 'closed the erase error dialog'
     }
 
     /** r30 reboot_engine: see UiDriver.waitEngineOnline. */
