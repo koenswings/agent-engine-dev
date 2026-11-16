@@ -976,6 +976,135 @@ describe('idea-app-data: borg', () => {
 })
 
 
+describe('idea-app-data borg-extract: the replaced folder goes to quarantine, every copy kept (helper v19, engine#468)', () => {
+    const ARCHIVE = '2026-11-16T03-34-19-273Z-hook'
+    const STAMP = '20261116T033756Z'
+    const COPY_RE = /^inst1-replaced-\d{8}T\d{6}Z(-[2-9])?$/
+    let target: string
+    let qdir: string
+    beforeEach(async () => {
+        const bk = await sb.addDisk('sdc1', { backup: true })
+        const repo = path.join(bk, 'backups', 'inst1')
+        await fs.ensureDir(repo)
+        await fs.writeFile(path.join(repo, 'config'), '[repository]\n')
+        target = await sb.addDisk('sdd1')
+        qdir = path.join(target, '.idea-quarantine')
+    })
+    const live = async (content: string) => {
+        await fs.ensureDir(path.join(target, 'instances', 'inst1', 'data', 'db'))
+        await fs.writeFile(path.join(target, 'instances', 'inst1', 'data', 'db', 'ibdata1'), content)
+    }
+    const extract = (env: Record<string, string> = {}) =>
+        sb.run(['borg-extract', 'sdc1', 'inst1', ARCHIVE, '3', 'sdd1'], { FAKE_BORG_EXTRACT: 'inst1', ...env })
+    const replacedCopies = async () => (await fs.pathExists(qdir)) ? (await fs.readdir(qdir)).filter(n => COPY_RE.test(n)).sort() : []
+    const lineOf = (out: string, key: string) => out.split('\n').filter(l => l.startsWith(`${key}=`)).map(l => l.slice(key.length + 1))
+    const db = (dir: string) => fs.readFile(path.join(dir, 'data', 'db', 'ibdata1'), 'utf8')
+
+    it('moves the replaced instances/<id> into .idea-quarantine/<id>-replaced-<stamp>, prints the path and never deletes it', async () => {
+        await live('the only good db')
+        const r = await extract()
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(await fs.readFile(path.join(target, 'instances', 'inst1', 'data.txt'), 'utf8')).toBe('restored\n')
+        const copies = await replacedCopies()
+        expect(copies).toHaveLength(1)
+        const q = path.join(qdir, copies[0])
+        expect(lineOf(r.stdout, 'replacedQuarantine')).toEqual([q])
+        expect(await db(q)).toBe('the only good db')
+        expect((await fs.stat(qdir)).mode & 0o777).toBe(0o700)
+        expect((await fs.stat(q)).mode & 0o777).toBe(0o700)
+        expect(await fs.pathExists(path.join(target, '.idea-app-data-staging'))).toBe(false)
+        expect(await sb.journalText()).toMatch(/quarantine: replaced instance folder -> .*inst1-replaced-/)
+    })
+
+    it('a restore onto an empty target quarantines nothing and creates no quarantine folder', async () => {
+        const r = await extract()
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout).not.toMatch(/replaced(Quarantine|Kept)=/)
+        expect(await fs.pathExists(qdir)).toBe(false)
+    })
+
+    it('two restores leave two copies (no keep-latest pruning; cleanup via #273), and nothing else in .idea-quarantine is touched', async () => {
+        const other = path.join(qdir, 'inst2-replaced-20200101T000000Z')
+        await fs.ensureDir(other)
+        await live('first')
+        const r1 = await extract({ FAKE_DATE_UTC_STAMP: '20261116T080000Z' })
+        expect(r1.exitCode, r1.stderr).toBe(0)
+        await live('second')
+        const r2 = await extract({ FAKE_DATE_UTC_STAMP: '20261116T080100Z' })
+        expect(r2.exitCode, r2.stderr).toBe(0)
+        expect(await replacedCopies()).toEqual(['inst1-replaced-20261116T080000Z', 'inst1-replaced-20261116T080100Z'])
+        expect(await db(path.join(qdir, 'inst1-replaced-20261116T080000Z'))).toBe('first')
+        expect(await db(path.join(qdir, 'inst1-replaced-20261116T080100Z'))).toBe('second')
+        expect(r2.stdout).not.toMatch(/pruned=/)
+        expect(await fs.pathExists(other)).toBe(true)
+    })
+
+    it('a stamp that is already taken is never overwritten: the next copy gets -2, -3 …', async () => {
+        const taken = path.join(qdir, `inst1-replaced-${STAMP}`)
+        await fs.ensureDir(path.join(taken, 'data'))
+        await fs.writeFile(path.join(taken, 'data', 'keep'), 'older copy')
+        await live('first')
+        const r1 = await extract({ FAKE_DATE_UTC_STAMP: STAMP })
+        expect(r1.exitCode, r1.stderr).toBe(0)
+        expect(lineOf(r1.stdout, 'replacedQuarantine')).toEqual([`${taken}-2`])
+        await live('second')
+        const r2 = await extract({ FAKE_DATE_UTC_STAMP: STAMP })
+        expect(lineOf(r2.stdout, 'replacedQuarantine')).toEqual([`${taken}-3`])
+        expect(await fs.readFile(path.join(taken, 'data', 'keep'), 'utf8')).toBe('older copy')
+        expect(await db(`${taken}-2`)).toBe('first')
+        expect(await db(`${taken}-3`)).toBe('second')
+    })
+
+    it('when the stamp and all its suffixes -2 … -9 are taken, nothing is overwritten and the folder stays in staging', async () => {
+        const taken = path.join(qdir, `inst1-replaced-${STAMP}`)
+        for (const n of ['', '-2', '-3', '-4', '-5', '-6', '-7', '-8', '-9']) await fs.ensureDir(`${taken}${n}`)
+        await fs.writeFile(path.join(`${taken}-9`, 'keep'), 'x')
+        await live('the only good db')
+        const r = await extract({ FAKE_DATE_UTC_STAMP: STAMP })
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect(r.stdout).not.toMatch(/replacedQuarantine=/)
+        const [kept] = lineOf(r.stdout, 'replacedKept')
+        expect(kept.startsWith(path.join(target, '.idea-app-data-staging', 'restore-inst1.'))).toBe(true)
+        expect(await db(kept)).toBe('the only good db')
+        expect(r.stderr).toMatch(/suffixes -2 to -9 already exist/)
+        expect(await fs.readFile(path.join(`${taken}-9`, 'keep'), 'utf8')).toBe('x')
+        expect(await fs.readdir(`${taken}-2`)).toEqual([])
+    })
+
+    for (const [what, make] of [
+        ['a symlink', async (q: string, outside: string) => { await fs.symlink(outside, q) }],
+        ['a regular file', async (q: string) => { await fs.writeFile(q, 'not a folder') }],
+    ] as [string, (q: string, outside: string) => Promise<void>][]) {
+        it(`when the quarantine folder is ${what}, the restore still succeeds and the replaced folder stays in staging (never removed)`, async () => {
+            const outside = path.join(sb.tmp, 'outside-q')
+            await fs.ensureDir(outside)
+            await make(qdir, outside)
+            await live('the only good db')
+            const r = await extract()
+            expect(r.exitCode, r.stderr).toBe(0)
+            expect(await fs.readFile(path.join(target, 'instances', 'inst1', 'data.txt'), 'utf8')).toBe('restored\n')
+            const [kept] = lineOf(r.stdout, 'replacedKept')
+            expect(kept.startsWith(path.join(target, '.idea-app-data-staging', 'restore-inst1.'))).toBe(true)
+            expect(kept.endsWith('/.previous')).toBe(true)
+            expect(await db(kept)).toBe('the only good db')
+            expect(r.stdout).not.toMatch(/replacedQuarantine=/)
+            expect(r.stderr).toMatch(/warning: the replaced instance folder was not quarantined/)
+            expect(r.stderr).toMatch(/warning: kept the staging folder/)
+            expect(await fs.readdir(outside)).toEqual([])
+        })
+    }
+
+    it('no code path removes a replaced folder: the restore section has no rm, and the staging cleanup checks for .previous first', async () => {
+        const text = await fs.readFile(HELPER_SOURCE, 'utf8')
+        const section = text.slice(text.indexOf('# ── Restore: the replaced instance folder'), text.indexOf('# ── updateApp snapshots'))
+        expect(section).toContain('replaced_to_quarantine()')
+        expect(section).not.toMatch(/\$RM|\$RMDIR|rm -/)
+        expect(text).not.toMatch(/prune_replaced|replaced-ok/)
+        const cleanup = text.slice(text.indexOf('cleanup_staging() {'), text.indexOf('# Cancellation: stop the child'))
+        expect(cleanup.indexOf('.previous')).toBeLessThan(cleanup.indexOf('$RM -rf'))
+    })
+})
+
 describe('idea-app-data: borg-list / borg-delete / borg-compact (idea#401, helper v9)', () => {
     const A = [
         '2026-01-01T00-00-00-000Z',
@@ -1614,10 +1743,10 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v18 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs)', async () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('18')
+    it('helper and Engine speak v19 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine)', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('19')
         const r = await sb.run(['version'])
-        expect(r.stdout.trim()).toBe('idea-app-data 18')
+        expect(r.stdout.trim()).toBe('idea-app-data 19')
     })
 
     it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {

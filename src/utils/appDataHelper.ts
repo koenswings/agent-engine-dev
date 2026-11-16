@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '18'
+export const APP_DATA_HELPER_VERSION = '19'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -187,6 +187,32 @@ export const borgExtractArgs = (bdev: string, id: string, archive: string, strip
     if (!Number.isInteger(strip) || strip < 1 || strip > 9) throw new Error(`strip ${strip} is out of range (1-9)`)
     return ['borg-extract', checkRoot(bdev), checkId(id), checkArchive(archive), String(strip), checkRoot(dstRoot)]
 }
+/**
+ * engine#468 / helper v19: borg-extract moves the instance folder it replaces into
+ * <target>/.idea-quarantine/<id>-replaced-<UTC stamp> (every copy is kept; cleanup via #273) instead
+ * of deleting it. An older helper deletes it, so an in-place restore refuses below v19.
+ */
+export const RESTORE_REPLACED_QUARANTINE_HELPER_MIN = 19
+
+export interface BorgExtractResult {
+    /** where the replaced instance folder went (helper v19), or null */
+    replacedQuarantine: string | null
+    /** the replaced folder could not be quarantined and is still at this staging path */
+    replacedKept: string | null
+}
+
+/** Parse borg-extract's v19 stdout (key=value lines; anything else is ignored). */
+export const parseBorgExtract = (stdout: string): BorgExtractResult => {
+    const out: BorgExtractResult = { replacedQuarantine: null, replacedKept: null }
+    for (const line of String(stdout ?? '').split('\n')) {
+        const m = line.trim().match(/^(replacedQuarantine|replacedKept)=(\/.+)$/)
+        if (!m) continue
+        if (m[1] === 'replacedQuarantine') out.replacedQuarantine = m[2]
+        else out.replacedKept = m[2]
+    }
+    return out
+}
+
 /** idea#401 / helper v9, fixed in v10 (idea#450): JSON of every archive (borg info --json --glob-archives '*') so the Engine can pick.
  *  idea#446: pass `archive` for a member list of that one archive (`borg list --short`). */
 export const borgListArgs = (bdev: string, id: string, archive?: string): string[] => {
@@ -530,7 +556,7 @@ export const parseSnapshotsList = (out: string): { snapshots: { instanceId: stri
 
 
 // ── Temporary pre-update backups on the system disk (helper v18, engine#469) ──
-/** engine#469: first helper with the temp-backup-* verbs. engine#468 also claims v18; whichever merges second renumbers. */
+/** engine#469: first helper with the temp-backup-* verbs. Feature min stays 18; the helper itself is v19 after engine#468. */
 export const TEMP_BACKUP_HELPER_MIN = 18
 /** Folder name under the system disk root (the helper's TEMP_BACKUPS_NAME). */
 export const TEMP_BACKUPS_DIR = '/.idea-temp-backups'

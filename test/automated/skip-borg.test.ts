@@ -74,6 +74,7 @@ case "$1" in
   borg-create) [ -n "$FAKE_BORG_REFUSE_CREATE" ] && [ -e "$FAKE_BORG_REFUSE_CREATE" ] && { echo "idea-app-data borg-create refused: unknown root '$2'" >&2; exit 2; } ;;
 esac
 case "$1" in
+  version) [ -n "$FAKE_HELPER_VERSION" ] && echo "idea-app-data $FAKE_HELPER_VERSION" ;;
   borg-init) mkdir -p "$IDEA_DISKS_ROOT/$2/backups/$3" && echo '[repository]' > "$IDEA_DISKS_ROOT/$2/backups/$3/config" ;;
   borg-info) echo '{"archives":[{"name":"2026-10-06T08-00-00-000Z","command_line":["borg","create","--numeric-ids","--","r::a","/disks/x/instances/${INST}"]}]}' ;;
 esac
@@ -199,17 +200,25 @@ describe('backupInstance / restoreApp with testMode on', () => {
 
     it('skipBorg false: borg init, create and extract all run through the helper (root tokens, real archive name), still in testMode', async () => {
         config.settings.skipBorg = false
-        const { backupOp } = await backupThenRestore()
+        // engine#468: the in-place restore needs helper v19 (the replaced folder goes to quarantine)
+        process.env.FAKE_HELPER_VERSION = '19'
+        let backupOp: any
+        try {
+            ({ backupOp } = await backupThenRestore())
+        } finally {
+            delete process.env.FAKE_HELPER_VERSION
+        }
         const log = await calls()
         expect(backupOp?.status, JSON.stringify(backupOp)).toBe('Done')
         expect(log[0]).toBe(`borg-init ${backupDevice} ${INST}`)
-        // engine#401: one helper version check picks the archive-name mode suffix; this fake
-        // helper reports no version, so the name stays untagged
+        // engine#401: one helper version check picks the archive-name mode suffix (v19 here: tagged)
         expect(log[1]).toBe('version')
-        expect(log[2]).toMatch(new RegExp(`^borg-create ${backupDevice} ${INST} \\d{4}-\\d{2}-\\d{2}T[0-9-]+Z ${appDevice}$`))
-        expect(log[3]).toBe(`borg-info ${backupDevice} ${INST}`)
-        expect(log[4]).toBe(`borg-extract ${backupDevice} ${INST} 2026-10-06T08-00-00-000Z 3 ${appDevice}`)
-        expect(log).toHaveLength(5)
+        expect(log[2]).toMatch(new RegExp(`^borg-create ${backupDevice} ${INST} \\d{4}-\\d{2}-\\d{2}T[0-9-]+Z-(hook|stop|cold) ${appDevice}$`))
+        // engine#468: restoreApp onto the existing instance folder checks for helper v19 first
+        expect(log[3]).toBe('version')
+        expect(log[4]).toBe(`borg-info ${backupDevice} ${INST}`)
+        expect(log[5]).toBe(`borg-extract ${backupDevice} ${INST} 2026-10-06T08-00-00-000Z 3 ${appDevice}`)
+        expect(log).toHaveLength(6)
         // engine#430: the successful backup queued one low-priority size measurement of the instance
         await dataBytesQueue.idle()
         expect((await allCalls()).filter(c => c.startsWith('size '))).toEqual([`size ${appDevice} ${INST}`])
