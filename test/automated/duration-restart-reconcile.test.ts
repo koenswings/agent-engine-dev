@@ -74,6 +74,34 @@ describe('evaluateRestartReconcile', () => {
         expect(evaluateRestartReconcile(view({ ncLast: T0 + 1, nc: 'Stopped' }), 'idea03', T0, parseDockerPs(ps('none'))).done).toBe(true)
         expect(evaluateRestartReconcile(view({ ncLast: T0 + 1, nc: 'Error' }), 'idea03', T0, []).error).toBe(`${NI} is Error on idea03`)
     })
+    it('kc7 FAIL@59: the system disk (systemDiskSkip, lastDocked never moves) is not gated; its instances still are', () => {
+        const SYS = 'gge6zxyl6ftmnri4qx6', SI = 'sys-kiwix-001'
+        const v = view({ ncLast: T0 + 1, nc: 'Running' })
+        v.diskDB[SYS] = { id: SYS, dockedTo: 'idea03', device: 'sda2', diskTypes: ['system'], lastDocked: T0 - 5 * 86_400_000 }
+        const ok = evaluateRestartReconcile(v, 'idea03', T0, parseDockerPs(ps('running')))
+        expect(ok.done).toBe(true)
+        expect(ok.fields).toContain(`disk ${SYS} lastDocked=${T0 - 5 * 86_400_000} restartAt=${T0} (system disk: not gated)`)
+        v.instanceDB[SI] = { id: SI, status: 'Running', diskId: SYS, port: 18381 }
+        expect(evaluateRestartReconcile(v, 'idea03', T0, parseDockerPs(ps('running'))).pending).toEqual([`${SI} Running but no containers`])
+        // A stale non-system disk is still pending (the r60 gate is unchanged)
+        v.diskDB[SYS] = { ...v.diskDB[SYS]!, diskTypes: ['app'] }
+        delete v.instanceDB[SI]
+        expect(evaluateRestartReconcile(v, 'idea03', T0, parseDockerPs(ps('running'))).pending).toEqual([`disk ${SYS} not re-processed since restart`])
+    })
+    it('kc7: a system-disk record without the marker is matched by the Engine id (ENGINE_<diskId>)', () => {
+        const SYS = 'gge6zxyl6ftmnri4qx6', stale = T0 - 5 * 86_400_000
+        const v = { ...view({ ncLast: T0 + 1, nc: 'Running' }), liveEngineId: `ENGINE_${SYS}` }
+        v.diskDB[SYS] = { id: SYS, dockedTo: 'idea03', device: 'sda2', lastDocked: stale }
+        const ok = evaluateRestartReconcile(v, 'idea03', T0, parseDockerPs(ps('running')))
+        expect(ok.done).toBe(true)
+        expect(ok.fields).toContain(`disk ${SYS} lastDocked=${stale} restartAt=${T0} (system disk: not gated)`)
+        // engineId passed as the live id also matches
+        expect(evaluateRestartReconcile({ ...v, liveEngineId: undefined, diskDB: { [SYS]: { ...v.diskDB[SYS]!, dockedTo: `ENGINE_${SYS}` } } },
+            `ENGINE_${SYS}`, T0, []).done).toBe(true)
+        // Another Pi's Engine id does not match: still pending
+        expect(evaluateRestartReconcile({ ...v, liveEngineId: 'ENGINE_5vyahbut147hw5dp4e1' }, 'idea03', T0, parseDockerPs(ps('running'))).pending)
+            .toEqual([`disk ${SYS} not re-processed since restart`])
+    })
     it('budget: default 180 s, env override', () => {
         expect(restartReconcileBudgetMs({})).toBe(DEFAULT_RESTART_RECONCILE_MS)
         expect(restartReconcileBudgetMs({ DURATION_RESTART_RECONCILE_MS: '5000' })).toBe(5000)

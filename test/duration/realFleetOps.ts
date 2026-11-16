@@ -2027,7 +2027,7 @@ export class RealFleetOps implements FleetOps {
             engineDB[logicalId] = { id: logicalId, hostname: eng.hostname ? String(eng.hostname) : logicalId }
         }
 
-        return { engineId: logicalId, instanceDB, diskDB, engineDB }
+        return { engineId: logicalId, ...(liveId ? { liveEngineId: liveId } : {}), instanceDB, diskDB, engineDB }
     }
 
 

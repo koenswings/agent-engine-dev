@@ -61,6 +61,8 @@ export interface Scenario {
 /** Semantic store view — compare fields, never raw Automerge blobs. */
 export interface SemanticStoreView {
     engineId: string
+    /** kc7: the Engine's own store id (ENGINE_<system diskId>, idea#524) when known; engineId is the logical host name. */
+    liveEngineId?: string
     instanceDB: Record<string, SemanticInstance>
     diskDB: Record<string, SemanticDisk>
     engineDB: Record<string, SemanticEngine>
