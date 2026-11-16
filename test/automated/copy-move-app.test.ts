@@ -235,8 +235,11 @@ describe('copyApp', () => {
         const { handle } = await makeHandle()
         const { processInstance } = await import('../../src/data/Disk.js')
         let capturedId: string | null = null
-        vi.mocked(processInstance).mockImplementationOnce(async (_h, _d, id) => {
-            capturedId = id; return undefined as any
+        vi.mocked(processInstance).mockImplementationOnce(async (h, d, id) => {
+            capturedId = id
+            // the register claims the id on the target (kc8: moveApp fails loud otherwise)
+            h.change((doc: any) => { const inst = doc.instanceDB[id]; if (inst) inst.storedOn = d.id })
+            return undefined as any
         })
         await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
         expect(capturedId).not.toBeNull()
@@ -390,8 +393,11 @@ describe('moveApp', () => {
         const { handle } = await makeHandle()
         const { processInstance } = await import('../../src/data/Disk.js')
         let capturedId: string | null = null
-        vi.mocked(processInstance).mockImplementationOnce(async (_h, _d, id) => {
-            capturedId = id; return undefined as any
+        vi.mocked(processInstance).mockImplementationOnce(async (h, d, id) => {
+            capturedId = id
+            // the register claims the id on the target (kc8: moveApp fails loud otherwise)
+            h.change((doc: any) => { const inst = doc.instanceDB[id]; if (inst) inst.storedOn = d.id })
+            return undefined as any
         })
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
         expect(capturedId).toBe(INSTANCE_ID)
@@ -406,7 +412,9 @@ describe('moveApp', () => {
         expect(vi.mocked(processInstance)).toHaveBeenCalledWith(
             handle,
             expect.objectContaining({ id: TARGET_DISK_ID }),
-            INSTANCE_ID
+            INSTANCE_ID,
+            // kc8 step 104: the explicit keep-id claim from the move's source disk
+            { moveFrom: SOURCE_DISK_ID },
         )
     })
 

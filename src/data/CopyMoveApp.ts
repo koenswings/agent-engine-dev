@@ -738,7 +738,14 @@ export const moveApp = async (
         }
 
         log(`moveApp: registering instance ${instance.id} on disk '${targetDisk.name}' (${targetDisk.id})`)
-        await processInstance(storeHandle, targetDisk, instance.id)
+        // kc8 step 104: claim the id explicitly (moveFrom). Without it the engine#381
+        // guard refused the claim, storedOn stayed on the source while the instance
+        // was started from the target, and ejecting the target never stopped it.
+        await processInstance(storeHandle, targetDisk, instance.id, { moveFrom: sourceDisk.id })
+        const storedOnNow = storeHandle.doc()?.instanceDB?.[instance.id]?.storedOn
+        if (String(storedOnNow) !== String(targetDisk.id)) {
+            throw new Error(`moveApp: instance ${instance.id} was not registered on '${targetDisk.name}' (${targetDisk.id}); storedOn is ${storedOnNow ?? 'none'}`)
+        }
         partialTarget = false
 
         // idea#474: processInstance does not auto-start a just-stopped instance
