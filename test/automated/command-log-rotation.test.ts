@@ -15,6 +15,7 @@ import {
     flushLogs, capCommandLogArchives, listCommandLogArchives, liveCommandLogHandle, shutdownRepo,
     COMMAND_LOG_CARRY_GRACE_MS,
 } from '../../src/data/CommandLogStore.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 let dir = ''
 const urlFile = () => path.join(dir, 'store-identity', 'command-log-url.txt')
@@ -99,7 +100,7 @@ describe('CommandLog daily rotation (idea#183)', () => {
         const fresh = await rotateCommandLog(repo, { urlFile: urlFile(), now: () => now, archiveDir: archiveDir() })
         expect(getCommandLogHandle()).toBe(fresh)
         expect(fresh.doc()!.recentTraceIds).toEqual(['recent', 'running'])
-        expect(fresh.doc()!.traces['recent'].errorMessage).toBe('boom')
+        expect(commandLogText(fresh.doc()!.traces['recent'].errorMessage)).toBe('boom')
         expect(liveCommandLogHandle(old)).toBe(fresh)
 
         // The command that started before midnight finishes through its old handle
@@ -107,7 +108,7 @@ describe('CommandLog daily rotation (idea#183)', () => {
         closeTrace(old, 'running', 'ok')
         const t = fresh.doc()!.traces['running']
         expect(t.status).toBe('ok')
-        expect(t.logs.map(l => l.message)).toEqual(['before', 'after'])
+        expect(t.logs.map(l => String(l.message))).toEqual(['before', 'after'])
         // New commands through the old handle too
         addTrace(old, trace('new-after-midnight'))
         expect(fresh.doc()!.traces['new-after-midnight']).toBeTruthy()

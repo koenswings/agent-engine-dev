@@ -39,6 +39,7 @@ import { startInstance } from '../../src/data/Instance.js'
 import { verifyMoveTarget } from '../../src/data/MoveAppRemote.js'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { enableStoreMonitor } from '../../src/monitors/storeMonitor.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const newStore = async (): Promise<DocHandle<Store>> => {
     const h = new Repo({ network: [], storage: undefined }).create<Store>({
@@ -84,7 +85,7 @@ describe('engine command queue (idea#168)', () => {
         await vi.waitFor(() => expect(queue(h)).toEqual([]))
         const bogus = traces(log).find(x => x.command === 'bogusword')
         expect(bogus?.status).toBe('error')
-        expect(bogus?.errorMessage).toBe('Unknown command: bogusword')
+        expect(commandLogText(bogus?.errorMessage)).toBe('Unknown command: bogusword')
         expect(vi.mocked(rebootEngine)).toHaveBeenCalledOnce()
     })
 
@@ -94,7 +95,7 @@ describe('engine command queue (idea#168)', () => {
         await vi.waitFor(() => expect(queue(h)).toEqual([]))
         const t = traces(log).find(x => x.command === 'ejectDisk')
         expect(t?.status).toBe('error')
-        expect(t?.errorMessage).toBe('Error: Insufficient arguments')
+        expect(commandLogText(t?.errorMessage)).toBe('Error: Insufficient arguments')
         expect(vi.mocked(rebootEngine)).toHaveBeenCalledOnce()
     })
 
@@ -107,7 +108,7 @@ describe('engine command queue (idea#168)', () => {
         expect(cmds.filter(c => c === 'ejectDisk')).toHaveLength(1)
         expect(cmds.filter(c => c === 'cancelOperation')).toHaveLength(1)
         expect(cmds.indexOf('ejectDisk')).toBeLessThan(cmds.indexOf('cancelOperation'))
-        expect(traces(log).find(t => t.command === 'ejectDisk')?.errorMessage).toContain("Disk 'no-such-disk' not found.")
+        expect(commandLogText(traces(log).find(t => t.command === 'ejectDisk')?.errorMessage)).toContain("Disk 'no-such-disk' not found.")
         expect(vi.mocked(rebootEngine)).toHaveBeenCalledOnce()
     })
 

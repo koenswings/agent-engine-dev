@@ -15,7 +15,7 @@
 import { AsyncLocalStorage } from 'async_hooks'
 import type { DocHandle } from '@automerge/automerge-repo'
 import type { CommandLogStore, LogEntry } from '../data/CommandLogStore.js'
-import { flushLogs } from '../data/CommandLogStore.js'
+import { flushLogs, commandLogText } from '../data/CommandLogStore.js'
 import { redactSecrets, redactString, redactedJson } from './redact.js'
 
 export interface TraceContext {
@@ -67,7 +67,7 @@ const scheduleFlush = (traceId: string): void => {
  */
 export const appendToTrace = (traceId: string, entry: LogEntry): void => {
   if (!pendingBuffers.has(traceId)) pendingBuffers.set(traceId, [])
-  pendingBuffers.get(traceId)!.push({ ...entry, message: redactString(entry.message) })
+  pendingBuffers.get(traceId)!.push({ ...entry, message: redactString(commandLogText(entry.message) ?? '') })
   scheduleFlush(traceId)
 }
 

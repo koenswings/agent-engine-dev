@@ -8,7 +8,7 @@
  * The doc URL is exposed at GET /api/command-log-url (added to httpMonitor).
  */
 
-import { DocHandle, Repo, isValidAutomergeUrl } from '@automerge/automerge-repo'
+import { DocHandle, Repo, isValidAutomergeUrl, ImmutableString } from '@automerge/automerge-repo'
 import { log, print } from '../utils/utils.js'
 import { fs } from 'zx'
 import path from 'path'
@@ -20,9 +20,40 @@ import { stopPeriodicFlush } from '../repo.js'
 
 export type LogLevel = 'log' | 'warn' | 'error' | 'debug' | 'info'
 
+/**
+ * A long command-log text field (engine#471 b). Written as an Automerge
+ * ImmutableString (one scalar value, not a character-by-character text CRDT:
+ * a big log costs a fraction of the wasm memory). Logs written before this
+ * hold plain strings, so readers take both: use commandLogText / commandLogJson.
+ */
+export type LogText = string | ImmutableString
+
+const IMMUTABLE_STRING = Symbol.for('_am_immutableString')
+
+/** Is `v` an Automerge ImmutableString (of any bundled automerge 3.x copy)? */
+export const isLogImmutable = (v: unknown): v is { val: string } =>
+  typeof v === 'object' && v !== null && ((v as any)[IMMUTABLE_STRING] === true || (v as any) instanceof ImmutableString)
+
+/** Command-log text field (string | ImmutableString | null/undefined) as a plain string, or null. */
+export const commandLogText = (v: unknown): string | null =>
+  v == null ? null : typeof v === 'string' ? v : isLogImmutable(v) ? String(v.val) : String(v)
+
+/** JSON text field (args/result) parsed; '' and null give null. Throws on bad JSON. */
+export const commandLogJson = (v: unknown): unknown => {
+  const s = commandLogText(v)
+  return s == null || s === '' ? null : JSON.parse(s)
+}
+
+/** The value a write path stores for a long text field: always an ImmutableString. */
+export const logStr = (s: LogText): ImmutableString =>
+  isLogImmutable(s) ? new ImmutableString(String(s.val)) : new ImmutableString(String(s))
+
+const logStrOrNull = (s: LogText | null | undefined): ImmutableString | null =>
+  s == null ? null : logStr(s)
+
 export interface LogEntry {
   level: LogLevel
-  message: string
+  message: LogText
   timestamp: number
 }
 
@@ -31,11 +62,11 @@ export type TraceStatus = 'running' | 'ok' | 'error'
 export interface CommandTrace {
   traceId: string
   command: string
-  args: string              // JSON.stringify of raw args array
+  args: LogText             // JSON.stringify of raw args array (ImmutableString when written, engine#471)
   startedAt: number
   completedAt: number | null
   status: TraceStatus
-  errorMessage: string | null
+  errorMessage: LogText | null
   /** Stable machine code of the error (e.g. moveApp's MoveCode, idea#79); absent when the error has none */
   errorCode?: string | null
   /**
@@ -43,9 +74,9 @@ export interface CommandTrace {
    * Some CLIs read `error` (the Operation field name) and were seeing null while
    * the reason lived only in errorMessage. closeTrace sets both together.
    */
-  error?: string | null
-  /** JSON result for commands that return data (summariseDisk, idea#134); null otherwise */
-  result?: string | null
+  error?: LogText | null
+  /** JSON result text for commands that return data (summariseDisk, idea#134); null otherwise. Never an object. */
+  result?: LogText | null
   logs: LogEntry[]          // Automerge list — appended in batches via flushLogs
 }
 
@@ -303,7 +334,8 @@ const _rotate = async (repo: Repo, options: CommandLogStoreOptions): Promise<Doc
     if (keep.length) {
       fresh.change(doc => {
         for (const id of keep) {
-          doc.traces[id] = JSON.parse(JSON.stringify(oldDoc.traces[id]))
+          // JSON copy turns ImmutableString into plain text (toJSON): wrap the long fields again (engine#471 b)
+          doc.traces[id] = rewrapTrace(JSON.parse(JSON.stringify(oldDoc.traces[id])))
           ;(doc.recentTraceIds as string[]).push(id)
         }
       })
@@ -334,6 +366,15 @@ const _rotate = async (repo: Repo, options: CommandLogStoreOptions): Promise<Doc
   }
   await capCommandLogArchives(archiveDir, archiveMaxBytes)
   return fresh
+}
+
+/** A JSON copy of a trace with its long text fields as ImmutableString again (rotation carry). */
+const rewrapTrace = (t: CommandTrace): CommandTrace => {
+  const out: CommandTrace = { ...t, args: logStr(t.args ?? ''), errorMessage: logStrOrNull(t.errorMessage) }
+  if (t.error !== undefined) out.error = logStrOrNull(t.error)
+  if (t.result !== undefined) out.result = logStrOrNull(t.result)
+  out.logs = (t.logs ?? []).map(e => ({ ...e, message: logStr(e.message ?? '') }))
+  return out
 }
 
 const ARCHIVE_RE = /^command-log-(.+)-[^-]+\.automerge$/
@@ -437,7 +478,10 @@ export const addTrace = (
   trace: Omit<CommandTrace, 'logs'>
 ): void => {
   liveCommandLogHandle(handle).change(doc => {
-    doc.traces[trace.traceId] = { ...trace, logs: [] }
+    const t: CommandTrace = { ...trace, args: logStr(trace.args ?? ''), errorMessage: logStrOrNull(trace.errorMessage), logs: [] }
+    if (trace.error !== undefined) t.error = logStrOrNull(trace.error)
+    if (trace.result !== undefined) t.result = logStrOrNull(trace.result)
+    doc.traces[trace.traceId] = t
     ;(doc.recentTraceIds as string[]).push(trace.traceId)
 
     // Evict oldest when over the limit
@@ -462,7 +506,7 @@ export const flushLogs = (
     const trace = doc.traces[traceId]
     if (!trace) return
     for (const entry of entries) {
-      ;(trace.logs as LogEntry[]).push(entry)
+      ;(trace.logs as LogEntry[]).push({ ...entry, message: logStr(entry.message) })
     }
   })
 }
@@ -516,15 +560,16 @@ export const closeTrace = (
     trace.status = status
     trace.completedAt = Date.now()
     if (status === 'error') {
-      const msg = errorMessage ? redactString(errorMessage) : (trace.errorMessage ?? null)
+      // an earlier errorMessage may be a plain string (log written before engine#471) or an ImmutableString
+      const msg = errorMessage ? redactString(errorMessage) : commandLogText(trace.errorMessage)
       if (msg) {
-        trace.errorMessage = msg
-        trace.error = msg
+        trace.errorMessage = logStr(msg)
+        trace.error = logStr(msg)
       }
     } else if (errorMessage) {
-      trace.errorMessage = redactString(errorMessage)
+      trace.errorMessage = logStr(redactString(errorMessage))
     }
     if (errorCode) trace.errorCode = errorCode
-    if (fromStash !== undefined && fromStash !== null) trace.result = redactString(fromStash)
+    if (fromStash !== undefined && fromStash !== null) trace.result = logStr(redactString(fromStash))
   })
 }

@@ -25,6 +25,7 @@ import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/dat
 import { fs, YAML } from 'zx'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import { MAKE_BACKUP_DISK_MIN_BYTES } from '../../src/data/MakeBackupDisk.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 // ── helpers ──────────────────────────────────────────────────────────────────
 
@@ -152,7 +153,7 @@ describe('handleCommand — variadic trailing argument', () => {
         await handleCommand(testCommands, null, 'engine', 'multi a b c', logHandle)
         const traces = Object.values(logHandle.doc()!.traces)
         expect(traces).toHaveLength(1)
-        expect(JSON.parse(traces[0].args)).toEqual({ first: 'a', rest: ['b', 'c'] })
+        expect(JSON.parse(String(traces[0].args))).toEqual({ first: 'a', rest: ['b', 'c'] })
     })
 
     it('still rejects extra args for commands without a variadic arg', async () => {
@@ -233,7 +234,7 @@ describe('createBackupDisk command', () => {
             `createBackupDisk ${diskId} on-demand kolibri nextcloud`, logHandle)
         const traces = Object.values(logHandle.doc()!.traces).filter(t => t.command === 'createBackupDisk')
         expect(traces).toHaveLength(1)
-        expect(JSON.parse(traces[0].args))
+        expect(JSON.parse(String(traces[0].args)))
             .toEqual({ diskId: 'DISK_backup_test', mode: 'on-demand', instanceNames: ['kolibri', 'nextcloud'] })
         expect(traces[0].status).toBe('ok')
     })
@@ -358,7 +359,7 @@ describe('createBackupDisk 8 GiB minimum (engine#452)', () => {
         await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri`, logHandle)
         const t = lastError(logHandle)
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toBe(`TOO_SMALL: this disk is ${EIGHT_GIB - 1} bytes; a Backup Disk must be at least ${EIGHT_GIB} bytes (8 GiB).`)
+        expect(commandLogText(t.errorMessage)).toBe(`TOO_SMALL: this disk is ${EIGHT_GIB - 1} bytes; a Backup Disk must be at least ${EIGHT_GIB} bytes (8 GiB).`)
         expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
         expect(storeHandle.doc()!.diskDB[diskId].backupConfig).toBeNull()
     })
@@ -378,7 +379,7 @@ describe('createBackupDisk 8 GiB minimum (engine#452)', () => {
         await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri`, logHandle)
         const t = lastError(logHandle)
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toBe(`TOO_SMALL: could not read the size of '${diskId}', so it was not turned into a Backup Disk.`)
+        expect(commandLogText(t.errorMessage)).toBe(`TOO_SMALL: could not read the size of '${diskId}', so it was not turned into a Backup Disk.`)
         expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 
@@ -386,7 +387,7 @@ describe('createBackupDisk 8 GiB minimum (engine#452)', () => {
         addDockedDisk(storeHandle, diskId, diskName, device, null)
         const logHandle = await createCommandLog(repo)
         await handleCommand(commands, storeHandle, 'engine', `createBackupDisk ${diskId} on-demand kolibri`, logHandle)
-        expect(lastError(logHandle).errorMessage).toMatch(/^TOO_SMALL: could not read the size of /)
+        expect(commandLogText(lastError(logHandle).errorMessage)).toMatch(/^TOO_SMALL: could not read the size of /)
         expect(await fs.pathExists(`${DISKS_ROOT}/${device}/BACKUP.yaml`)).toBe(false)
     })
 })

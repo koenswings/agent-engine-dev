@@ -27,6 +27,7 @@ import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js
 import { undockAllOnDevice } from '../../src/monitors/usbDeviceMonitor.js'
 import { DeviceName, DiskID, DiskName, DiskType, EngineID, Timestamp } from '../../src/data/CommonTypes.js'
 import { createTestStore } from '../harness/diskSim.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const LOCAL = localEngineId as EngineID
 
@@ -113,7 +114,7 @@ describe('ejectDisk never ejects the system disk (idea#152)', () => {
         const trace = lastTrace(log)
         expect(trace.command).toBe('ejectDisk')
         expect(trace.status).toBe('error')
-        expect(trace.errorMessage).toContain("system disk and cannot be ejected")
+        expect(commandLogText(trace.errorMessage)).toContain("system disk and cannot be ejected")
     })
 
     it('by name: refused the same way', async () => {

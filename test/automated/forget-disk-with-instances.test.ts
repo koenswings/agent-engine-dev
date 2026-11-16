@@ -20,6 +20,7 @@ import {
 import { removeInstance } from '../../src/data/RemoveInstance.js'
 import { commands } from '../../src/data/Commands.js'
 import { handleCommand } from '../../src/utils/commandUtils.js'
+import { commandLogText, commandLogJson } from '../../src/data/CommandLogStore.js'
 
 const OTHER = 'ENGINE_other-engine-000000'
 const GONE = 'updtest10i76'
@@ -178,7 +179,7 @@ describe('forgetDisk --with-instances command trace (idea#466)', () => {
         const t = lastTrace(log)
         expect(t.command).toBe('forgetDisk')
         expect(t.status).toBe('ok')
-        const result = typeof t.result === 'string' ? JSON.parse(t.result) : t.result
+        const result = commandLogJson(t.result) as any
         expect(result.diskId).toBe(GONE)
         expect(result.removedInstances.map((i: any) => i.id).sort()).toEqual(['updtest-i76major', 'updtest-i76minor', 'updtest-i76stale'])
         expect(h.doc()!.diskDB[GONE as any]).toBeUndefined()
@@ -195,8 +196,8 @@ describe('forgetDisk --with-instances command trace (idea#466)', () => {
         await handleCommand(commands, h, 'engine', `forgetDisk ${GONE} --with-instances`, log)
         const t = lastTrace(log)
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toMatch(new RegExp(`^${code}: `))
-        expect(t.error).toBe(t.errorMessage)
+        expect(commandLogText(t.errorMessage)).toMatch(new RegExp(`^${code}: `))
+        expect(commandLogText(t.error)).toBe(commandLogText(t.errorMessage))
         expect(snapshot(h)).toBe(before)
     })
 
@@ -204,11 +205,11 @@ describe('forgetDisk --with-instances command trace (idea#466)', () => {
         const before = snapshot(h)
         let log = newLog()
         await handleCommand(commands, h, 'engine', 'forgetDisk nope --with-instances', log)
-        expect(lastTrace(log).errorMessage).toMatch(/^NOT_FOUND: /)
+        expect(commandLogText(lastTrace(log).errorMessage)).toMatch(/^NOT_FOUND: /)
         log = newLog()
         await handleCommand(commands, h, 'engine', `forgetDisk ${GONE} --force`, log)
         expect(lastTrace(log).status).toBe('error')
-        expect(lastTrace(log).errorMessage).toMatch(/^BAD_OPTION: /)
+        expect(commandLogText(lastTrace(log).errorMessage)).toMatch(/^BAD_OPTION: /)
         expect(snapshot(h)).toBe(before)
     })
 
@@ -216,7 +217,7 @@ describe('forgetDisk --with-instances command trace (idea#466)', () => {
         const log = newLog()
         await handleCommand(commands, h, 'engine', `forgetDisk ${GONE}`, log)
         expect(lastTrace(log).status).toBe('error')
-        expect(lastTrace(log).errorMessage).toMatch(/forgetDisk does not remove instances/)
+        expect(commandLogText(lastTrace(log).errorMessage)).toMatch(/forgetDisk does not remove instances/)
         expect(h.doc()!.diskDB[GONE as any]).toBeTruthy()
     })
 

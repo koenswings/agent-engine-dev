@@ -377,9 +377,9 @@ describe('busy unmount on undock sets Disk.unmountError; the next mount clears i
             expect(state.calls.filter(c => c === `umount ${device}`).length - umountsBefore).toBe(UMOUNT_MAX_ATTEMPTS)
             expect(state.calls.slice(callsBefore)).not.toContain(`rmdir ${mp}`)
             const failure = traces(logHandle).find(t => t.command === DISK_DETECTION_COMMAND &&
-                JSON.parse(t.args).step === 'undock' && JSON.parse(t.args).device === device)
+                JSON.parse(String(t.args)).step === 'undock' && JSON.parse(String(t.args)).device === device)
             expect(failure?.status).toBe('error')
-            expect(JSON.parse(failure!.args).fsUuid).toBe('CAFE-0126')
+            expect(JSON.parse(String(failure!.args)).fsUuid).toBe('CAFE-0126')
 
             // The disk comes back (the old mount has gone): mounted again, error cleared
             state.mounts = state.mounts.filter(m => m.target !== mp)

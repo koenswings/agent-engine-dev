@@ -35,6 +35,7 @@ import { startInstance, runInstance, stopInstance } from '../../src/data/Instanc
 import { commands } from '../../src/data/Commands.js'
 import { lookupInstanceArg, resolveInstanceArg } from '../../src/data/InstanceArg.js'
 import { handleCommand } from '../../src/utils/commandUtils.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const LOCAL = localEngineId as EngineID
 
@@ -119,14 +120,14 @@ describe('startInstance / runInstance / stopInstance resolve the instance id-fir
             // Neither 'kolibri' is on DiskC, so the disk cannot disambiguate
             const t = await run(`${cmd} kolibri DiskC`)
             expect(t.status).toBe('error')
-            expect(t.errorMessage).toContain(`${cmd}: instance name 'kolibri' is ambiguous: inst-k1 (on disk d-a), inst-k2 (on disk d-b). Use the instance id.`)
+            expect(commandLogText(t.errorMessage)).toContain(`${cmd}: instance name 'kolibri' is ambiguous: inst-k1 (on disk d-a), inst-k2 (on disk d-b). Use the instance id.`)
             expect(targets[cmd]()).not.toHaveBeenCalled()
         })
 
         it(`${cmd} refuses an unknown instance`, async () => {
             const t = await run(`${cmd} ghost DiskA`)
             expect(t.status).toBe('error')
-            expect(t.errorMessage).toContain(`${cmd}: instance 'ghost' not found.`)
+            expect(commandLogText(t.errorMessage)).toContain(`${cmd}: instance 'ghost' not found.`)
             expect(targets[cmd]()).not.toHaveBeenCalled()
         })
     }
@@ -135,7 +136,7 @@ describe('startInstance / runInstance / stopInstance resolve the instance id-fir
         addInstance(h, 'inst-k3', 'kolibri', 'd-a')
         const t = await run('stopInstance kolibri d-a')
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toContain("stopInstance: instance name 'kolibri' is ambiguous: inst-k1 (on disk d-a), inst-k3 (on disk d-a)")
+        expect(commandLogText(t.errorMessage)).toContain("stopInstance: instance name 'kolibri' is ambiguous: inst-k1 (on disk d-a), inst-k3 (on disk d-a)")
         expect(vi.mocked(stopInstance)).not.toHaveBeenCalled()
         // ...but the id still stops exactly the right one
         expect((await run('stopInstance inst-k3 d-a')).status).toBe('ok')

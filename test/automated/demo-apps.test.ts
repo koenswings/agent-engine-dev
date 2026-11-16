@@ -418,11 +418,11 @@ describe('setupDemo command trace apps and packVersion (engine#369 follow-up)', 
         const log = newLog()
         await log.whenReady()
         await handleCommand(commands, h, 'engine', 'setupDemo d1 --apps kolibri', log)
-        const args = JSON.parse(lastTrace(log)!.args)
+        const args = JSON.parse(String(lastTrace(log)!.args))
         expect(args).toEqual({ targetDiskId: 'd1', apps: 'kolibri' })
         expect(typeof args.apps).toBe('string')
         await handleCommand(commands, h, 'engine', 'setupDemo d1', log)
-        expect(JSON.parse(lastTrace(log)!.args)).toEqual({ targetDiskId: 'd1', apps: 'kolibri,nextcloud' })
+        expect(JSON.parse(String(lastTrace(log)!.args))).toEqual({ targetDiskId: 'd1', apps: 'kolibri,nextcloud' })
     })
 
     it("packVersion stays null during download and is set to the real version at verify, never 'github'", async () => {

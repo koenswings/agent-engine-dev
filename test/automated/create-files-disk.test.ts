@@ -33,6 +33,7 @@ import { SUDO_CHOWN, SUDO_CHOWN_ROOT, chownRootCommand, runSudoChownRoot, setFil
 import { resourceLock, diskKey } from '../../src/utils/ResourceLock.js'
 import { initCommandLogger } from '../../src/utils/CommandLogger.js'
 import { DISKS_ROOT, FIXTURES_DIR, uniqueTestDevice } from '../harness/diskSim.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const LOCAL = localEngineId as EngineID
 const OTHER = 'ENGINE_other-engine-000000' as EngineID
@@ -116,8 +117,8 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         const t = await run(cmd)
         expect(t.command).toBe('createFilesDisk')
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toMatch(message)
-        expect(JSON.parse(t.args).diskId).toBe(diskId ?? cmd.split(' ')[1])
+        expect(commandLogText(t.errorMessage)).toMatch(message)
+        expect(JSON.parse(String(t.args)).diskId).toBe(diskId ?? cmd.split(' ')[1])
         if (root) expect(await snapshot(root)).toBe(before)
         return t
     }
@@ -140,8 +141,8 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         const root = await disk('e-1', ['empty'])
         const meta = await fs.readFile(`${root}/META.yaml`, 'utf8')
         const t = await run('createFilesDisk e-1')
-        expect(t.status, t.errorMessage ?? '').toBe('ok')
-        expect(JSON.parse(t.args)).toEqual({ diskId: 'e-1', shareName: [] })
+        expect(t.status, String(t.errorMessage ?? '')).toBe('ok')
+        expect(JSON.parse(String(t.args))).toEqual({ diskId: 'e-1', shareName: [] })
         const y = YAML.parse(await fs.readFile(`${root}/FILES.yaml`, 'utf8'))
         expect(y).toMatchObject({ version: 1, createdBy: LOCAL, shareName: 'School Files', readOnly: false, password: null })
         expect(typeof y.created).toBe('number')
@@ -160,8 +161,8 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         const root = await disk('a-1', ['app'], appRoot)
         const before = { apps: await snapshot(`${root}/apps`), instances: await snapshot(`${root}/instances`), services: await snapshot(`${root}/services`) }
         const t = await run('createFilesDisk a-1 My Share (2)')
-        expect(t.status, t.errorMessage ?? '').toBe('ok')
-        expect(JSON.parse(t.args)).toEqual({ diskId: 'a-1', shareName: ['My', 'Share', '(2)'] })
+        expect(t.status, String(t.errorMessage ?? '')).toBe('ok')
+        expect(JSON.parse(String(t.args))).toEqual({ diskId: 'a-1', shareName: ['My', 'Share', '(2)'] })
         expect(YAML.parse(await fs.readFile(`${root}/FILES.yaml`, 'utf8')).shareName).toBe('My Share (2)')
         expect(await snapshot(`${root}/apps`)).toBe(before.apps)
         expect(await snapshot(`${root}/instances`)).toBe(before.instances)
@@ -176,7 +177,7 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         const root = await disk('b-1', ['backup'], backupRoot)
         const before = { yaml: await fs.readFile(`${root}/BACKUP.yaml`, 'utf8'), backups: await snapshot(`${root}/backups`) }
         const t = await run('createFilesDisk b-1 Backup_Share')
-        expect(t.status, t.errorMessage ?? '').toBe('ok')
+        expect(t.status, String(t.errorMessage ?? '')).toBe('ok')
         expect(await fs.readFile(`${root}/BACKUP.yaml`, 'utf8')).toBe(before.yaml)
         expect(await snapshot(`${root}/backups`)).toBe(before.backups)
         const d = h.doc()!.diskDB['b-1' as DiskID]
@@ -187,7 +188,7 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
     it('App + Backup disk: [app, backup, files], disk ID kept', async () => {
         const root = await disk('ab-1', ['app', 'backup'], async r => { await appRoot(r); await backupRoot(r) })
         const t = await run('createFilesDisk ab-1')
-        expect(t.status, t.errorMessage ?? '').toBe('ok')
+        expect(t.status, String(t.errorMessage ?? '')).toBe('ok')
         expect([...h.doc()!.diskDB['ab-1' as DiskID].diskTypes]).toEqual(['app', 'backup', 'files'])
         expect(YAML.parse(await fs.readFile(`${root}/META.yaml`, 'utf8')).diskId).toBe('ab-1')
         expect(Object.keys(h.doc()!.diskDB)).toEqual(['ab-1'])
@@ -196,7 +197,7 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
     it('META.yaml missing: written with the existing disk ID', async () => {
         const root = await disk('m-1', ['empty'], async () => {}, { meta: false })
         const t = await run('createFilesDisk m-1')
-        expect(t.status, t.errorMessage ?? '').toBe('ok')
+        expect(t.status, String(t.errorMessage ?? '')).toBe('ok')
         const meta = YAML.parse(await fs.readFile(`${root}/META.yaml`, 'utf8'))
         expect(meta.diskId).toBe('m-1')
         expect(meta.diskName).toBe('Disk m-1')
@@ -209,7 +210,7 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         chown.mockImplementation(async (mp: string) => { calls.push(chownRootCommand(mp)); await fs.chmod(mp, 0o755) })
         setFilesDiskOpsForTests({ fsType: async () => 'ext4', chownRoot: chown, rootOwner: async () => ({ uid: 0, gid: 0, mode: 0o755 }) })
         const t = await run('createFilesDisk ro-1')
-        expect(t.status, t.errorMessage ?? '').toBe('ok')
+        expect(t.status, String(t.errorMessage ?? '')).toBe('ok')
         expect(chown).toHaveBeenCalledTimes(1)
         expect(calls).toEqual([`/usr/bin/chown -h pi:pi ${root}`])
         const text = traceText(t)
@@ -223,7 +224,7 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         await fs.chmod(root, 0o555)
         chown.mockImplementation(async (mp: string) => { await fs.chmod(mp, 0o755) })
         const t = await run('createFilesDisk ro-2')
-        expect(t.status, t.errorMessage ?? '').toBe('ok')
+        expect(t.status, String(t.errorMessage ?? '')).toBe('ok')
         expect(chown).toHaveBeenCalledWith(root)
         expect(traceText(t)).toContain(`Previous owner uid:gid ${process.getuid!()}:${process.getgid!()}, mode 0555`)
     })
@@ -309,7 +310,7 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         h.change(doc => { (doc.engineDB[LOCAL] as any).eraseInProgress = { targetId: 'er-1', label: 'IDEA Disk', step: 'mounting' } })
         await expectRefused('createFilesDisk er-1', /being erased \(mounting\)/, root)
         const t = await run('createFilesDisk er-2')
-        expect(t.status, t.errorMessage ?? '').toBe('ok')
+        expect(t.status, String(t.errorMessage ?? '')).toBe('ok')
     })
 
     it('share names: over 16 bytes, other characters, leading/trailing space are refused and nothing is written', async () => {
@@ -319,7 +320,7 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         await expectRefused('createFilesDisk s-1 Ümlaut', /is not allowed/, root)
         await expectRefused('createFilesDisk s-1 a.b', /is not allowed/, root)
         const ok = await run('createFilesDisk s-1 1234567890123456')
-        expect(ok.status, ok.errorMessage ?? '').toBe('ok')
+        expect(ok.status, String(ok.errorMessage ?? '')).toBe('ok')
     })
 
     it('the lock is released after success and after a refusal', async () => {
@@ -337,7 +338,7 @@ describe('createFilesDisk <diskId> [<shareName…>] (idea#131)', () => {
         expect(logH.doc()!.recentTraceIds.length).toBe(n + 1)
         const t = lastTrace(logH)
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toMatch(/Insufficient arguments/)
+        expect(commandLogText(t.errorMessage)).toMatch(/Insufficient arguments/)
     })
 })
 

@@ -35,6 +35,7 @@ vi.mock('../../src/monitors/backupMonitor.js', async (importOriginal) => {
 import { backupInstance, restoreApp } from '../../src/monitors/backupMonitor.js'
 import { commands, resolveInstanceArg } from '../../src/data/Commands.js'
 import { handleCommand, splitArgs } from '../../src/utils/commandUtils.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const LOCAL = localEngineId as EngineID
 const OTHER = 'ENGINE_other-engine-000000' as EngineID
@@ -115,33 +116,33 @@ describe('restoreApp / backupApp resolve their disk and instance args (idea#168 
             expect(t.status).toBe('ok')
             expect((target().mock.calls[0][2] as any).id).toBe('d-spaced')
             // engine#399: the resolved id under instanceId, the display name under instanceName
-            expect(JSON.parse(t.args)).toEqual({ instanceId: 'inst-nc', backupDiskId: SPACED, instanceName: 'nextcloud' })
+            expect(JSON.parse(String(t.args))).toEqual({ instanceId: 'inst-nc', backupDiskId: SPACED, instanceName: 'nextcloud' })
         })
 
         it(`${cmd} refuses an ambiguous disk name, listing the ids`, async () => {
             const t = await run(`${cmd} nextcloud "IDEA Disk"`)
             expect(t.status).toBe('error')
-            expect(t.errorMessage).toMatch(/Disk name 'IDEA Disk' is ambiguous: d-twin-a \(idea-test-2\), d-twin-b \(idea-test-3\)/)
+            expect(commandLogText(t.errorMessage)).toMatch(/Disk name 'IDEA Disk' is ambiguous: d-twin-a \(idea-test-2\), d-twin-b \(idea-test-3\)/)
             expect(target()).not.toHaveBeenCalled()
         })
 
         it(`${cmd} refuses an unknown disk and a disk docked to another engine`, async () => {
-            expect((await run(`${cmd} nextcloud no-such-disk`)).errorMessage).toContain("Disk 'no-such-disk' not found.")
-            expect((await run(`${cmd} nextcloud d-remote`)).errorMessage).toContain('not docked to this engine')
+            expect(commandLogText((await run(`${cmd} nextcloud no-such-disk`)).errorMessage)).toContain("Disk 'no-such-disk' not found.")
+            expect(commandLogText((await run(`${cmd} nextcloud d-remote`)).errorMessage)).toContain('not docked to this engine')
             expect(target()).not.toHaveBeenCalled()
         })
 
         it(`${cmd} refuses an instance name shared by two instances, listing the ids`, async () => {
             const t = await run(`${cmd} kolibri d-spaced`)
             expect(t.status).toBe('error')
-            expect(t.errorMessage).toContain(`${cmd}: instance name 'kolibri' is ambiguous: inst-k1 (on disk d-twin-a), inst-k2 (on disk d-twin-b). Use the instance id.`)
+            expect(commandLogText(t.errorMessage)).toContain(`${cmd}: instance name 'kolibri' is ambiguous: inst-k1 (on disk d-twin-a), inst-k2 (on disk d-twin-b). Use the instance id.`)
             expect(target()).not.toHaveBeenCalled()
         })
 
         it(`${cmd} refuses an unknown instance`, async () => {
             const t = await run(`${cmd} ghost d-spaced`)
             expect(t.status).toBe('error')
-            expect(t.errorMessage).toContain(`${cmd}: instance 'ghost' not found.`)
+            expect(commandLogText(t.errorMessage)).toContain(`${cmd}: instance 'ghost' not found.`)
             expect(target()).not.toHaveBeenCalled()
         })
     }
@@ -149,7 +150,7 @@ describe('restoreApp / backupApp resolve their disk and instance args (idea#168 
     it('unquoted disk name with spaces is still refused as too many arguments (no guessing)', async () => {
         const t = await run(`restoreApp nextcloud ${SPACED}`)
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toBe('Error: Too many arguments')
+        expect(commandLogText(t.errorMessage)).toBe('Error: Too many arguments')
         expect(vi.mocked(restoreApp)).not.toHaveBeenCalled()
     })
 

@@ -10,6 +10,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { commands } from '../../src/data/Commands.js'
 import { handleCommand } from '../../src/utils/commandUtils.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const newLog = (): DocHandle<CommandLogStore> =>
     new Repo({ network: [], storage: undefined }).create<CommandLogStore>({ traces: {}, recentTraceIds: [] })
@@ -43,11 +44,11 @@ describe('initialiseDisk role is required at dispatch (engine#394)', () => {
         const t = lastTrace(log)
         expect(t.command).toBe('initialiseDisk')
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toBe('Error: Insufficient arguments')
+        expect(commandLogText(t.errorMessage)).toBe('Error: Insufficient arguments')
         // The wrapper's first act with no store is to throw 'Store is not available.'
         // That must not appear: the dispatcher refused the command first.
-        expect(t.errorMessage).not.toMatch(/Store is not available/)
-        expect(JSON.parse(t.args)).toEqual(['cand-1'])
+        expect(commandLogText(t.errorMessage)).not.toMatch(/Store is not available/)
+        expect(JSON.parse(String(t.args))).toEqual(['cand-1'])
     })
 
     it('the two-arg form still reaches the wrapper', async () => {
@@ -60,8 +61,8 @@ describe('initialiseDisk role is required at dispatch (engine#394)', () => {
         const t = lastTrace(log)
         expect(t.command).toBe('initialiseDisk')
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toBe('Store is not available.')
-        expect(t.errorMessage).not.toMatch(/Insufficient arguments/)
-        expect(JSON.parse(t.args)).toEqual({ candidateId: 'cand-1', role: 'empty' })
+        expect(commandLogText(t.errorMessage)).toBe('Store is not available.')
+        expect(commandLogText(t.errorMessage)).not.toMatch(/Insufficient arguments/)
+        expect(JSON.parse(String(t.args))).toEqual({ candidateId: 'cand-1', role: 'empty' })
     })
 })

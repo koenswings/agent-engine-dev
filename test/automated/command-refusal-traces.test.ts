@@ -29,6 +29,7 @@ import { DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../src/dat
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { commands } from '../../src/data/Commands.js'
 import { handleCommand } from '../../src/utils/commandUtils.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const newStore = async (): Promise<DocHandle<Store>> => {
     const h = new Repo({ network: [], storage: undefined }).create<Store>({
@@ -68,9 +69,9 @@ describe('command refusals end the trace as error (idea#168 r29@97)', () => {
         const t = lastTrace(log)
         expect(t.command).toBe(cmd.split(' ')[0])
         expect(t.status).toBe('error')
-        if (typeof message === 'string') expect(t.errorMessage).toContain(message)
-        else expect(t.errorMessage).toMatch(message)
-        expect(t.error).toBe(t.errorMessage)
+        if (typeof message === 'string') expect(commandLogText(t.errorMessage)).toContain(message)
+        else expect(commandLogText(t.errorMessage)).toMatch(message)
+        expect(commandLogText(t.error)).toBe(commandLogText(t.errorMessage))
         expect(t.completedAt).not.toBeNull()
     }
 

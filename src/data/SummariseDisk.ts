@@ -15,7 +15,8 @@ import { Store } from './Store.js'
 import { Disk, diskMountRoot, joinMountRoot } from './Disk.js'
 import { localEngineId } from './Engine.js'
 import { DiskID, Timestamp } from './CommonTypes.js'
-import { getCommandLogHandle, stashTraceResult } from './CommandLogStore.js'
+import { getCommandLogHandle, stashTraceResult, logStr, commandLogText } from './CommandLogStore.js'
+import { redactString } from '../utils/redact.js'
 import { getActiveTrace } from '../utils/CommandLogger.js'
 import { log } from '../utils/utils.js'
 import { labelForUnformatted } from './UnformattedDisks.js'
@@ -280,7 +281,8 @@ export const attachTraceResult = (result: unknown, traceId?: string): void => {
     if (!h) return
     h.change(doc => {
         const t = doc.traces[id]
-        if (t) t.result = json
+        // ImmutableString, redacted like closeTrace's write of the same result (engine#471 b)
+        if (t) t.result = logStr(redactString(json))
     })
 }
 
@@ -294,11 +296,13 @@ export const readSummaryFromTrace = (
     if (!h) return null
     const t = h.doc()?.traces[traceId]
     if (!t || t.command !== 'summariseDisk' || t.status !== 'ok') return null
-    if (t.result == null || t.result === '') return null
+    // plain string (log written before engine#471) or ImmutableString
+    const text = commandLogText(t.result)
+    if (String(text ?? '') === '') return null
     const age = Date.now() - (t.completedAt ?? t.startedAt)
     if (age > SUMMARY_MAX_AGE_MS) return null
     try {
-        const summary = JSON.parse(t.result) as ContentSummary
+        const summary = JSON.parse(text!) as ContentSummary
         if (summary.targetId !== expectTargetId) return null
         return summary
     } catch { return null }

@@ -33,16 +33,18 @@ export function startCommandLogSession(workerData, io) {
         post({ event: 'mem', heapUsed: m.heapUsed, external: m.external, arrayBuffers: m.arrayBuffers })
     }, Number(workerData.memEveryMs ?? 15_000)).unref()
 
+    const isImm = (v) => typeof v === 'object' && v !== null && (v[Symbol.for('_am_immutableString')] === true || typeof v.val === 'string')
     const compact = (doc) => Object.entries(doc?.traces ?? {}).map(([id, raw]) => {
         const t = raw ?? {}
         return {
             traceId: String(t.traceId ?? id),
             command: String(t.command ?? ''),
-            args: typeof t.args === 'string' ? t.args : JSON.stringify(t.args ?? null),
+            // engine#471 (b): new Engines write args/errorMessage as ImmutableString ({ val }); old ones as plain text
+            args: typeof t.args === 'string' ? t.args : isImm(t.args) ? String(t.args.val) : JSON.stringify(t.args ?? null),
             status: String(t.status ?? ''),
             startedAt: typeof t.startedAt === 'number' ? t.startedAt : null,
             completedAt: typeof t.completedAt === 'number' ? t.completedAt : null,
-            errorMessage: t.errorMessage == null ? null : String(t.errorMessage),
+            errorMessage: t.errorMessage == null ? null : isImm(t.errorMessage) ? String(t.errorMessage.val) : String(t.errorMessage),
         }
     })
 
