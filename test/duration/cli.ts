@@ -42,7 +42,7 @@ import { EXIT_ENGINE_UNREACHABLE, installProcessGuards, timeoutSummary, walkExit
 import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
 import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
 import { EXIT_SLOT_PREFLIGHT } from './slotLayout.js'
-import { describeStage2Windows, EXIT_STAGE2_PREFLIGHT, resolveDurationStage, stage2Preflight, stage2HomeOf, stage2SummaryFields, STAGE2_FIXTURES } from './stage2.js'
+import { describeStage2Windows, EXIT_STAGE2_PREFLIGHT, resolveDurationStage, stage2Preflight, stage2HomeOf, stage2SummaryFields, STAGE2_FIXTURES, STAGE2_GAP_SHORT } from './stage2.js'
 import { resolveStage2StoreFixMode, runStage2StoreFix } from './stage2StoreFix.js'
 import { Stage2FleetOps } from './stage2FleetOps.js'
 import { EXIT_FIXTURE_PREFLIGHT, fixtureDiskPreflight } from './fixtureDisks.js'
@@ -784,7 +784,7 @@ const main = async () => {
     }
     console.log(`[duration] ${reconnectLine()}`)
     console.log(formatRunSummaryLine(summary) + (stage2Fields
-        ? ` | STAGE 2: ${stage2Fields.stage2NotCovered.map(n => `@${n.step} ${n.action} = network copy`).join(', ') || 'no gap steps'} (physical move not covered)`
+        ? ` | STAGE 2: ${stage2Fields.stage2NotCovered.map(n => `@${n.step} ${n.action} = ${STAGE2_GAP_SHORT[n.action] ?? 'declared gap'}`).join(', ') || 'no gap steps'} (physical move and real whole-disk erase not covered)`
         : ''))
     console.log(JSON.stringify({
         event: 'duration_done',

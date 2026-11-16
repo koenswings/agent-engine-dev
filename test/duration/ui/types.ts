@@ -66,6 +66,11 @@ export interface UiDriver {
         hostname: string,
         opts?: { timeoutMs?: number; allowReload?: boolean },
     ): Promise<string>
+    /**
+     * kc9 FAIL@105 (optional): close the Console erase dialog after the Engine refused the erase
+     * (dialog in its error phase: alert + Close). No-op when the dialog is already closed.
+     */
+    dismissEraseError?(): Promise<string>
     /** r55 (optional): sequence number of the newest tab the browser context opened. */
     tabSeq?(): number
     /**

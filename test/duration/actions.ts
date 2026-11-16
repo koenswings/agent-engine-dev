@@ -9,7 +9,7 @@
 import { isIdea02Target } from './walkHost.js'
 import { settleAfterLongOp, poolInstanceIds, type PostOpSettleIo } from './postOpSettle.js'
 import { opStartBudget, WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
-import { STAGE2_ADD_FILES_DISK_ID, STAGE2_MOVE_TARGET_HOST, STAGE2_ROLE_MAP, stage2HomeOf } from './stage2.js'
+import { STAGE2_ADD_FILES_DISK_ID, STAGE2_MOVE_TARGET_HOST, STAGE2_ROLE_MAP, stage2ConfirmEraseVerdict, stage2Fixture, stage2HomeOf, stage2MountedSiblings, type Stage2Status, type Stage2StatusFixture } from './stage2.js'
 import type {
     DurationOptions,
     FleetOps,
@@ -658,6 +658,83 @@ export const stage2RedockSharedEraseDisk = async (ctx: ActionContext): Promise<s
         { purgeStoreInstances: true },
     )
     return note
+}
+
+/** kc9 FAIL@105: what the Stage 2 confirm_erase pre-check found on the Erase partition's home Pi. */
+export interface Stage2ConfirmErasePre { diskId: string; home: string; parent: string; siblings: Stage2StatusFixture[] }
+type Stage2StatusReader = { stage2Status?: (engineId: string) => Promise<Stage2Status> }
+
+/**
+ * kc9 FAIL@105 (Engine 9040e73): every Stage 2 Empty is a partition on a two-partition SSD
+ * (idea03: Nextcloud p1 + empty-001 p2). Erase wipes the WHOLE disk, so since #188 (323accd,
+ * 2026-10-16) the Engine refuses before touching anything. r86t (Engine f194fb5, before #188)
+ * "passed" only because the Intent counts a closed dialog as success: f194fb5 undocked the
+ * target and deleted its row before idea-erase-disk refused the mounted sibling.
+ *
+ * Before the Intent (Stage 2 live only): read stage2-dock status on the home Pi. Mounted siblings
+ * on the target's disk → the step expects the Engine's refusal. Target alone on its disk → fail
+ * loud before clicking: a real erase rewrites the GPT without the PARTLABEL stage2-dock.sh needs.
+ * Returns null when not Stage 2 or the ops cannot read stage2-dock status (fake/stub runs).
+ */
+export const stage2ConfirmErasePrecheck = async (ctx: ActionContext): Promise<Stage2ConfirmErasePre | null> => {
+    if (!isStage2(ctx)) return null
+    const ops = ctx.opts.ops as FleetOps & Stage2StatusReader
+    if (typeof ops.stage2Status !== 'function') return null
+    const diskId = eraseDiskTargetId()
+    const home = stage2HomeOf(diskId)
+    const { parent, siblings } = stage2MountedSiblings(await ops.stage2Status(home), diskId)
+    if (!siblings.length) {
+        throw new Error(
+            `Stage 2 confirm_erase: ${diskId} is alone on /dev/${parent} on ${home}, so the Engine would really erase it. ` +
+                `idea-erase-disk rewrites the GPT without PARTLABEL ${stage2Fixture(diskId).partLabel}, and stage2-dock.sh could not find the fixture again. ` +
+                `Extend the harness (post-erase relabel/redock) before a real Stage 2 erase. Nothing was clicked.`,
+        )
+    }
+    return { diskId, home, parent, siblings }
+}
+
+/**
+ * kc9 FAIL@105: after the confirm_erase Intent on a shared SSD. Pass only when the Engine gave its
+ * exact shared-disk refusal AND nothing changed (target still docked on its home and Empty; target
+ * and every sibling still mounted). Then close the Console error dialog so the walk goes on from
+ * op_disk. The erase partition is not re-docked: it was never touched.
+ */
+export const stage2ConfirmEraseAfter = async (
+    ctx: ActionContext,
+    pre: Stage2ConfirmErasePre,
+    result: { ok: boolean; message?: string },
+    driver: { dismissEraseError?: () => Promise<string> },
+): Promise<{ ok: boolean; message: string }> => {
+    const v = stage2ConfirmEraseVerdict(result, pre.diskId, pre.parent, pre.siblings)
+    if (v.kind === 'fail') return { ok: false, message: v.note }
+    const st = diskEmptiness(await ctx.opts.ops.readStore(pre.home), pre.diskId)
+    if (!st.empty || st.dockedTo !== pre.home) {
+        return { ok: false, message: `${v.note}; but after the refusal the store shows ${describeDisk(st)} (expected docked on ${pre.home} and Empty)` }
+    }
+    const ops = ctx.opts.ops as FleetOps & Stage2StatusReader
+    const after = stage2MountedSiblings(await ops.stage2Status!(pre.home), pre.diskId)
+    if (!after.target.mounted) {
+        return { ok: false, message: `${v.note}; but ${pre.diskId} (${after.target.kname}) is no longer mounted on ${pre.home} after the refusal` }
+    }
+    const gone = pre.siblings.filter(s => !after.siblings.some(a => a.partLabel === s.partLabel))
+    if (gone.length) {
+        return { ok: false, message: `${v.note}; but sibling(s) ${gone.map(s => s.partLabel).join(', ')} are no longer mounted on ${pre.home} after the refusal` }
+    }
+    let dismissed = 'no dismissEraseError on this driver'
+    if (typeof driver.dismissEraseError === 'function') {
+        try {
+            dismissed = await driver.dismissEraseError()
+        } catch (e) {
+            return { ok: false, message: `${v.note}; ${e instanceof Error ? e.message : String(e)}` }
+        }
+    }
+    return {
+        ok: true,
+        message:
+            `${v.note}; nothing changed (${describeDisk(st)}, ${after.target.kname} still mounted at ${after.target.mounted}, ` +
+            `${after.siblings.map(s => `${s.kname} at ${s.mounted}`).join(', ')} still mounted); ${dismissed}; ` +
+            `Stage 2 gap: real whole-disk erase not covered`,
+    }
 }
 
 /**
@@ -3466,6 +3543,20 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
         }
     }
+    // kc9 FAIL@105: Stage 2 confirm_erase on a shared SSD expects the Engine's refusal (see stage2ConfirmErasePrecheck).
+    let eraseShared: Stage2ConfirmErasePre | null = null
+    if (ctx.action === 'confirm_erase') {
+        try {
+            eraseShared = await stage2ConfirmErasePrecheck(ctx)
+            if (eraseShared) {
+                const n = `confirm_erase expects the shared-disk refusal: ${eraseShared.diskId} shares /dev/${eraseShared.parent} on ${eraseShared.home} with mounted ${eraseShared.siblings.map(s => `${s.kname} (${s.partLabel})`).join(', ')}`
+                preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${n}` : n
+            }
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
+        }
+    }
     // Prefer A r22 FAIL@93: add_files_role ≠ make_files_disk. Never "already satisfied"
     // by the make_files_disk Files Disk; never soft-pass. Restore an app-only disk onto
     // the Console engine (Kolibri back from infra_move_disk@62, or
@@ -3678,6 +3769,10 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     let message = result.message ?? `${result.mode}: ${ctx.action}`
     if (preStartSettleNote) {
         message = `${message}; ${preStartSettleNote}`
+    }
+    if (eraseShared) {
+        const r = await stage2ConfirmEraseAfter(ctx, eraseShared, result, driver)
+        return { ok: r.ok, message: preStartSettleNote ? `${r.message}; ${preStartSettleNote}` : r.message, layer }
     }
     // r55 post-use: the App tabs this step used must be on the store URLs, and each used instance must
     // still be Running and owned by its own container on its own Pi (Stage 2; Intent ok only).
