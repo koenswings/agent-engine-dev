@@ -784,6 +784,12 @@ export const applyBackupMethod = (instance: Instance, compose: any): void => {
  */
 export interface InstanceRegisterOptions {
   reclaim?: 'restore'
+  /**
+   * kc8 step 104: a same-Engine moveApp registers the id on the target disk.
+   * The claim is allowed only when storedOn is exactly this source disk (the
+   * move's own source); any other storedOn keeps the engine#381 refusal.
+   */
+  moveFrom?: DiskID
 }
 
 const RECLAIM_BLOCKING_STATES = new Set(['Running', 'Starting'])
@@ -849,7 +855,10 @@ export const createOrUpdateInstance = async (storeHandle: DocHandle<Store>, inst
         // engine#381: never claim an id whose storedOn is already a different disk
         // (in-flight keep-id move, or a leftover source folder after storedOn flipped).
         // engine#418: restoreApp's explicit restore-reclaim is the only exception.
-        if (storedInstance.storedOn && String(storedInstance.storedOn) !== String(disk.id)) {
+        const moveClaim = !!opts.moveFrom && String(storedInstance.storedOn) === String(opts.moveFrom)
+        if (moveClaim) {
+          log(`createOrUpdateInstance: moveApp claim of ${instanceId} from ${storedInstance.storedOn} onto ${disk.id} (kc8)`)
+        } else if (storedInstance.storedOn && String(storedInstance.storedOn) !== String(disk.id)) {
           const reclaim = opts.reclaim === 'restore' ? restoreReclaimDecision(doc, storedInstance, disk) : null
           if (!reclaim?.allowed) {
             log(`createOrUpdateInstance: not claiming ${instanceId} on ${disk.id}; storedOn is already ${storedInstance.storedOn}${reclaim ? ` (restore-reclaim refused: ${reclaim.reason})` : ''}`)
