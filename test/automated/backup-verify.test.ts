@@ -207,9 +207,9 @@ describe('parse helpers (idea#446)', () => {
         expect(parseScratchBytes('scratchBytes=9007199254740992\n')).toBeNull() // > MAX_SAFE_INTEGER
     })
 
-    it('registers the four commands and the backupVerify capability; Engine speaks helper v17 (engine#415), verify min stays v10', () => {
+    it('registers the four commands and the backupVerify capability; Engine speaks helper v19 (engine#468; v17 engine#415), verify min stays v10', () => {
         expect(BACKUP_VERIFY_HELPER_MIN).toBe(10)
-        expect(APP_DATA_HELPER_VERSION).toBe('17')
+        expect(APP_DATA_HELPER_VERSION).toBe('19')
         expect(ENGINE_CAPABILITIES).toContain('backupVerify')
         for (const name of ['listBackup', 'verifyBackup', 'clearBackupLock', 'removeBackupRole']) {
             expect(commands.find(c => c.name === name), name).toBeTruthy()

@@ -8,7 +8,10 @@
  *     Operation Done (engine#428 heal path);
  *   - any other non-Running state fails the restore with RESTORE_START_FAILED
  *     (Operation Failed, the command throws so the trace ends as error); the
- *     restored files are not rolled back and the locks are released.
+ *     restored files are not rolled back and the locks are released;
+ *   - helper v19 moves the replaced instance folder into .idea-quarantine; the
+ *     Engine logs that path and puts it in the trace result and the error;
+ *   - an in-place restore refuses HELPER_OUTDATED below v19, before any stop.
  */
 import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { Repo } from '@automerge/automerge-repo'
@@ -26,6 +29,27 @@ vi.mock('../../src/data/RestorePreQuarantine.js', async (importOriginal) => {
     const actual = await importOriginal<any>()
     return { ...actual, assertPreQuarantineHelper: vi.fn(async () => null), quarantinePreRestore: vi.fn(async () => null) }
 })
+const helperFake = vi.hoisted(() => ({
+    problem: null as string | null,
+    extractOut: '',
+    calls: [] as string[][],
+}))
+vi.mock('../../src/utils/appDataHelper.js', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    return {
+        ...actual,
+        borgProblem: () => null,
+        helperAtLeast: vi.fn(async () => helperFake.problem),
+        runAppData: vi.fn(async (args: string[]) => {
+            helperFake.calls.push(args)
+            if (args[0] === 'borg-info') {
+                return JSON.stringify({ archives: [{ name: '2026-11-16T03-34-19-273Z-hook', command_line: ['/usr/bin/borg', 'create', 'x::y', `/disks/sdb1/instances/${args[2]}`] }] })
+            }
+            if (args[0] === 'borg-extract') return helperFake.extractOut
+            return ''
+        }),
+    }
+})
 
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
@@ -34,8 +58,9 @@ import { Disk } from '../../src/data/Disk.js'
 import { config } from '../../src/data/Config.js'
 import { PORT_NOT_READY_PREFIX } from '../../src/data/Instance.js'
 import {
-    restoreApp, backupLifecycle, restoreStartOutcome, postStartWarningMessage,
+    restoreApp, backupLifecycle, restoreStartOutcome, postStartWarningMessage, replacedFolderNote,
 } from '../../src/monitors/backupMonitor.js'
+import { parseBorgExtract, APP_DATA_HELPER_VERSION, RESTORE_REPLACED_QUARANTINE_HELPER_MIN } from '../../src/utils/appDataHelper.js'
 import { resourceLock, instanceKey, diskKey } from '../../src/utils/ResourceLock.js'
 import { runWithTrace } from '../../src/utils/CommandLogger.js'
 import { takePendingTraceCloseMessage, takePendingTraceResult } from '../../src/data/CommandLogStore.js'
@@ -43,6 +68,7 @@ import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 
 const INST = 'inst-468-restore' as InstanceID
 const DB_EXITED = 'Engine error: dependency nextcloud-db failed to start: container inst-468-restore-nextcloud-db-1 exited (1)'
+const QPATH = '/disks/sdb1/.idea-quarantine/inst-468-restore-replaced-20261116T033756123456789Z'
 
 const makeDisk = (id: string, device: string, dockedTo: EngineID | null, backup = false): Disk => ({
     id: id as DiskID,
@@ -55,7 +81,7 @@ const makeDisk = (id: string, device: string, dockedTo: EngineID | null, backup 
     backupConfig: null,
 } as Disk)
 
-describe('restoreStartOutcome / postStartWarningMessage (engine#468, pure)', () => {
+describe('restoreStartOutcome / postStartWarningMessage / parseBorgExtract (engine#468, pure)', () => {
     it('Running is ok; PORT_NOT_READY Error is pending; any other state is RESTORE_START_FAILED', () => {
         expect(restoreStartOutcome({ status: 'Running', statusCondition: null } as any, 'App Disk')).toEqual({ kind: 'running' })
         expect(restoreStartOutcome({ status: 'Error', statusCondition: `${PORT_NOT_READY_PREFIX} at=1; never stayed ready` } as any, 'App Disk')).toEqual({ kind: 'pending' })
@@ -74,6 +100,24 @@ describe('restoreStartOutcome / postStartWarningMessage (engine#468, pure)', () 
             .toBe(`POST_START_WARNING: the instance did not return to Running after backup: ${DB_EXITED}`)
         expect(postStartWarningMessage({ status: 'Stopped', statusCondition: null } as any, 'after failed backup'))
             .toBe('POST_START_WARNING: the instance did not return to Running after failed backup: status is Stopped')
+    })
+
+    it('parseBorgExtract reads the v19 key=value lines and ignores anything else', () => {
+        expect(parseBorgExtract('')).toEqual({ replacedQuarantine: null, replacedKept: null, pruned: [] })
+        expect(parseBorgExtract(`noise\nreplacedQuarantine=${QPATH}\npruned=/disks/sdb1/.idea-quarantine/a-replaced-1\npruned=/b\n`)).toEqual({
+            replacedQuarantine: QPATH, replacedKept: null, pruned: ['/disks/sdb1/.idea-quarantine/a-replaced-1', '/b'],
+        })
+        expect(parseBorgExtract('replacedKept=/disks/sdb1/.idea-app-data-staging/restore-x.AbC/.previous\nreplacedQuarantine=relative\n')).toEqual({
+            replacedQuarantine: null, replacedKept: '/disks/sdb1/.idea-app-data-staging/restore-x.AbC/.previous', pruned: [],
+        })
+        expect(replacedFolderNote({ replacedQuarantine: QPATH, replacedKept: null, pruned: [] })).toBe(`the replaced folder is in quarantine at ${QPATH}`)
+        expect(replacedFolderNote({ replacedQuarantine: null, replacedKept: '/k', pruned: [] })).toBe('the replaced folder could not be quarantined and is kept at /k')
+        expect(replacedFolderNote({ replacedQuarantine: null, replacedKept: null, pruned: [] })).toBeNull()
+    })
+
+    it('Engine speaks helper v19 and an in-place restore needs v19', () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('19')
+        expect(RESTORE_REPLACED_QUARANTINE_HELPER_MIN).toBe(19)
     })
 })
 
@@ -131,6 +175,9 @@ describe('restoreApp after the post-restore start (engine#468)', () => {
     beforeEach(() => {
         config.settings.testMode = true
         config.settings.skipBorg = true
+        helperFake.problem = null
+        helperFake.extractOut = ''
+        helperFake.calls.length = 0
         stopCalls = 0
         backupLifecycle.stopInstance = vi.fn(async (handle: any, inst: any) => {
             stopCalls += 1
@@ -196,5 +243,47 @@ describe('restoreApp after the post-restore start (engine#468)', () => {
         expect(opOf(h)?.status).toBe('Done')
         expect(takePendingTraceCloseMessage('tr-468-ok')).toBeUndefined()
         expect(takePendingTraceResult('tr-468-ok')).toBeUndefined()
+    })
+
+    it('helper v19: the quarantine path of the replaced folder is in the trace result (ok) and in RESTORE_START_FAILED', async () => {
+        config.settings.skipBorg = false
+        helperFake.extractOut = `replacedQuarantine=${QPATH}\n`
+        const first = await setup()
+        startLeaves('Running', null)
+        expect(await traced('tr-468-q-ok', () => restoreApp(first.h, INST, first.appDisk))).toBeNull()
+        expect(helperFake.calls.map(c => c[0])).toEqual(['borg-info', 'borg-extract'])
+        expect(JSON.parse(takePendingTraceResult('tr-468-q-ok')!)).toEqual({ replacedQuarantine: QPATH })
+
+        await fs.remove(`${DISKS_ROOT}/${appDevice}`)
+        await fs.remove(`${DISKS_ROOT}/${backupDevice}`)
+        const second = await setup()
+        startLeaves('Error', DB_EXITED)
+        const error = await traced('tr-468-q-failed', () => restoreApp(second.h, INST, second.appDisk))
+        expect(error).toBe(`RESTORE_START_FAILED: restored files to App Disk; the instance did not start: ${DB_EXITED}; the replaced folder is in quarantine at ${QPATH}`)
+        expect(JSON.parse(takePendingTraceResult('tr-468-q-failed')!)).toEqual({ replacedQuarantine: QPATH })
+    })
+
+    it('helper v19 could not quarantine: the restore still succeeds and reports where the folder was kept', async () => {
+        config.settings.skipBorg = false
+        const kept = `/disks/sdb1/.idea-app-data-staging/restore-${INST}.AbC123/.previous`
+        helperFake.extractOut = `replacedKept=${kept}\n`
+        const { h, appDisk } = await setup()
+        startLeaves('Running', null)
+        expect(await traced('tr-468-kept', () => restoreApp(h, INST, appDisk))).toBeNull()
+        expect(opOf(h)?.status).toBe('Done')
+        expect(JSON.parse(takePendingTraceResult('tr-468-kept')!)).toEqual({ replacedKept: kept })
+    })
+
+    it('an in-place restore with a helper older than v19 refuses HELPER_OUTDATED before any stop or extract', async () => {
+        config.settings.skipBorg = false
+        helperFake.problem = 'restoreApp onto an existing instance folder needs the app-data root helper v19 or later'
+        const { h, appDisk } = await setup()
+        startLeaves('Running', null)
+        const error = await traced('tr-468-old', () => restoreApp(h, INST, appDisk))
+        expect(error).toMatch(/^HELPER_OUTDATED: restoreApp onto an existing instance folder/)
+        expect(stopCalls).toBe(0)
+        expect(helperFake.calls).toEqual([])
+        expect(opOf(h)?.status).toBe('Failed')
+        expect(h.doc()!.instanceDB[INST].status).toBe('Running')
     })
 })

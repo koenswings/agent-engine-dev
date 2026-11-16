@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '17'
+export const APP_DATA_HELPER_VERSION = '19'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -187,6 +187,35 @@ export const borgExtractArgs = (bdev: string, id: string, archive: string, strip
     if (!Number.isInteger(strip) || strip < 1 || strip > 9) throw new Error(`strip ${strip} is out of range (1-9)`)
     return ['borg-extract', checkRoot(bdev), checkId(id), checkArchive(archive), String(strip), checkRoot(dstRoot)]
 }
+/**
+ * engine#468 / helper v19: borg-extract moves the instance folder it replaces into
+ * <target>/.idea-quarantine/<id>-replaced-<UTC stamp> (keep-latest per instance) instead
+ * of deleting it. An older helper deletes it, so an in-place restore refuses below v19.
+ */
+export const RESTORE_REPLACED_QUARANTINE_HELPER_MIN = 19
+
+export interface BorgExtractResult {
+    /** where the replaced instance folder went (helper v19), or null */
+    replacedQuarantine: string | null
+    /** the replaced folder could not be quarantined and is still at this staging path */
+    replacedKept: string | null
+    /** older replaced copies of the same instance that keep-latest removed */
+    pruned: string[]
+}
+
+/** Parse borg-extract's v19 stdout (key=value lines; anything else is ignored). */
+export const parseBorgExtract = (stdout: string): BorgExtractResult => {
+    const out: BorgExtractResult = { replacedQuarantine: null, replacedKept: null, pruned: [] }
+    for (const line of String(stdout ?? '').split('\n')) {
+        const m = line.trim().match(/^(replacedQuarantine|replacedKept|pruned)=(\/.+)$/)
+        if (!m) continue
+        if (m[1] === 'replacedQuarantine') out.replacedQuarantine = m[2]
+        else if (m[1] === 'replacedKept') out.replacedKept = m[2]
+        else out.pruned.push(m[2])
+    }
+    return out
+}
+
 /** idea#401 / helper v9, fixed in v10 (idea#450): JSON of every archive (borg info --json --glob-archives '*') so the Engine can pick.
  *  idea#446: pass `archive` for a member list of that one archive (`borg list --short`). */
 export const borgListArgs = (bdev: string, id: string, archive?: string): string[] => {

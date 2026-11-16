@@ -24,7 +24,7 @@ import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot, backupOrphanLinks, syncBackupOrphanLinks } from '../data/Disk.js'
-import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast, ARCHIVE_MODE_HELPER_MIN } from '../utils/appDataHelper.js'
+import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast, ARCHIVE_MODE_HELPER_MIN, RESTORE_REPLACED_QUARANTINE_HELPER_MIN, parseBorgExtract, type BorgExtractResult } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, parseBackupHookExcludeList, mergeBackupExcludeLists, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
 import { backupCleanupRunner, backupDiskFullError, cleanupIsEnabled } from '../utils/backupCleanup.js'
 import { backupArchiveName, type ArchiveMode } from '../utils/backupArchiveName.js'
@@ -1020,15 +1020,38 @@ export const latestArchiveFromInfo = (infoJson: string, instanceId: string): { n
  * and moves it into place (replacing a previous folder of that instance).
  * Roots are app-data helper root tokens. The runner is injectable for tests.
  */
-export const extractLatestArchive = async (backupRoot: string, instanceId: string, targetRoot: string, run: AppDataRunner = runAppData): Promise<string> => {
+export const extractLatestArchive = async (backupRoot: string, instanceId: string, targetRoot: string, run: AppDataRunner = runAppData): Promise<string> =>
+    (await extractLatestArchiveDetailed(backupRoot, instanceId, targetRoot, run)).name
+
+/** extractLatestArchive plus where the helper put the replaced instance folder (v19, engine#468). */
+export const extractLatestArchiveDetailed = async (
+    backupRoot: string, instanceId: string, targetRoot: string, run: AppDataRunner = runAppData,
+): Promise<BorgExtractResult & { name: string }> => {
     if (run === runAppData) {
         const borgMissing = borgProblem()
         if (borgMissing) throw new Error(borgMissing)
     }
     const { name, stripComponents } = latestArchiveFromInfo(await run(borgInfoArgs(backupRoot, instanceId)), instanceId)
     log(`Extracting archive ${name} (--strip-components ${stripComponents}) onto ${targetRoot} instances/${instanceId}`)
-    await run(borgExtractArgs(backupRoot, instanceId, name, stripComponents, targetRoot))
-    return name
+    const out = await run(borgExtractArgs(backupRoot, instanceId, name, stripComponents, targetRoot))
+    return { name, ...parseBorgExtract(out) }
+}
+
+/**
+ * engine#468: log what the helper did with the instance folder the restore replaced.
+ * Returns a short note for the trace result and the error message, or null.
+ */
+export const replacedFolderNote = (r: BorgExtractResult): string | null => {
+    for (const p of r.pruned) log(`restoreApp: removed the older replaced copy ${p} (keep-latest, engine#468)`)
+    if (r.replacedQuarantine) {
+        log(`restoreApp: the replaced instance folder is in quarantine at ${r.replacedQuarantine} (engine#468)`)
+        return `the replaced folder is in quarantine at ${r.replacedQuarantine}`
+    }
+    if (r.replacedKept) {
+        log(chalk.yellow(`restoreApp: the replaced instance folder could not be quarantined; it is kept at ${r.replacedKept} (engine#468)`))
+        return `the replaced folder could not be quarantined and is kept at ${r.replacedKept}`
+    }
+    return null
 }
 
 // ── restoreApp ────────────────────────────────────────────────────────────────
@@ -1047,10 +1070,10 @@ export const restoreStartPendingMessage = (instance: Instance): string => {
     return `START_PENDING: restored; ${err}`
 }
 
-const recordRestoreStartPending = (instance: Instance): string => {
+const recordRestoreStartPending = (instance: Instance, extra: Record<string, string> = {}): string => {
     const msg = restoreStartPendingMessage(instance)
     log(msg)
-    attachTraceResult({ startPending: msg })
+    attachTraceResult({ ...extra, startPending: msg })
     const tid = getActiveTrace()?.traceId
     if (tid) stashTraceCloseMessage(tid, msg)
     return msg
@@ -1184,6 +1207,12 @@ export const restoreApp = async (
 
         // #190: restoring to another disk quarantines the old folder afterwards (helper v4)
         const prevDisk = await assertPreQuarantineHelper(store, instanceId, targetDisk, String(localEngineId))
+        // engine#468: an in-place restore needs helper v19, which quarantines the folder it
+        // replaces; an older helper deletes it, so refuse before anything changes
+        if (!skipBorg() && await fs.pathExists(`${await diskMountRoot(targetDisk)}/instances/${instanceId}`)) {
+            const old = await helperAtLeast(RESTORE_REPLACED_QUARANTINE_HELPER_MIN, 'restoreApp onto an existing instance folder (the replaced folder goes to quarantine, engine#468)')
+            if (old) throw new Error(`HELPER_OUTDATED: ${old}`)
+        }
 
         const repoPath = backupDir(backupDevice, instanceId)
         const instancesDir = `${await diskMountRoot(targetDisk)}/instances`
@@ -1210,9 +1239,15 @@ export const restoreApp = async (
 
         await fs.ensureDir(instancesDir)
 
+        let replacedNote: string | null = null
+        let startPending = false
+        const traceExtra: Record<string, string> = {}
         if (!skipBorg()) {
             log(`Restoring instance ${instanceId} from ${backupDevice} to ${targetDevice} (repo ${repoPath})`)
-            await extractLatestArchive(backupDevice, instanceId, await appDataRoot(targetDisk))
+            const extracted = await extractLatestArchiveDetailed(backupDevice, instanceId, await appDataRoot(targetDisk))
+            replacedNote = replacedFolderNote(extracted)
+            if (extracted.replacedQuarantine) traceExtra.replacedQuarantine = extracted.replacedQuarantine
+            if (extracted.replacedKept) traceExtra.replacedKept = extracted.replacedKept
         } else {
             log(`skipBorg: skipping borg extract for instance ${instanceId}`)
         }
@@ -1256,11 +1291,15 @@ export const restoreApp = async (
                 // restore (RESTORE_START_FAILED); the restored files stay in place.
                 const after = getInstance(storeHandle.doc(), instanceId)
                 const outcome = restoreStartOutcome(after, String(targetDisk.name))
-                if (outcome.kind === 'pending') recordRestoreStartPending(after!)
-                else if (outcome.kind === 'failed') throw new Error(outcome.message)
+                if (outcome.kind === 'pending') { recordRestoreStartPending(after!, traceExtra); startPending = true }
+                else if (outcome.kind === 'failed') {
+                    if (Object.keys(traceExtra).length) attachTraceResult(traceExtra)
+                    throw new Error(replacedNote ? `${outcome.message}; ${replacedNote}` : outcome.message)
+                }
             }
         }
 
+        if (Object.keys(traceExtra).length && !startPending) attachTraceResult(traceExtra)
         updateOperation(storeHandle, opId, {
             status: 'Done',
             progressPercent: 100,
