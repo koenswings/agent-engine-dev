@@ -2245,6 +2245,36 @@ export const hasBackupProbe = (ctx: ActionContext): boolean =>
     typeof (ctx.opts.ops as BackupOps).probeBackupDisk === 'function'
 
 /**
+ * Backup Disks docked on a pool engine (never idea02 / excluded), shared store: any view.
+ * With instanceId: only disks that link it (or carry no backupLinks list), as the Console's
+ * InstanceRow requires before it shows Back up.
+ */
+export const dockedBackupDisks = async (
+    ctx: Pick<ActionContext, 'opts' | 'poolEngines' | 'excludeEngines'>,
+    instanceId?: string,
+): Promise<{ id: string; engine: string }[]> => {
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    const candidates: { id: string; engine: string }[] = []
+    const seen = new Set<string>()
+    for (const eng of pool) {
+        let view: SemanticStoreView
+        try {
+            view = await ctx.opts.ops.readStore(eng)
+        } catch {
+            continue
+        }
+        for (const d of Object.values(view.diskDB)) {
+            if (seen.has(d.id) || !d.dockedTo || !d.diskTypes?.includes('backup')) continue
+            if (!pool.includes(d.dockedTo)) continue
+            if (instanceId && d.backupLinks && !d.backupLinks.includes(instanceId)) continue
+            seen.add(d.id)
+            candidates.push({ id: d.id, engine: d.dockedTo })
+        }
+    }
+    return candidates
+}
+
+/**
  * r30 preflight before the backup_instance Intent (live only). Console 0760c01
  * InstanceRow shows `backup-instance-<id>` only for a Backup Disk that is docked on the
  * SAME engine as the instance's disk and links the instance (InstanceList
@@ -2276,23 +2306,7 @@ export const ensureBackupDiskForInstance = async (
         )
     }
     // Backup Disks linked to the instance, docked on a pool engine (shared store: any view).
-    const candidates: { id: string; engine: string }[] = []
-    const seen = new Set<string>()
-    for (const eng of pool) {
-        let view: SemanticStoreView
-        try {
-            view = await ctx.opts.ops.readStore(eng)
-        } catch {
-            continue
-        }
-        for (const d of Object.values(view.diskDB)) {
-            if (seen.has(d.id) || !d.dockedTo || !d.diskTypes?.includes('backup')) continue
-            if (!pool.includes(d.dockedTo)) continue
-            if (d.backupLinks && !d.backupLinks.includes(instanceId)) continue
-            seen.add(d.id)
-            candidates.push({ id: d.id, engine: d.dockedTo })
-        }
-    }
+    const candidates = await dockedBackupDisks(ctx, instanceId)
     if (!candidates.length) {
         throw new Error(
             `backup_instance: no docked Backup Disk linked to ${instanceId} on any pool engine ` +
@@ -2532,6 +2546,45 @@ export const stage2MoveAppPins = (
     if (!envInst) set.DURATION_COPY_INSTANCE_ID = instanceId
     if (!envTarget) set.DURATION_COPY_TARGET_DISK = targetDiskId
     return { instanceId, targetDiskId, set }
+}
+
+/**
+ * Markov (--scenario random) draw guard, idea#168 Markov 9040e73@8: a random walk drew move_app
+ * before any copy_app had recorded a disposable instance and aborted before the Intent. A step whose
+ * harness precondition is an earlier step's result is not drawable until that result exists; the
+ * walker resamples among the other edges (runner.ts). Each rule mirrors the fail-loud check the
+ * dispatcher would hit, so a Fake / Stage 1 run (where those checks do not fire) draws exactly as before.
+ * Deterministic walks (cover-all, cover-registered-intents, …) never call this: they still fail loud.
+ * Returns why the step cannot be drawn now, or null when it can.
+ *   move_app            (Stage 2) needs the copy_app instance (walker.stage2CopyInstanceId) or DURATION_COPY_INSTANCE_ID.
+ *   backup_instance     (live) needs a docked Backup Disk linking the instance (make_backup_disk first).
+ *   backup_schedule     (live) needs a docked Backup Disk (make_backup_disk first).
+ *   restore_from_backup (live) needs a docked Backup Disk and an archive from a backup_instance of this run.
+ */
+export const randomStepPrecondition = async (
+    ctx: Pick<ActionContext, 'opts' | 'walker' | 'poolEngines' | 'excludeEngines' | 'fixtureInstance'>,
+    action: string,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> => {
+    if (action === 'move_app') {
+        if (!isStage2(ctx) || env.DURATION_COPY_INSTANCE_ID?.trim() || ctx.walker.stage2CopyInstanceId?.trim()) return null
+        return 'no copy_app instance recorded yet (Stage 2 move_app moves that copy; never the Kolibri fixture)'
+    }
+    if (action !== 'backup_instance' && action !== 'backup_schedule' && action !== 'restore_from_backup') return null
+    if (!hasBackupProbe(ctx as ActionContext)) return null
+    const linked = action === 'backup_instance' ? ctx.fixtureInstance : undefined
+    if (!(await dockedBackupDisks(ctx, linked)).length) {
+        return `no docked Backup Disk${linked ? ` linked to ${linked}` : ''} on the pool yet (make_backup_disk first)`
+    }
+    if (action === 'restore_from_backup' && !ctx.walker.backupTaken) {
+        return 'no backup_instance archive taken in this run yet (restore needs one)'
+    }
+    return null
+}
+
+/** Markov draw guard bookkeeping: remember results later steps depend on (after an ok step). */
+export const noteStepPreconditionProgress = (walker: WalkerState, action: string): void => {
+    if (action === 'backup_instance') walker.backupTaken = true
 }
 
 /** Sets harness-owned env vars; returns the restore function. */

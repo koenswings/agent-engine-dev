@@ -238,6 +238,8 @@ export interface WalkerState {
     stage2CopyInstanceId?: string | null
     /** true once erase_disk ran: later install_app targets the erase partition, not the files one. */
     eraseStarted?: boolean
+    /** Markov draw guard: true after an ok backup_instance (restore_from_backup becomes drawable). */
+    backupTaken?: boolean
 }
 
 /** One step in a deterministic walk file (kind: walk). */

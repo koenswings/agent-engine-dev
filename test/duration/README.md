@@ -90,6 +90,7 @@ across filesystems). The harness never downloads, builds or deletes a staged tar
 
 **`--scenario` semantics:**
 - `random` / `unified` / default → **Markov** simulation on `scenarios/unified.yaml`
+  - Draw guard (idea#168 Markov 9040e73@8): a step whose precondition is an earlier step's result is not drawable until it exists; the walker resamples among the other edges (`randomStepPrecondition` in `actions.ts`). Stage 2 `move_app` waits for a recorded `copy_app` instance (or `DURATION_COPY_INSTANCE_ID`); live `backup_instance` / `backup_schedule` / `restore_from_backup` wait for a docked Backup Disk, and `restore_from_backup` also for a `backup_instance` of this run. Walks (`cover-all`, …) never use the guard: they still fail loud.
 - `cover-all` → **deterministic walk** (`walks/cover-all.yaml`) covering every graph action once — strict full-graph regression (under `--ui`, Pixel-missing still **failLoud** abort; live retry requires Console@`6e359bd` or newer)
 - `cover-registered-intents` (chat: **registered-intents walk**; alias `cover-hardpass`) → **deterministic walk** (`walks/cover-registered-intents.yaml`) covering the current Pixel-registered demo subset + Engine infra FleetOps — **live `--ui` demo now** (coaching Intents are registered but walk expansion is deferred; excludes DEFERRED + PIXEL_MISSING)
 - `kolibri-learn-smoke` / `kolibri-teacher-preview-smoke` → short Prefer A walks to `finish_exercise` (6 / 7 steps; skips coaching 3–7)
