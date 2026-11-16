@@ -35,6 +35,7 @@ import {
 import type { UiDriver, UiIntentContext, UiIntentResult } from './types.js'
 import { loadPlaywright, type PlaywrightModule } from './playwrightLoader.js'
 import { ActiveTabTracker, captureFrameFrom, followContextTabs, type TrackablePage } from './activeTab.js'
+import { consoleFramePath, formatConsoleScreen, readConsoleScreen } from './consoleScreen.js'
 
 export interface PlaywrightUiOptions {
     baseUrl?: string
@@ -406,10 +407,11 @@ export class PlaywrightUiDriver implements UiDriver {
             if (!result.ok) {
                 const missing = /not found|timeout|missing|blocker|not landed|visible|not registered/i
                     .test(result.message ?? '')
+                const diag = await this.consoleFailureNote(ctx.screenshotPath)
                 return {
                     ok: false,
                     mode: !result.registered || missing ? 'missing_fixture' : 'error',
-                    message: `runDurationIntent('${ctx.action}'): ${result.message ?? 'failed'}`,
+                    message: `runDurationIntent('${ctx.action}'): ${result.message ?? 'failed'}${diag}`,
                 }
             }
             return {
@@ -420,11 +422,40 @@ export class PlaywrightUiDriver implements UiDriver {
         } catch (err) {
             const raw = err instanceof Error ? err.message : String(err)
             const missing = /not found|timeout|missing|blocker|not landed|visible/i.test(raw)
+            const diag = await this.consoleFailureNote(ctx.screenshotPath)
             return {
                 ok: false,
                 mode: missing ? 'missing_fixture' : 'error',
-                message: `Playwright Intent '${ctx.action}' failed: ${raw}`,
+                message: `Playwright Intent '${ctx.action}' failed: ${raw}${diag}`,
             }
+        }
+    }
+
+    /**
+     * kc10 step 133: on an Intent failure, record the Console page the Intent drove (the
+     * active-tab frame may show a leftover App tab instead). Writes `<frame>-console.png`
+     * when the step has a frame path and returns `; console page … visible=[…]` for the
+     * step message. Read-only; never throws.
+     */
+    private async consoleFailureNote(framePath?: string): Promise<string> {
+        if (!this.page) return ''
+        try {
+            const snap = await readConsoleScreen(this.page)
+            let shot = ''
+            if (framePath) {
+                const path = consoleFramePath(framePath)
+                try {
+                    mkdirSync(dirname(path), { recursive: true })
+                    const p = this.page as { screenshot?: (o: { path: string; fullPage?: boolean }) => Promise<unknown> }
+                    if (typeof p.screenshot === 'function') {
+                        await p.screenshot({ path, fullPage: true })
+                        shot = ` frame=${path}`
+                    }
+                } catch { /* diagnostics only */ }
+            }
+            return `; ${formatConsoleScreen(snap)}${shot}`
+        } catch {
+            return ''
         }
     }
 
