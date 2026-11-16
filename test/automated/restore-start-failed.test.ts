@@ -103,16 +103,17 @@ describe('restoreStartOutcome / postStartWarningMessage / parseBorgExtract (engi
     })
 
     it('parseBorgExtract reads the v19 key=value lines and ignores anything else', () => {
-        expect(parseBorgExtract('')).toEqual({ replacedQuarantine: null, replacedKept: null, pruned: [] })
-        expect(parseBorgExtract(`noise\nreplacedQuarantine=${QPATH}\npruned=/disks/sdb1/.idea-quarantine/a-replaced-1\npruned=/b\n`)).toEqual({
-            replacedQuarantine: QPATH, replacedKept: null, pruned: ['/disks/sdb1/.idea-quarantine/a-replaced-1', '/b'],
+        expect(parseBorgExtract('')).toEqual({ replacedQuarantine: null, replacedKept: null })
+        // v19 never prunes; an old pruned= line is just noise
+        expect(parseBorgExtract(`noise\nreplacedQuarantine=${QPATH}\npruned=/disks/sdb1/.idea-quarantine/a-replaced-1\n`)).toEqual({
+            replacedQuarantine: QPATH, replacedKept: null,
         })
         expect(parseBorgExtract('replacedKept=/disks/sdb1/.idea-app-data-staging/restore-x.AbC/.previous\nreplacedQuarantine=relative\n')).toEqual({
-            replacedQuarantine: null, replacedKept: '/disks/sdb1/.idea-app-data-staging/restore-x.AbC/.previous', pruned: [],
+            replacedQuarantine: null, replacedKept: '/disks/sdb1/.idea-app-data-staging/restore-x.AbC/.previous',
         })
-        expect(replacedFolderNote({ replacedQuarantine: QPATH, replacedKept: null, pruned: [] })).toBe(`the replaced folder is in quarantine at ${QPATH}`)
-        expect(replacedFolderNote({ replacedQuarantine: null, replacedKept: '/k', pruned: [] })).toBe('the replaced folder could not be quarantined and is kept at /k')
-        expect(replacedFolderNote({ replacedQuarantine: null, replacedKept: null, pruned: [] })).toBeNull()
+        expect(replacedFolderNote({ replacedQuarantine: QPATH, replacedKept: null })).toBe(`the replaced folder is in quarantine at ${QPATH}`)
+        expect(replacedFolderNote({ replacedQuarantine: null, replacedKept: '/k' })).toBe('the replaced folder could not be quarantined and is kept at /k')
+        expect(replacedFolderNote({ replacedQuarantine: null, replacedKept: null })).toBeNull()
     })
 
     it('Engine speaks helper v19 and an in-place restore needs v19', () => {

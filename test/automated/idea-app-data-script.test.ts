@@ -976,9 +976,10 @@ describe('idea-app-data: borg', () => {
 })
 
 
-describe('idea-app-data borg-extract: the replaced folder goes to quarantine, keep-latest (helper v19, engine#468)', () => {
+describe('idea-app-data borg-extract: the replaced folder goes to quarantine, every copy kept (helper v19, engine#468)', () => {
     const ARCHIVE = '2026-11-16T03-34-19-273Z-hook'
-    const STAMP_RE = /^inst1-replaced-\d{8}T\d{15}Z$/
+    const STAMP = '20261116T033756Z'
+    const COPY_RE = /^inst1-replaced-\d{8}T\d{6}Z(-[2-9])?$/
     let target: string
     let qdir: string
     beforeEach(async () => {
@@ -993,11 +994,13 @@ describe('idea-app-data borg-extract: the replaced folder goes to quarantine, ke
         await fs.ensureDir(path.join(target, 'instances', 'inst1', 'data', 'db'))
         await fs.writeFile(path.join(target, 'instances', 'inst1', 'data', 'db', 'ibdata1'), content)
     }
-    const extract = () => sb.run(['borg-extract', 'sdc1', 'inst1', ARCHIVE, '3', 'sdd1'], { FAKE_BORG_EXTRACT: 'inst1' })
-    const replacedCopies = async () => (await fs.pathExists(qdir)) ? (await fs.readdir(qdir)).filter(n => STAMP_RE.test(n)).sort() : []
+    const extract = (env: Record<string, string> = {}) =>
+        sb.run(['borg-extract', 'sdc1', 'inst1', ARCHIVE, '3', 'sdd1'], { FAKE_BORG_EXTRACT: 'inst1', ...env })
+    const replacedCopies = async () => (await fs.pathExists(qdir)) ? (await fs.readdir(qdir)).filter(n => COPY_RE.test(n)).sort() : []
     const lineOf = (out: string, key: string) => out.split('\n').filter(l => l.startsWith(`${key}=`)).map(l => l.slice(key.length + 1))
+    const db = (dir: string) => fs.readFile(path.join(dir, 'data', 'db', 'ibdata1'), 'utf8')
 
-    it('moves the replaced instances/<id> into .idea-quarantine/<id>-replaced-<stamp> with a marker, prints the path and never deletes it', async () => {
+    it('moves the replaced instances/<id> into .idea-quarantine/<id>-replaced-<stamp>, prints the path and never deletes it', async () => {
         await live('the only good db')
         const r = await extract()
         expect(r.exitCode, r.stderr).toBe(0)
@@ -1006,8 +1009,7 @@ describe('idea-app-data borg-extract: the replaced folder goes to quarantine, ke
         expect(copies).toHaveLength(1)
         const q = path.join(qdir, copies[0])
         expect(lineOf(r.stdout, 'replacedQuarantine')).toEqual([q])
-        expect(await fs.readFile(path.join(q, 'data', 'db', 'ibdata1'), 'utf8')).toBe('the only good db')
-        expect(await fs.pathExists(`${q}.replaced-ok`)).toBe(true)
+        expect(await db(q)).toBe('the only good db')
         expect((await fs.stat(qdir)).mode & 0o777).toBe(0o700)
         expect((await fs.stat(q)).mode & 0o777).toBe(0o700)
         expect(await fs.pathExists(path.join(target, '.idea-app-data-staging'))).toBe(false)
@@ -1021,42 +1023,52 @@ describe('idea-app-data borg-extract: the replaced folder goes to quarantine, ke
         expect(await fs.pathExists(qdir)).toBe(false)
     })
 
-    it('keeps only the latest marked replaced copy of that instance; never touches unmarked, other-instance, #190, symlinked or outside copies', async () => {
+    it('two restores leave two copies (no keep-latest pruning; cleanup via #273), and nothing else in .idea-quarantine is touched', async () => {
+        const other = path.join(qdir, 'inst2-replaced-20200101T000000Z')
+        await fs.ensureDir(other)
         await live('first')
-        expect((await extract()).exitCode).toBe(0)
-        const [firstCopy] = await replacedCopies()
-        // things clean-up must never touch
-        const unmarked = path.join(qdir, 'inst1-replaced-20200101T000000Z')
-        await fs.ensureDir(unmarked)
-        const otherId = path.join(qdir, 'inst2-replaced-20200101T000000Z')
-        await fs.ensureDir(otherId); await fs.writeFile(`${otherId}.replaced-ok`, '')
-        const prefixId = path.join(qdir, 'inst1-x-replaced-20200101T000000Z')
-        await fs.ensureDir(prefixId); await fs.writeFile(`${prefixId}.replaced-ok`, '')
-        const moved190 = path.join(qdir, 'inst1-20200101T000000Z')
-        await fs.ensureDir(moved190)
-        const outside = path.join(sb.tmp, 'outside-keep')
-        await fs.ensureDir(outside); await fs.writeFile(path.join(outside, 'precious'), 'x')
-        const link = path.join(qdir, 'inst1-replaced-20190101T000000Z')
-        await fs.symlink(outside, link); await fs.writeFile(`${link}.replaced-ok`, '')
-        const badStamp = path.join(qdir, 'inst1-replaced-notastamp')
-        await fs.ensureDir(badStamp); await fs.writeFile(`${badStamp}.replaced-ok`, '')
-
-        await new Promise(res => setTimeout(res, 5))
+        const r1 = await extract({ FAKE_DATE_UTC_STAMP: '20261116T080000Z' })
+        expect(r1.exitCode, r1.stderr).toBe(0)
         await live('second')
-        const r = await extract()
+        const r2 = await extract({ FAKE_DATE_UTC_STAMP: '20261116T080100Z' })
+        expect(r2.exitCode, r2.stderr).toBe(0)
+        expect(await replacedCopies()).toEqual(['inst1-replaced-20261116T080000Z', 'inst1-replaced-20261116T080100Z'])
+        expect(await db(path.join(qdir, 'inst1-replaced-20261116T080000Z'))).toBe('first')
+        expect(await db(path.join(qdir, 'inst1-replaced-20261116T080100Z'))).toBe('second')
+        expect(r2.stdout).not.toMatch(/pruned=/)
+        expect(await fs.pathExists(other)).toBe(true)
+    })
+
+    it('a stamp that is already taken is never overwritten: the next copy gets -2, -3 …', async () => {
+        const taken = path.join(qdir, `inst1-replaced-${STAMP}`)
+        await fs.ensureDir(path.join(taken, 'data'))
+        await fs.writeFile(path.join(taken, 'data', 'keep'), 'older copy')
+        await live('first')
+        const r1 = await extract({ FAKE_DATE_UTC_STAMP: STAMP })
+        expect(r1.exitCode, r1.stderr).toBe(0)
+        expect(lineOf(r1.stdout, 'replacedQuarantine')).toEqual([`${taken}-2`])
+        await live('second')
+        const r2 = await extract({ FAKE_DATE_UTC_STAMP: STAMP })
+        expect(lineOf(r2.stdout, 'replacedQuarantine')).toEqual([`${taken}-3`])
+        expect(await fs.readFile(path.join(taken, 'data', 'keep'), 'utf8')).toBe('older copy')
+        expect(await db(`${taken}-2`)).toBe('first')
+        expect(await db(`${taken}-3`)).toBe('second')
+    })
+
+    it('when the stamp and all its suffixes -2 … -9 are taken, nothing is overwritten and the folder stays in staging', async () => {
+        const taken = path.join(qdir, `inst1-replaced-${STAMP}`)
+        for (const n of ['', '-2', '-3', '-4', '-5', '-6', '-7', '-8', '-9']) await fs.ensureDir(`${taken}${n}`)
+        await fs.writeFile(path.join(`${taken}-9`, 'keep'), 'x')
+        await live('the only good db')
+        const r = await extract({ FAKE_DATE_UTC_STAMP: STAMP })
         expect(r.exitCode, r.stderr).toBe(0)
-        const [latest] = lineOf(r.stdout, 'replacedQuarantine')
-        expect(latest).not.toBe(path.join(qdir, firstCopy))
-        expect(await fs.readFile(path.join(latest, 'data', 'db', 'ibdata1'), 'utf8')).toBe('second')
-        expect(lineOf(r.stdout, 'pruned')).toEqual([path.join(qdir, firstCopy)])
-        expect(await fs.pathExists(path.join(qdir, firstCopy))).toBe(false)
-        expect(await fs.pathExists(path.join(qdir, `${firstCopy}.replaced-ok`))).toBe(false)
-        for (const kept of [unmarked, otherId, prefixId, moved190, badStamp]) expect(await fs.pathExists(kept), kept).toBe(true)
-        expect((await fs.lstat(link)).isSymbolicLink()).toBe(true)
-        expect(await fs.readFile(path.join(outside, 'precious'), 'utf8')).toBe('x')
-        expect(r.stderr).toMatch(/skipped .*inst1-replaced-20190101T000000Z: a symlink/)
-        expect(r.stderr).toMatch(/kept .*inst1-replaced-20200101T000000Z: no replaced-ok marker/)
-        expect(await sb.journalText()).toMatch(/pruned older replaced copy .*inst1-replaced-/)
+        expect(r.stdout).not.toMatch(/replacedQuarantine=/)
+        const [kept] = lineOf(r.stdout, 'replacedKept')
+        expect(kept.startsWith(path.join(target, '.idea-app-data-staging', 'restore-inst1.'))).toBe(true)
+        expect(await db(kept)).toBe('the only good db')
+        expect(r.stderr).toMatch(/suffixes -2 to -9 already exist/)
+        expect(await fs.readFile(path.join(`${taken}-9`, 'keep'), 'utf8')).toBe('x')
+        expect(await fs.readdir(`${taken}-2`)).toEqual([])
     })
 
     for (const [what, make] of [
@@ -1074,7 +1086,7 @@ describe('idea-app-data borg-extract: the replaced folder goes to quarantine, ke
             const [kept] = lineOf(r.stdout, 'replacedKept')
             expect(kept.startsWith(path.join(target, '.idea-app-data-staging', 'restore-inst1.'))).toBe(true)
             expect(kept.endsWith('/.previous')).toBe(true)
-            expect(await fs.readFile(path.join(kept, 'data', 'db', 'ibdata1'), 'utf8')).toBe('the only good db')
+            expect(await db(kept)).toBe('the only good db')
             expect(r.stdout).not.toMatch(/replacedQuarantine=/)
             expect(r.stderr).toMatch(/warning: the replaced instance folder was not quarantined/)
             expect(r.stderr).toMatch(/warning: kept the staging folder/)
@@ -1082,11 +1094,14 @@ describe('idea-app-data borg-extract: the replaced folder goes to quarantine, ke
         })
     }
 
-    it('the staging cleanup (also run on a signal or a failed swap) checks for .previous before any rm', async () => {
+    it('no code path removes a replaced folder: the restore section has no rm, and the staging cleanup checks for .previous first', async () => {
         const text = await fs.readFile(HELPER_SOURCE, 'utf8')
-        const body = text.slice(text.indexOf('cleanup_staging() {'), text.indexOf('# Cancellation: stop the child'))
-        expect(body).toMatch(/\.previous/)
-        expect(body.indexOf('.previous')).toBeLessThan(body.indexOf('$RM -rf'))
+        const section = text.slice(text.indexOf('# ── Restore: the replaced instance folder'), text.indexOf('# ── updateApp snapshots'))
+        expect(section).toContain('replaced_to_quarantine()')
+        expect(section).not.toMatch(/\$RM|\$RMDIR|rm -/)
+        expect(text).not.toMatch(/prune_replaced|replaced-ok/)
+        const cleanup = text.slice(text.indexOf('cleanup_staging() {'), text.indexOf('# Cancellation: stop the child'))
+        expect(cleanup.indexOf('.previous')).toBeLessThan(cleanup.indexOf('$RM -rf'))
     })
 })
 

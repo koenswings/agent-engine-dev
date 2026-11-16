@@ -189,7 +189,7 @@ export const borgExtractArgs = (bdev: string, id: string, archive: string, strip
 }
 /**
  * engine#468 / helper v19: borg-extract moves the instance folder it replaces into
- * <target>/.idea-quarantine/<id>-replaced-<UTC stamp> (keep-latest per instance) instead
+ * <target>/.idea-quarantine/<id>-replaced-<UTC stamp> (every copy is kept; cleanup via #273) instead
  * of deleting it. An older helper deletes it, so an in-place restore refuses below v19.
  */
 export const RESTORE_REPLACED_QUARANTINE_HELPER_MIN = 19
@@ -199,19 +199,16 @@ export interface BorgExtractResult {
     replacedQuarantine: string | null
     /** the replaced folder could not be quarantined and is still at this staging path */
     replacedKept: string | null
-    /** older replaced copies of the same instance that keep-latest removed */
-    pruned: string[]
 }
 
 /** Parse borg-extract's v19 stdout (key=value lines; anything else is ignored). */
 export const parseBorgExtract = (stdout: string): BorgExtractResult => {
-    const out: BorgExtractResult = { replacedQuarantine: null, replacedKept: null, pruned: [] }
+    const out: BorgExtractResult = { replacedQuarantine: null, replacedKept: null }
     for (const line of String(stdout ?? '').split('\n')) {
-        const m = line.trim().match(/^(replacedQuarantine|replacedKept|pruned)=(\/.+)$/)
+        const m = line.trim().match(/^(replacedQuarantine|replacedKept)=(\/.+)$/)
         if (!m) continue
         if (m[1] === 'replacedQuarantine') out.replacedQuarantine = m[2]
-        else if (m[1] === 'replacedKept') out.replacedKept = m[2]
-        else out.pruned.push(m[2])
+        else out.replacedKept = m[2]
     }
     return out
 }

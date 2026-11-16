@@ -1042,7 +1042,6 @@ export const extractLatestArchiveDetailed = async (
  * Returns a short note for the trace result and the error message, or null.
  */
 export const replacedFolderNote = (r: BorgExtractResult): string | null => {
-    for (const p of r.pruned) log(`restoreApp: removed the older replaced copy ${p} (keep-latest, engine#468)`)
     if (r.replacedQuarantine) {
         log(`restoreApp: the replaced instance folder is in quarantine at ${r.replacedQuarantine} (engine#468)`)
         return `the replaced folder is in quarantine at ${r.replacedQuarantine}`

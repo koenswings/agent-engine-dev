@@ -99,12 +99,10 @@
 #        to .idea-verify scratch copies.
 #   v19 (engine#468; builds on v18, PR #472): borg-extract never deletes the instance folder it replaces. The previous
 #        instances/<id> is moved (one rename, same disk) to .idea-quarantine/<id>-replaced-<UTC stamp>
-#        with a root marker <that path>.replaced-ok next to it, and stdout gets
-#        replacedQuarantine=<path>. Keep-latest per instance (the engine#415 policy): older marked
-#        <id>-replaced-<stamp> copies of that one instance are removed (pruned=<path>); unmarked
-#        copies, symlinks, non-root copies, other instances' copies and anything outside
-#        .idea-quarantine are never touched. When the move cannot be done the restore still
-#        succeeds, the folder stays in the staging folder and stdout gets replacedKept=<path>.
+#        (a taken stamp gets -2 … -9; nothing is ever overwritten) and stdout gets
+#        replacedQuarantine=<path>. Every replaced copy is kept (quarantine, never delete;
+#        cleanup via #273). When the move cannot be done the restore still succeeds, the folder
+#        stays in the staging folder and stdout gets replacedKept=<path>.
 #        The staging cleanup (also on a signal) never removes a .previous folder.
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
@@ -405,47 +403,23 @@ replaced_to_quarantine() {   # replaced_to_quarantine <R_DIR> <id> <path>
         replaced_kept "$3" "quarantine folder $qdir must be owned by root and not group/other writable"; return 0
     fi
     $CHMOD 0700 -- "$qdir" 2>/dev/null || true
-    dest="$qdir/$2-replaced-$($DATE -u +%Y%m%dT%H%M%S%NZ)"
-    if [[ -e "$dest" || -L "$dest" ]]; then replaced_kept "$3" "$dest already exists"; return 0; fi
+    # Every replaced copy is kept (quarantine, never delete; cleanup via #273). A
+    # stamp that is already taken gets -2 … -9; when all are taken the folder stays
+    # in staging. Nothing in .idea-quarantine is ever overwritten or removed here.
+    local base n
+    base="$qdir/$2-replaced-$($DATE -u +%Y%m%dT%H%M%SZ)"
+    dest="$base"; n=1
+    while [[ -e "$dest" || -L "$dest" ]]; do
+        n=$((n + 1))
+        if (( n > 9 )); then replaced_kept "$3" "$base and its suffixes -2 to -9 already exist"; return 0; fi
+        dest="$base-$n"
+    done
     if ! $MV -T -- "$3" "$dest"; then replaced_kept "$3" "cannot move it to $dest"; return 0; fi
+    if [[ -e "$3" || -L "$3" ]]; then replaced_kept "$3" "it is still in staging after the move to $dest"; return 0; fi
     $CHOWN root:root -- "$dest" 2>/dev/null || true
     $CHMOD 0700 -- "$dest" 2>/dev/null || true
     journal "quarantine: replaced instance folder -> $dest"
     echo "replacedQuarantine=$dest"
-    if ! : > "$dest.replaced-ok"; then
-        echo "warning: cannot write the marker $dest.replaced-ok; this copy is never pruned" >&2
-        return 0
-    fi
-    prune_replaced "$qdir" "$2" "$dest"
-}
-# Keep-latest (engine#415 policy): remove the OTHER marked replaced copies of <id> only.
-prune_replaced() {   # prune_replaced <qdir> <id> <keep>
-    local cand cname cstamp cuid
-    shopt -s nullglob dotglob
-    for cand in "$1/$2-replaced-"*; do
-        cname=${cand##*/}
-        cstamp=${cname#"$2-replaced-"}
-        # a marker file, or another instance whose id starts with '<id>-replaced-': not ours
-        [[ "$cstamp" =~ $RE_STAMP ]] || continue
-        [[ "$cand" != "$3" ]] || continue
-        if [[ -L "$cand" ]]; then echo "skipped $cand: a symlink (never followed)" >&2; continue; fi
-        [[ -d "$cand" ]] || continue
-        if [[ ! -f "$cand.replaced-ok" || -L "$cand.replaced-ok" ]]; then
-            echo "kept $cand: no replaced-ok marker" >&2; continue
-        fi
-        exact_path "$cand" || { echo "skipped $cand: does not resolve to itself" >&2; continue; }
-        [[ "$cand" == "$1/$cname" ]] || continue
-        read -r cuid _ _ <<<"$(stat_fields "$cand")"
-        [[ "$cuid" == "$ROOT_UID" ]] || { echo "skipped $cand: not owned by root" >&2; continue; }
-        if $RM -rf --one-file-system -- "$cand"; then
-            $RM -f -- "$cand.replaced-ok" || true
-            journal "quarantine: pruned older replaced copy $cand (kept $3)"
-            echo "pruned=$cand"
-        else
-            echo "pruneFailed=$cand"
-        fi
-    done
-    shopt -u nullglob dotglob
 }
 
 # ── updateApp snapshots (v5, idea#230) ───────────────────────────────────────
