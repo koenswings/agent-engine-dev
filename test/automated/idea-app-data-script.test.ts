@@ -1743,7 +1743,7 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v19 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v19 adds the engine#468 replaced-folder quarantine)', async () => {
+    it('helper and Engine speak v19 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine)', async () => {
         expect(APP_DATA_HELPER_VERSION).toBe('19')
         const r = await sb.run(['version'])
         expect(r.stdout.trim()).toBe('idea-app-data 19')

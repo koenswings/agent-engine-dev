@@ -97,6 +97,19 @@
 #        <stamp>. A copy without the marker (a failed or running extract, or one made by a helper
 #        older than v17) is never touched. A deliberate exception to quarantine-not-delete, limited
 #        to .idea-verify scratch copies.
+
+#   idea-app-data temp-backup-estimate <root> <id> [exclude…]                (v18, engine#469: read-only "<net kb> <free kb> <same fs 0|1>")
+#   idea-app-data temp-backup-create   <root> <id> <stamp> <archive> [exclude…]  (v18: Borg repo at <system>/.idea-temp-backups/<id>/<stamp>/repo,
+#                                                                           containers stopped, TEMP_BACKUP_NO_SPACE exit 3, borg check, COMPLETE last)
+#   idea-app-data temp-backup-delete   <id> <stamp>                          (v18: rm -rf --one-file-system of that one folder only)
+#   idea-app-data temp-backup-restore  <root> <id> <stamp>                   (v18: extract into staging, carry excluded paths over,
+#                                                                           quarantine the current folder, put the restored one in place)
+#   idea-app-data temp-backups                                               (v18: "<id> <stamp> <kb> complete|incomplete" lines, then "TOTAL <kb>")
+#   v18 (engine#469, Koen's decision on idea#374): temporary pre-update backups on the SYSTEM disk when
+#        no Backup Disk is linked. They live only under $SYSTEM_ROOT/.idea-temp-backups/ (root, 0700).
+#        temp-backup-delete is the second deliberate exception to quarantine-not-delete, limited to
+#        that subtree: the Engine calls it after an update passed its health gate (and for a failed,
+#        never-COMPLETE create). Merged first as v18; engine#468 (borg-extract keeps the replaced folder) follows as v19 and this helper carries both.
 #   v19 (engine#468; builds on v18, PR #472): borg-extract never deletes the instance folder it replaces. The previous
 #        instances/<id> is moved (one rename, same disk) to .idea-quarantine/<id>-replaced-<UTC stamp>
 #        (a taken stamp gets -2 … -9; nothing is ever overwritten) and stdout gets
@@ -252,6 +265,8 @@ DISKS_DIR=/disks
 # SYSTEM_ROOT=/ would produce //instances/<id> and fail exact_path (idea#237).
 # Verbs that pass the root itself to df must treat '' as / (avail_kb, free_floor; idea#427).
 SYSTEM_ROOT=
+# v18 (engine#469): temporary pre-update backups live in $SYSTEM_ROOT/$TEMP_BACKUPS_NAME (system disk only).
+TEMP_BACKUPS_NAME=.idea-temp-backups
 ROOTS_FILE=/etc/idea/app-data-roots
 LOCK_DIR=/run/lock/idea-app-data
 ROOT_HOME=/root
@@ -2028,6 +2043,263 @@ case "$SUB" in
         exit "$CV_FAIL"
         ;;
 
+    temp-backup-estimate)
+        # v18 (engine#469): read-only (no lock, nothing stopped or written). Prints
+        # "<net kb> <free kb> <same filesystem 0|1>": the instance folder net of the given
+        # x-app.backup.exclude paths (the borg-create rules), the free space of the system
+        # disk, and 1 when <root> is on that same filesystem (the snapshot then lands there too).
+        need_min 2 $(($# - 1)) "<root> <id> [exclude…]"
+        check_id "$3"
+        resolve_root "$2" instances
+        INST=$(inst_dir "$R_DIR" "$3")
+        [[ ! -L "$INST" ]] || refuse "$INST is a symlink"
+        existing_dir "$INST" "instance folder"
+        parse_excludes "$INST" "${@:4}"
+        INST_KB=$(dir_kb "$INST"); [[ "$INST_KB" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $INST"
+        excluded_kb "$INST"
+        NET_KB=$(( INST_KB > EXCL_KB ? INST_KB - EXCL_KB : 0 ))
+        SYS_DIR="${SYSTEM_ROOT:-/}"
+        FREE_KB=$(avail_kb "$SYS_DIR")
+        D1=$($STAT -c %d -- "${R_DIR:-/}") || refuse "cannot stat ${R_DIR:-/}"
+        D2=$($STAT -c %d -- "$SYS_DIR") || refuse "cannot stat $SYS_DIR"
+        if [[ "$D1" == "$D2" ]]; then SAME=1; else SAME=0; fi
+        echo "$NET_KB $FREE_KB $SAME"
+        exit 0
+        ;;
+
+    temp-backup-create)
+        # v18 (engine#469, Koen's decision on idea#374): the temporary pre-update backup when
+        # no Backup Disk is linked. A Borg repository (encryption none) of instances/<id> at
+        # <system disk>/.idea-temp-backups/<id>/<stamp>/repo, archive <archive>, with the
+        # given x-app.backup.exclude paths left out (borg-create rules). Only while the
+        # instance's containers are stopped. Refuses TEMP_BACKUP_NO_SPACE (exit 3) before
+        # anything is written when the system disk has less than the net size plus the
+        # snapshot margin free. `borg check` must pass before COMPLETE is written (by
+        # rename, last). Prints "<folder> <kb>". A failed run leaves its folder without
+        # COMPLETE; the Engine removes it with temp-backup-delete.
+        need_min 4 $(($# - 1)) "<root> <id> <stamp> <archive> [exclude…]"
+        check_id "$3"
+        check_stamp "$4"
+        [[ "$5" =~ $RE_ARCHIVE ]] || refuse "archive name '$5' does not match $RE_ARCHIVE"
+        resolve_root "$2" instances
+        SRC=$(inst_dir "$R_DIR" "$3")
+        [[ ! -L "$SRC" ]] || refuse "$SRC is a symlink"
+        existing_dir "$SRC" "source instance folder"
+        parse_excludes "$SRC" "${@:6}"
+        take_locks "tmpbk.$3" "inst.$2.$3"
+        containers_stopped "$3"
+        INST_KB=$(dir_kb "$SRC"); [[ "$INST_KB" =~ ^[0-9]+$ ]] || refuse "cannot tell the size of $SRC"
+        excluded_kb "$SRC"
+        NET_KB=$(( INST_KB > EXCL_KB ? INST_KB - EXCL_KB : 0 ))
+        MARGIN_KB=$(( NET_KB * SNAPSHOT_MARGIN_PCT / 100 ))
+        (( MARGIN_KB >= FREE_FLOOR_KB )) || MARGIN_KB=$FREE_FLOOR_KB
+        FREE_KB=$(avail_kb "${SYSTEM_ROOT:-/}")
+        if (( FREE_KB < NET_KB + MARGIN_KB )); then
+            REFUSAL="TEMP_BACKUP_NO_SPACE"
+            echo "TEMP_BACKUP_NO_SPACE: the temporary backup needs $(( (NET_KB + MARGIN_KB) * 1024 )) bytes ($NET_KB KB folder + $MARGIN_KB KB margin; $EXCL_KB KB excluded), free $(( FREE_KB * 1024 )) bytes on the system disk" >&2
+            exit $EXIT_NO_SPACE
+        fi
+        TB_BASE="$SYSTEM_ROOT/$TEMP_BACKUPS_NAME"
+        root_dir "$TB_BASE" 0700 "temporary backup folder"
+        $CHMOD 0700 -- "$TB_BASE" || refuse "cannot set mode 0700 on $TB_BASE"
+        exact_path "$TB_BASE" || refuse "$TB_BASE does not resolve to itself"
+        TB_ID="$TB_BASE/$3"
+        root_dir "$TB_ID" 0700 "temporary backup folder"
+        $CHMOD 0700 -- "$TB_ID" || refuse "cannot set mode 0700 on $TB_ID"
+        exact_path "$TB_ID" || refuse "$TB_ID does not resolve to itself"
+        T="$TB_ID/$4"
+        [[ ! -e "$T" && ! -L "$T" ]] || refuse "$T already exists"
+        $MKDIR -m 0700 -- "$T" || refuse "cannot create $T"
+        exact_path "$T" || refuse "$T does not resolve to itself"
+        printf '%s\n' "$SRC" > "$T/SOURCE" || refuse "cannot write $T/SOURCE"
+        printf '%s\n' "$5" > "$T/ARCHIVE" || refuse "cannot write $T/ARCHIVE"
+        : > "$T/EXCLUDE" || refuse "cannot write $T/EXCLUDE"
+        for rel in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+            printf '%s\n' "$rel" >> "$T/EXCLUDE" || refuse "cannot write $T/EXCLUDE"
+        done
+        journal "temp-backup-create: $SRC -> $T started (net $NET_KB KB, free $FREE_KB KB, ${#EXCLUDES[@]} excludes)"
+        REPO="$T/repo"
+        borg_env
+        run_child $BORG init --encryption=none -- "$REPO" || exit $?
+        PAT=""
+        cleanup_pat() { [[ -n "$PAT" && -e "$PAT" ]] && $RM -f -- "$PAT"; PAT=""; }
+        EC=0
+        if (( ${#EXCLUDES[@]} > 0 )); then
+            lock_ready
+            PAT=$($MKTEMP -- "$LOCK_DIR/borg-exclude.XXXXXX") || refuse "cannot create a borg exclude pattern file"
+            $CHMOD 600 -- "$PAT" || { cleanup_pat; refuse "cannot chmod the borg exclude pattern file"; }
+            for rel in "${EXCLUDES[@]}"; do
+                printf -- '- pp:%s\n' "$SRC/$rel" >> "$PAT" || { cleanup_pat; refuse "cannot write the borg exclude pattern file"; }
+            done
+            run_child $BORG create --numeric-ids --patterns-from "$PAT" -- "$REPO::$5" "$SRC" || EC=$?
+            cleanup_pat
+        else
+            run_child $BORG create --numeric-ids -- "$REPO::$5" "$SRC" || EC=$?
+        fi
+        (( EC == 0 )) || exit "$EC"
+        run_child $BORG check -- "$REPO" || exit $?
+        GOT_KB=$(dir_kb "$T"); GOT_KB=${GOT_KB:-0}
+        echo "complete $($DATE -u +%Y-%m-%dT%H:%M:%SZ) kb=$GOT_KB archive=$5" > "$T/.COMPLETE.tmp" || refuse "cannot write the COMPLETE marker"
+        $MV -T -- "$T/.COMPLETE.tmp" "$T/COMPLETE" || refuse "cannot write the COMPLETE marker"
+        journal "temp-backup-create: $T complete ($GOT_KB KB)"
+        echo "$T $GOT_KB"
+        exit 0
+        ;;
+
+    temp-backup-delete)
+        # v18 (engine#469): Koen's explicit exception to quarantine-not-delete, limited to
+        # the temporary pre-update backups: rm -rf --one-file-system of
+        # <system disk>/.idea-temp-backups/<id>/<stamp> only. The path is built from checked
+        # tokens; the base, the instance folder and the backup must be real folders (no
+        # symlink anywhere, realpath gives the path back) owned by root and not group/other
+        # writable. A missing backup is exit 0 (a retry). The empty <id> folder is removed too.
+        need 2 $(($# - 1)) "<id> <stamp>"
+        check_id "$2"
+        check_stamp "$3"
+        TB_BASE="$SYSTEM_ROOT/$TEMP_BACKUPS_NAME"
+        TB_ID="$TB_BASE/$2"
+        T="$TB_ID/$3"
+        for p in "$TB_BASE" "$TB_ID" "$T"; do [[ ! -L "$p" ]] || refuse "$p is a symlink"; done
+        if [[ ! -e "$T" ]]; then
+            echo "ok: $T does not exist; nothing to delete" >&2
+            exit 0
+        fi
+        for p in "$TB_BASE" "$TB_ID" "$T"; do
+            exact_path "$p" && [[ -d "$p" ]] || refuse "$p is not a folder (missing, or a symlink in its path)"
+            read -r P_UID _ P_MODE <<<"$(stat_fields "$p")"
+            [[ "$P_UID" == "$ROOT_UID" ]] && no_group_other_write "$P_MODE" \
+                || refuse "$p must be owned by root and not group/other writable"
+        done
+        case "$T" in
+            "$TB_BASE"/"$2"/"$3") ;;
+            *) refuse "internal error: $T is not under $TB_BASE" ;;
+        esac
+        take_locks "tmpbk.$2"
+        if ! $RM -rf --one-file-system -- "$T"; then
+            echo "could not remove $T completely (left in place; the next temp-backup-delete retries)" >&2
+            exit 1
+        fi
+        $RMDIR -- "$TB_ID" 2>/dev/null || true
+        journal "temp-backup-delete: removed $T"
+        echo "removed $T"
+        exit 0
+        ;;
+
+    temp-backup-restore)
+        # v18 (engine#469): restore instances/<id> on <root> from a COMPLETE temporary backup
+        # (failure path, or Ops by hand). Only while the containers are stopped. The archive
+        # is extracted into a root-only staging folder on <root>; the paths the backup left
+        # out (its EXCLUDE, e.g. data/tailscale) are moved over from the current folder so
+        # their inodes survive; then the current folder goes to
+        # <root>/.idea-quarantine/<id>-before-temp-restore-<stamp> (never rm) and the restored
+        # one takes its place. The temporary backup itself is kept. Last line: the
+        # quarantined folder, or 'none'.
+        need 3 $(($# - 1)) "<root> <id> <stamp>"
+        check_id "$3"
+        check_stamp "$4"
+        resolve_root "$2" instances; D_DIR="$R_DIR"
+        TB_BASE="$SYSTEM_ROOT/$TEMP_BACKUPS_NAME"
+        T="$TB_BASE/$3/$4"
+        REPO="$T/repo"
+        for p in "$TB_BASE" "$TB_BASE/$3" "$T" "$REPO"; do
+            [[ ! -L "$p" ]] || refuse "$p is a symlink"
+            exact_path "$p" && [[ -d "$p" ]] || refuse "$p is not a folder (missing, or a symlink in its path)"
+        done
+        [[ -f "$T/COMPLETE" && ! -L "$T/COMPLETE" ]] || refuse "the temporary backup $T has no COMPLETE marker; it is never restored"
+        [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
+        for f in ARCHIVE SOURCE EXCLUDE; do
+            [[ -f "$T/$f" && ! -L "$T/$f" ]] || refuse "$T/$f is missing or not a regular file"
+        done
+        IFS= read -r ARCH < "$T/ARCHIVE" || true
+        [[ "${ARCH:-}" =~ $RE_ARCHIVE ]] || refuse "$T/ARCHIVE does not hold an archive name"
+        IFS= read -r SRC_REC < "$T/SOURCE" || true
+        # The system disk's SYSTEM_ROOT is '' (idea#237), so a kit's SOURCE is /instances/<id>
+        # with no component before 'instances' (engine#469 Pi proof step 6); a disk's is
+        # /disks/<dev>/instances/<id>. Both are allowed; '..', '//' and other ids are not.
+        [[ ( "${SRC_REC:-}" == /instances/"$3" || "${SRC_REC:-}" == /*/instances/"$3" ) && "$SRC_REC" != *..* && "$SRC_REC" != *//* ]] \
+            || refuse "$T/SOURCE does not hold an instances/$3 path"
+        REL=${SRC_REC#/}
+        IFS=/ read -r -a PARTS <<<"$REL"
+        STRIP=$(( ${#PARTS[@]} - 1 ))
+        (( STRIP >= 1 && STRIP <= 32 )) || refuse "cannot strip $SRC_REC ($STRIP components)"
+        REC=()
+        while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -n "$line" ]] && REC+=("$line")
+        done < "$T/EXCLUDE"
+        existing_dir "$D_DIR/instances" "destination instances folder"
+        DST=$(inst_dir "$D_DIR" "$3")
+        [[ ! -L "$DST" ]] || refuse "destination $DST is a symlink"
+        if [[ -e "$DST" ]]; then existing_dir "$DST" "destination"; fi
+        EXCLUDES=(); RSYNC_EXCL=()
+        if [[ -e "$DST" ]]; then parse_excludes "$DST" ${REC[@]+"${REC[@]}"}; fi
+        take_locks "tmpbk.$3" "inst.$2.$3"
+        containers_stopped "$3"
+        STG="$D_DIR/.idea-app-data-staging"
+        if [[ ! -e "$STG" && ! -L "$STG" ]]; then $MKDIR -m 0700 -- "$STG" || refuse "cannot create $STG"; fi
+        existing_dir "$STG" "staging folder"
+        read -r STG_UID _ STG_MODE <<<"$(stat_fields "$STG")"
+        [[ "$STG_UID" == "$ROOT_UID" && "$STG_MODE" == 700 ]] || refuse "staging folder $STG must be owned by root with mode 0700"
+        STAGING_TMP=$($MKTEMP -d -- "$STG/temp-restore-$3.XXXXXX") || refuse "cannot create a staging folder in $STG"
+        pin_cwd "$STAGING_TMP"
+        borg_env
+        EC=0
+        run_child $BORG extract --numeric-ids --strip-components "$STRIP" -- "$REPO::$ARCH" || EC=$?
+        cd /
+        if (( EC != 0 )); then cleanup_staging; exit "$EC"; fi
+        shopt -s nullglob dotglob
+        GOT=("$STAGING_TMP"/*)
+        shopt -u nullglob dotglob
+        if (( ${#GOT[@]} != 1 )) || [[ "${GOT[0]}" != "$STAGING_TMP/$3" || -L "${GOT[0]}" || ! -d "${GOT[0]}" ]]; then
+            TB_NAMES=""; for g in ${GOT[@]+"${GOT[@]}"}; do TB_NAMES+="${g##*/} "; done
+            cleanup_staging
+            refuse "archive $ARCH did not hold exactly instances/$3 at strip $STRIP (got: ${TB_NAMES:-nothing})"
+        fi
+        NEW="$STAGING_TMP/$3"
+        for rel in ${EXCLUDES[@]+"${EXCLUDES[@]}"}; do
+            if [[ ( -e "$DST/$rel" || -L "$DST/$rel" ) && ! -e "$NEW/$rel" && ! -L "$NEW/$rel" ]]; then
+                if [[ "$rel" == */* ]]; then
+                    $MKDIR -p -m 0700 -- "$NEW/${rel%/*}" || { cleanup_staging; refuse "cannot prepare $NEW/${rel%/*}"; }
+                fi
+                $MV -T -- "$DST/$rel" "$NEW/$rel" || { cleanup_staging; refuse "cannot carry over the excluded path $rel"; }
+                echo "kept excluded path $rel" >&2
+            fi
+        done
+        ASIDE=none
+        if [[ -e "$DST" ]]; then
+            ASIDE=$(quarantine_aside "$D_DIR" "$DST" "$3-before-temp-restore") || { cleanup_staging; exit 2; }
+        fi
+        if ! $MV -T -- "$NEW" "$DST"; then
+            EC=1
+            [[ "$ASIDE" != none ]] && $MV -T -- "$ASIDE" "$DST"
+            cleanup_staging
+            exit "$EC"
+        fi
+        cleanup_staging
+        journal "temp-backup-restore: $DST restored from $T ($ARCH); replaced folder: $ASIDE"
+        echo "restored $DST from $T" >&2
+        echo "$ASIDE"
+        exit 0
+        ;;
+
+    temp-backups)
+        # v18 (engine#469): read-only list "<id> <stamp> <kb> complete|incomplete" of the
+        # temporary pre-update backups on the system disk, then "TOTAL <kb>".
+        need 0 $(($# - 1)) ""
+        TB_BASE="$SYSTEM_ROOT/$TEMP_BACKUPS_NAME"
+        [[ ! -L "$TB_BASE" ]] || refuse "$TB_BASE is a symlink"
+        if [[ ! -d "$TB_BASE" ]]; then echo "TOTAL 0"; exit 0; fi
+        for d in "$TB_BASE"/*/*/; do
+            [[ -d "$d" ]] || continue
+            t=${d%/}; [[ ! -L "$t" && ! -L "${t%/*}" ]] || continue
+            stamp=${t##*/}; id=${t%/*}; id=${id##*/}
+            [[ "$id" =~ $RE_ID && "$stamp" =~ $RE_STAMP ]] || continue
+            kb=$(dir_kb "$t"); kb=${kb:-0}
+            if [[ -f "$t/COMPLETE" && ! -L "$t/COMPLETE" ]]; then echo "$id $stamp $kb complete"; else echo "$id $stamp $kb incomplete"; fi
+        done
+        echo "TOTAL $(dir_kb "$TB_BASE")"
+        exit 0
+        ;;
+
     quarantine-backups)
         # idea#446 / helper v9: move <disk>/backups/ to
         # <disk>/.idea-quarantine/backups-<UTC stamp>/ (mv only, never rm).
@@ -2150,7 +2422,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, clear-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, temp-backup-estimate, temp-backup-create, temp-backup-delete, temp-backup-restore, temp-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, clear-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"
