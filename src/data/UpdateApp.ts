@@ -62,7 +62,7 @@ import {
     TEMP_BACKUP_HELPER_MIN, borgProblem, tempBackupEstimateArgs, parseTempBackupEstimate, tempBackupCreateArgs,
     parseTempBackupCreate, tempBackupDeleteArgs, tempBackupRestoreArgs, TempBackupEstimate, verifyStampNow,
 } from '../utils/appDataHelper.js'
-import { createOperation, updateOperation } from './Operations.js'
+import { createOperation, updateOperation, dropInterruptedCommand } from './Operations.js'
 import { log } from '../utils/utils.js'
 import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
@@ -855,6 +855,8 @@ const rollBack = async (
     storeHandle: DocHandle<Store>, d: UpdateDeps, inst: Instance, disk: Disk, instDir: string,
     failedAt: UpdateStep, why: string, snap: { path: string, sizeBytes: number }, excludes: string[],
     tempBackup: TempBackupRef | null = null,
+    /** the version the rollback puts back (the op's fromAppId); at boot inst.instanceOf may already be the new one */
+    restoredAppId: string = String(inst.instanceOf),
 ): Promise<UpdateAppError> => {
     const plan = rollbackPlan(failedAt)
     log(`updateApp: ${failedAt} failed for ${inst.id} (${why}); rolling back from ${snap.path}`)
@@ -879,7 +881,7 @@ const rollBack = async (
             log(`updateApp: ${inst.id} restored in place from ${snap.path}; the replaced files are kept at ${aside}`)
         }
         await startOld()
-        return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. ${inst.instanceOf} and its data were restored from ${snap.path}`)
+        return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. ${restoredAppId} and its data were restored from ${snap.path}`)
     } catch (e) {
         const snapWhy = (e as Error).message
         // engine#469: the snapshot could not be put back: restore from the temporary backup instead.
@@ -891,7 +893,7 @@ const rollBack = async (
                 await waitContainersGone(d, inst.id)
                 const aside = await d.tempBackupRestore(disk, inst.id, tempBackup.stamp)
                 await startOld()
-                return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. The snapshot rollback failed (${snapWhy}), so ${inst.instanceOf} and its data were restored from the temporary pre-update backup ${tempBackup.path}${aside && aside !== 'none' ? ` (the replaced folder is at ${aside})` : ''}`)
+                return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. The snapshot rollback failed (${snapWhy}), so ${restoredAppId} and its data were restored from the temporary pre-update backup ${tempBackup.path}${aside && aside !== 'none' ? ` (the replaced folder is at ${aside})` : ''}`)
             } catch (te) {
                 tempWhy = (te as Error).message
             }
@@ -941,9 +943,13 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
         try { excludes = (await readComposeBackup(path.join(instDir, 'compose.yaml'), 'current')).exclude } catch (e) {
             log(`updateApp: ${inst.id}: ${(e as Error).message}; restoring with the snapshot's own EXCLUDE list only`)
         }
-        const err = await rollBack(storeHandle, d, inst, disk, instDir, step, 'the Engine restarted during the update', { path: joinMountRoot(root, PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 }, excludes, tempBackupFromOp(op))
+        const err = await rollBack(storeHandle, d, inst, disk, instDir, step, 'the Engine restarted during the update', { path: joinMountRoot(root, PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 }, excludes, tempBackupFromOp(op),
+            op.args.fromAppId ? String(op.args.fromAppId) : String(inst.instanceOf))
         keepTempBackup(storeHandle, op.id, err, tempBackupFromOp(op))
         updateOperation(storeHandle, op.id, { status: 'Failed', error: `INTERRUPTED: ${err.message}`, completedAt: d.now() as Timestamp })
+        // Pi proof step 8: the updateApp command is still queued (a command leaves the queue only
+        // when it finishes), so the startup replay would run the same update again on every boot.
+        dropInterruptedCommand(storeHandle, op)
         out.push(`${inst.id}: ${err.message}`)
     }
     if (out.length) await refreshOfferAfterUpdate(storeHandle, engineId, d)

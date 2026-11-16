@@ -305,6 +305,40 @@ export const cancelOperation = (
 
 // ── Startup crash recovery ────────────────────────────────────────────────────
 
+/** Kinds whose interrupted run boot recovery settles (rolled back or Failed INTERRUPTED) and never re-runs. */
+export const NO_REPLAY_AFTER_RECOVERY: readonly OperationKind[] = ['updateApp', 'restoreApp']
+
+/**
+ * engine#469 Pi proof step 8: a queued command leaves engineDB[x].commands only when it finishes,
+ * so the command of an operation the Engine died in is still queued at boot and the startup replay
+ * runs it again (an updateApp took a second temporary backup and rolled back again, on every boot).
+ * Once boot recovery has settled such an operation, remove the first queued '<kind> <instance> ...'
+ * command for its instance (id or name), the one that was running. A later identical command
+ * someone queued on purpose stays. Returns the removed command, or null.
+ */
+export const dropInterruptedCommand = (storeHandle: DocHandle<Store>, op: Operation): string | null => {
+    if (!NO_REPLAY_AFTER_RECOVERY.includes(op.kind)) return null
+    const id = String(op.args?.instanceId ?? '')
+    if (!id) return null
+    const store = storeHandle.doc()
+    const name = store?.instanceDB?.[id as any]?.name
+    const refs = new Set([id, ...(name ? [String(name)] : [])])
+    let removed: string | null = null
+    storeHandle.change(doc => {
+        const list = doc.engineDB[op.engineId as any]?.commands as unknown[] | undefined
+        if (!list) return
+        const i = list.findIndex(c => {
+            const t = (typeof c === 'string' ? c : String(c ?? '')).trim().split(/\s+/)
+            return t[0] === op.kind && refs.has(t[1] ?? '')
+        })
+        if (i === -1) return
+        removed = String(list[i])
+        list.splice(i, 1)
+    })
+    if (removed) log(`recovery: ${op.id.slice(0, 8)} ${op.kind}: removed its queued command '${removed}' so the startup replay does not run it again`)
+    return removed
+}
+
 /**
  * Called during engine startup. Scans operationDB for any operation left in
  * Running or Pending state (caused by a crash or reboot mid-operation).
@@ -417,6 +451,7 @@ export const recoverInterruptedOperations = async (
                 ...(op.kind === 'flashCard' ? { safeToRemove: false } : {}),
                 completedAt: Date.now() as Timestamp,
             })
+            dropInterruptedCommand(storeHandle, op)
         }
     }
 }

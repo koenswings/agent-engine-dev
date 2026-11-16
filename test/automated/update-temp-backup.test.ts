@@ -11,7 +11,7 @@ import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { updateApp, UpdateDeps, recoverInterruptedUpdates, tempBackupSpace, tempBackupFromOp, snapshotMarginBytes } from '../../src/data/UpdateApp.js'
 import { checkUpdate } from '../../src/data/UpdateAppPolicy.js'
-import { createOperation, updateOperation } from '../../src/data/Operations.js'
+import { createOperation, updateOperation, recoverInterruptedOperations, dropInterruptedCommand } from '../../src/data/Operations.js'
 import {
     TEMP_BACKUP_HELPER_MIN, APP_DATA_HELPER_VERSION, tempBackupCreateArgs, tempBackupDeleteArgs, tempBackupRestoreArgs, tempBackupEstimateArgs,
     tempBackupsArgs, parseTempBackupEstimate, parseTempBackupCreate, parseTempBackups, tempBackupPath,
@@ -273,6 +273,65 @@ describe('engine#469 boot recovery never deletes it', () => {
     it('tempBackupFromOp: none recorded, or already deleted', () => {
         expect(tempBackupFromOp({ args: {} })).toBeNull()
         expect(tempBackupFromOp({ args: { tempBackup: '/x', tempBackupStamp: '20261116T080000Z', tempBackupState: 'deleted' } })).toBeNull()
+    })
+})
+
+describe('engine#469 Pi proof step 8: boot recovery names the restored version and never replays the update', () => {
+    const interrupted = (step: number) => {
+        const opId = createOperation(h, 'updateApp', { instanceId: 'i1', diskId: 'd1', fromAppId: 'kolibri-1.0', toAppId: 'kolibri-2.0', tempBackup: '/.idea-temp-backups/i1/20261116T080000Z', tempBackupStamp: '20261116T080000Z', tempBackupState: 'created' }, 'console-command', { type: 'instance', id: 'i1' as any })
+        updateOperation(h, opId, { status: 'Running', currentStep: step, totalSteps: 6, stepLabel: 'x' })
+        return opId
+    }
+    const queue = (cmds: string[]) => h.change(d => { (d.engineDB[ME as any] as any).commands = cmds })
+    const queued = () => [...((h.doc().engineDB[ME as any] as any).commands ?? [])].map(String)
+    // after Swap the Engine reread the new compose, so the store already says the new version
+    const swapped = async () => { h.change(d => { (d.instanceDB['i1' as any] as any).instanceOf = 'kolibri-2.0' }); await fs.writeFile(`${tmp}/instances/i1/compose.yaml`, compose('2.0')) }
+    it('the INTERRUPTED message names the pre-update version (fromAppId), not the new one', async () => {
+        const opId = interrupted(5)
+        await swapped()
+        const out = await recoverInterruptedUpdates(h, ME, deps())
+        expect(out[0]).toMatch(/kolibri-1\.0 and its data were restored from /)
+        expect(out[0]).not.toMatch(/kolibri-2\.0 and its data/)
+        expect(h.doc().operationDB[opId].error).toMatch(/^INTERRUPTED: ROLLED BACK: .*kolibri-1\.0 and its data were restored/)
+        expect(inst().instanceOf).toBe('kolibri-1.0')
+    })
+    it('the same through the temporary-backup restore', async () => {
+        interrupted(5)
+        await swapped()
+        const out = await recoverInterruptedUpdates(h, ME, deps({ restoreSnapshot: async () => { throw new Error('rsync exited 12') } }))
+        expect(out[0]).toMatch(/so kolibri-1\.0 and its data were restored from the temporary pre-update backup/)
+    })
+    it('rolled back at boot: its queued command is removed (by name or id), a later identical one and other commands stay', async () => {
+        const opId = interrupted(5)
+        await swapped()
+        queue(['updateApp Old kolibri-2.0 --allow-major', 'ls', 'updateApp i1 kolibri-2.0 --allow-major'])
+        await recoverInterruptedUpdates(h, ME, deps())
+        await recoverInterruptedOperations(h, {}, ME as any)
+        expect(queued()).toEqual(['ls', 'updateApp i1 kolibri-2.0 --allow-major'])
+        expect(h.doc().operationDB[opId].status).toBe('Failed')
+        expect(h.doc().operationDB[opId].error).toMatch(/^INTERRUPTED: /)
+    })
+    it('interrupted before Swap: marked Failed by recoverInterruptedOperations, and its command removed too', async () => {
+        const opId = interrupted(2)
+        queue(['updateApp i1 kolibri-2.0 --allow-major'])
+        await recoverInterruptedUpdates(h, ME, deps({ listSnapshots: async () => ({ snapshots: [], preUpdateBytes: 0, quarantineBytes: 0 }) }))
+        expect(queued()).toEqual(['updateApp i1 kolibri-2.0 --allow-major'])   // not yet settled
+        await recoverInterruptedOperations(h, {}, ME as any)
+        expect(h.doc().operationDB[opId].status).toBe('Failed')
+        expect(queued()).toEqual([])
+    })
+    it('an interrupted restoreApp is not replayed either; other kinds and other instances are left alone', async () => {
+        const r = createOperation(h, 'restoreApp', { instanceId: 'i1', targetDiskId: 'd1' }, 'console-command', { type: 'instance', id: 'i1' as any })
+        updateOperation(h, r, { status: 'Running' })
+        queue(['restoreApp Old d1', 'restoreApp i2 d1', 'backupApp i1 b1'])
+        await recoverInterruptedOperations(h, {}, ME as any)
+        expect(h.doc().operationDB[r].status).toBe('Failed')
+        expect(queued()).toEqual(['restoreApp i2 d1', 'backupApp i1 b1'])
+        const cId = createOperation(h, 'copyApp', { instanceId: 'i1', sourceDiskId: 'd1', targetDiskId: 'd2' }, 'console-command')
+        const c = h.doc().operationDB[cId]
+        queue(['copyApp i1 d1 d2'])
+        expect(dropInterruptedCommand(h, c as any)).toBeNull()
+        expect(queued()).toEqual(['copyApp i1 d1 d2'])
     })
 })
 
