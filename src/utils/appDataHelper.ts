@@ -293,7 +293,7 @@ export const appDataErrorMessage = (sub: string, code: number | null, signal: st
  * helper path) are exactly those of runAppData. The helper and sudoers stay unchanged.
  */
 export const lowPriorityAppDataArgv = (args: string[]): string[] =>
-    ['-n', '18', 'ionice', '-c3', 'sudo', ...appDataSudoArgv(args)]
+    ['-n', '19', 'ionice', '-c3', 'sudo', ...appDataSudoArgv(args)]
 
 const spawnAppData = (cmd: string, argv: string[], args: string[]): Promise<string> => new Promise((resolve, reject) => {
     log(`${cmd} ${argv.join(' ')}`)
