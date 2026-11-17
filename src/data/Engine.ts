@@ -66,6 +66,22 @@ export interface Engine {
   lanAddress?: string | null;
   /** Every eligible LAN IPv4 in selection order; lanAddress is the first (null: none). Written only on change. See LanAddress.ts. */
   lanAddresses?: string[] | null;
+  /**
+   * Temporary pre-update backups on this Engine's system disk (idea#374 exception,
+   * engine#469 list + deleteTempBackup). Whole-list replace after every create,
+   * every delete, and at boot. Absent on Engines older than this field.
+   * Optional: do not add to store-template.json.
+   */
+  tempBackups?: TempBackupPublic[];
+}
+
+/** Engine.tempBackups entry (console#230 option A / deleteTempBackup). */
+export interface TempBackupPublic {
+  instanceId: string
+  stamp: string
+  path: string
+  sizeBytes: number
+  complete: boolean
 }
 
 /** Engine.peerAccess (design-per-pi-engine-key.md) */

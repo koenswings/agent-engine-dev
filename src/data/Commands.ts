@@ -37,6 +37,7 @@ import { pruneUnusedInstanceNetworksForIds } from '../utils/instanceNetworks.js'
 import { removeInstance } from './RemoveInstance.js';
 import { renameInstance } from './RenameInstance.js';
 import { updateApp, parseUpdateAppArgs } from './UpdateApp.js';
+import { deleteTempBackup, DELETE_TEMP_BACKUP_USAGE } from './TempBackups.js';
 import { flashCard, cancelFlash, initialiseDisk } from './FlashCard.js';
 import { testContext } from "./TestContext.js";
 
@@ -491,6 +492,14 @@ const updateAppWrapper = async (storeHandle: DocHandle<Store> | null, argsString
         : `The temporary pre-update backup ${result.tempBackup.path} could not be deleted and is still on the system disk`)
 }
 
+/** deleteTempBackup <instanceId> <stamp>: remove one #469 temp backup on the system disk (idea#374). */
+const deleteTempBackupWrapper = async (storeHandle: DocHandle<Store> | null, instanceId: string, stamp: string) => {
+    if (!storeHandle) throw new Error("Store is not available. Please connect first.")
+    if (!instanceId || !stamp) throw new Error(DELETE_TEMP_BACKUP_USAGE)
+    const result = await deleteTempBackup(storeHandle, instanceId, stamp)
+    print(chalk.green(`deleteTempBackup: removed ${result.path} (${result.sizeBytes} bytes)`))
+}
+
 /** #263 source side: pushAppBundle <sourceDiskId> <appId> <targetEngineId> <targetRoot> <requestId> <instanceId> */
 const pushAppBundleWrapper = async (storeHandle: DocHandle<Store> | null, sourceDiskId: string, appId: string, targetEngineId: string, targetRoot: string, requestId: string, instanceId: string) => {
     if (!storeHandle) throw new Error('Store is not available.')
@@ -727,6 +736,7 @@ export const commands: CommandDefinition[] = [
     { name: "removeInstance", execute: removeInstanceWrapper, args: [{ type: "string", name: "instanceId" }], scope: 'engine' },
     { name: "renameInstance", execute: renameInstanceWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "newName", variadic: true }], scope: 'engine' },
     { name: "updateApp", execute: updateAppWrapper, args: [{ type: "string" }], scope: 'engine' },
+    { name: "deleteTempBackup", execute: deleteTempBackupWrapper, args: [{ type: "string", name: "instanceId" }, { type: "string", name: "stamp" }], scope: 'engine' },
     { name: "pushAppBundle", execute: pushAppBundleWrapper, args: ['sourceDiskId', 'appId', 'targetEngineId', 'targetRoot', 'requestId', 'instanceId'].map(name => ({ type: "string" as const, name })), scope: 'engine' },
     { name: "appFetchResult", execute: appFetchResultWrapper, args: [{ type: "string", name: "requestId" }, { type: "string", name: "status" }, { type: "string", name: "why", variadic: true, optional: true }], scope: 'engine' },
     { name: "summariseDisk", execute: summariseDiskWrapper, args: [{ type: "string", name: "targetId" }], scope: 'engine' },
