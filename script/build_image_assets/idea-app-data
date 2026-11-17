@@ -53,6 +53,8 @@
 #   idea-app-data ensure-dirs        <root>   (apps/ instances/ services/, owned by pi)
 #   idea-app-data erase-slot       <slot> <stagingDir>   (TEST-ONLY: umount+mkfs+remount a loop-backed slot)
 #   idea-app-data put-files        <root> <id> <stagingDir>  (local Engine: copy basenames from staging into instance as root)
+#   idea-app-data kolibri-rebind   <root> <id>   (v21, engine#503: give a Kolibri copy a fresh morango id as root;
+#                                    local Engine only, never through idea-peer-gate; see v21 below)
 #   Peer keys (the Engine, from its store):
 #   idea-app-data sync-peers   <engineId> <storeDocId> < "<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>" lines
 #                                    (v15, engine#376: the caller's own Engine id and store document id;
@@ -138,6 +140,18 @@
 #        destination only under a matching marker; without one it refuses as before. verify-copy checks
 #        the result. borg-break-lock frees a repository left locked by this Engine's killed backup.
 #        Every Engine skips registering or starting an instance folder that has a marker.
+#   v21 (engine#503, Steve's decision): kolibri-rebind <root> <id>. The Kolibri container writes
+#        data/kolibri/db.sqlite3 as root:root 0644 and the root copy keeps that owner, so the Engine's
+#        old python-as-pi rebind failed with "attempt to write a readonly database" on every start of a
+#        copy. Here, as root: the DB is ONLY <root>/instances/<id>/data/kolibri/db.sqlite3 (exact path,
+#        no symlink anywhere, a regular file with one link); refused while a container of project <id>
+#        runs; under the instance lock. A fresh 32-hex id (python3 secrets.token_hex(16)) replaces the id
+#        of the current=1 row of morango_instanceidmodel (no row: nothing changes). The DB keeps its owner
+#        and mode (checked after the write, restored if sqlite changed them). Nothing is deleted: a stale
+#        data/kolibri/server.pid or process_cache from the source and the consumed .idea-rebind-morango
+#        markers (instance root and data/kolibri/) are moved to <root>/.idea-quarantine/<id>-kolibri-*-<stamp>.
+#        stdout: previousId=<id|none> and morangoId=<id|none>, or kolibriDb=absent; one quarantined=<path>
+#        line per moved item. Same sudoers line (no argument list); not in the peer gate's allowlist.
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
 # excludes may hold '/'):
@@ -232,7 +246,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=20
+readonly IDEA_APP_DATA_VERSION=21
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -279,6 +293,7 @@ LOSETUP=/usr/sbin/losetup
 DOCKER=/usr/bin/docker
 TAR=/usr/bin/tar
 SHA256SUM=/usr/bin/sha256sum
+PYTHON3=/usr/bin/python3
 
 # ── Fixed locations ──────────────────────────────────────────────────────────
 DISKS_DIR=/disks
@@ -1378,6 +1393,95 @@ case "$SUB" in
             $CP -f -- "$f" "$DST/$base" || refuse "cannot write $DST/$base"
         done
         echo "ok: put ${#entries[@]} file(s) into $DST"
+        ;;
+
+    kolibri-rebind)
+        # v21 (engine#503): a fresh morango instance id for a Kolibri copy, as root (the container
+        # owns db.sqlite3). Local Engine only; idea-peer-gate never maps a peer command here.
+        need 2 $(($# - 1)) "<root> <id>"
+        check_id "$3"
+        KID="$3"
+        resolve_root "$2" instances
+        INST=$(inst_dir "$R_DIR" "$3")
+        existing_dir "$INST" "instance folder"
+        containers_stopped "$3"
+        take_locks "inst.$2.$3"
+        KHOME="$INST/data/kolibri"
+        KDB="$KHOME/db.sqlite3"
+        KMARKERS=("$INST/.idea-rebind-morango" "$KHOME/.idea-rebind-morango")
+        kolibri_aside() {   # kolibri_aside <path> <name>: quarantine one item, if it is there
+            [[ -e "$1" || -L "$1" ]] || return 0
+            local q
+            q=$(quarantine_aside "$R_DIR" "$1" "$KID-$2") || refuse "cannot move $1 to the quarantine folder"
+            echo "quarantined=$q"
+        }
+        if [[ ! -e "$KDB" && ! -L "$KDB" ]]; then
+            echo "kolibriDb=absent"
+            kolibri_aside "${KMARKERS[0]}" rebind-marker
+            if exact_path "$KHOME" && [[ -d "$KHOME" ]]; then kolibri_aside "${KMARKERS[1]}" rebind-marker-data; fi
+            journal "kolibri-rebind: $KDB absent; nothing to rebind"
+            exit 0
+        fi
+        exact_path "$KDB" || refuse "$KDB is not the exact path (a symlink in its path, or it cannot be resolved)"
+        [[ -f "$KDB" && ! -L "$KDB" ]] || refuse "$KDB is not a regular file"
+        KLINKS=$($STAT -c '%h' -- "$KDB" 2>/dev/null) || refuse "cannot stat $KDB"
+        [[ "$KLINKS" == 1 ]] || refuse "$KDB has $KLINKS hard links (must be 1)"
+        KST=$(stat_fields "$KDB") || refuse "cannot stat $KDB"
+        read -r KUID KGID KMODE <<<"$KST"
+        [[ -x "$PYTHON3" ]] || refuse "$PYTHON3 is not installed; cannot update $KDB"
+        # Stale pid/cache from the source must not convince Kolibri it is already up (moved, never removed).
+        kolibri_aside "$KHOME/server.pid" kolibri-server.pid
+        kolibri_aside "$KHOME/process_cache" kolibri-process_cache
+        KPY='import sqlite3,sys,secrets
+db=sys.argv[1]
+c=sqlite3.connect(db,timeout=30,isolation_level=None)
+try:
+    c.execute("PRAGMA trusted_schema=OFF")
+except sqlite3.Error:
+    pass
+c.execute("BEGIN IMMEDIATE")
+row=c.execute("select id from morango_instanceidmodel where current=1").fetchone()
+if not row:
+    c.execute("ROLLBACK"); c.close()
+    print("previousId=none"); print("morangoId=none")
+    raise SystemExit(0)
+new_id=secrets.token_hex(16)
+c.execute("update morango_instanceidmodel set id=? where current=1",(new_id,))
+c.execute("COMMIT"); c.close()
+print("previousId="+str(row[0])); print("morangoId="+new_id)'
+        KOUT=$($PYTHON3 -I -S -c "$KPY" "$KDB" 2>&1) || {
+            KERR=${KOUT//$'\n'/ | }
+            refuse "cannot update the morango id in $KDB: ${KERR:0:600}"
+        }
+        KPREV=""; KNEW=""
+        while IFS= read -r line; do
+            case "$line" in
+                previousId=*) KPREV=${line#previousId=} ;;
+                morangoId=*) KNEW=${line#morangoId=} ;;
+            esac
+        done <<<"$KOUT"
+        [[ "$KNEW" =~ ^([0-9a-f]{32}|none)$ ]] || refuse "unexpected output from the morango update of $KDB: ${KOUT:0:200}"
+        [[ "$KPREV" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || KPREV=unreadable
+        # The DB keeps the owner and mode the container gave it; so do sqlite's -wal/-shm, when present.
+        KST2=$(stat_fields "$KDB") || refuse "cannot stat $KDB after the update"
+        if [[ "$KST2" != "$KST" ]]; then
+            $CHOWN -- "$KUID:$KGID" "$KDB" || refuse "cannot restore the owner $KUID:$KGID of $KDB"
+            $CHMOD -- "$KMODE" "$KDB" || refuse "cannot restore the mode 0$KMODE of $KDB"
+            journal "kolibri-rebind: restored owner/mode $KST of $KDB (was $KST2)"
+        fi
+        for side in "$KDB-wal" "$KDB-shm"; do
+            [[ -f "$side" && ! -L "$side" ]] || continue
+            read -r SUID SGID _ <<<"$(stat_fields "$side")"
+            if [[ "$SUID:$SGID" != "$KUID:$KGID" ]]; then
+                $CHOWN -- "$KUID:$KGID" "$side" || refuse "cannot give $side the owner $KUID:$KGID of $KDB"
+            fi
+        done
+        echo "previousId=$KPREV"
+        echo "morangoId=$KNEW"
+        kolibri_aside "${KMARKERS[0]}" rebind-marker
+        kolibri_aside "${KMARKERS[1]}" rebind-marker-data
+        journal "kolibri-rebind: $KDB morango id $KPREV -> $KNEW (owner/mode $KST kept)"
+        exit 0
         ;;
 
     peer-delete)
@@ -2552,7 +2656,7 @@ case "$SUB" in
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, temp-backup-estimate, temp-backup-create, temp-backup-delete, temp-backup-restore, temp-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, sync-peers, clear-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, temp-backup-estimate, temp-backup-create, temp-backup-delete, temp-backup-restore, temp-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, kolibri-rebind, sync-peers, clear-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

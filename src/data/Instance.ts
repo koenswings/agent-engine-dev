@@ -11,7 +11,7 @@ import { createOperation, updateOperation } from './Operations.js'
 import { composeFileEnv } from './FilesMount.js'
 import { appForInstance, instanceUsbSync } from './InstanceApp.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
-import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
+import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot, appDataRoot } from "./Disk.js";
 import { inFlightRefusal } from './InFlight.js'
 import { updateInFlightRefusal } from './UpdateInFlight.js'
 import { localEngineId } from "./Engine.js";
@@ -1992,9 +1992,10 @@ export const runInstance = async (storeHandle: DocHandle<Store>, instance: Insta
     const hit: string[] = []
     for (const m of markers) { if (await fs.pathExists(m)) hit.push(m) }
     if (hit.length) {
+      // engine#503: as root through the app-data helper (the container owns db.sqlite3);
+      // the helper also moves the markers it consumed to .idea-quarantine (never deleted).
       try {
-        await rebindKolibriMorangoInstanceId(home)
-        for (const m of hit) await fs.remove(m).catch(() => undefined)
+        await rebindKolibriMorangoInstanceId(await appDataRoot(disk), String(instance.id))
       } catch (e: any) {
         throw new Error(`Kolibri morango rebind before start failed: ${e?.message ?? e}`)
       }

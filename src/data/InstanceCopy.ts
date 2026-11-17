@@ -19,12 +19,15 @@
  */
 
 import path from 'path'
-import crypto from 'crypto'
-import { fs, chalk, $ } from 'zx'
+import { fs, chalk } from 'zx'
 import { parseDocument } from 'yaml'
 import { log } from '../utils/utils.js'
 import type { Store } from './Store.js'
 import type { InstanceName } from './CommonTypes.js'
+import {
+    runAppData, helperAtLeast, kolibriRebindArgs, parseKolibriRebind, KOLIBRI_REBIND_HELPER_MIN,
+    type AppDataRunner, type KolibriRebindResult,
+} from '../utils/appDataHelper.js'
 
 // ── Off-disk links ────────────────────────────────────────────────────────────
 
@@ -208,47 +211,56 @@ export const preparedCopyFiles = async (
  * before the copy starts. mDNS itself stays on (Koen rule) — only the service
  * instance id changes.
  *
- * No-op when the folder is not a Kolibri home or has no current row. Throws when
- * the DB exists but cannot be updated.
+ * engine#503: the container writes db.sqlite3 as root:root 0644 and the root copy
+ * keeps that owner, so the update runs in the app-data root helper
+ * (`idea-app-data kolibri-rebind <root> <id>`, v21), never as pi and never by
+ * chowning the container's file. The helper also moves a stale server.pid /
+ * process_cache and the consumed .idea-rebind-morango markers to .idea-quarantine.
+ *
+ * Returns the new id, or null when the folder has no Kolibri DB or no current
+ * row. Throws HELPER_OUTDATED below v21, and when the DB cannot be updated.
  */
-export const rebindKolibriMorangoInstanceId = async (instanceDir: string): Promise<string | null> => {
-    const dbPath = path.join(instanceDir, 'data', 'kolibri', 'db.sqlite3')
-    if (!(await fs.pathExists(dbPath))) return null
+export interface KolibriRebindDeps {
+    run: AppDataRunner
+    helperAtLeast: (min: number, what: string) => Promise<string | null>
+}
+export const kolibriRebindDeps: KolibriRebindDeps = {
+    run: (args) => runAppData(args),
+    helperAtLeast: (min, what) => helperAtLeast(min, what),
+}
 
-    const newId = crypto.randomBytes(16).toString('hex')
-    // Stale pid/cache from the source must not convince Kolibri it is already up.
-    for (const rel of ['data/kolibri/server.pid', 'data/kolibri/process_cache']) {
-        try { await fs.remove(path.join(instanceDir, rel)) } catch { /* ignore */ }
+export const rebindKolibriMorangoInstanceId = async (
+    root: string,
+    instanceId: string,
+    deps: KolibriRebindDeps = kolibriRebindDeps,
+): Promise<string | null> => {
+    const args = kolibriRebindArgs(root, instanceId)
+    const outdated = await deps.helperAtLeast(KOLIBRI_REBIND_HELPER_MIN,
+        'Starting a copied or moved Kolibri (the morango id rebind as root, engine#503)')
+    if (outdated) {
+        throw new Error(`HELPER_OUTDATED: ${outdated} ` +
+            `Without a fresh morango id, a host-network Kolibri copy will clash with the original on zeroconf.`)
     }
-
-    // python3 + stdlib sqlite3 (no better-sqlite3 dependency on the Engine host).
-    const script =
-        'import sqlite3,sys\n' +
-        'db,new_id=sys.argv[1],sys.argv[2]\n' +
-        'c=sqlite3.connect(db)\n' +
-        "row=c.execute('select id from morango_instanceidmodel where current=1').fetchone()\n" +
-        'if not row:\n' +
-        " print('none'); c.close(); raise SystemExit(0)\n" +
-        "c.execute('update morango_instanceidmodel set id=? where current=1',(new_id,))\n" +
-        'c.commit(); c.close(); print(new_id)\n'
-
-    let result
+    let result: KolibriRebindResult
     try {
-        result = await $`python3 -c ${script} ${dbPath} ${newId}`.quiet()
+        result = parseKolibriRebind(await deps.run(args))
     } catch (e: any) {
-        const msg = (e?.stderr?.toString?.() || e?.message || String(e)).trim()
         throw new Error(
-            `rebindKolibriMorangoInstanceId: cannot update ${dbPath}: ${msg}. ` +
+            `rebindKolibriMorangoInstanceId: cannot update the morango id of instance ${instanceId} on ${root}: ${e?.message ?? e}. ` +
             `Without a fresh morango id, a host-network Kolibri copy will clash with the original on zeroconf.`,
         )
     }
-    const out = (result.stdout || '').trim()
-    if (out === 'none' || !out) {
-        log(`rebindKolibriMorangoInstanceId: no current morango row in ${dbPath}; leaving as-is`)
+    for (const q of result.quarantined) log(`rebindKolibriMorangoInstanceId: moved ${q} (quarantine, never deleted)`)
+    if (!result.dbPresent) {
+        log(`rebindKolibriMorangoInstanceId: instance ${instanceId} on ${root} has no Kolibri db; leaving as-is`)
         return null
     }
-    log(`rebindKolibriMorangoInstanceId: ${dbPath} current id → ${out}`)
-    return out
+    if (!result.morangoId) {
+        log(`rebindKolibriMorangoInstanceId: no current morango row for instance ${instanceId} on ${root}; leaving as-is`)
+        return null
+    }
+    log(`rebindKolibriMorangoInstanceId: instance ${instanceId} on ${root}: current morango id ${result.previousId ?? '?'} → ${result.morangoId}`)
+    return result.morangoId
 }
 
 /** True when this instance folder looks like Kolibri (data home or compose). */
