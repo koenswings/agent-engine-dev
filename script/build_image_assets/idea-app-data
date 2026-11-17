@@ -56,8 +56,8 @@
 #   idea-app-data kolibri-rebind   <root> <id>   (v21, engine#503: give a Kolibri copy a fresh morango id as root;
 #                                    local Engine only, never through idea-peer-gate; see v21 below)
 #   idea-app-data swap-quarantine  <root> <id>  < "<instance-relative path>" lines
-#                                    (v22, engine#506: move files the new bundle dropped out of instances/<id>/
-#                                    into .idea-quarantine/<id>-swap-dropped-<stamp>/; local Engine only; see v22)
+#                                    (v24, engine#506: move files the new bundle dropped out of instances/<id>/
+#                                    into .idea-quarantine/<id>-swap-dropped-<stamp>/; local Engine only; see v24)
 #   Peer keys (the Engine, from its store):
 #   idea-app-data sync-peers   <engineId> <storeDocId> < "<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>" lines
 #                                    (v15, engine#376: the caller's own Engine id and store document id;
@@ -155,7 +155,7 @@
 #        markers (instance root and data/kolibri/) are moved to <root>/.idea-quarantine/<id>-kolibri-*-<stamp>.
 #        stdout: previousId=<id|none> and morangoId=<id|none>, or kolibriDb=absent; one quarantined=<path>
 #        line per moved item. Same sudoers line (no argument list); not in the peer gate's allowlist.
-#   v22 (engine#506, Steve's decision): swap-quarantine <root> <id>, the instance-relative paths of the
+#   v24 (engine#506, Steve's decision): swap-quarantine <root> <id>, the instance-relative paths of the
 #        files the old bundle had and the new one dropped on stdin (one per line, at most 4096, each at
 #        most 1024 characters). updateApp's Swap copies the new bundle over instances/<id>/ and never
 #        removed anything, so a dropped file (Nextcloud 1.8's bundled-apps/richdocuments-v8.8.3.tar.gz)
@@ -264,7 +264,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=22
+readonly IDEA_APP_DATA_VERSION=24
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -350,7 +350,7 @@ SNAP_EXCLUDE_MAX_LEN=256
 EXIT_NO_SPACE=3
 VOLUMES_DIR=/var/lib/docker/volumes
 PEER_MAX=256
-# v22 (engine#506): swap-quarantine reads at most this many paths, each at most this long
+# v24 (engine#506): swap-quarantine reads at most this many paths, each at most this long
 SWAP_PATHS_MAX=4096
 SWAP_PATH_MAX_LEN=1024
 
@@ -1506,7 +1506,7 @@ print("previousId="+str(row[0])); print("morangoId="+new_id)'
         ;;
 
     swap-quarantine)
-        # v22 (engine#506): updateApp's Swap copies the new bundle over instances/<id>/ and never
+        # v24 (engine#506): updateApp's Swap copies the new bundle over instances/<id>/ and never
         # removed the files the old bundle had and the new one dropped. The Engine sends their
         # instance-relative paths on stdin (one per line); each is MOVED (rename, same disk, never
         # rm) to <root>/.idea-quarantine/<id>-swap-dropped-<UTC stamp>/<same relative path>.

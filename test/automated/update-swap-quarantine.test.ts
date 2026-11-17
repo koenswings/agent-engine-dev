@@ -1,13 +1,13 @@
 /**
  * update-swap-quarantine.test.ts — engine#506 (Steve's decision: Important, a separate small PR
  * after #505): updateApp's Swap moves the files the old bundle had and the new one dropped out of
- * the instance folder (helper v22 swap-quarantine, mv into .idea-quarantine, never rm) and
+ * the instance folder (helper v24 swap-quarantine, mv into .idea-quarantine, never rm) and
  * refreshes the instance's top-level SHA256SUMS from the new bundle.
  *
  *  (A) the pieces: sumsPaths, bundleTreeEntries, swapDroppedPaths, refreshInstanceSums, and the
  *      Engine's argv / stdin / output parsing for the helper (swapPathProblem mirrors its rules)
- *  (B) updateApp with injected deps (fake exec): v22 moves the dropped files before the copy;
- *      below v22 it warns and goes on; a helper failure rolls back; no SHA256SUMS = nothing moved
+ *  (B) updateApp with injected deps (fake exec): v24 moves the dropped files before the copy;
+ *      below v24 it warns and goes on; a helper failure rolls back; no SHA256SUMS = nothing moved
  *  (C) updateApp → the real helper in the sandbox (test/harness/appDataSandbox.ts)
  */
 import { describe, it, beforeEach, afterEach, expect } from 'vitest'
@@ -89,8 +89,8 @@ describe('(A) the pieces', () => {
         expect(await refreshInstanceSums(bundle, path.join(tmp, 'missing'))).toMatch(/ENOENT/)
     })
 
-    it('helper argv, stdin and output: exactly `swap-quarantine <root> <id>`, one path per line, v22', () => {
-        expect(SWAP_QUARANTINE_HELPER_MIN).toBe(22)
+    it('helper argv, stdin and output: exactly `swap-quarantine <root> <id>`, one path per line, v24', () => {
+        expect(SWAP_QUARANTINE_HELPER_MIN).toBe(24)
         expect(swapQuarantineArgs('sdb2', 'nc1')).toEqual(['swap-quarantine', 'sdb2', 'nc1'])
         expect(() => swapQuarantineArgs('/disks/sdb2', 'nc1')).toThrow(/not a disk root/)
         expect(() => swapQuarantineArgs('sdb2', '../x')).toThrow(/not an instance id/)
@@ -204,7 +204,7 @@ describe('(B)/(C) updateApp Swap with the dropped files', () => {
     afterEach(async () => { if (sb) await fs.remove(sb.tmp); else await fs.remove(tmp) })
     const update = (over: Partial<UpdateDeps> = {}) => updateApp(h, 'nc1', NEW_APP, ME, {}, deps(over))
 
-    it('(B) v22: the dropped files leave before the copy, data/ and .env stay, SHA256SUMS becomes the new bundle\'s, the op records it', async () => {
+    it('(B) v24: the dropped files leave before the copy, data/ and .env stay, SHA256SUMS becomes the new bundle\'s, the op records it', async () => {
         await setup(await fs.mkdtemp(path.join(os.tmpdir(), 'swapq-b-')))
         const r = await update()
         expect(r.steps).toContain('Swap')
@@ -223,10 +223,10 @@ describe('(B)/(C) updateApp Swap with the dropped files', () => {
         expect((await swapDroppedPaths(instDir(), bundleDir())).paths).toEqual([])
     })
 
-    it('(B) below v22: warns, moves nothing, the update still passes and SHA256SUMS is still refreshed', async () => {
+    it('(B) below v24: warns, moves nothing, the update still passes and SHA256SUMS is still refreshed', async () => {
         await setup(await fs.mkdtemp(path.join(os.tmpdir(), 'swapq-b-')))
         let called = false
-        const r = await update({ swapQuarantineProblem: async () => "... needs ... v22 or later, but the installed one reports 'idea-app-data 21'", swapQuarantine: async () => { called = true; throw new Error('must not run') } })
+        const r = await update({ swapQuarantineProblem: async () => "... needs ... v24 or later, but the installed one reports 'idea-app-data 21'", swapQuarantine: async () => { called = true; throw new Error('must not run') } })
         expect(called).toBe(false)
         expect(r.steps).toContain('Health')
         expect(op().status).toBe('Done')
@@ -235,7 +235,7 @@ describe('(B)/(C) updateApp Swap with the dropped files', () => {
         expect(op().args).toMatchObject({ swapDropped: '3', swapQuarantine: 'skipped: HELPER_OUTDATED' })
     })
 
-    it('(B) v22 and the helper fails: ROLLED BACK inside Swap, before the new bundle is copied, old version restarted', async () => {
+    it('(B) v24 and the helper fails: ROLLED BACK inside Swap, before the new bundle is copied, old version restarted', async () => {
         await setup(await fs.mkdtemp(path.join(os.tmpdir(), 'swapq-b-')))
         const m = await codeOf(update({ swapQuarantine: async () => { calls.push('swapQuarantine'); throw new Error('idea-app-data swap-quarantine refused: quarantine folder /disks/sdb2/.idea-quarantine must be owned by root (got uid 1000)') } }))
         expect(m).toMatch(/^ROLLED BACK: Swap failed: the 3 file\(s\) the new bundle dropped could not be moved to quarantine \(engine#506\): idea-app-data swap-quarantine refused: quarantine folder .* must be owned by root/)

@@ -1746,10 +1746,10 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v22 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine; v20 the engine#497 in-flight marker; v21 the engine#503 kolibri-rebind; v22 the engine#506 swap-quarantine)', async () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('22')
+    it('helper and Engine speak v24 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine; v20 the engine#497 in-flight marker; v21 the engine#503 kolibri-rebind; v24 the engine#506 swap-quarantine)', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('24')
         const r = await sb.run(['version'])
-        expect(r.stdout.trim()).toBe('idea-app-data 22')
+        expect(r.stdout.trim()).toBe('idea-app-data 24')
     })
 
     it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {

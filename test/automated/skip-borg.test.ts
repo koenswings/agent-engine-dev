@@ -30,7 +30,7 @@ import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import { drainDataBytesQueue } from '../harness/drainDataBytes.js'
 // static: an earlier test calls vi.resetModules(); a dynamic import would get fresh Config/helper modules
 import { bootRetryHandlers } from '../../src/data/RecoveryRetry.js'
-import { recoverInterruptedOperations, noteDiskDocked, noteDiskUndocked, resetResumeStateForTests, resetEngineStoppingForTests } from '../../src/data/Operations.js'
+import { recoverInterruptedOperations, noteDiskDocked, noteDiskUndocked, resetResumeStateForTests, resetEngineStoppingForTests, markEngineStopping } from '../../src/data/Operations.js'
 import { staleBackupLock, recordBackupStaleLocks } from '../../src/monitors/backupMonitor.js'
 
 const INST = 'inst-borg-1' as InstanceID
@@ -76,6 +76,10 @@ shift 2
 echo "$*" >> "$FAKE_BORG_LOG"
 case "$1" in
   borg-create) [ -n "$FAKE_BORG_REFUSE_CREATE" ] && [ -e "$FAKE_BORG_REFUSE_CREATE" ] && { echo "idea-app-data borg-create refused: unknown root '$2'" >&2; exit 2; } ;;
+esac
+# engine#497 stage 3: the Backup Disk is pulled mid borg-create (its repo leaves the mount point)
+case "$1" in
+  borg-create) [ -n "$FAKE_BORG_PULL" ] && [ ! -e "$FAKE_BORG_PULL" ] && { mv "$IDEA_DISKS_ROOT/$2/backups/$3" "$FAKE_BORG_PULL"; echo "borg: Input/output error" >&2; exit 2; } ;;
 esac
 case "$1" in
   version) [ -n "$FAKE_HELPER_VERSION" ] && echo "idea-app-data $FAKE_HELPER_VERSION" ;;
@@ -435,5 +439,101 @@ describe('engine#497 stage 2: an interrupted backup resumes in its own op (borg 
         noteDiskDocked(h, 'borg-bd')
         await new Promise(r => setTimeout(r, 30))
         expect((await calls()).some(l => l.startsWith('borg-'))).toBe(false)
+    })
+})
+
+describe('engine#497 stage 3 (b): a live backup interrupted at args.phase=locked ends Done in its own op (not stuck, not Failed)', () => {
+    const LOCK = () => `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
+    const setup = async () => {
+        const h = await createMinimalStore()
+        const appDisk = makeDisk('borg-ad', appDevice, false)
+        const backupDisk = makeDisk('borg-bd', backupDevice, true)
+        h.change(doc => { doc.diskDB[appDisk.id] = appDisk; doc.diskDB[backupDisk.id] = backupDisk })
+        addInstance(h, appDisk.id)
+        return { h, backupDisk }
+    }
+    const backupOps = (h: DocHandle<Store>) => Object.values(h.doc()!.operationDB ?? {}).filter((o: any) => o.kind === 'backupApp') as any[]
+
+    beforeEach(() => {
+        config.settings.skipBorg = false
+        process.env.FAKE_HELPER_VERSION = '21'
+        staleBackupLock.borgPidUsingRepo = async () => null
+    })
+    afterEach(() => {
+        delete process.env.FAKE_HELPER_VERSION
+        delete process.env.FAKE_BORG_PULL
+        staleBackupLock.borgPidUsingRepo = async () => null
+    })
+
+    it('the Engine stops mid borg-create (SIGTERM): the op stays Running (no Failed, no failed result), the lock stays; the next boot resumes it in the same op → Done', async () => {
+        const { h, backupDisk } = await setup()
+        const refuse = path.join(binDir, 'refuse-create')
+        await fs.writeFile(refuse, '')
+        process.env.FAKE_BORG_REFUSE_CREATE = refuse
+        markEngineStopping()
+        await backupInstance(h, INST, backupDisk)
+        const [op] = backupOps(h)
+        expect(op.status).toBe('Running')
+        expect(op.error).toBeNull()
+        expect(op.args.phase).toBe('locked')
+        expect(op.args.resumeFailures).toBeUndefined()
+        expect((h.doc()!.instanceDB[INST] as any).lastResult ?? null).toBeNull()
+        expect(await fs.pathExists(LOCK())).toBe(true)
+        // the restart: recovery parks it until both disks docked, then it resumes and ends Done
+        await fs.remove(refuse)
+        resetResumeStateForTests(); resetEngineStoppingForTests()
+        await recoverInterruptedOperations(h, bootRetryHandlers)
+        expect(h.doc()!.operationDB[op.id].error).toMatch(/^RESUME_WAITING/)
+        await recordBackupStaleLocks(h, backupDisk)
+        expect((h.doc()!.instanceDB[INST] as any).lastResult?.result).not.toBe('INTERRUPTED')
+        noteDiskDocked(h, 'borg-ad')
+        noteDiskDocked(h, 'borg-bd')
+        await vi.waitFor(() => expect(h.doc()!.operationDB[op.id].status).toBe('Done'))
+        const done = h.doc()!.operationDB[op.id] as any
+        expect(done.error).toBeNull()
+        expect(done.args.phase).toBe('done')
+        expect(backupOps(h)).toHaveLength(1)
+        expect((await calls()).filter(l => l.startsWith('borg-create'))).toHaveLength(2)
+        expect(await fs.pathExists(LOCK())).toBe(false)
+    })
+
+    it('the Backup Disk is pulled mid borg-create: RESUME_WAITING (not counted, not Failed); it resumes when the disk docks again → Done, one op', async () => {
+        const { h, backupDisk } = await setup()
+        await recoverInterruptedOperations(h, bootRetryHandlers)   // boot: handlers in place, no ops yet
+        noteDiskDocked(h, 'borg-ad')
+        noteDiskDocked(h, 'borg-bd')
+        const aside = path.join(binDir, 'pulled-repo')
+        process.env.FAKE_BORG_PULL = aside
+        await backupInstance(h, INST, backupDisk)
+        const [op] = backupOps(h)
+        expect(op.status).toBe('Pending')
+        expect(op.error).toMatch(/^RESUME_WAITING: Backup Disk 'Backup Disk' \(borg-bd\) is no longer mounted: /)
+        expect(op.args.resumeFailures).toBeUndefined()
+        expect((h.doc()!.instanceDB[INST] as any).lastResult ?? null).toBeNull()
+        expect(runningBackupOnDisk(h.doc()!, backupDisk.id), 'a parked backup does not hold the disk').toBeUndefined()
+        // the disk comes back (its repo and our lock with it)
+        noteDiskUndocked('borg-bd')
+        delete process.env.FAKE_BORG_PULL
+        await fs.move(aside, `${DISKS_ROOT}/${backupDevice}/backups/${INST}`)
+        expect(await fs.pathExists(LOCK())).toBe(true)
+        noteDiskDocked(h, 'borg-bd')
+        await vi.waitFor(() => expect(h.doc()!.operationDB[op.id].status).toBe('Done'))
+        expect(h.doc()!.operationDB[op.id].error).toBeNull()
+        expect(backupOps(h)).toHaveLength(1)
+        const c = await calls()
+        expect(c.filter(l => l.startsWith('borg-create'))).toHaveLength(2)
+        expect(c.some(l => l === `borg-break-lock ${backupDevice} ${INST}`)).toBe(true)
+        expect(await fs.pathExists(LOCK())).toBe(false)
+    })
+
+    it('a real failure of a live run is unchanged: Failed with the borg error (only a resume run counts it, stage 2)', async () => {
+        const { h, backupDisk } = await setup()
+        const refuse = path.join(binDir, 'refuse-create')
+        await fs.writeFile(refuse, '')
+        process.env.FAKE_BORG_REFUSE_CREATE = refuse
+        await backupInstance(h, INST, backupDisk)
+        const [op] = backupOps(h)
+        expect(op.status).toBe('Failed')
+        expect(op.error).toMatch(/borg-create refused/)
     })
 })

@@ -134,9 +134,9 @@ export interface UpdateDeps {
     uptimeS: () => number
     dirBytes: (dir: string) => Promise<number>
     copyBundle: (src: string, dst: string) => Promise<void>
-    /** engine#506: why the helper cannot quarantine the files the new bundle dropped (below v22), or null */
+    /** engine#506: why the helper cannot quarantine the files the new bundle dropped (below v24), or null */
     swapQuarantineProblem: () => Promise<string | null>
-    /** engine#506: helper swap-quarantine (v22): move those instance-relative files to .idea-quarantine (never rm) */
+    /** engine#506: helper swap-quarantine (v24): move those instance-relative files to .idea-quarantine (never rm) */
     swapQuarantine: (disk: Disk, id: InstanceID, paths: string[]) => Promise<SwapQuarantineResult>
     stop: (inst: Instance, disk: Disk) => Promise<void>
     containerIds: (id: InstanceID) => Promise<string[]>
@@ -1044,9 +1044,9 @@ export const updateApp = async (
 
 /** engine#469: the temporary backup of one updateApp operation. */
 /**
- * engine#506 (helper v22): at Swap, move the files the new bundle dropped (swapDroppedPaths) out
- * of the instance folder. Below v22 it warns and leaves them (the update goes on: no App depends
- * on it, app-nextcloud 8860c5d ignores unlisted tarballs). With v22 a helper failure throws, so
+ * engine#506 (helper v24): at Swap, move the files the new bundle dropped (swapDroppedPaths) out
+ * of the instance folder. Below v24 it warns and leaves them (the update goes on: no App depends
+ * on it, app-nextcloud 8860c5d ignores unlisted tarballs). With v24 a helper failure throws, so
  * the update rolls back before the point of no return.
  */
 const quarantineSwapDropped = async (

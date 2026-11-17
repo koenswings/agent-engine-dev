@@ -452,3 +452,82 @@ describe('engine#497 stage 2: real failures count, interruptions do not; after 3
         expect(FS.markers.get(`idea-test-2/${INSTANCE_ID}`)).toBe(opId)
     })
 })
+
+describe('engine#497 stage 3 (c): the source of a move in flight is not started by the Engine; it is started again only if the move gives up', () => {
+    const sourceStarts = async () => {
+        const { startInstance } = await import('../../src/data/Instance.js')
+        return vi.mocked(startInstance).mock.calls.filter(c => String((c[2] as any)?.id) === String(SOURCE_DISK_ID))
+    }
+
+    it('a power cut mid-move: the dock pass may not auto-start the source while the op is Running or parked (RESUME_WAITING)', async () => {
+        const { shouldAutoStart } = await import('../../src/data/AutoStart.js')
+        const handle = await makeHandle('Running')
+        FS.rsync.push('cut')
+        await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)).rejects.toBeTruthy()
+        const op = onlyOp(handle)
+        expect(op.args.phase).toBe('copying')
+        const src = () => handle.doc().instanceDB[INSTANCE_ID] as any
+        expect(shouldAutoStart(handle.doc(), src())).toMatchObject({ start: false, reason: expect.stringMatching(/a move of this instance is in flight/) })
+        // boot: parked until both disks docked; still held back
+        reboot()
+        await recoverInterruptedOperations(handle, bootRetryHandlers)
+        expect(handle.doc().operationDB[op.id].error).toMatch(/^RESUME_WAITING/)
+        expect(shouldAutoStart(handle.doc(), src())).toMatchObject({ start: false })
+        expect(await sourceStarts()).toEqual([])
+        // the dock pass: the move resumes and finishes; the instance is on the target, which the move starts itself
+        noteDiskDocked(handle, SOURCE_DISK_ID)
+        noteDiskDocked(handle, TARGET_DISK_ID)
+        await vi.waitFor(() => expect(handle.doc().operationDB[op.id].status).toBe('Done'))
+        expect(await sourceStarts()).toEqual([])
+        expect(src().storedOn).toBe(TARGET_DISK_ID)
+    })
+
+    it('real failures: the source stays stopped at (1/3) and (2/3); at RESUME_GAVE_UP it is started again on its own disk, once', async () => {
+        const handle = await makeHandle('Running')
+        FS.rsync.push('fail', 'fail', 'fail')
+        await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)).rejects.toBeTruthy()
+        const opId = onlyOp(handle).id
+        expect(handle.doc().operationDB[opId].error).toMatch(/^RESUME_PENDING \(1\/3\)/)
+        expect(await sourceStarts()).toEqual([])
+        await boot(handle)
+        await vi.waitFor(() => expect(handle.doc().operationDB[opId].error).toMatch(/^RESUME_PENDING \(2\/3\)/))
+        expect(await sourceStarts()).toEqual([])
+        await boot(handle)
+        await vi.waitFor(() => expect(handle.doc().operationDB[opId].status).toBe('Failed'))
+        expect(handle.doc().operationDB[opId].error).toMatch(/^RESUME_GAVE_UP: /)
+        await vi.waitFor(async () => expect(await sourceStarts()).toHaveLength(1))
+        expect((await sourceStarts())[0][3]).toBe('post-move')
+        expect(handle.doc().instanceDB[INSTANCE_ID]?.storedOn).toBe(SOURCE_DISK_ID)
+        // terminal now: the dock pass may start the source again
+        const { shouldAutoStart } = await import('../../src/data/AutoStart.js')
+        expect(shouldAutoStart(handle.doc(), { ...(handle.doc().instanceDB[INSTANCE_ID] as any), status: 'Docked' }).start).toBe(true)
+        // the partial target and its marker are kept
+        expect(FS.markers.get(`idea-test-2/${INSTANCE_ID}`)).toBe(opId)
+    })
+
+    it('gave up with the source disk docked elsewhere: nothing is started here (its next dock starts it)', async () => {
+        const handle = await makeHandle('Running')
+        FS.rsync.push('fail', 'fail', 'fail')
+        await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)).rejects.toBeTruthy()
+        const opId = onlyOp(handle).id
+        await boot(handle)
+        await vi.waitFor(() => expect(handle.doc().operationDB[opId].error).toMatch(/^RESUME_PENDING \(2\/3\)/))
+        // the third resume runs, then (before the hook) the source disk leaves this Engine
+        const { restartMoveSourceAfterGiveUp } = await import('../../src/data/CopyMoveApp.js')
+        handle.change(doc => { (doc.diskDB[SOURCE_DISK_ID] as any).dockedTo = 'ENGINE_elsewhere' })
+        await restartMoveSourceAfterGiveUp(handle, handle.doc().operationDB[opId] as any)
+        expect(await sourceStarts()).toEqual([])
+    })
+
+    it('a failure before the marker (not enough space) is a plain Failed move: the source is started again at once, as before', async () => {
+        const handle = await makeHandle('Running')
+        const helper = await import('../../src/utils/appDataHelper.js')
+        vi.mocked(helper.instanceDataBytes).mockResolvedValueOnce(50 * 1024 * 1024 * 1024)
+        await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)).rejects.toBeTruthy()
+        const op = onlyOp(handle)
+        expect(op.status).toBe('Failed')
+        expect(op.error).toMatch(/Not enough space/)
+        expect(FS.markers.size).toBe(0)
+        expect(await sourceStarts()).toHaveLength(1)
+    })
+})

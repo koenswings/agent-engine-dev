@@ -1,5 +1,5 @@
 /**
- * idea-app-data-swap-quarantine.test.ts — helper v22 (engine#506, Steve's decision): updateApp's
+ * idea-app-data-swap-quarantine.test.ts — helper v24 (engine#506, Steve's decision): updateApp's
  * Swap moves the files the old bundle had and the new one dropped out of instances/<id>/ into
  * <root>/.idea-quarantine/<id>-swap-dropped-<stamp>/ (mv, never rm), as root, because
  * .idea-quarantine is root 0700.
@@ -46,12 +46,12 @@ const addUpdatedInstance = async (sb: AppDataSandbox, dev: string, id: string) =
 const swap = (sb: AppDataSandbox, dev: string, id: string, paths: string[], env: Record<string, string> = {}) =>
     sb.run(['swap-quarantine', dev, id], { FAKE_STDIN: paths.map(p => `${p}\n`).join(''), ...env })
 
-describe('idea-app-data v22: swap-quarantine (engine#506)', () => {
-    it('is version 22, and the Engine needs v22 to quarantine at Swap', async () => {
+describe('idea-app-data v24: swap-quarantine (engine#506)', () => {
+    it('is version 24, and the Engine needs v24 to quarantine at Swap', async () => {
         const sb = await sandbox()
-        expect(APP_DATA_HELPER_VERSION).toBe('22')
-        expect(SWAP_QUARANTINE_HELPER_MIN).toBe(22)
-        expect((await sb.run(['version'])).stdout.trim()).toBe('idea-app-data 22')
+        expect(APP_DATA_HELPER_VERSION).toBe('24')
+        expect(SWAP_QUARANTINE_HELPER_MIN).toBe(24)
+        expect((await sb.run(['version'])).stdout.trim()).toBe('idea-app-data 24')
     })
 
     it('moves each listed file into .idea-quarantine/<id>-swap-dropped-<stamp>/ keeping its relative path; deletes nothing; data/ untouched', async () => {

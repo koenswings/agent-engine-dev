@@ -170,7 +170,7 @@ describe('same-Engine moveApp re-homes the instance (kc8 step 104)', () => {
         expect(w.h.doc()!.instanceDB[INST].status).toBe('Undocked')
     })
 
-    it('3. a register that does not claim the id fails the move loud and restarts the source', async () => {
+    it('3. a register that does not claim the id fails the move loud; the parked move keeps the source stopped (engine#497 stage 3 c)', async () => {
         const w = await setup('Running')
         const real = DiskMod.processInstance
         // e.g. a concurrent writer moved storedOn to a third disk: the moveFrom claim must refuse
@@ -187,7 +187,8 @@ describe('same-Engine moveApp re-homes the instance (kc8 step 104)', () => {
         // engine#497 (Koen's rule): a real failure after the marker parks the op (1/3) and keeps the partial target
         expect(moveOp(w.h)?.status).toBe('Pending')
         expect(moveOp(w.h)?.error).toMatch(/^RESUME_PENDING \(1\/3\): moveApp: instance .* was not registered on/)
-        expect(events).toEqual([`stop:${w.source.id}`, `start:${w.source.id}:storedOn=${w.source.id}`])
+        // engine#497 stage 3 (c): not started again while the move is in flight (only if it gives up)
+        expect(events).toEqual([`stop:${w.source.id}`])
         expect(await fs.pathExists(`${DISKS_ROOT}/${w.target.device}/instances/${INST}`)).toBe(true)
     })
 

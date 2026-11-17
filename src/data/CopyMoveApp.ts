@@ -29,7 +29,7 @@ import { stopInstance, startInstance, applyBackupMethod } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
 import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
-import { createOperation, updateOperation, setOperationArgs, parkResumableOp } from './Operations.js'
+import { createOperation, updateOperation, setOperationArgs, parkResumableOp, resumeGaveUpHooks } from './Operations.js'
 import { markInFlight, clearInFlight, verifyInstanceCopy, resumeHelperProblem } from './InFlight.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { sendCommand } from '../utils/commandUtils.js'
@@ -1033,7 +1033,10 @@ export const moveApp = async (
         // On failure, restart the source only if we stopped it and it is still
         // registered there (idea#474: after a successful register, a later
         // start-on-target failure must not start the old source project).
-        if (wasRunning && stillOnSource) {
+        // engine#497 stage 3 (c): not while the move is in flight under its marker (parked to
+        // resume): the source stays stopped until the move resumes, and is started again by
+        // restartMoveSourceAfterGiveUp only if the move gives up (RESUME_GAVE_UP).
+        if (wasRunning && stillOnSource && !markerWritten) {
             try {
                 const freshStore = storeHandle.doc()
                 const freshInstance = getInstance(freshStore, instance.id)
@@ -1055,6 +1058,29 @@ export const moveApp = async (
         endUsageSkip('move')
     }
 }
+
+/**
+ * engine#497 stage 3 (c): a resumable local move gave up (RESUME_GAVE_UP). If it had stopped
+ * the source (args.wasRunning) and the instance is still stored on the source disk, docked
+ * here, start it there again. If the source disk is not docked here, nothing is started now:
+ * the op is terminal, so the next dock of the source disk auto-starts it as usual.
+ */
+export const restartMoveSourceAfterGiveUp = async (storeHandle: DocHandle<Store>, op: { id: string, args?: Record<string, string> }): Promise<void> => {
+    const args = (op.args ?? {}) as Record<string, string>
+    if (args.wasRunning !== '1') return
+    const store = storeHandle.doc()
+    const instance = getInstance(store, String(args.instanceId ?? '') as InstanceID)
+    if (!instance || String(instance.storedOn) !== String(args.sourceDiskId)) return
+    const sourceDisk = getDisk(store, args.sourceDiskId as DiskID) as Disk | undefined
+    const { localEngineId } = await import('./Engine.js')
+    if (!sourceDisk?.device || String(sourceDisk.dockedTo) !== String(localEngineId)) {
+        log(`moveApp: operation ${op.id} gave up; source disk ${args.sourceDiskId} is not docked here, so '${instance.name}' starts at its next dock`)
+        return
+    }
+    log(`moveApp: operation ${op.id} gave up; starting the source instance '${instance.name}' (${instance.id}) on '${sourceDisk.name}' again`)
+    await startInstance(storeHandle, instance, sourceDisk, 'post-move')
+}
+resumeGaveUpHooks.moveApp = restartMoveSourceAfterGiveUp
 
 // recoverInterruptedOperations moved to Operations.ts
 export { recoverInterruptedOperations } from './Operations.js'

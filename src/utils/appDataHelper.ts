@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '22'
+export const APP_DATA_HELPER_VERSION = '24'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -152,14 +152,14 @@ export const parseKolibriRebind = (out: string): KolibriRebindResult => {
         quarantined,
     }
 }
-// ── engine#506 (helper v22): files the new bundle dropped, out of the instance at Swap ──
+// ── engine#506 (helper v24): files the new bundle dropped, out of the instance at Swap ──
 /**
  * updateApp's Swap copies the new bundle over instances/<id>/. Files the old bundle had and
  * the new one dropped are moved (never removed) to <root>/.idea-quarantine/<id>-swap-dropped-<stamp>/
- * by the helper as root (swap-quarantine, v22), because .idea-quarantine is root 0700. Below v22
+ * by the helper as root (swap-quarantine, v24), because .idea-quarantine is root 0700. Below v24
  * updateApp warns and leaves them in place.
  */
-export const SWAP_QUARANTINE_HELPER_MIN = 22
+export const SWAP_QUARANTINE_HELPER_MIN = 24
 /** At most this many paths per call, each at most this long (the helper's SWAP_PATHS_MAX / SWAP_PATH_MAX_LEN). */
 export const SWAP_PATHS_MAX = 4096
 export const SWAP_PATH_MAX_LEN = 1024
