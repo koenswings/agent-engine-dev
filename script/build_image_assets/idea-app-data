@@ -55,6 +55,9 @@
 #   idea-app-data put-files        <root> <id> <stagingDir>  (local Engine: copy basenames from staging into instance as root)
 #   idea-app-data kolibri-rebind   <root> <id>   (v21, engine#503: give a Kolibri copy a fresh morango id as root;
 #                                    local Engine only, never through idea-peer-gate; see v21 below)
+#   idea-app-data swap-quarantine  <root> <id>  < "<instance-relative path>" lines
+#                                    (v22, engine#506: move files the new bundle dropped out of instances/<id>/
+#                                    into .idea-quarantine/<id>-swap-dropped-<stamp>/; local Engine only; see v22)
 #   Peer keys (the Engine, from its store):
 #   idea-app-data sync-peers   <engineId> <storeDocId> < "<engineId> ssh-ed25519 <key> ssh-ed25519 <hostkey>" lines
 #                                    (v15, engine#376: the caller's own Engine id and store document id;
@@ -152,6 +155,21 @@
 #        markers (instance root and data/kolibri/) are moved to <root>/.idea-quarantine/<id>-kolibri-*-<stamp>.
 #        stdout: previousId=<id|none> and morangoId=<id|none>, or kolibriDb=absent; one quarantined=<path>
 #        line per moved item. Same sudoers line (no argument list); not in the peer gate's allowlist.
+#   v22 (engine#506, Steve's decision): swap-quarantine <root> <id>, the instance-relative paths of the
+#        files the old bundle had and the new one dropped on stdin (one per line, at most 4096, each at
+#        most 1024 characters). updateApp's Swap copies the new bundle over instances/<id>/ and never
+#        removed anything, so a dropped file (Nextcloud 1.8's bundled-apps/richdocuments-v8.8.3.tar.gz)
+#        stayed and failed the next prepare hook. Every line is checked first and one bad line refuses
+#        the whole call: relative, no '.'/'..' component, no '//', no control character or backslash,
+#        not data/ (instance data), not .idea-* (Engine markers), not the top-level .env, SHA256SUMS or
+#        compose.yaml, not listed twice; an existing path must be a regular file with no symlink in its
+#        path, on the instance's filesystem. A missing path is reported (absent=) and skipped. Refused
+#        while a container of project <id> runs; under the instance lock. Each file is MOVED (one
+#        rename from inside its checked parent folder, never rm) to
+#        <root>/.idea-quarantine/<id>-swap-dropped-<UTC stamp>/<same relative path> (root 0700; a
+#        quarantine folder with another owner or group/other write is refused; a taken stamp gets -2 to
+#        -9). stdout: absent=<path> lines, quarantine=<folder|none>, moved=<path> lines. Journaled.
+#        Same sudoers line (no argument list); not in the peer gate's allowlist.
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
 # excludes may hold '/'):
@@ -246,7 +264,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=21
+readonly IDEA_APP_DATA_VERSION=22
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -332,6 +350,9 @@ SNAP_EXCLUDE_MAX_LEN=256
 EXIT_NO_SPACE=3
 VOLUMES_DIR=/var/lib/docker/volumes
 PEER_MAX=256
+# v22 (engine#506): swap-quarantine reads at most this many paths, each at most this long
+SWAP_PATHS_MAX=4096
+SWAP_PATH_MAX_LEN=1024
 
 export HOME="$ROOT_HOME"
 
@@ -1481,6 +1502,104 @@ print("previousId="+str(row[0])); print("morangoId="+new_id)'
         kolibri_aside "${KMARKERS[0]}" rebind-marker
         kolibri_aside "${KMARKERS[1]}" rebind-marker-data
         journal "kolibri-rebind: $KDB morango id $KPREV -> $KNEW (owner/mode $KST kept)"
+        exit 0
+        ;;
+
+    swap-quarantine)
+        # v22 (engine#506): updateApp's Swap copies the new bundle over instances/<id>/ and never
+        # removed the files the old bundle had and the new one dropped. The Engine sends their
+        # instance-relative paths on stdin (one per line); each is MOVED (rename, same disk, never
+        # rm) to <root>/.idea-quarantine/<id>-swap-dropped-<UTC stamp>/<same relative path>.
+        # Local Engine only; idea-peer-gate never maps a peer command here.
+        need 2 $(($# - 1)) "<root> <id>"
+        check_id "$3"
+        SQID="$3"
+        resolve_root "$2" instances
+        INST=$(inst_dir "$R_DIR" "$3")
+        existing_dir "$INST" "instance folder"
+        containers_stopped "$3"
+        take_locks "inst.$2.$3"
+        INST_DEV=$($STAT -c '%d' -- "$INST" 2>/dev/null) || refuse "cannot stat $INST"
+        declare -A SQ_SEEN=()
+        SQ_MOVE=()
+        SQ_ABSENT=()
+        SQ_N=0
+        sq_bad() { refuse "path $(printf '%q' "${rel:0:200}") (line $SQ_N): $*"; }
+        # Pass 1: every line is checked before anything moves; one bad line refuses the whole call.
+        while IFS= read -r rel || [[ -n "$rel" ]]; do
+            SQ_N=$((SQ_N + 1))
+            (( SQ_N <= SWAP_PATHS_MAX )) || refuse "more than $SWAP_PATHS_MAX paths on stdin"
+            [[ -n "$rel" ]] || sq_bad "empty line"
+            (( ${#rel} <= SWAP_PATH_MAX_LEN )) || sq_bad "longer than $SWAP_PATH_MAX_LEN characters"
+            [[ "$rel" != *[[:cntrl:]]* && "$rel" != *\\* ]] || sq_bad "holds a control character or a backslash"
+            [[ "$rel" != /* ]] || sq_bad "is absolute; only paths relative to the instance folder are accepted"
+            [[ "$rel" != */ && "$rel" != *//* ]] || sq_bad "has a trailing '/' or '//'"
+            IFS=/ read -r -a SQ_PARTS <<<"$rel"
+            for part in "${SQ_PARTS[@]}"; do
+                [[ "$part" != "." && "$part" != ".." ]] || sq_bad "has a '.' or '..' component"
+            done
+            SQ_TOP=${SQ_PARTS[0]}
+            [[ "$SQ_TOP" != data ]] || sq_bad "is instance data (data/); never moved"
+            [[ "$SQ_TOP" != .idea-* ]] || sq_bad "is an Engine marker (.idea-*); never moved"
+            if (( ${#SQ_PARTS[@]} == 1 )); then
+                [[ "$rel" != .env && "$rel" != SHA256SUMS && "$rel" != compose.yaml ]] || sq_bad "is the instance's $rel; never moved"
+            fi
+            [[ -z "${SQ_SEEN[$rel]:-}" ]] || sq_bad "is listed twice"
+            SQ_SEEN[$rel]=1
+            SQ_FULL="$INST/$rel"
+            if [[ ! -e "$SQ_FULL" && ! -L "$SQ_FULL" ]]; then SQ_ABSENT+=("$rel"); continue; fi
+            exact_path "$SQ_FULL" || sq_bad "is a symlink or has a symlink in its path"
+            [[ -f "$SQ_FULL" && ! -L "$SQ_FULL" ]] || sq_bad "is not a regular file"
+            [[ "$($STAT -c '%d' -- "$SQ_FULL" 2>/dev/null)" == "$INST_DEV" ]] || sq_bad "is on another filesystem than $INST"
+            SQ_MOVE+=("$rel")
+        done
+        for rel in "${SQ_ABSENT[@]}"; do echo "absent=$rel"; done
+        if (( ${#SQ_MOVE[@]} == 0 )); then
+            echo "quarantine=none"
+            journal "swap-quarantine: nothing to move in $INST (${#SQ_ABSENT[@]} path(s) already absent)"
+            exit 0
+        fi
+        # Pass 2: the quarantine folder (root 0700; any other owner refused), then one rename per file.
+        QDIR="$R_DIR/.idea-quarantine"
+        root_dir "$QDIR" 0700 "quarantine folder"
+        $CHMOD 0700 -- "$QDIR" || refuse "cannot set mode 0700 on $QDIR"
+        [[ "$($STAT -c '%d' -- "$QDIR" 2>/dev/null)" == "$INST_DEV" ]] || refuse "$QDIR is on another filesystem than $INST"
+        SQ_BASE="$QDIR/$SQID-swap-dropped-$($DATE -u +%Y%m%dT%H%M%SZ)"
+        QDEST="$SQ_BASE"; SQ_K=1
+        while [[ -e "$QDEST" || -L "$QDEST" ]]; do
+            SQ_K=$((SQ_K + 1))
+            (( SQ_K <= 9 )) || refuse "$SQ_BASE and its suffixes -2 to -9 already exist"
+            QDEST="$SQ_BASE-$SQ_K"
+        done
+        $MKDIR -m 0700 -- "$QDEST" || refuse "cannot create $QDEST"
+        echo "quarantine=$QDEST"
+        SQ_DONE=0
+        sq_fail() {
+            refuse "$* ($SQ_DONE of ${#SQ_MOVE[@]} file(s) were already moved to $QDEST; they stay there, and updateApp's rollback restores the instance folder from its snapshot)"
+        }
+        for rel in "${SQ_MOVE[@]}"; do
+            SQ_BASENAME=${rel##*/}
+            if [[ "$rel" == */* ]]; then SQ_SUB=${rel%/*}; else SQ_SUB=""; fi
+            # Work from inside the checked parent folder, so a folder swapped for a symlink after
+            # pass 1 cannot redirect the move (pin_cwd refuses when the real path differs).
+            if [[ -n "$SQ_SUB" ]]; then
+                cd -P -- "$INST/$SQ_SUB" 2>/dev/null || sq_fail "cannot enter $INST/$SQ_SUB"
+                [[ "$(pwd -P)" == "$INST/$SQ_SUB" ]] || sq_fail "$INST/$SQ_SUB changed while it was checked"
+                $MKDIR -p -- "$QDEST/$SQ_SUB" || sq_fail "cannot create $QDEST/$SQ_SUB"
+            else
+                cd -P -- "$INST" 2>/dev/null || sq_fail "cannot enter $INST"
+                [[ "$(pwd -P)" == "$INST" ]] || sq_fail "$INST changed while it was checked"
+            fi
+            [[ -f "./$SQ_BASENAME" && ! -L "./$SQ_BASENAME" ]] || sq_fail "$INST/$rel is no longer a regular file"
+            [[ ! -e "$QDEST/$rel" && ! -L "$QDEST/$rel" ]] || sq_fail "$QDEST/$rel already exists"
+            $MV -T -- "./$SQ_BASENAME" "$QDEST/$rel" || sq_fail "cannot move $INST/$rel to $QDEST/$rel"
+            SQ_DONE=$((SQ_DONE + 1))
+            echo "moved=$rel"
+        done
+        cd / || true
+        $CHOWN root:root -- "$QDEST" 2>/dev/null || true
+        $CHMOD 0700 -- "$QDEST" || true
+        journal "swap-quarantine: $SQ_DONE file(s) the new bundle dropped: $INST -> $QDEST (${#SQ_ABSENT[@]} path(s) already absent)"
         exit 0
         ;;
 
@@ -2656,7 +2775,7 @@ print("previousId="+str(row[0])); print("morangoId="+new_id)'
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, temp-backup-estimate, temp-backup-create, temp-backup-delete, temp-backup-restore, temp-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, kolibri-rebind, sync-peers, clear-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, temp-backup-estimate, temp-backup-create, temp-backup-delete, temp-backup-restore, temp-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, kolibri-rebind, swap-quarantine, sync-peers, clear-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

@@ -61,6 +61,8 @@ import {
     helperAtLeast, lastLine, SnapshotResult, estimateArgs, parseEstimate,
     TEMP_BACKUP_HELPER_MIN, borgProblem, tempBackupEstimateArgs, parseTempBackupEstimate, tempBackupCreateArgs,
     parseTempBackupCreate, tempBackupDeleteArgs, tempBackupRestoreArgs, TempBackupEstimate, verifyStampNow,
+    runAppDataWithInput, swapQuarantineArgs, swapQuarantineInput, parseSwapQuarantine, swapPathProblem,
+    SWAP_QUARANTINE_HELPER_MIN, SwapQuarantineResult,
 } from '../utils/appDataHelper.js'
 import { createOperation, updateOperation, dropInterruptedCommand } from './Operations.js'
 import { log } from '../utils/utils.js'
@@ -132,6 +134,10 @@ export interface UpdateDeps {
     uptimeS: () => number
     dirBytes: (dir: string) => Promise<number>
     copyBundle: (src: string, dst: string) => Promise<void>
+    /** engine#506: why the helper cannot quarantine the files the new bundle dropped (below v22), or null */
+    swapQuarantineProblem: () => Promise<string | null>
+    /** engine#506: helper swap-quarantine (v22): move those instance-relative files to .idea-quarantine (never rm) */
+    swapQuarantine: (disk: Disk, id: InstanceID, paths: string[]) => Promise<SwapQuarantineResult>
     stop: (inst: Instance, disk: Disk) => Promise<void>
     containerIds: (id: InstanceID) => Promise<string[]>
     composeDown: (dir: string, id: InstanceID) => Promise<void>
@@ -241,6 +247,83 @@ export const copyBundle = async (src: string, dst: string): Promise<void> => {
 }
 
 /**
+ * engine#506: the relative paths a SHA256SUMS lists (`<64 hex>  <path>` or `<64 hex> *<path>`,
+ * a leading ./ dropped). sha256sum's escaped lines (a leading backslash: a name with a newline
+ * or a backslash) and anything else are left out.
+ */
+export const sumsPaths = (sums: string): string[] => {
+    const out: string[] = []
+    for (const line of sums.split('\n')) {
+        const m = line.replace(/\r$/, '').match(/^[0-9a-fA-F]{64} [ *](.+)$/)
+        if (!m) continue
+        out.push(m[1].replace(/^(\.\/)+/, ''))
+    }
+    return out
+}
+
+/** engine#506: every non-folder entry under `dir` (files and links, never followed), relative, '/'-separated. */
+export const bundleTreeEntries = async (dir: string, rel = ''): Promise<string[]> => {
+    const out: string[] = []
+    for (const name of await fs.readdir(path.join(dir, rel))) {
+        const r = rel ? `${rel}/${name}` : name
+        const st = await fs.lstat(path.join(dir, r))
+        if (st.isDirectory()) out.push(...await bundleTreeEntries(dir, r))
+        else out.push(r)
+    }
+    return out
+}
+
+export interface SwapDropped {
+    /** false when the instance has no top-level SHA256SUMS (nothing to compare; nothing is moved) */
+    oldSums: boolean
+    /** listed in the instance's SHA256SUMS (the bundle it was installed or last updated from), absent from the new bundle */
+    paths: string[]
+    /** dropped too, but never moved: instance data (data/), Engine markers, .env, or a name the helper refuses */
+    skipped: { path: string, why: string }[]
+}
+
+/**
+ * engine#506: the bundle-owned files the old bundle had and the new one dropped. "Old" is the
+ * instance's own top-level SHA256SUMS (install copies it; Swap refreshes it), never a walk of the
+ * instance folder, so data/ and anything the App or the Engine wrote there is never a candidate.
+ * "New" is the new bundle's SHA256SUMS plus every entry in its tree (copyBundle copies both).
+ */
+export const swapDroppedPaths = async (instDir: string, bundleDir: string): Promise<SwapDropped> => {
+    let oldSums: string
+    try { oldSums = await fs.readFile(path.join(instDir, 'SHA256SUMS'), 'utf8') } catch { return { oldSums: false, paths: [], skipped: [] } }
+    const keep = new Set<string>(await bundleTreeEntries(bundleDir))
+    try { for (const p of sumsPaths(await fs.readFile(path.join(bundleDir, 'SHA256SUMS'), 'utf8'))) keep.add(p) } catch { /* no SHA256SUMS: the tree alone */ }
+    const paths: string[] = []
+    const skipped: SwapDropped['skipped'] = []
+    for (const p of [...new Set(sumsPaths(oldSums))].sort()) {
+        if (keep.has(p)) continue
+        const why = swapPathProblem(p)
+        if (why) skipped.push({ path: p, why })
+        else paths.push(p)
+    }
+    return { oldSums: true, paths, skipped }
+}
+
+/**
+ * engine#506: the instance's top-level SHA256SUMS becomes the new bundle's (copyBundle skips it,
+ * so the install-time file used to stay forever). Written to a temp file and renamed. Returns why
+ * it could not, or null; a failure is a warning (the update itself does not depend on it).
+ */
+export const refreshInstanceSums = async (bundleDir: string, instDir: string): Promise<string | null> => {
+    const src = path.join(bundleDir, 'SHA256SUMS')
+    if (!await fs.pathExists(src)) return `the new bundle ${bundleDir} has no SHA256SUMS`
+    const tmp = path.join(instDir, '.SHA256SUMS.swap-tmp')
+    try {
+        await fs.copyFile(src, tmp)
+        await fs.rename(tmp, path.join(instDir, 'SHA256SUMS'))
+        return null
+    } catch (e) {
+        await fs.remove(tmp).catch(() => undefined)
+        return (e as Error).message
+    }
+}
+
+/**
  * engine#456 LoadImages (§1 gap, §10): load the swapped compose's service images from the App
  * Disk's services/*.tar with the Start path's pinned-tar logic (preloadServiceImageFromTar,
  * verifyServiceImageDigest). Offline: never a pull. Without x-app.update a missing tar stays a
@@ -293,6 +376,9 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
     uptimeS: defaultReadUptimeS,
     dirBytes: async (dir) => (await import('./CopyMoveApp.js')).directoryBytes(dir),
     copyBundle,
+    swapQuarantineProblem: () => helperAtLeast(SWAP_QUARANTINE_HELPER_MIN, 'Moving the files the new bundle dropped out of the instance folder (engine#506)'),
+    swapQuarantine: async (disk, id, paths) =>
+        parseSwapQuarantine(await runAppDataWithInput(swapQuarantineArgs(await appDataRoot(disk), String(id)), swapQuarantineInput(paths))),
     stop: async (inst, disk) => (await import('./Instance.js')).stopInstance(storeHandle, inst, disk),
     containerIds: async (id) => (await docker(['ps', '-q', '--filter', `label=${COMPOSE_PROJECT_LABEL}=${composeProjectFor(String(id))}`])).split('\n').map(s => s.trim()).filter(Boolean),
     composeDown: async (dir, id) => {
@@ -774,7 +860,13 @@ export const updateApp = async (
             // engine#456 Q4: from here until verify passes, no other start may run this folder
             if (staged) { await writeUpdateInFlight(instDir, opId, engineId); markerWritten = true }
             if (bundle!.dir !== targetApps) await d.copyBundle(bundle!.dir, targetApps)
+            // engine#506: files the old bundle had and the new one dropped leave the instance folder
+            // first (moved to .idea-quarantine by the helper, never removed). A failure throws here,
+            // inside Swap, so the rollback puts the old version back from the snapshot.
+            await quarantineSwapDropped(storeHandle, d, opId, disk, inst.id, instDir, bundle!.dir)
             await d.copyBundle(bundle!.dir, instDir)
+            const sumsProblem = await refreshInstanceSums(bundle!.dir, instDir)
+            if (sumsProblem) log(`updateApp: ${inst.id}: WARNING: the instance's SHA256SUMS was not refreshed from the new bundle (${sumsProblem}); it still lists the previous bundle's files (engine#506)`)
             const composePath = path.join(instDir, 'compose.yaml')
             await fs.writeFile(composePath, stampComposeInstanceIdentity(await fs.readFile(composePath, 'utf8'), { instanceName: String(inst.name), demo: oldDemo }))
             await d.reread(disk, inst.id)
@@ -951,6 +1043,42 @@ export const updateApp = async (
 }
 
 /** engine#469: the temporary backup of one updateApp operation. */
+/**
+ * engine#506 (helper v22): at Swap, move the files the new bundle dropped (swapDroppedPaths) out
+ * of the instance folder. Below v22 it warns and leaves them (the update goes on: no App depends
+ * on it, app-nextcloud 8860c5d ignores unlisted tarballs). With v22 a helper failure throws, so
+ * the update rolls back before the point of no return.
+ */
+const quarantineSwapDropped = async (
+    storeHandle: DocHandle<Store>, d: UpdateDeps, opId: string, disk: Disk, id: InstanceID, instDir: string, bundleDir: string,
+): Promise<void> => {
+    const dropped = await swapDroppedPaths(instDir, bundleDir)
+    if (!dropped.oldSums) { log(`updateApp: ${id}: the instance has no SHA256SUMS, so the files the new bundle dropped cannot be told apart; none are moved (engine#506)`); return }
+    for (const s of dropped.skipped) log(`updateApp: ${id}: the new bundle dropped ${s.path}, left in place (${s.why}) (engine#506)`)
+    if (!dropped.paths.length) return
+    const outdated = await d.swapQuarantineProblem()
+    if (outdated) {
+        log(`updateApp: ${id}: WARNING: ${dropped.paths.length} file(s) the new bundle dropped stay in the instance folder: ${outdated}`)
+        setSwapOpArgs(storeHandle, opId, dropped.paths.length, 'skipped: HELPER_OUTDATED')
+        return
+    }
+    let r: SwapQuarantineResult
+    try { r = await d.swapQuarantine(disk, id, dropped.paths) } catch (e) {
+        throw new Error(`the ${dropped.paths.length} file(s) the new bundle dropped could not be moved to quarantine (engine#506): ${(e as Error).message}`)
+    }
+    log(`updateApp: ${id}: moved ${r.moved.length} file(s) the new bundle dropped to ${r.quarantine ?? '(nothing to move)'}${r.absent.length ? `; ${r.absent.length} already absent` : ''} (engine#506)`)
+    setSwapOpArgs(storeHandle, opId, r.moved.length, r.quarantine ?? 'none')
+}
+/** engine#506: what Swap did with the dropped files, on the operation (args.swapDropped / args.swapQuarantine). */
+const setSwapOpArgs = (storeHandle: DocHandle<Store>, opId: string, count: number, where: string): void => {
+    storeHandle.change(doc => {
+        const op = doc.operationDB?.[opId]
+        if (!op) return
+        op.args.swapDropped = String(count)
+        op.args.swapQuarantine = where
+    })
+}
+
 export interface TempBackupRef { stamp: string, path: string, sizeBytes: number }
 export type TempBackupState = 'created' | 'deleted' | 'delete-failed' | 'kept'
 
