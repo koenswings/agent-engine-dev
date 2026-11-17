@@ -250,7 +250,14 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
     if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
     // #239 (Steve): await the start too, so a stopInstance queued behind it cannot run mid-start
     // and the start trace closes only once the start is done.
-    await startInstance(storeHandle, instance, disk, cause, deferStoreStatus ? { deferStoreStatus: true } : {})
+    // engine#497 stage 3 (a): `--op <opId>` — the cross-Engine move that marked this folder starts
+    // it while it is still under its in-flight marker (any other start of a marked folder is refused)
+    const opFlag = rest.indexOf('--op')
+    const inFlightOpId = opFlag >= 0 ? rest[opFlag + 1] : undefined
+    await startInstance(storeHandle, instance, disk, cause, {
+        ...(deferStoreStatus ? { deferStoreStatus: true } : {}),
+        ...(inFlightOpId ? { inFlightOpId } : {}),
+    })
 }
 
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {

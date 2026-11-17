@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
-import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH, helperAtLeast, BACKUP_CLEANUP_HELPER_MIN, type AppDataRunner } from '../utils/appDataHelper.js';
+import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH, helperAtLeast, BACKUP_CLEANUP_HELPER_MIN, CROSS_RESUME_HELPER_MIN, type AppDataRunner } from '../utils/appDataHelper.js';
 import { PEER_GATE, PEER_AUTHORIZED_KEYS, PEER_KNOWN_HOSTS } from '../utils/peerSsh.js';
 import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js';
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
@@ -197,6 +197,11 @@ export interface EraseInProgress {
  *   preUpdateQuarantine: 24 h cleanup of a pre-update snapshot (idea#396);
  *               advertised only when the app-data helper is at v14 or newer,
  *               checked once at startup (same pattern as backupCleanup).
+ *   crossEngineResume: engine#497 stage 3 (a). This Engine's helper and peer gate take the
+ *               v23 verbs (mark-in-flight, clear-in-flight, receive with an op id,
+ *               verify-receive), so a source Engine may resume a copy or move into it.
+ *               Advertised only when the app-data helper is at v23 or newer, checked once
+ *               at startup. A source refuses a target without it (TARGET_OUTDATED).
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
@@ -293,6 +298,29 @@ export const checkPreUpdateQuarantineCapability = async (
 /** Test seam: drop the cached startup check so later cases start from "not checked". */
 export const resetPreUpdateQuarantineCapabilityForTests = (): void => { preUpdateQuarantineHelperOk = null }
 
+/** engine#497 stage 3 (a): advertised only when the app-data helper (and its gate) is v23 or newer */
+import { CROSS_ENGINE_RESUME_CAPABILITY } from './InFlight.js'
+export { CROSS_ENGINE_RESUME_CAPABILITY }
+let crossEngineResumeHelperOk: boolean | null = null
+
+/** Once at startup, decide whether to advertise `crossEngineResume`. Never throws. */
+export const checkCrossEngineResumeCapability = async (
+  run?: AppDataRunner,
+  timeoutMs: number = PRE_UPDATE_QUARANTINE_HELPER_CHECK_MS,
+): Promise<boolean> => {
+  try {
+    const outdated = await withTimeout(helperAtLeast(CROSS_RESUME_HELPER_MIN, 'crossEngineResume', run), timeoutMs)
+    crossEngineResumeHelperOk = outdated === null
+  } catch {
+    crossEngineResumeHelperOk = false
+  }
+  log(`crossEngineResume capability ${crossEngineResumeHelperOk ? 'advertised' : 'omitted'} (app-data helper ${crossEngineResumeHelperOk ? '' : 'older than '}v${CROSS_RESUME_HELPER_MIN}${crossEngineResumeHelperOk ? '+' : ', missing, error or timeout'})`)
+  return crossEngineResumeHelperOk
+}
+
+/** Test seam: drop the cached startup check. */
+export const resetCrossEngineResumeCapabilityForTests = (): void => { crossEngineResumeHelperOk = null }
+
 /** The capability list written at this startup */
 let demoAppsPythonOk: boolean | null = null
 
@@ -321,12 +349,14 @@ export const engineCapabilities = (
   cleanupHelperOk: boolean = backupCleanupHelperOk === true,
   quarantineHelperOk: boolean = preUpdateQuarantineHelperOk === true,
   demoAppsOk: boolean = demoAppsPythonOk === true,
+  crossResumeOk: boolean = crossEngineResumeHelperOk === true,
 ): string[] => {
   const caps = [...ENGINE_CAPABILITIES]
   if (helperInstalled) caps.push(FLASH_CARD_CAPABILITY)
   if (cleanupHelperOk) caps.push(BACKUP_CLEANUP_CAPABILITY)
   if (quarantineHelperOk) caps.push(PRE_UPDATE_QUARANTINE_CAPABILITY)
   if (demoAppsOk) caps.push(DEMO_APPS_CAPABILITY)
+  if (crossResumeOk) caps.push(CROSS_ENGINE_RESUME_CAPABILITY)
   return caps
 }
 

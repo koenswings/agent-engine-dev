@@ -10,7 +10,7 @@ import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
 import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
 import { warnIfTestFailUpdateRestartIgnored } from './data/UpdateAppTestHook.js'
-import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkDemoAppsCapability } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkCrossEngineResumeCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
@@ -22,7 +22,7 @@ import { createServerStore } from './data/Store.js'
 import { assertStoreIdentityMatchesData, prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { enableInstanceStatusMonitor } from './monitors/instanceStatusMonitor.js'
-import { recoverInterruptedOperations, archiveOldOperations, markEngineStopping } from './data/Operations.js'
+import { recoverInterruptedOperations, archiveOldOperations, markEngineStopping, watchPeerResumes } from './data/Operations.js'
 import { startBackupScheduler } from './monitors/backupScheduler.js'
 import { startDataBytesMonitor } from './data/DataBytes.js'
 import { startPreUpdateQuarantine } from './monitors/preUpdateQuarantine.js'
@@ -146,6 +146,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Must run before createOrUpdateEngine writes Engine.capabilities.
     await checkBackupCleanupCapability()
     await checkPreUpdateQuarantineCapability()
+    await checkCrossEngineResumeCapability()
     checkDemoAppsCapability()
 
     // Create or update the local engine object
@@ -196,6 +197,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
     // engine#497: each retry runs inside the interrupted op and rejects on failure (RecoveryRetry.ts)
     await recoverInterruptedOperations(storeHandle, bootRetryHandlers)
+    // engine#497 stage 3 (a): a parked cross-Engine copy/move resumes when its target is ready on a peer
+    watchPeerResumes(storeHandle)
 
     // Create the command log store and initialise the console patcher
     log(chalk.bgMagenta('STARTING COMMAND LOG STORE'))

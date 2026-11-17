@@ -365,3 +365,88 @@ describe('idea-app-data receive-app / receive-service (written as pi)', () => {
         refused(await sb.run(['receive-service', 'sdc1', '-e', 'sh', '.', '.']), /first server argument must be --server/)
     })
 })
+
+describe('idea-app-data v23 (engine#497 a): the peer in-flight marker, resume and verify on the receiving side', () => {
+    const OP = 'Ab3dEf5hJk7mNp9qRs1'
+    const DRY = ['--server', '-nlHogDtpAXrxe.iLsfxCIvu', '--log-format=%i', '--numeric-ids', '.', '.']
+    let dst: string
+    beforeEach(async () => { dst = await sb.addDisk('sdc1') })
+    const marker = () => path.join(dst, 'instances', 'new1.idea-op-in-flight')
+
+    it('peer-mark-in-flight writes a root-owned 0644 marker naming the PEER (not the caller) and is journaled; the same op again is fine', async () => {
+        const r = await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])
+        expect(r.exitCode, r.stderr).toBe(0)
+        expect((await fs.stat(marker())).mode & 0o777).toBe(0o644)
+        expect(await fs.readFile(marker(), 'utf8')).toMatch(new RegExp(`^opId=${OP}\nengineId=ENGINE_a\ncreated=\\d{4}-`))
+        expect(await sb.journalText()).toMatch(/peer-mark-in-flight: .*new1\.idea-op-in-flight for operation Ab3dEf5hJk7mNp9qRs1 of Engine ENGINE_a/)
+        expect((await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
+        refused(await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', 'Other0p']), /IN_FLIGHT: .* marks operation Ab3dEf5hJk7mNp9qRs1, not Other0p/)
+        refused(await sb.run(['peer-mark-in-flight', 'ENGINE_b', 'sdc1', 'new1', OP]), /IN_FLIGHT: .* belongs to Engine ENGINE_a, not ENGINE_b/)
+        expect(await fs.pathExists(path.join(dst, 'instances', 'new1'))).toBe(false)   // marking writes no folder
+    })
+
+    it('peer-mark-in-flight refuses an existing folder (an instance of this Engine, or any leftover)', async () => {
+        await sb.addInstance(dst, 'users-data')
+        refused(await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'users-data', OP]), /users-data already exists; a peer marks only a new instance folder/)
+        await fs.ensureDir(path.join(dst, 'instances', 'empty1'))
+        refused(await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'empty1', OP]), /already exists/)
+        refused(await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', 'bad op']), /operation id 'bad op' does not match/)
+        expect(await fs.pathExists(path.join(dst, 'instances', 'users-data.idea-op-in-flight'))).toBe(false)
+    })
+
+    it('peer-receive refuses a marked id; peer-resume-receive writes only under that peer\'s marker of that op (rrsync -wo, ledger line)', async () => {
+        expect((await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
+        refused(await sb.run(['peer-receive', 'ENGINE_a', 'sdc1', 'new1', ...SERVER]), /IN_FLIGHT: .* only that operation resumes it/)
+        refused(await sb.run(['peer-resume-receive', 'ENGINE_b', 'sdc1', 'new1', OP, ...SERVER]), /belongs to Engine ENGINE_a, not ENGINE_b/)
+        refused(await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', 'Other0p', ...SERVER]), /marks operation .*, not Other0p/)
+        refused(await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'nomark', OP, ...SERVER]), /no in-flight marker/)
+        refused(await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, '--server', '--sender', '.', '.']), /--sender is not allowed/)
+        expect(await sb.calls('rrsync')).toEqual([])
+        const r = await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER])
+        expect(r.exitCode, r.stderr).toBe(0)
+        await fs.writeFile(path.join(dst, 'instances', 'new1', 'half'), 'x')
+        const again = await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER])
+        expect(again.exitCode, again.stderr).toBe(0)
+        expect((await sb.calls('rrsync')).map(c => c.argv)).toEqual([['-wo', path.join(dst, 'instances', 'new1')], ['-wo', path.join(dst, 'instances', 'new1')]])
+        expect(await fs.readFile(path.join(sb.ledgerDir, 'received'), 'utf8')).toMatch(/^\d+ ENGINE_a sdc1 new1\n$/)
+        // the free-space floor holds here too
+        refused(await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER], { FAKE_DF_AVAIL_KB: '5' }), /only 5 KB free/)
+    })
+
+    it('peer-receive-files is allowed by that peer\'s marker (no 24 h ledger TTL), never by another peer\'s', async () => {
+        expect((await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
+        expect((await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER])).exitCode).toBe(0)
+        await fs.writeFile(path.join(sb.ledgerDir, 'received'), '')                       // ledger line gone (e.g. > 24 h)
+        const ok = await sb.run(['peer-receive-files', 'ENGINE_a', 'sdc1', 'new1', ...SERVER])
+        expect(ok.exitCode, ok.stderr).toBe(0)
+        refused(await sb.run(['peer-receive-files', 'ENGINE_b', 'sdc1', 'new1', ...SERVER]), /did not create .*its in-flight marker belongs to Engine ENGINE_a/)
+    })
+
+    it('peer-verify-receive: a dry run only, under the marker, into an existing folder; the one exact --log-format=%i token', async () => {
+        expect((await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
+        refused(await sb.run(['peer-verify-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...DRY]), /instance folder .* is not a folder/)
+        expect((await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER])).exitCode).toBe(0)
+        refused(await sb.run(['peer-verify-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER]), /runs only a dry run/)
+        refused(await sb.run(['peer-verify-receive', 'ENGINE_a', 'sdc1', 'new1', OP, '--server', '-n', '--log-format=%n', '.', '.']), /unsafe rsync server argument/)
+        refused(await sb.run(['peer-verify-receive', 'ENGINE_a', 'sdc1', 'new1', OP, '--server', '-n', '--sender', '.', '.']), /--sender is not allowed/)
+        refused(await sb.run(['peer-verify-receive', 'ENGINE_b', 'sdc1', 'new1', OP, ...DRY]), /belongs to Engine ENGINE_a/)
+        const n = (await sb.calls('rrsync')).length
+        const r = await sb.run(['peer-verify-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...DRY])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const calls = await sb.calls('rrsync')
+        expect(calls.length).toBe(n + 1)
+        expect(calls.at(-1)!.argv).toEqual(['-wo', path.join(dst, 'instances', 'new1')])
+        expect(calls.at(-1)!.env.SSH_ORIGINAL_COMMAND).toBe(`rsync ${DRY.join(' ')}`)
+    })
+
+    it('peer-clear-in-flight removes only that peer\'s marker of that op; an absent marker is fine', async () => {
+        expect((await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
+        refused(await sb.run(['peer-clear-in-flight', 'ENGINE_b', 'sdc1', 'new1', OP]), /belongs to Engine ENGINE_a/)
+        refused(await sb.run(['peer-clear-in-flight', 'ENGINE_a', 'sdc1', 'new1', 'Other0p']), /not Other0p/)
+        expect(await fs.pathExists(marker())).toBe(true)
+        expect((await sb.run(['peer-clear-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
+        expect(await fs.pathExists(marker())).toBe(false)
+        expect((await sb.run(['peer-clear-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
+        expect(await sb.journalText()).toMatch(/peer-clear-in-flight: .*new1\.idea-op-in-flight of operation Ab3dEf5hJk7mNp9qRs1 of Engine ENGINE_a/)
+    })
+})

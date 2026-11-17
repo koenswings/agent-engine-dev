@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '21'
+export const APP_DATA_HELPER_VERSION = '23'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -153,10 +153,29 @@ export const parseKolibriRebind = (out: string): KolibriRebindResult => {
     }
 }
 /** send: the peer's address AND its Engine id (the helper pins the peer's host key by Engine id). */
-export const sendArgs = (srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string): string[] => {
+export const sendArgs = (srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string, opId?: string): string[] => {
     if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host)) throw new Error(`'${host}' is not a host the app-data helper accepts`)
-    return ['send', checkRoot(srcRoot), checkId(srcId), host, checkEngineId(peerEngineId), checkRoot(dstRoot), checkId(dstId)]
+    return ['send', checkRoot(srcRoot), checkId(srcId), host, checkEngineId(peerEngineId), checkRoot(dstRoot), checkId(dstId), ...(opId ? [checkOpId(opId)] : [])]
 }
+
+// ── engine#497 stage 3 (a) (helper v23): cross-Engine resume ─────────────────
+/**
+ * Koen 2026-11-17, Q1 option A: the SOURCE Engine owns the resume and pushes again into the
+ * same folder and id on the peer, under an in-flight marker the peer's gate writes with the
+ * gate's own peer id. v22 is engine#506 (swap quarantine); this feature takes v23.
+ */
+export const CROSS_RESUME_HELPER_MIN = 23
+/** verify-send: the content check of a cross-Engine copy against its source (dry run both sides). */
+export const verifySendArgs = (srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string, opId: string): string[] => {
+    if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host)) throw new Error(`'${host}' is not a host the app-data helper accepts`)
+    return ['verify-send', checkRoot(srcRoot), checkId(srcId), host, checkEngineId(peerEngineId), checkRoot(dstRoot), checkId(dstId), checkOpId(opId)]
+}
+/** On a peer (through its gate → peer-mark-in-flight <this Engine>): mark a NEW id for this op. */
+export const remoteMarkInFlightArgs = (root: string, id: string, opId: string): string[] =>
+    ['mark-in-flight', checkRoot(root), checkId(id), checkOpId(opId)]
+/** On a peer (through its gate → peer-clear-in-flight <this Engine>): clear this op's marker. */
+export const remoteClearInFlightArgs = (root: string, id: string, opId: string): string[] =>
+    ['clear-in-flight', checkRoot(root), checkId(id), checkOpId(opId)]
 /** On a peer (through its gate): create apps/, instances/, services/ on <root>, owned by pi. */
 export const ensureDirsArgs = (root: string): string[] => ['ensure-dirs', checkRoot(root)]
 /**
@@ -354,6 +373,11 @@ export const remoteSizeSshArgs = (host: string, peerEngineId: string, root: stri
 /** The ssh argv that creates apps/, instances/ and services/ on the peer's target disk (idea#80). */
 export const remoteEnsureDirsSshArgs = (host: string, peerEngineId: string, root: string): string[] =>
     peerSshArgv(host, peerEngineId, remoteHelperCommand(ensureDirsArgs(root)))
+/** engine#497 (a): mark / clear this op's in-flight marker on a peer (v23 gate verbs). */
+export const remoteMarkInFlightSshArgs = (host: string, peerEngineId: string, root: string, id: string, opId: string): string[] =>
+    peerSshArgv(host, peerEngineId, remoteHelperCommand(remoteMarkInFlightArgs(root, id, opId)))
+export const remoteClearInFlightSshArgs = (host: string, peerEngineId: string, root: string, id: string, opId: string): string[] =>
+    peerSshArgv(host, peerEngineId, remoteHelperCommand(remoteClearInFlightArgs(root, id, opId)))
 
 // ── Running the helper ───────────────────────────────────────────────────────
 

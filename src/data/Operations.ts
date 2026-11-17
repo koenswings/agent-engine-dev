@@ -20,6 +20,7 @@ import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
 import { getCommandLogHandle, addTrace, closeTrace } from './CommandLogStore.js'
 import { runWithTrace, flushTrace } from '../utils/CommandLogger.js'
+import { engineCanResume, isPeerLinkFailure } from './InFlight.js'
 
 // ── Recovery strategy per operation kind ─────────────────────────────────────
 
@@ -426,9 +427,13 @@ export const RESUME_GAVE_UP = 'RESUME_GAVE_UP'
 const RESUME_TEXT = /^RESUME_(WAITING|PENDING|GAVE_UP)\b/
 const RESUMABLE_KINDS: readonly OperationKind[] = ['copyApp', 'moveApp', 'backupApp']
 
-/** An op that resumes in place: a local copy/move or a backup that recorded args.phase. */
+/**
+ * An op that resumes in place: a local copy/move or a backup that recorded args.phase, or
+ * (engine#497 stage 3 (a)) a cross-Engine copy/move that recorded args.crossResume '1'.
+ * A cross-Engine move of an older Engine (op.move without crossResume) is not resumable.
+ */
 export const isResumableOp = (op: Operation | null | undefined): boolean =>
-    !!op && RESUMABLE_KINDS.includes(op.kind) && !op.move && !!op.args?.phase
+    !!op && RESUMABLE_KINDS.includes(op.kind) && !!op.args?.phase && (!op.move || op.args?.crossResume === '1')
 
 /** A resumable op waiting for its next boot or dock (Pending, RESUME_WAITING / RESUME_PENDING). */
 export const isParkedOp = (op: Operation | null | undefined): boolean =>
@@ -526,6 +531,25 @@ export const resumeDisksOf = (store: Store | undefined, op: Operation): string[]
 const dockedThisBoot = new Set<string>()
 
 /**
+ * engine#497 stage 3 (a): how this Engine reaches a peer now (its address in the network
+ * connections, or undefined). CopyMoveApp.ts wires it to Network.getEngineAddress; tests replace it.
+ */
+export const peerResumeProbe: { address: (engineId: string) => string | undefined } = { address: () => undefined }
+
+/**
+ * The target disk of a cross-Engine copy/move is ready on a peer: docked there, the peer is
+ * connected now and advertises crossEngineResume (this boot). Only the op's target may be on a
+ * peer; its source is always on this Engine.
+ */
+export const peerTargetReady = (store: Store | undefined, op: Operation, diskId: string, engineId: EngineID = localEngineId): boolean => {
+    const a = (op.args ?? {}) as Record<string, string>
+    if (a.crossEngine !== 'true' || String(a.targetDiskId) !== String(diskId)) return false
+    const d = store?.diskDB?.[diskId as any] as any
+    if (!d?.device || !d.dockedTo || String(d.dockedTo) === String(engineId)) return false
+    return !!peerResumeProbe.address(String(d.dockedTo)) && engineCanResume(store, String(d.dockedTo))
+}
+
+/**
  * Ready when every disk the op needs that is (or was) on this Engine has finished a dock pass
  * here since the Engine started. Boot recovery runs before the USB monitor docks anything, so
  * a resumable op always waits for its dock pass (the source App is started by that pass and
@@ -538,6 +562,8 @@ export const resumeGate = (store: Store | undefined, op: Operation, engineId: En
         const d = store?.diskDB?.[id as any] as any
         if (!d) return false
         // docked to another Engine: only this Engine resumes its op, when the disk is back here
+        // (engine#497 (a): or, for a cross-Engine op's target, when it is ready on a peer)
+        if (peerTargetReady(store, op, id, engineId)) return false
         return !(dockedThisBoot.has(id) && d.device && String(d.dockedTo) === String(engineId))
     })
     return { ready: waitingFor.length === 0, waitingFor }
@@ -557,6 +583,8 @@ export const resetResumeStateForTests = (): void => {
     dockedThisBoot.clear()
     activeResumes.clear()
     resumeHandlers = null
+    peerSeen.clear()
+    peerTriedAt.clear()
 }
 
 /**
@@ -639,6 +667,86 @@ export const resumeParkedOps = (storeHandle: DocHandle<Store>, diskId?: string, 
     return started
 }
 
+/**
+ * engine#497 stage 3 (a): why a failed cross-Engine run counts as an interruption on the peer side
+ * (the target disk left its Engine, that Engine is not connected, or the link to it failed), or
+ * null when it is a real failure.
+ */
+export const peerInterruption = (store: Store | undefined, targetDiskId: string, targetEngineId: string, reason: string): string | null => {
+    const d = store?.diskDB?.[targetDiskId as any] as any
+    const label = d?.name ? `'${d.name}' (${targetDiskId})` : targetDiskId
+    if (!d?.device || !d.dockedTo) return `target disk ${label} is no longer docked`
+    if (String(d.dockedTo) !== String(targetEngineId)) return `target disk ${label} is no longer docked to Engine ${targetEngineId}`
+    if (!peerResumeProbe.address(String(targetEngineId))) return `Engine ${targetEngineId} is not connected`
+    if (isPeerLinkFailure(reason)) return `the link to Engine ${targetEngineId} failed`
+    return null
+}
+
+// ── engine#497 stage 3 (a): resume when a peer target comes back ─────────────
+//
+// The target disk of a cross-Engine op docks on the PEER, so noteDiskDocked never fires here.
+// The source Engine watches the store (and a timer) instead. A parked op whose target is ready
+// on a peer resumes when:
+//   - it is RESUME_WAITING (an interruption, never counted): at most once per PEER_RESUME_RETRY_MS;
+//   - it is RESUME_PENDING (a counted failure): only when the peer rebooted or the disk re-docked
+//     there since this Engine last looked (lastBooted / lastDocked / address changed), like a dock.
+
+/** How often a RESUME_WAITING cross-Engine op is tried again while its peer target is ready. */
+export const PEER_RESUME_RETRY_MS = 60_000
+const peerSeen = new Map<string, string>()
+const peerTriedAt = new Map<string, number>()
+
+const peerKeyOf = (store: Store | undefined, op: Operation): string => {
+    const d = store?.diskDB?.[String(op.args?.targetDiskId ?? '') as any] as any
+    const e = d?.dockedTo ? (store?.engineDB as any)?.[String(d.dockedTo)] : undefined
+    return `${d?.dockedTo ?? '-'}|${e?.lastBooted ?? '-'}|${d?.lastDocked ?? '-'}|${d?.dockedTo ? peerResumeProbe.address(String(d.dockedTo)) ?? '-' : '-'}`
+}
+
+/** Resume this Engine's parked cross-Engine ops whose peer target is ready (see above). Returns the ids it started. */
+export const resumePeerParkedOps = (storeHandle: DocHandle<Store>, now: number = Date.now(), engineId: EngineID = localEngineId): string[] => {
+    if (!resumeHandlers) return []
+    const store = storeHandle.doc()
+    const started: string[] = []
+    for (const op of Object.values(store?.operationDB ?? {})) {
+        if (!op || op.args?.crossEngine !== 'true' || !isResumableOp(op) || !isParkedOp(op)) continue
+        if (String(op.engineId) !== String(engineId) || activeResumes.has(op.id)) continue
+        const key = peerKeyOf(store, op)
+        const prev = peerSeen.get(op.id)
+        peerSeen.set(op.id, key)
+        if (!resumeGate(store, op, engineId).ready) continue
+        const waiting = String(op.error ?? '').startsWith(RESUME_WAITING)
+        const changed = prev !== undefined && prev !== key
+        const due = now - (peerTriedAt.get(op.id) ?? 0) >= PEER_RESUME_RETRY_MS
+        if (!changed && !(waiting && due)) continue
+        const handler = resumeHandlers[op.kind]
+        if (!handler) continue
+        peerTriedAt.set(op.id, now)
+        log(chalk.blue(`resume: ${op.id.slice(0, 8)} ${op.kind}: its target is ready on Engine ${String((store?.diskDB as any)?.[String(op.args?.targetDiskId)]?.dockedTo)}; resuming it in the same operation (was: ${op.error})`))
+        updateOperation(storeHandle, op.id, { status: 'Pending', error: RETRY_MARKER })
+        void runRecoveryRetry(storeHandle, op, handler)
+        started.push(op.id)
+    }
+    return started
+}
+
+/**
+ * Start the watch for resumePeerParkedOps: on every store change (throttled to once a second)
+ * and every PEER_RESUME_RETRY_MS. Returns a stop function.
+ */
+export const watchPeerResumes = (storeHandle: DocHandle<Store>, intervalMs: number = PEER_RESUME_RETRY_MS): (() => void) => {
+    let last = 0
+    const run = () => {
+        const now = Date.now()
+        if (now - last < 1000) return
+        last = now
+        try { resumePeerParkedOps(storeHandle, now) } catch (e: any) { log(chalk.red(`resume: peer watch: ${e?.message ?? e}`)) }
+    }
+    storeHandle.on('change', run)
+    const timer = setInterval(run, Math.max(1000, intervalMs))
+    timer.unref?.()
+    return () => { clearInterval(timer); try { storeHandle.off('change', run) } catch { /* typings */ } }
+}
+
 /** A disk finished its dock pass on this Engine: resume the parked ops that waited for it. */
 export const noteDiskDocked = (storeHandle: DocHandle<Store>, diskId: string): string[] => {
     dockedThisBoot.add(String(diskId))
@@ -694,7 +802,7 @@ export const recoverInterruptedOperations = async (
     for (const op of interrupted) {
         // idea#79: an interrupted cross-Engine move is never retried and never
         // removes the source; only a recorded verify means the copy is good.
-        if (op.kind === 'moveApp' && op.move) {
+        if (op.kind === 'moveApp' && op.move && !isResumableOp(op)) {
             const verified = op.move.verified === true
             const { cleanupUnverifiedMoveTarget, flipStoredOnAfterVerify } = await import('./MoveAppRemote.js')
             if (!verified) {

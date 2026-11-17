@@ -26,6 +26,9 @@ const H = '/usr/local/sbin/idea-app-data'
 const SRV = '--server -logDtpre.iLsfxCIvu --numeric-ids . .'
 const PEER = 'ENGINE_peer2'
 const sudoArgv = async () => (await sb.calls('sudo')).map(c => c.argv)
+const OPID = 'Ab3dEf5hJk7mNp9qRs1'
+// what rsync sends the server for verify-send (a dry, itemized push)
+const VSRV = '--server -nlHogDtpAXrxe.iLsfxCIvu --log-format=%i --numeric-ids . .'
 
 describe('idea-peer-gate: the allow-list and its mapping', () => {
     const cases: [string, string[]][] = [
@@ -37,6 +40,11 @@ describe('idea-peer-gate: the allow-list and its mapping', () => {
         [`sudo -n ${H} receive-service sdb1 ${SRV}`, ['receive-service', 'sdb1', ...SRV.split(' ')]],
         [`sudo -n ${H} delete sdb1 new1`, ['peer-delete', PEER, 'sdb1', 'new1']],
         [`/usr/bin/sudo -n ${H} delete sdb1 new1`, ['peer-delete', PEER, 'sdb1', 'new1']],
+        // engine#497 (a, v23): always with the gate's own peer id, never one the caller names
+        [`sudo -n ${H} mark-in-flight sdb1 new1 ${OPID}`, ['peer-mark-in-flight', PEER, 'sdb1', 'new1', OPID]],
+        [`sudo -n ${H} clear-in-flight sdb1 new1 ${OPID}`, ['peer-clear-in-flight', PEER, 'sdb1', 'new1', OPID]],
+        [`sudo -n ${H} receive sdb1 new1 ${OPID} ${SRV}`, ['peer-resume-receive', PEER, 'sdb1', 'new1', OPID, ...SRV.split(' ')]],
+        [`/usr/bin/sudo -n ${H} verify-receive sdb1 new1 ${OPID} ${VSRV}`, ['peer-verify-receive', PEER, 'sdb1', 'new1', OPID, ...VSRV.split(' ')]],
     ]
     for (const [cmd, helperArgs] of cases) {
         it(`${cmd.slice(0, 70)} → idea-app-data ${helperArgs.slice(0, 3).join(' ')}`, async () => {
@@ -95,7 +103,18 @@ describe('idea-peer-gate: everything outside the allow-list is refused, sudo nev
         [`sudo -n ${H} ensure-dirs sdb1 sdc1`, /ensure-dirs takes exactly <root>/],
         [`sudo -n ${H} delete sdb1`, /delete takes exactly <root> <id>/],
         [`sudo -n ${H} delete sdb1 new1 new2`, /delete takes exactly <root> <id>/],
-        [`sudo -n ${H} receive sdb1 new1`, /receive takes <root> <id> and the rsync server arguments/],
+        [`sudo -n ${H} receive sdb1 new1`, /receive takes <root> <id> \[<opId>\] and the rsync server arguments/],
+        // engine#497 (a, v23): the resumable receive, the marker verbs and the dry-run verify
+        [`sudo -n ${H} receive sdb1 new1 ${OPID}`, /receive takes <root> <id> \[<opId>\] and the rsync server arguments/],
+        [`sudo -n ${H} receive sdb1 new1 ${OPID} --server --sender . .`, /write-only/],
+        [`sudo -n ${H} mark-in-flight sdb1 new1`, /mark-in-flight takes exactly <root> <id> <opId>/],
+        [`sudo -n ${H} mark-in-flight sdb1 new1 ${OPID} ENGINE_other`, /mark-in-flight takes exactly <root> <id> <opId>/],
+        [`sudo -n ${H} clear-in-flight sdb1 new1`, /clear-in-flight takes exactly <root> <id> <opId>/],
+        [`sudo -n ${H} verify-receive sdb1 new1 ${OPID}`, /verify-receive takes <root> <id> <opId> and the rsync server arguments/],
+        [`sudo -n ${H} verify-receive sdb1 new1 ${OPID} --server --sender -n . .`, /write-only/],
+        [`sudo -n ${H} receive sdb1 new1 ${OPID} --server -nlogDtpre.iLsfxCIvu --log-format=%i . .`, /only verify-receive may carry --log-format=%i/],
+        [`sudo -n ${H} verify-receive sdb1 new1 ${OPID} --server -n --log-format=%n . .`, /character outside/],
+        [`sudo -n ${H} verify-receive sdb1 new1 ${OPID} --server -n --log-format=%i%n . .`, /character outside/],
         [`sudo -n ${H} receive sdb1 new1 -e sh . .`, /receive needs the rsync server arguments/],
         [`sudo -n ${H} receive sdb1 new1 --server --sender -logDtpre.iLsfxCIvu . .`, /write-only: --sender is not allowed/],
         [`sudo -n ${H} receive-files sdb1 new1 --server --sender . .`, /write-only/],
@@ -103,7 +122,7 @@ describe('idea-peer-gate: everything outside the allow-list is refused, sudo nev
         [`sudo -n ${H} receive-service sdb1 --server --sender . .`, /write-only/],
         [`sudo -n ${H} receive-service sdb1`, /receive-service takes <root>/],
         // helper subcommands a peer must never reach directly
-        ...['send', 'copy', 'size', 'sync-peers', 'clear-peers', 'install-usage-key', 'peer-delete', 'peer-receive', 'peer-receive-files',
+        ...['send', 'verify-send', 'peer-mark-in-flight', 'peer-clear-in-flight', 'peer-resume-receive', 'peer-verify-receive', 'copy', 'size', 'sync-peers', 'clear-peers', 'install-usage-key', 'peer-delete', 'peer-receive', 'peer-receive-files',
             'borg-init', 'borg-info', 'borg-create', 'borg-extract', 'unknown'].map(s =>
             [`sudo -n ${H} ${s} sdb1 new1 x y z`, new RegExp(`subcommand '${s}' is not allowed for a peer Engine key`)] as [string, RegExp]),
         [`sudo -n ${H} peer-delete ENGINE_other sdb1 new1`, /subcommand 'peer-delete' is not allowed/],
@@ -152,6 +171,66 @@ describe('idea-peer-gate end to end (gate → sudo → helper)', () => {
         const own = await sb.runGate([PEER], `sudo -n ${H} delete sdc1 new1`)
         expect(own.exitCode, own.stderr).toBe(0)
         expect(await fs.pathExists(path.join(root, 'instances', 'new1'))).toBe(false)
+    })
+
+    it('engine#497 (a): the resumable receive end to end — marked by the peer, resumed only by that peer and op, verified dry, cleared', async () => {
+        const root = await sb.addDisk('sdc1')
+        const marker = path.join(root, 'instances', 'new1.idea-op-in-flight')
+        const mark = await sb.runGate([PEER], `sudo -n ${H} mark-in-flight sdc1 new1 ${OPID}`)
+        expect(mark.exitCode, mark.stderr).toBe(0)
+        expect(await fs.readFile(marker, 'utf8')).toMatch(new RegExp(`^opId=${OPID}\nengineId=${PEER}\ncreated=`))
+        // a plain receive (or another peer) cannot take the marked id
+        const plain = await sb.runGate([PEER], `sudo -n ${H} receive sdc1 new1 ${SRV}`)
+        expect(plain.exitCode).toBe(2)
+        expect(plain.stderr).toMatch(/IN_FLIGHT: .* only that operation resumes it/)
+        const other = await sb.runGate(['ENGINE_peer3'], `sudo -n ${H} receive sdc1 new1 ${OPID} ${SRV}`)
+        expect(other.exitCode).toBe(2)
+        expect(other.stderr).toMatch(/IN_FLIGHT: .* belongs to Engine ENGINE_peer2, not ENGINE_peer3/)
+        const otherMark = await sb.runGate(['ENGINE_peer3'], `sudo -n ${H} mark-in-flight sdc1 new1 Other0p`)
+        expect(otherMark.exitCode).toBe(2)
+        // the first push, then a half-written folder, then the resumed push of the same op
+        const first = await sb.runGate([PEER], `sudo -n ${H} receive sdc1 new1 ${OPID} ${SRV}`)
+        expect(first.exitCode, first.stderr).toBe(0)
+        await fs.writeFile(path.join(root, 'instances', 'new1', 'half'), 'x')
+        const again = await sb.runGate([PEER], `sudo -n ${H} receive sdc1 new1 ${OPID} ${SRV}`)
+        expect(again.exitCode, again.stderr).toBe(0)
+        expect(again.stderr).toMatch(/resume: .*new1 is not empty; continuing operation/)
+        const wrongOp = await sb.runGate([PEER], `sudo -n ${H} receive sdc1 new1 Other0p ${SRV}`)
+        expect(wrongOp.exitCode).toBe(2)
+        expect(wrongOp.stderr).toMatch(/IN_FLIGHT: .* marks operation Ab3dEf5hJk7mNp9qRs1, not Other0p/)
+        // the verify is a dry run only
+        const wet = await sb.runGate([PEER], `sudo -n ${H} verify-receive sdc1 new1 ${OPID} ${SRV}`)
+        expect(wet.exitCode).toBe(2)
+        expect(wet.stderr).toMatch(/runs only a dry run/)
+        const dry = await sb.runGate([PEER], `sudo -n ${H} verify-receive sdc1 new1 ${OPID} ${VSRV}`)
+        expect(dry.exitCode, dry.stderr).toBe(0)
+        const rr = await sb.calls('rrsync')
+        expect(rr.map(c => c.argv)).toEqual([0, 1, 2].map(() => ['-wo', path.join(root, 'instances', 'new1')]))
+        expect(rr[2].env.SSH_ORIGINAL_COMMAND).toBe(`rsync ${VSRV}`)
+        // only the marking peer clears it (another peer is refused; absent is fine)
+        expect((await sb.runGate(['ENGINE_peer3'], `sudo -n ${H} clear-in-flight sdc1 new1 ${OPID}`)).exitCode).toBe(2)
+        expect(await fs.pathExists(marker)).toBe(true)
+        const clear = await sb.runGate([PEER], `sudo -n ${H} clear-in-flight sdc1 new1 ${OPID}`)
+        expect(clear.exitCode, clear.stderr).toBe(0)
+        expect(await fs.pathExists(marker)).toBe(false)
+        expect((await sb.runGate([PEER], `sudo -n ${H} clear-in-flight sdc1 new1 ${OPID}`)).exitCode).toBe(0)
+        // without its marker the folder is no longer the peer's to resume into
+        const after = await sb.runGate([PEER], `sudo -n ${H} receive sdc1 new1 ${OPID} ${SRV}`)
+        expect(after.exitCode).toBe(2)
+        expect(after.stderr).toMatch(/no in-flight marker/)
+    })
+
+    it('engine#497 (a): a peer can never mark an existing instance of this Engine', async () => {
+        const root = await sb.addDisk('sdc1')
+        await sb.addInstance(root, 'mine')
+        const mark = await sb.runGate([PEER], `sudo -n ${H} mark-in-flight sdc1 mine ${OPID}`)
+        expect(mark.exitCode).toBe(2)
+        expect(mark.stderr).toMatch(/mine already exists; a peer marks only a new instance folder/)
+        expect(await fs.pathExists(path.join(root, 'instances', 'mine.idea-op-in-flight'))).toBe(false)
+        const resume = await sb.runGate([PEER], `sudo -n ${H} receive sdc1 mine ${OPID} ${SRV}`)
+        expect(resume.exitCode).toBe(2)
+        expect(await fs.readFile(path.join(root, 'instances', 'mine', 'compose.yaml'), 'utf8')).toBe('services: {}\n')
+        expect(await sb.calls('rrsync')).toEqual([])
     })
 
     it('a peer cannot delete or overwrite an existing instance of this Engine', async () => {

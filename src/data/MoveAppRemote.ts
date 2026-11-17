@@ -40,7 +40,8 @@ import { Disk, appDataRoot, diskMountRoot } from './Disk.js'
 import { Instance, startInstance } from './Instance.js'
 import { CHECKING_PROGRESS_INTERVAL_MS, checkingProgressMessage, clearPortReadyProgress, getPortReadyProgress } from './PortReadyProgress.js'
 import { InstanceID, InstanceName, DiskID, EngineID, OperationCause, Timestamp, Command } from './CommonTypes.js'
-import { createOperation, updateOperation } from './Operations.js'
+import { createOperation, updateOperation, setOperationArgs, peerResumeProbe } from './Operations.js'
+import { engineCanResume, peerInFlight } from './InFlight.js'
 import { attachTraceResult } from './SummariseDisk.js'
 import { sendCommand } from '../utils/commandUtils.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
@@ -50,7 +51,7 @@ import { getEngineAddress } from './Network.js'
 import { fs } from 'zx'
 import {
     MOVE_CROSS_ENGINE_CAPABILITY, MOVE_STEPS, MOVE_STEP_INDEX, MoveError, MoveProgress, MoveResult,
-    MOVE_FAILURE_CODES, MoveRefusalCode, MoveVerify, VerifyCode, MoveFailureCode, moveFailedText, movedText, sourceNotRemovedText, sourceKeptText, withTargetCleanupText, sizesMatch,
+    MOVE_FAILURE_CODES, MoveRefusalCode, MoveVerify, VerifyCode, MoveFailureCode, moveFailedText, movePausedText, movedText, sourceNotRemovedText, sourceKeptText, withTargetCleanupText, sizesMatch,
 } from './MoveAppShapes.js'
 
 export interface MoveDeps {
@@ -67,6 +68,10 @@ export interface MoveDeps {
     targetFolderExists: (store: Store, disk: Disk, id: InstanceID) => Promise<boolean>
     startSource: (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => Promise<void>
     removeSource: (storeHandle: DocHandle<Store>, instanceId: InstanceID, engineId: string, sourceDiskId: DiskID) => Promise<{ quarantinePath: string }>
+    /** engine#497 (a): null when this Engine's helper speaks the v23 cross-Engine resume verbs. */
+    crossResumeHelperProblem: () => Promise<string | null>
+    /** engine#497 (a): clear this op's in-flight marker of instances/<id> on the target Engine (its gate). */
+    clearTargetMarker: (host: string, targetEngineId: string, root: string, id: string, opId: string) => Promise<void>
     verifyTimeoutMs: number
     /** How long the source waits for the target to report move.targetCleanup (default CLEANUP_TIMEOUT_MS). Does not change verify timing. */
     cleanupTimeoutMs: number
@@ -196,6 +201,8 @@ const defaultDeps: MoveDeps = {
         // compose down -t 0 avoids waiting out a stop timeout on a stopped container.
         return quarantineInstanceOnDisk(disk, instanceId, { composeTimeoutSec: 0 })
     },
+    crossResumeHelperProblem: () => peerInFlight.helperProblem('moveApp to another Engine (resumable cross-Engine move, engine#497)'),
+    clearTargetMarker: (host, engine, root, id, opId) => peerInFlight.clear(host, engine, root, id, opId),
     verifyTimeoutMs: 6 * 60 * 1000,
     cleanupTimeoutMs: CLEANUP_TIMEOUT_MS,
     pollMs: 250,
@@ -335,6 +342,11 @@ export const waitForTargetCleanup = (
     if (already) finish(already)
 })
 
+export interface MoveCrossOptions {
+    /** engine#497 stage 3 (a): resume this (parked or interrupted) cross-Engine moveApp op in place */
+    recoveredOpId?: string
+}
+
 export const moveAppCrossEngine = async (
     storeHandle: DocHandle<Store>,
     instanceName: InstanceName,
@@ -342,12 +354,16 @@ export const moveAppCrossEngine = async (
     targetDiskId: DiskID,
     cause: OperationCause = 'console-command',
     deps: Partial<MoveDeps> = {},
+    opts: MoveCrossOptions = {},
 ): Promise<MoveResult> => {
     const d = { ...defaultDeps, ...deps }
     const refuse = (code: MoveRefusalCode, reason: string): never => {
         const text = moveFailedText(reason)
         throw new MoveError(code, text, { code, text, sourceInstanceId: String(instanceName), targetInstanceId: null, targetEngineId: '', quarantinePath: null })
     }
+    // engine#497 stage 3 (a): a resumed move continues in its own op, from op.move.phase
+    const recovered = opts.recoveredOpId ? (storeHandle.doc().operationDB?.[opts.recoveredOpId] as any) : undefined
+    const resuming = !!recovered?.move
 
     // ── Refusals: nothing has happened yet ──────────────────────────────────
     const v = await d.validate(storeHandle.doc(), instanceName, sourceDiskId, targetDiskId)
@@ -360,28 +376,60 @@ export const moveAppCrossEngine = async (
     if (!engineHasCapability(storeHandle.doc(), targetEngineId, MOVE_CROSS_ENGINE_CAPABILITY)) {
         refuse('TARGET_OUTDATED', `Engine ${targetName} cannot receive a move yet; update it first`)
     }
-    const helper = await d.helperProblem()
+    // engine#497 (a): every cross-Engine move is resumable, so the target needs the v23 gate verbs
+    if (!engineCanResume(storeHandle.doc(), targetEngineId)) {
+        refuse('TARGET_OUTDATED', `Engine ${targetName} cannot resume an interrupted move (no crossEngineResume capability); update it first`)
+    }
+    const helper = await d.helperProblem() ?? await d.crossResumeHelperProblem()
     if (helper) refuse('HELPER_OUTDATED', helper)
     if (resourceLock.isLocked(instanceKey(instance.id)) || resourceLock.isLocked(diskKey(targetDisk.id))) {
         refuse('BUSY', `another operation is running on '${instance.name}' or the target disk; retry when it completes`)
     }
-    const alreadyOn = occupyingTarget(storeHandle.doc(), instance.id, targetDisk, targetEngineId)
-    if (alreadyOn) refuse('TARGET_EXISTS', `instance ${instance.id} already exists on ${alreadyOn}`)
-    if (await d.targetFolderExists(storeHandle.doc(), targetDisk, instance.id)) {
-        refuse('TARGET_EXISTS', `instance ${instance.id} already exists on ${targetDisk.name}`)
+    if (resuming && String(recovered.move.targetEngineId) !== targetEngineId) {
+        throw new Error(`the target disk ${targetDisk.id} is now docked to Engine ${targetName}, not ${recovered.move.targetEngineId}; the move resumes only on the Engine it was marked on`)
+    }
+    if (!resuming) {
+        const alreadyOn = occupyingTarget(storeHandle.doc(), instance.id, targetDisk, targetEngineId)
+        if (alreadyOn) refuse('TARGET_EXISTS', `instance ${instance.id} already exists on ${alreadyOn}`)
+        if (await d.targetFolderExists(storeHandle.doc(), targetDisk, instance.id)) {
+            refuse('TARGET_EXISTS', `instance ${instance.id} already exists on ${targetDisk.name}`)
+        }
     }
 
-    const expectRunning = instance.status === 'Running' || instance.status === 'Starting'
-    const move: MoveProgress = {
-        phase: 'copying', targetEngineId, sourceInstanceId: String(instance.id), targetInstanceId: null,
-        expectedBytes: null, expectRunning, verify: null, verified: false, sourceRemoved: false,
-        quarantinePath: null, targetCleanup: null, targetCleanupDetail: null, code: null, resultText: null,
+    let opId: string
+    let expectRunning: boolean
+    let startedBaseline: number
+    if (resuming) {
+        opId = String(opts.recoveredOpId)
+        expectRunning = recovered.move.expectRunning === true
+        startedBaseline = Number(recovered.args?.startedBaseline ?? getInstance(storeHandle.doc(), instance.id)?.lastStarted ?? 0)
+        log(`moveApp: resuming operation ${opId} (phase ${recovered.move.phase}) to '${targetDisk.name}' on ${targetName}`)
+    } else {
+        expectRunning = instance.status === 'Running' || instance.status === 'Starting'
+        // The source must not be started or written to from here until it is removed
+        // (idea#79 call 3): the copy stops it and keeps it stopped; the remove step
+        // re-checks lastStarted, status and size against this baseline.
+        startedBaseline = Number(getInstance(storeHandle.doc(), instance.id)?.lastStarted ?? 0)
+        const move: MoveProgress = {
+            phase: 'copying', targetEngineId, sourceEngineId: engineId, sourceInstanceId: String(instance.id), targetInstanceId: null,
+            expectedBytes: null, expectRunning, verify: null, verified: false, sourceRemoved: false,
+            quarantinePath: null, targetCleanup: null, targetCleanupDetail: null, code: null, resultText: null,
+        }
+        opId = createOperation(storeHandle, 'moveApp', {
+            instanceId: String(instance.id), sourceDiskId: String(sourceDisk.id), targetDiskId: String(targetDisk.id), crossEngine: 'true',
+            instanceName: String(instance.name),
+            // engine#497 (a): resumable in place (Operations.isResumableOp), and what the source was
+            crossResume: '1', phase: 'copying', wasRunning: expectRunning ? '1' : '0', startedBaseline: String(startedBaseline),
+            targetEngineId,
+        }, cause, { type: 'instance', id: String(instance.id) })
+        storeHandle.change(doc => { const op = doc.operationDB?.[opId] as any; if (op) op.move = { ...move } })
     }
-    const opId = createOperation(storeHandle, 'moveApp', {
-        instanceId: String(instance.id), sourceDiskId: String(sourceDisk.id), targetDiskId: String(targetDisk.id), crossEngine: 'true',
-        instanceName: String(instance.name),
-    }, cause, { type: 'instance', id: String(instance.id) })
-    storeHandle.change(doc => { const op = doc.operationDB?.[opId] as any; if (op) op.move = { ...move } })
+    const moveNow = () => (storeHandle.doc().operationDB?.[opId] as any)?.move ?? {}
+    const argsNow = () => ((storeHandle.doc().operationDB?.[opId] as any)?.args ?? {}) as Record<string, string>
+    const enter = (phase: 'copying' | 'checking' | 'removing') => {
+        setPhase(storeHandle, opId, phase)
+        setOperationArgs(storeHandle, opId, { phase })
+    }
 
     const result = (code: MoveResult['code'], text: string, targetInstanceId: string | null, quarantinePath: string | null = null): MoveResult =>
         ({ code, text, sourceInstanceId: String(instance.id), targetInstanceId, targetEngineId, quarantinePath })
@@ -398,7 +446,31 @@ export const moveAppCrossEngine = async (
         finish(storeHandle, opId, r, true)
         return r
     }
-    let targetInstanceId: InstanceID | undefined
+    /**
+     * engine#497 (a), Koen Q1 option A + Q2: after the target is marked, a failed run never ends the
+     * move. The partial copy stays under its marker on the target, the source stays stopped, and the
+     * op parks (Pending RESUME_WAITING for an interruption, RESUME_PENDING (n/3) for a real failure,
+     * Failed RESUME_GAVE_UP at the third). This Engine resumes it into the same folder and id.
+     */
+    const park = async (e: unknown, targetId: string | null): Promise<MoveResult> => {
+        const { parkCrossCopyMove } = await import('./CopyMoveApp.js')
+        await parkCrossCopyMove(storeHandle, opId, String(sourceDisk.id), String(targetDisk.id), targetEngineId, e)
+        const op = storeHandle.doc().operationDB?.[opId] as any
+        const why = String(op?.error ?? (e as any)?.message ?? e)
+        const gaveUp = op?.status === 'Failed'
+        const text = gaveUp ? moveFailedText(why) : movePausedText(why)
+        log(`moveApp: ${text} (the copy on ${targetName} is kept under its in-flight marker)`)
+        return result(gaveUp ? 'RESUME_GAVE_UP' : 'RESUME_PARKED', text, targetId)
+    }
+    const targetMarked = () => argsNow().targetMarked === '1'
+    const targetRootP = appDataRoot(targetDisk)
+    const clearTargetMarker = async () => {
+        const host = peerResumeProbe.address(targetEngineId)
+        if (!host) throw new Error(`Engine ${targetName} is not currently reachable (not in network connections)`)
+        await d.clearTargetMarker(host, targetEngineId, await targetRootP, String(instance.id), opId)
+        setOperationArgs(storeHandle, opId, { targetMarked: null })
+    }
+    let targetInstanceId: InstanceID | undefined = (moveNow().targetInstanceId ?? undefined) as InstanceID | undefined
     // engine#388: on a pre-flip failure, ask the target to stop any Checking
     // container and quarantine its folder. Never runs after storedOn flips, and
     // never points at a folder whose row already says it is stored on the target.
@@ -423,88 +495,130 @@ export const moveAppCrossEngine = async (
         if (!seen) return record('failed', `timed out waiting for ${targetName} to confirm the target cleanup`)
         return seen.status
     }
-    const failAfterCleanup = async (code: MoveResult['code'], reason: string, targetId: string | null): Promise<MoveResult> => {
-        const base = moveFailedText(reason)
-        // Mark terminal non-success before asking the target to clean up, so a
-        // late or duplicate cleanup can tell this op from a newer or successful one.
-        finish(storeHandle, opId, result(code, base, targetId), true)
+    // SOURCE_CHANGED only (the source was started or written to): the move stops for good. The
+    // target marker goes first (best effort), then the engine#388 quarantine of the target copy.
+    const stopForGood = async (code: 'SOURCE_CHANGED', base: string, targetId: string | null): Promise<MoveResult> => {
+        finish(storeHandle, opId, result(code, base, targetId), false)
+        if (targetMarked()) {
+            try { await clearTargetMarker() } catch (e: any) { log(`moveApp: could not clear the in-flight marker on ${targetName}: ${e?.message ?? e}`) }
+        }
         const cleanup = await cleanupTargetCopy()
         await restartIfNeeded()
         const r = result(code, withTargetCleanupText(base, cleanup, targetName), targetId)
         log(`moveApp: ${r.text}`)
-        finish(storeHandle, opId, r, true)
+        finish(storeHandle, opId, r, false)
         return r
     }
 
+    let phase = String(moveNow().phase ?? 'copying')
+    if (phase !== 'checking' && phase !== 'removing') phase = 'copying'
+    if (moveNow().verified === true) phase = 'removing'
+    let baselineBytes: number = Number(moveNow().expectedBytes ?? NaN)
+
     // ── 1. Copying ─────────────────────────────────────────────────────────
-    setPhase(storeHandle, opId, 'copying')
-    // idea#498: ephemeral progress at the start of Copying so the Console is not
-    // blank for the 5–8 s before journaled copyApp steps (those are not stored
-    // on the moveApp operation; percent-only patches are dropped).
-    const emit = d.broadcast ?? ((msg: object) => { try { storeHandle.broadcast(msg as any) } catch { /* no peers */ } })
-    emit({ type: MOVE_PROGRESS_TYPE, opId, step: MOVE_STEPS[0], bytesDone: 0, bytesTotal: 0 })
-    const emitCopyBytes = throttledCopyProgress(emit, opId)
-    copyByteProgressByOp.set(opId, emitCopyBytes)
-    // The source must not be started or written to from here until it is removed
-    // (idea#79 call 3): the copy stops it and keeps it stopped; the remove step
-    // re-checks lastStarted, status and size against this baseline.
-    const startedBaseline = Number(getInstance(storeHandle.doc(), instance.id)?.lastStarted ?? 0)
-    let baselineBytes: number
-    try {
-        targetInstanceId = await d.copy(storeHandle, instance.id, sourceDisk.id, targetDisk.id, cause, opId)
-    } catch (e: any) {
-        await restartIfNeeded()
-        return fail('COPY_FAILED', `the copy to ${targetName} failed (${e?.message ?? e})`, null)
-    } finally {
-        copyByteProgressByOp.delete(opId)
+    if (phase === 'copying') {
+        enter('copying')
+        // idea#498: ephemeral progress at the start of Copying so the Console is not
+        // blank for the 5–8 s before journaled copyApp steps (those are not stored
+        // on the moveApp operation; percent-only patches are dropped).
+        const emit = d.broadcast ?? ((msg: object) => { try { storeHandle.broadcast(msg as any) } catch { /* no peers */ } })
+        emit({ type: MOVE_PROGRESS_TYPE, opId, step: MOVE_STEPS[0], bytesDone: 0, bytesTotal: 0 })
+        const emitCopyBytes = throttledCopyProgress(emit, opId)
+        copyByteProgressByOp.set(opId, emitCopyBytes)
+        try {
+            // engine#497 (a): copyApp marks instances/<id> on the target (args.targetMarked) before
+            // its first byte, pushes with this op id (a resumed run continues into the same folder)
+            // and verifies the folder against the source; the marker stays until the removing step.
+            targetInstanceId = await d.copy(storeHandle, instance.id, sourceDisk.id, targetDisk.id, cause, opId)
+        } catch (e: any) {
+            if (targetMarked()) return park(e, String(instance.id))
+            await restartIfNeeded()
+            return fail('COPY_FAILED', `the copy to ${targetName} failed (${e?.message ?? e})`, null)
+        } finally {
+            copyByteProgressByOp.delete(opId)
+        }
+        try {
+            patchMove(storeHandle, opId, { targetInstanceId: String(targetInstanceId) })
+            // Measured with the source stopped, right after the copy
+            baselineBytes = await d.sourceBytes(sourceDisk, instance.id)
+            patchMove(storeHandle, opId, { expectedBytes: baselineBytes })
+        } catch (e: any) {
+            return park(e, String(targetInstanceId))
+        }
+        phase = 'checking'
     }
-    try {
-        patchMove(storeHandle, opId, { targetInstanceId: String(targetInstanceId) })
-        // Measured with the source stopped, right after the copy
-        baselineBytes = await d.sourceBytes(sourceDisk, instance.id)
-        patchMove(storeHandle, opId, { expectedBytes: baselineBytes })
-    } catch (e: any) {
-        return failAfterCleanup('SOURCE_KEPT', e?.message ?? String(e), String(targetInstanceId))
-    }
+    targetInstanceId = (targetInstanceId ?? moveNow().targetInstanceId ?? instance.id) as InstanceID
 
     // ── 2. Checking (on the target) ───────────────────────────────────────────
-    setPhase(storeHandle, opId, 'checking')
-    if (expectRunning) {
-        d.requestStart(storeHandle, targetEngineId, `startInstance ${targetInstanceId} ${targetDisk.id} --cause cross-engine-cmd`)
+    if (phase === 'checking') {
+        enter('checking')
+        try {
+            if (!Number.isFinite(baselineBytes)) {
+                baselineBytes = await d.sourceBytes(sourceDisk, instance.id)
+                patchMove(storeHandle, opId, { expectedBytes: baselineBytes })
+            }
+        } catch (e: any) {
+            return park(e, String(targetInstanceId))
+        }
+        // a resumed check asks again: an older verdict does not count
+        patchMove(storeHandle, opId, { verify: null })
+        // engine#497 (a): the folder is still marked; the target starts it as this op (--op)
+        if (expectRunning) {
+            d.requestStart(storeHandle, targetEngineId, `startInstance ${targetInstanceId} ${targetDisk.id} --cause cross-engine-cmd --op ${opId}`)
+        }
+        d.requestVerify(storeHandle, targetEngineId, `verifyMoveTarget ${opId} ${targetInstanceId} ${baselineBytes} ${expectRunning}`)
+        const verdict = await waitForMoveVerify(storeHandle, opId, { timeoutMs: d.verifyTimeoutMs, pollMs: d.pollMs })
+        if (!verdict) return park(new Error(`VERIFY_TIMEOUT: ${targetName} did not confirm the copy in time`), String(targetInstanceId))
+        if (!verdict.ok) return park(new Error(`${verdict.code ?? 'VERIFY_FAILED'}: the copy on ${targetName} did not check out (${verdict.detail ?? 'no detail'})`), String(targetInstanceId))
+        // The one gate for removing the source: recorded before any removal step
+        patchMove(storeHandle, opId, { verified: true })
+        phase = 'removing'
     }
-    d.requestVerify(storeHandle, targetEngineId, `verifyMoveTarget ${opId} ${targetInstanceId} ${baselineBytes} ${expectRunning}`)
-    const verdict = await waitForMoveVerify(storeHandle, opId, { timeoutMs: d.verifyTimeoutMs, pollMs: d.pollMs })
-    if (!verdict) return failAfterCleanup('VERIFY_TIMEOUT', `${targetName} did not confirm the copy in time`, String(targetInstanceId))
-    if (!verdict.ok) return failAfterCleanup(verdict.code ?? 'VERIFY_FAILED', `the copy on ${targetName} did not check out (${verdict.detail ?? 'no detail'})`, String(targetInstanceId))
-    // The one gate for removing the source: recorded before any removal step
-    patchMove(storeHandle, opId, { verified: true })
 
     // ── 3. Removing the old copy (quarantine, never rm) ─────────────────────
-    setPhase(storeHandle, opId, 'removing')
+    enter('removing')
     const removeStarted = Date.now()
     const removeTimed = async <T>(step: string, fn: () => Promise<T>): Promise<T> => {
         const t0 = Date.now()
         try { return await fn() }
         finally { log(`moveApp remove: ${step} ${Date.now() - t0}ms (since step start ${Date.now() - removeStarted}ms)`) }
     }
+    const flippedNow = () => String(getInstance(storeHandle.doc(), instance.id)?.storedOn ?? '') === String(targetDisk.id)
     try {
-        const verifiedNow = (storeHandle.doc().operationDB?.[opId] as any)?.move?.verified === true
+        const verifiedNow = moveNow().verified === true
         if (!verifiedNow) throw new Error('verify was not recorded')
-        const src = getInstance(storeHandle.doc(), instance.id)
-        if (!src) throw new MoveError('SOURCE_CHANGED', 'the source instance record is gone')
-        if (src.status === 'Running' || src.status === 'Starting' || Number(src.lastStarted ?? 0) !== startedBaseline) {
-            throw new MoveError('SOURCE_CHANGED', `the source was started during the move (status ${src.status}); it may hold newer data than the copy`)
+        if (!flippedNow()) {
+            const src = getInstance(storeHandle.doc(), instance.id)
+            if (!src) throw new MoveError('SOURCE_CHANGED', 'the source instance record is gone')
+            if (src.status === 'Running' || src.status === 'Starting' || Number(src.lastStarted ?? 0) !== startedBaseline) {
+                throw new MoveError('SOURCE_CHANGED', `the source was started during the move (status ${src.status}); it may hold newer data than the copy`)
+            }
+            const nowBytes = await removeTimed('sourceBytes', () => d.sourceBytes(sourceDisk, instance.id))
+            if (nowBytes !== baselineBytes) {
+                throw new MoveError('SOURCE_CHANGED', `the source was written to during the move (${baselineBytes} → ${nowBytes} bytes); it may hold newer data than the copy`)
+            }
         }
-        const nowBytes = await removeTimed('sourceBytes', () => d.sourceBytes(sourceDisk, instance.id))
-        if (nowBytes !== baselineBytes) {
-            throw new MoveError('SOURCE_CHANGED', `the source was written to during the move (${baselineBytes} → ${nowBytes} bytes); it may hold newer data than the copy`)
-        }
+    } catch (e: any) {
+        const why = e instanceof RemoveError ? `${e.code}: ${e.message}` : (e?.message ?? String(e))
+        if (e instanceof MoveError && e.code === 'SOURCE_CHANGED') return stopForGood('SOURCE_CHANGED', sourceKeptText(why), String(targetInstanceId))
+        return park(e, String(targetInstanceId))
+    }
+    // engine#497 (a): verified; the marker on the target goes before the flip, so the target
+    // owns an ordinary folder from the moment storedOn names it
+    if (targetMarked()) {
+        try { await removeTimed('clearTargetMarker', clearTargetMarker) } catch (e: any) { return park(e, String(targetInstanceId)) }
+    }
+    try {
         // Flip storedOn only after verify and SOURCE_CHANGED checks; then quarantine
         // the source folder (not the store row). The target adopts port/status after.
-        const flipAt = Date.now()
-        flipStoredOnAfterVerify(storeHandle, String(instance.id), String(targetDisk.id))
-        log(`moveApp remove: flipStoredOn ${Date.now() - flipAt}ms (since step start ${Date.now() - removeStarted}ms)`)
-        const removed = await removeTimed('removeSource', () => d.removeSource(storeHandle, instance.id, engineId, sourceDisk.id))
+        if (!flippedNow()) {
+            const flipAt = Date.now()
+            flipStoredOnAfterVerify(storeHandle, String(instance.id), String(targetDisk.id))
+            log(`moveApp remove: flipStoredOn ${Date.now() - flipAt}ms (since step start ${Date.now() - removeStarted}ms)`)
+        }
+        const removed = moveNow().sourceRemoved === true
+            ? { quarantinePath: String(moveNow().quarantinePath ?? '') }
+            : await removeTimed('removeSource', () => d.removeSource(storeHandle, instance.id, engineId, sourceDisk.id))
         patchMove(storeHandle, opId, { sourceRemoved: true, quarantinePath: removed.quarantinePath })
         if (expectRunning) {
             const startAt = Date.now()
@@ -515,29 +629,51 @@ export const moveAppCrossEngine = async (
         log(`moveApp: ${r.text}; the old copy is quarantined at ${removed.quarantinePath}`)
         const finishAt = Date.now()
         finish(storeHandle, opId, r, false)
+        updateOperation(storeHandle, opId, { error: null })
+        setOperationArgs(storeHandle, opId, { phase: 'done' })
         log(`moveApp remove: finish ${Date.now() - finishAt}ms (since step start ${Date.now() - removeStarted}ms)`)
         return r
     } catch (e: any) {
-        const flipped = String(getInstance(storeHandle.doc(), instance.id)?.storedOn ?? '') === String(targetDisk.id)
         const why = e instanceof RemoveError ? `${e.code}: ${e.message}` : (e?.message ?? String(e))
         // After the flip, only source removal failed: the app is on the target.
-        if (flipped) {
-            const r = result('SOURCE_NOT_REMOVED', sourceNotRemovedText(why), String(targetInstanceId))
-            log(`moveApp: ${r.text}`)
-            finish(storeHandle, opId, r, false)
-            return r
-        }
-        // Pre-flip: mark terminal, then stop and quarantine the target copy; keep the source authoritative.
-        const changed = e instanceof MoveError && e.code === 'SOURCE_CHANGED'
-        const code = changed ? 'SOURCE_CHANGED' : 'SOURCE_KEPT'
-        const base = changed ? sourceKeptText(why) : moveFailedText(why)
-        finish(storeHandle, opId, result(code, base, String(targetInstanceId)), !changed)
-        const cleanup = await cleanupTargetCopy()
-        await restartIfNeeded()
-        const r = result(code, withTargetCleanupText(base, cleanup, targetName), String(targetInstanceId))
+        const r = result('SOURCE_NOT_REMOVED', sourceNotRemovedText(why), String(targetInstanceId))
         log(`moveApp: ${r.text}`)
-        finish(storeHandle, opId, r, !changed)
+        finish(storeHandle, opId, r, false)
+        updateOperation(storeHandle, opId, { error: r.text })
+        setOperationArgs(storeHandle, opId, { phase: 'done' })
         return r
+    }
+}
+
+/**
+ * engine#497 stage 3 (a): a resumable cross-Engine move gave up (RESUME_GAVE_UP). Records the end
+ * on op.move (phase 'failed', code RESUME_GAVE_UP). The partial target stays under its marker on
+ * the target Engine (Koen's rule: kept for the operator). When the move gave up while Checking (the
+ * target copy is complete and may have been started there as this op), the marker is cleared and
+ * the target is asked to stop and quarantine that copy (engine#388 cleanupMoveTarget; never rm), so
+ * the source and the copy never both run. The source restart is restartMoveSourceAfterGiveUp's.
+ */
+export const crossMoveGaveUp = async (storeHandle: DocHandle<Store>, op: { id: string, args?: Record<string, string>, move?: any, error?: string | null }): Promise<void> => {
+    const opId = op.id
+    const args = (op.args ?? {}) as Record<string, string>
+    const text = moveFailedText(String(op.error ?? 'RESUME_GAVE_UP'))
+    patchMove(storeHandle, opId, { phase: 'failed', code: 'RESUME_GAVE_UP', resultText: text })
+    if (String(op.move?.phase ?? args.phase) !== 'checking') return
+    const id = String(op.move?.targetInstanceId ?? args.instanceId ?? '')
+    const disk = getDisk(storeHandle.doc(), args.targetDiskId as DiskID)
+    const engine = String(op.move?.targetEngineId ?? '')
+    const host = engine ? peerResumeProbe.address(engine) : undefined
+    if (!id || !disk || !host) {
+        log(`moveApp: operation ${opId} gave up while Checking; ${engine || 'the target'} is not reachable, the copy stays there under its marker`)
+        return
+    }
+    try {
+        await defaultDeps.clearTargetMarker(host, engine, await appDataRoot(disk), id, opId)
+        setOperationArgs(storeHandle, opId, { targetMarked: null })
+        defaultDeps.requestCleanup(storeHandle, engine, `cleanupMoveTarget ${opId} ${id} ${disk.id}`)
+        log(`moveApp: operation ${opId} gave up while Checking; asked ${engine} to stop and quarantine its copy ${id}`)
+    } catch (e: any) {
+        log(`moveApp: operation ${opId} gave up while Checking; could not clean up the copy on ${engine}: ${e?.message ?? e}`)
     }
 }
 

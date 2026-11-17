@@ -34,7 +34,12 @@
 #                                    The same op again is ok; another op's marker is refused IN_FLIGHT)
 #   idea-app-data clear-in-flight <root> <id> <opId>
 #                                    (v20: remove that marker, only when it names <opId>; absent is ok)
-#   idea-app-data send         <srcRoot> <srcId> <host> <peerEngineId> <dstRoot> <dstId>
+#   idea-app-data send         <srcRoot> <srcId> <host> <peerEngineId> <dstRoot> <dstId> [<opId>]
+#                                    (v23, engine#497 (a): with <opId> the peer receives through
+#                                    peer-resume-receive, into a folder that op marked there)
+#   idea-app-data verify-send  <srcRoot> <srcId> <host> <peerEngineId> <dstRoot> <dstId> <opId>
+#                                    (v23: read-only rsync dry run source → peer folder; prints
+#                                    "differences=<n>" and up to 10 "diff=<item> <path>" lines, like verify-copy)
 #   idea-app-data receive      <dstRoot> <dstId> <rsync server args...>   (remote side of send only)
 #   idea-app-data delete       <root> <id>
 #   idea-app-data quarantine   <root> <id>   (v4, idea#347: rename instances/<id> to
@@ -47,7 +52,17 @@
 #   idea-app-data peer-receive-files <peerEngineId> <root> <id> <rsync server args...>
 #   idea-app-data peer-delete        <peerEngineId> <root> <id>
 #                                    (both only for a folder that peer's receive created
-#                                    in the last 24 h, per the root-owned ledger)
+#                                    in the last 24 h, per the root-owned ledger; v23: receive-files
+#                                    also into a folder under a marker of that peer)
+#   idea-app-data peer-mark-in-flight   <peerEngineId> <root> <id> <opId>   (v23: marker engineId = the peer;
+#                                    only for an id with NO folder yet, or the same op's own marker)
+#   idea-app-data peer-clear-in-flight  <peerEngineId> <root> <id> <opId>   (v23: only that peer's marker of that op)
+#   idea-app-data peer-resume-receive   <peerEngineId> <root> <id> <opId> <rsync server args...>
+#                                    (v23: a new or half-written folder, only under a marker naming
+#                                    that peer AND that op; no TTL; recorded in the ledger)
+#   idea-app-data peer-verify-receive   <peerEngineId> <root> <id> <opId> <rsync server args...>
+#                                    (v23: the receiving side of verify-send: dry run (-n) only,
+#                                    under that peer's marker of that op; writes nothing)
 #   idea-app-data receive-app        <root> <appId> <rsync server args...>   (as pi)
 #   idea-app-data receive-service    <root> <rsync server args...>           (as pi)
 #   idea-app-data ensure-dirs        <root>   (apps/ instances/ services/, owned by pi)
@@ -152,6 +167,14 @@
 #        markers (instance root and data/kolibri/) are moved to <root>/.idea-quarantine/<id>-kolibri-*-<stamp>.
 #        stdout: previousId=<id|none> and morangoId=<id|none>, or kolibriDb=absent; one quarantined=<path>
 #        line per moved item. Same sudoers line (no argument list); not in the peer gate's allowlist.
+#   v22 is taken by engine#506 (swap quarantine, PR on axle/506-swap-quarantine); this helper skips it.
+#   v23 (engine#497 stage 3 (a), Koen 2026-11-17 Q1 option A: the SOURCE Engine owns the resume and
+#        pushes again): cross-Engine copies and moves resume into the same folder and id on the peer.
+#        The peer's gate maps four new peer verbs, always with the gate's own peer id (never one the
+#        peer sends): peer-mark-in-flight (a NEW id only), peer-clear-in-flight, peer-resume-receive
+#        (write into that peer's own marked folder) and peer-verify-receive (dry run only).
+#        peer-receive refuses an id that has a marker. send takes an optional <opId>; verify-send is the
+#        source side of the content check against the source. Nothing is ever deleted on a peer.
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
 # excludes may hold '/'):
@@ -246,7 +269,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=21
+readonly IDEA_APP_DATA_VERSION=23
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -926,6 +949,25 @@ marker_opid() {   # marker_opid <path>
     return 1
 }
 
+# v23: print the engineId a marker names (same file checks as marker_opid).
+marker_engine() {   # marker_engine <path>
+    local m="$1" line
+    [[ -f "$m" && ! -L "$m" ]] || return 1
+    [[ "$($STAT -c %u -- "$m" 2>/dev/null)" == "$ROOT_UID" ]] || return 1
+    while IFS= read -r line; do
+        if [[ "$line" == engineId=* ]]; then printf '%s\n' "${line#engineId=}"; return 0; fi
+    done < "$m"
+    return 1
+}
+# v23: refuse unless instances/<id> of R_DIR carries a marker of peer <peer> for op <opId>.
+need_peer_marker() {   # need_peer_marker <R_DIR> <id> <peer> <opId>
+    local m cur eng
+    m=$(marker_path "$1" "$2")
+    cur=$(marker_opid "$m") || refuse "no in-flight marker $m (a peer resumes only into a folder it marked)"
+    eng=$(marker_engine "$m") || refuse "in-flight marker $m names no Engine"
+    [[ "$eng" == "$3" ]] || refuse "IN_FLIGHT: $m belongs to Engine $eng, not $3"
+    [[ "$cur" == "$4" ]] || refuse "IN_FLIGHT: $m marks operation $cur, not $4"
+}
 check_engine_id() { [[ "$1" =~ $RE_ENGINE ]] || refuse "Engine id '$1' does not match $RE_ENGINE"; }
 check_app() { [[ "$1" =~ $RE_APP && "$1" != *..* ]] || refuse "app id '$1' does not match $RE_APP (or holds '..')"; }
 
@@ -1250,10 +1292,13 @@ case "$SUB" in
         ;;
 
     send)
-        need 6 $(($# - 1)) "<srcRoot> <srcId> <host> <peerEngineId> <dstRoot> <dstId>"
+        given=$(($# - 1))
+        (( given == 6 || given == 7 )) || refuse "$SUB takes 6 or 7 argument(s) (<srcRoot> <srcId> <host> <peerEngineId> <dstRoot> <dstId> [<opId>]), got $given"
         check_id "$3"; check_id "$7"
         check_engine_id "$5"
         check_root_shape "$6"
+        SEND_RECEIVE="receive $6 $7"
+        if (( given == 7 )); then check_opid "$8"; SEND_RECEIVE="receive $6 $7 $8"; fi
         resolve_root "$2" instances; S_DIR="$R_DIR"
         SRC=$(inst_dir "$S_DIR" "$3")
         existing_dir "$SRC" "source instance folder"
@@ -1263,9 +1308,39 @@ case "$SUB" in
         pin_cwd "$SRC"
         run_child $RSYNC "${RSYNC_OPTS[@]}" \
             -e "$RUNUSER -u $REMOTE_USER -- $SSH -i $PEER_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$PEER_KNOWN_HOSTS -o HostKeyAlias=$5 -o ConnectTimeout=10" \
-            --rsync-path="$SUDO -n $HELPER_PATH receive $6 $7" \
+            --rsync-path="$SUDO -n $HELPER_PATH $SEND_RECEIVE" \
             -- ./ "$REMOTE_USER@$ADDR:."
         exit $?
+        ;;
+
+    verify-send)
+        # v23, engine#497 (a): the content check of a cross-Engine copy against its source. A dry
+        # run (-n) with the copy's own options; the peer's gate forces the dry run on its side too.
+        need 7 $(($# - 1)) "<srcRoot> <srcId> <host> <peerEngineId> <dstRoot> <dstId> <opId>"
+        check_id "$3"; check_id "$7"; check_opid "$8"
+        check_engine_id "$5"
+        check_root_shape "$6"
+        resolve_root "$2" instances; S_DIR="$R_DIR"
+        SRC=$(inst_dir "$S_DIR" "$3")
+        existing_dir "$SRC" "source instance folder"
+        check_host "$4"
+        refuse_external_links "$SRC"
+        take_locks "inst.$2.$3"
+        pin_cwd "$SRC"
+        VOUT=$($RSYNC -aHAX --numeric-ids -x -n --itemize-changes --out-format='%i %n' \
+            -e "$RUNUSER -u $REMOTE_USER -- $SSH -i $PEER_KEY -o IdentitiesOnly=yes -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$PEER_KNOWN_HOSTS -o HostKeyAlias=$5 -o ConnectTimeout=10" \
+            --rsync-path="$SUDO -n $HELPER_PATH verify-receive $6 $7 $8" \
+            -- ./ "$REMOTE_USER@$ADDR:.") || exit $?
+        VN=0
+        VLIST=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            VN=$((VN + 1))
+            (( ${#VLIST[@]} < 10 )) && VLIST+=("$line")
+        done <<<"$VOUT"
+        echo "differences=$VN"
+        for line in "${VLIST[@]}"; do echo "diff=$line"; done
+        exit 0
         ;;
 
     receive)
@@ -1298,6 +1373,9 @@ case "$SUB" in
         take_locks "inst.$DST_ROOT_TOKEN.$DST_ID"
         # a NEW folder only: a peer never writes into an instance that exists
         [[ ! -e "$DST" && ! -L "$DST" ]] || refuse "destination $DST already exists; a peer receive needs a new instance folder"
+        # v23: nor into an id an operation has marked (only that op resumes it, peer-resume-receive)
+        DSTM=$(marker_path "$D_DIR" "$DST_ID")
+        [[ ! -e "$DSTM" && ! -L "$DSTM" ]] || refuse "IN_FLIGHT: $DSTM marks $DST for an operation; only that operation resumes it"
         ledger_ready
         prepare_dst "$DST"
         ledger_rewrite "$DST_ROOT_TOKEN" "$DST_ID" "$(ledger_now) $PEER $DST_ROOT_TOKEN $DST_ID"
@@ -1317,7 +1395,106 @@ case "$SUB" in
         free_floor "$R_DIR/instances"
         take_locks "inst.$ROOT_TOKEN.$INST_ID"
         ledger_ready
-        ledger_has "$PEER" "$ROOT_TOKEN" "$INST_ID" || refuse "Engine $PEER did not create $DST with a receive in the last $((LEDGER_TTL_SECONDS / 3600)) h"
+        # v23: or the folder carries an in-flight marker of that same peer (no TTL)
+        if ! ledger_has "$PEER" "$ROOT_TOKEN" "$INST_ID"; then
+            PM=$(marker_path "$R_DIR" "$INST_ID")
+            PME=$(marker_engine "$PM") || refuse "Engine $PEER did not create $DST with a receive in the last $((LEDGER_TTL_SECONDS / 3600)) h"
+            [[ "$PME" == "$PEER" ]] || refuse "Engine $PEER did not create $DST with a receive in the last $((LEDGER_TTL_SECONDS / 3600)) h (its in-flight marker belongs to Engine $PME)"
+        fi
+        existing_dir "$DST" "instance folder"
+        export SSH_ORIGINAL_COMMAND="rsync $*"
+        run_child $RRSYNC -wo "$DST"
+        exit $?
+        ;;
+
+    peer-mark-in-flight)
+        # v23, engine#497 (a): a peer marks an id on this disk before its first byte. Only an id with
+        # no folder yet (or the same op's own marker again): a peer can never mark an existing instance.
+        need 4 $(($# - 1)) "<peerEngineId> <root> <id> <opId>"
+        check_engine_id "$2"; check_id "$4"; check_opid "$5"
+        PEER="$2"
+        resolve_root "$3" instances
+        PARENT="$R_DIR/instances"
+        existing_dir "$PARENT" "instances folder"
+        M=$(marker_path "$R_DIR" "$4")
+        take_locks "inst.$3.$4"
+        if [[ -e "$M" || -L "$M" ]]; then
+            need_peer_marker "$R_DIR" "$4" "$PEER" "$5"
+            echo "ok: $M already marks operation $5 of Engine $PEER"
+            exit 0
+        fi
+        [[ ! -e "$PARENT/$4" && ! -L "$PARENT/$4" ]] || refuse "$PARENT/$4 already exists; a peer marks only a new instance folder"
+        MTMP="$PARENT/.$4$MARKER_SUFFIX.tmp.$$"
+        [[ ! -e "$MTMP" && ! -L "$MTMP" ]] || refuse "temporary marker $MTMP already exists"
+        printf 'opId=%s\nengineId=%s\ncreated=%s\n' "$5" "$PEER" "$($DATE -u +%Y-%m-%dT%H:%M:%SZ)" > "$MTMP" \
+            || { $RM -f -- "$MTMP"; refuse "cannot write the in-flight marker $M"; }
+        $CHMOD 0644 -- "$MTMP" || { $RM -f -- "$MTMP"; refuse "cannot chmod the in-flight marker $M"; }
+        $MV -T -- "$MTMP" "$M" || { $RM -f -- "$MTMP"; refuse "cannot put the in-flight marker $M in place"; }
+        journal "peer-mark-in-flight: $M for operation $5 of Engine $PEER"
+        echo "ok: $M marks operation $5 of Engine $PEER"
+        exit 0
+        ;;
+
+    peer-clear-in-flight)
+        need 4 $(($# - 1)) "<peerEngineId> <root> <id> <opId>"
+        check_engine_id "$2"; check_id "$4"; check_opid "$5"
+        PEER="$2"
+        resolve_root "$3" instances
+        existing_dir "$R_DIR/instances" "instances folder"
+        M=$(marker_path "$R_DIR" "$4")
+        if [[ ! -e "$M" && ! -L "$M" ]]; then
+            echo "ok: $M does not exist; nothing to clear"
+            exit 0
+        fi
+        take_locks "inst.$3.$4"
+        need_peer_marker "$R_DIR" "$4" "$PEER" "$5"
+        $RM -f -- "$M" || refuse "cannot remove the in-flight marker $M"
+        journal "peer-clear-in-flight: $M of operation $5 of Engine $PEER"
+        echo "ok: cleared $M"
+        exit 0
+        ;;
+
+    peer-resume-receive)
+        # v23: the receive of a resumable cross-Engine copy. The folder may be new or half-written,
+        # but only under a marker naming this peer AND this op (written by peer-mark-in-flight).
+        (( $# >= 7 )) || refuse "peer-resume-receive takes <peerEngineId> <dstRoot> <dstId> <opId> and the rsync server arguments, got $(($# - 1)) argument(s)"
+        check_engine_id "$2"; check_id "$4"; check_opid "$5"
+        PEER="$2"; DST_ROOT_TOKEN="$3"; DST_ID="$4"; DST_OP="$5"
+        resolve_root "$DST_ROOT_TOKEN" instances; D_DIR="$R_DIR"
+        existing_dir "$D_DIR/instances" "destination instances folder"
+        DST=$(inst_dir "$D_DIR" "$DST_ID")
+        shift 5
+        check_server_args "$@"
+        free_floor "$D_DIR/instances"
+        take_locks "inst.$DST_ROOT_TOKEN.$DST_ID"
+        need_peer_marker "$D_DIR" "$DST_ID" "$PEER" "$DST_OP"
+        ledger_ready
+        prepare_dst "$DST" "$DST_OP"
+        ledger_rewrite "$DST_ROOT_TOKEN" "$DST_ID" "$(ledger_now) $PEER $DST_ROOT_TOKEN $DST_ID"
+        journal "peer-resume-receive: $DST for operation $DST_OP of Engine $PEER"
+        export SSH_ORIGINAL_COMMAND="rsync $*"
+        run_child $RRSYNC -wo "$DST"
+        exit $?
+        ;;
+
+    peer-verify-receive)
+        # v23: the receiving side of verify-send. Dry run only: the first server argument is the
+        # short-option cluster and must hold n (--dry-run) before its '.'. Writes nothing.
+        (( $# >= 7 )) || refuse "peer-verify-receive takes <peerEngineId> <root> <id> <opId> and the rsync server arguments, got $(($# - 1)) argument(s)"
+        check_engine_id "$2"; check_id "$4"; check_opid "$5"
+        PEER="$2"; ROOT_TOKEN="$3"; INST_ID="$4"; V_OP="$5"
+        resolve_root "$ROOT_TOKEN" instances
+        DST=$(inst_dir "$R_DIR" "$INST_ID")
+        shift 5
+        [[ "${1:-}" == --server ]] || refuse "$SUB only runs an rsync server (first server argument must be --server)"
+        VFLAGS="${2:-}"
+        [[ "$VFLAGS" == -* && "$VFLAGS" != --* && "${VFLAGS%%.*}" == *n* ]] || refuse "$SUB runs only a dry run (the rsync flags must hold -n)"
+        for a in "$@"; do
+            [[ "$a" != --sender ]] || refuse "$SUB is write-only: --sender is not allowed"
+            [[ "$a" == "--log-format=%i" || "$a" =~ $RE_SERVER_ARG ]] || refuse "unsafe rsync server argument $(printf '%q' "$a")"
+        done
+        take_locks "inst.$ROOT_TOKEN.$INST_ID"
+        need_peer_marker "$R_DIR" "$INST_ID" "$PEER" "$V_OP"
         existing_dir "$DST" "instance folder"
         export SSH_ORIGINAL_COMMAND="rsync $*"
         run_child $RRSYNC -wo "$DST"
@@ -2656,7 +2833,7 @@ print("previousId="+str(row[0])); print("morangoId="+new_id)'
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, temp-backup-estimate, temp-backup-create, temp-backup-delete, temp-backup-restore, temp-backups, peer-receive, peer-receive-files, peer-delete, receive-app, receive-service, ensure-dirs, erase-slot, put-files, kolibri-rebind, sync-peers, clear-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, temp-backup-estimate, temp-backup-create, temp-backup-delete, temp-backup-restore, temp-backups, peer-receive, peer-receive-files, peer-delete, peer-mark-in-flight, peer-clear-in-flight, peer-resume-receive, peer-verify-receive, verify-send, receive-app, receive-service, ensure-dirs, erase-slot, put-files, kolibri-rebind, sync-peers, clear-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

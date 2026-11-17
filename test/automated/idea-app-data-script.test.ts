@@ -108,7 +108,7 @@ describe('idea-app-data: argument checks', () => {
 
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
-            ['version', 0], ['size', 2], ['send', 6], ['mark-in-flight', 4], ['clear-in-flight', 3], ['verify-copy', 4], ['borg-break-lock', 2], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['quarantine-snapshot', 2],
+            ['version', 0], ['size', 2], ['verify-send', 7], ['mark-in-flight', 4], ['clear-in-flight', 3], ['verify-copy', 4], ['borg-break-lock', 2], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['quarantine-snapshot', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1], ['clean-verify', 3],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['kolibri-rebind', 2], ['peer-delete', 3], ['sync-peers', 2], ['clear-peers', 2], ['install-usage-key', 3],
         ]
@@ -122,6 +122,9 @@ describe('idea-app-data: argument checks', () => {
         // engine#497 (v20): copy takes an optional <opId>
         refused(await sb.run(['copy', 'x', 'x', 'x']), /copy takes 4 or 5 argument/)
         refused(await sb.run(['copy', 'x', 'x', 'x', 'x', 'x', 'x']), /copy takes 4 or 5 argument/)
+        // engine#497 (a, v23): send takes an optional <opId>
+        refused(await sb.run(['send', 'x', 'x', 'x', 'x', 'x']), /send takes 6 or 7 argument/)
+        refused(await sb.run(['send', 'x', 'x', 'x', 'x', 'x', 'x', 'x', 'x']), /send takes 6 or 7 argument/)
         refused(await sb.run(['receive', 'sdb1', 'id1', '--server']), /receive takes <dstRoot> <dstId> and the rsync server arguments/)
         refused(await sb.run(['borg-create', 'x', 'x', 'x']), /borg-create takes at least 4 argument/)
         refused(await sb.run(['snapshot', 'x']), /snapshot takes at least 2 argument/)
@@ -289,6 +292,30 @@ describe('idea-app-data: send and receive', () => {
             '--', './', 'pi@10.0.0.4:.',
         ])
         expect(call.cwd).toBe(path.join(sb.disks, 'sdb1', 'instances', 'inst1'))
+    })
+
+    it('engine#497 (a, v23): send with an <opId> asks the peer for the resumable receive of that op', async () => {
+        const r = await sb.run(['send', 'sdb1', 'inst1', '10.0.0.4', 'ENGINE_peer4', 'sdc1', 'new1', 'Ab3dEf5hJk7mNp9qRs1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const [call] = await sb.calls('rsync')
+        expect(call.argv).toContain('--rsync-path=/usr/bin/sudo -n /usr/local/sbin/idea-app-data receive sdc1 new1 Ab3dEf5hJk7mNp9qRs1')
+        refused(await sb.run(['send', 'sdb1', 'inst1', '10.0.0.4', 'ENGINE_peer4', 'sdc1', 'new1', 'bad op']), /operation id 'bad op' does not match/)
+    })
+
+    it('engine#497 (a, v23): verify-send is a dry, itemized push against the peer\'s verify-receive of that op; it prints differences=N', async () => {
+        const r = await sb.run(['verify-send', 'sdb1', 'inst1', '10.0.0.4', 'ENGINE_peer4', 'sdc1', 'new1', 'Ab3dEf5hJk7mNp9qRs1'])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const [call] = await sb.calls('rsync')
+        expect(call.argv).toEqual([
+            '-aHAX', '--numeric-ids', '-x', '-n', '--itemize-changes', '--out-format=%i %n',
+            '-e', `${sb.bin}/runuser -u pi -- /usr/bin/ssh ${peerSshOptions('ENGINE_peer4').join(' ').replace(PEER_KNOWN_HOSTS, sb.peerKnownHosts)}`,
+            '--rsync-path=/usr/bin/sudo -n /usr/local/sbin/idea-app-data verify-receive sdc1 new1 Ab3dEf5hJk7mNp9qRs1',
+            '--', './', 'pi@10.0.0.4:.',
+        ])
+        expect(call.cwd).toBe(path.join(sb.disks, 'sdb1', 'instances', 'inst1'))
+        // the fake rsync prints one progress line: counted as one difference
+        expect(r.stdout).toMatch(/^differences=1\ndiff=/)
+        refused(await sb.run(['verify-send', 'sdb1', 'inst1', '8.8.8.8', 'ENGINE_peer4', 'sdc1', 'new1', 'Ab3dEf5hJk7mNp9qRs1']), /resolves to 8\.8\.8\.8, which is not a private LAN/)
     })
 
     it('accepts 10/8, 172.16/12, 192.168/16, 100.64/10 and a host name that resolves only to those (connects to the resolved address)', async () => {
@@ -1746,10 +1773,10 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v21 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine; v20 the engine#497 in-flight marker; v21 the engine#503 kolibri-rebind)', async () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('21')
+    it('helper and Engine speak v23 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine; v20 the engine#497 in-flight marker; v21 the engine#503 kolibri-rebind; v22 is engine#506; v23 the engine#497 (a) cross-Engine resume verbs)', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('23')
         const r = await sb.run(['version'])
-        expect(r.stdout.trim()).toBe('idea-app-data 21')
+        expect(r.stdout.trim()).toBe('idea-app-data 23')
     })
 
     it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {
