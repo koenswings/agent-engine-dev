@@ -3,6 +3,7 @@ import os from 'os'
 import { enableUsbDeviceMonitor } from './monitors/usbDeviceMonitor.js'
 import { runDiskDetectionSelfCheck, recordDiskDetectionFailure, errorMessage } from './monitors/diskDetection.js'
 import { runIgmpMaxMembershipsSelfCheck } from './monitors/igmpSelfCheck.js'
+import { runContainerdImageStoreSelfCheck } from './monitors/containerdImageStoreCheck.js'
 import { enableTimeMonitor } from './monitors/timeMonitor.js'
 import { startLiveness, writeLastSeen } from './data/Liveness.js'
 import { $, chalk, fs, sleep } from 'zx'
@@ -21,7 +22,7 @@ import { createServerStore } from './data/Store.js'
 import { assertStoreIdentityMatchesData, prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { enableInstanceStatusMonitor } from './monitors/instanceStatusMonitor.js'
-import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
+import { recoverInterruptedOperations, archiveOldOperations, markEngineStopping } from './data/Operations.js'
 import { startBackupScheduler } from './monitors/backupScheduler.js'
 import { startDataBytesMonitor } from './data/DataBytes.js'
 import { startPreUpdateQuarantine } from './monitors/preUpdateQuarantine.js'
@@ -229,6 +230,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired when you kill the app with ctrl + c.
         log('Shutting down automerge')
         log('*** SIGINT received ****');
+        markEngineStopping()   // engine#497: what fails from now on is an interruption, not a counted failure
         await ideaLocalPublisher?.stop().catch(() => {})
         await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
@@ -237,6 +239,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired by the Linux shutdown command
         log('Shutting down automerge')
         log('*** SIGTERM received ****');
+        markEngineStopping()   // engine#497: what fails from now on is an interruption, not a counted failure
         await ideaLocalPublisher?.stop().catch(() => {})
         await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
@@ -277,6 +280,11 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // idea#467: warn if net.ipv4.igmp_max_memberships is below 1024 (Kolibri zeroconf).
     // Read-only, no root, never blocks startup. Skipped when IDEA_WATCH_DIR is set.
     runIgmpMaxMembershipsSelfCheck()
+    // idea#322: warn if Docker is not using the containerd image store (digest pins
+    // need RepoDigests after docker load). Read-only, never blocks startup.
+    // Skipped when IDEA_WATCH_DIR is set.
+    runContainerdImageStoreSelfCheck().catch(e =>
+        log(`[selfCheck] containerd image store check crashed: ${e instanceof Error ? e.message : String(e)}`))
     // Not awaited (startup continues), but a start failure (e.g. `ls /dev/engine`
     // fails) is reported instead of silently disabling disk detection.
     enableUsbDeviceMonitor(storeHandle).catch(e =>

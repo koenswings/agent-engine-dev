@@ -406,6 +406,232 @@ export const dropInterruptedCommand = (
 /** Text a retried op carries while boot recovery re-runs it (engine#497). */
 export const RETRY_MARKER = 'Retrying after interrupted run'
 
+// ── engine#497 stage 2: resumable operations (Koen's rule) ───────────────────
+//
+// An interrupted local copyApp / moveApp (in-flight marker next to the target folder)
+// or backupApp (its own .backup-in-progress lock) RESUMES inside the original op: on
+// every boot and when its disks dock again. An interruption (power cut, Engine stop,
+// a disk going away) is never counted. A real failure increments args.resumeFailures;
+// at RESUME_LIMIT the op goes Failed with RESUME_GAVE_UP and its partial target and
+// marker are kept for the operator. Such an op records args.phase (isResumableOp).
+
+/** Real failures after which a resumable op gives up (engine#497). */
+export const RESUME_LIMIT = 3
+/** Waiting for its disks (interrupted, not counted). */
+export const RESUME_WAITING = 'RESUME_WAITING'
+/** A counted failure; resumes at the next boot or dock. */
+export const RESUME_PENDING = 'RESUME_PENDING'
+/** RESUME_LIMIT real failures: Failed, the partial target and its marker are kept. */
+export const RESUME_GAVE_UP = 'RESUME_GAVE_UP'
+const RESUME_TEXT = /^RESUME_(WAITING|PENDING|GAVE_UP)\b/
+const RESUMABLE_KINDS: readonly OperationKind[] = ['copyApp', 'moveApp', 'backupApp']
+
+/** An op that resumes in place: a local copy/move or a backup that recorded args.phase. */
+export const isResumableOp = (op: Operation | null | undefined): boolean =>
+    !!op && RESUMABLE_KINDS.includes(op.kind) && !op.move && !!op.args?.phase
+
+/** A resumable op waiting for its next boot or dock (Pending, RESUME_WAITING / RESUME_PENDING). */
+export const isParkedOp = (op: Operation | null | undefined): boolean =>
+    !!op && op.status === 'Pending' && /^RESUME_(WAITING|PENDING)\b/.test(String(op.error ?? ''))
+
+/** Set (string) or delete (null) fields of Operation.args. */
+export const setOperationArgs = (storeHandle: DocHandle<Store>, id: string, patch: Record<string, string | null>): void => {
+    storeHandle.change(doc => {
+        const op = doc.operationDB?.[id]
+        if (!op) return
+        if (!op.args) (op as any).args = {}
+        for (const [k, v] of Object.entries(patch)) {
+            if (v === null) delete op.args[k]
+            else op.args[k] = v
+        }
+    })
+}
+
+let engineStopping = false
+/** start.ts SIGINT/SIGTERM: what fails from now on is an interruption, never a counted failure. */
+export const markEngineStopping = (): void => { engineStopping = true }
+export const isEngineStopping = (): boolean => engineStopping
+/** Tests only. */
+export const resetEngineStoppingForTests = (): void => { engineStopping = false }
+
+const stripResumePrefixes = (reason: string): string => {
+    let r = String(reason ?? '').trim()
+    for (;;) {
+        const next = r.replace(/^(RESUME_(WAITING|PENDING|GAVE_UP)( \(\d+\/\d+\))?|Retry failed|COPY_FAILED|MOVE FAILED):\s*/, '')
+        if (next === r) return r || 'unknown error'
+        r = next
+    }
+}
+
+export type ParkOutcome = 'left' | 'waiting' | 'pending' | 'gaveUp'
+
+/**
+ * Close a run of a resumable op that did not finish. `interrupted` (its disks are gone):
+ * Pending RESUME_WAITING, not counted. Otherwise a real failure: args.resumeFailures + 1,
+ * Pending `RESUME_PENDING (n/3): <reason>`, and at RESUME_LIMIT Failed
+ * `RESUME_GAVE_UP: <reason>`. A Cancelled op, or one whose Engine is stopping, is left as it is.
+ */
+export const parkResumableOp = (
+    storeHandle: DocHandle<Store>,
+    id: string,
+    reason: string,
+    opts: { interrupted?: boolean } = {},
+): ParkOutcome => {
+    const op = storeHandle.doc()?.operationDB?.[id]
+    if (!op || op.status === 'Cancelled' || op.status === 'Done' || engineStopping) return 'left'
+    const why = stripResumePrefixes(reason)
+    if (opts.interrupted) {
+        updateOperation(storeHandle, id, { status: 'Pending', error: `${RESUME_WAITING}: ${why}`, completedAt: null })
+        log(chalk.yellow(`resume: ${id.slice(0, 8)} ${op.kind} interrupted (${why}); it resumes when its disks are docked (not counted)`))
+        return 'waiting'
+    }
+    const n = (Number(op.args?.resumeFailures ?? 0) || 0) + 1
+    setOperationArgs(storeHandle, id, { resumeFailures: String(n) })
+    if (n < RESUME_LIMIT) {
+        updateOperation(storeHandle, id, { status: 'Pending', error: `${RESUME_PENDING} (${n}/${RESUME_LIMIT}): ${why}`, completedAt: null })
+        log(chalk.yellow(`resume: ${id.slice(0, 8)} ${op.kind} failed (${n}/${RESUME_LIMIT}): ${why}; it resumes at the next boot or dock`))
+        return 'pending'
+    }
+    updateOperation(storeHandle, id, { status: 'Failed', error: `${RESUME_GAVE_UP}: ${why}`, completedAt: Date.now() as Timestamp })
+    log(chalk.red(`resume: ${id.slice(0, 8)} ${op.kind} gave up after ${n} failures: ${why}; the partial target and its marker are kept`))
+    return 'gaveUp'
+}
+
+/** The disks a resumable op needs docked here before it resumes. */
+export const resumeDisksOf = (store: Store | undefined, op: Operation): string[] => {
+    const a = (op.args ?? {}) as Record<string, string>
+    const ids = op.kind === 'backupApp'
+        ? [a.backupDiskId, store?.instanceDB?.[a.instanceId as any]?.storedOn]
+        : [a.sourceDiskId, a.targetDiskId]
+    return Array.from(new Set(ids.filter(Boolean).map(String)))
+}
+
+/** Disks that docked (finished their dock pass) on this Engine since it started. */
+const dockedThisBoot = new Set<string>()
+
+/**
+ * Ready when every disk the op needs that is (or was) on this Engine has finished a dock pass
+ * here since the Engine started. Boot recovery runs before the USB monitor docks anything, so
+ * a resumable op always waits for its dock pass (the source App is started by that pass and
+ * stopped again by the resumed copy, never in the middle of it). A disk docked to another
+ * Engine holds it back too (only the owning Engine resumes). A disk unknown to the store
+ * does not: the op's own validation refuses it, which counts as a real failure.
+ */
+export const resumeGate = (store: Store | undefined, op: Operation, engineId: EngineID = localEngineId): { ready: boolean, waitingFor: string[] } => {
+    const waitingFor = resumeDisksOf(store, op).filter(id => {
+        const d = store?.diskDB?.[id as any] as any
+        if (!d) return false
+        // docked to another Engine: only this Engine resumes its op, when the disk is back here
+        return !(dockedThisBoot.has(id) && d.device && String(d.dockedTo) === String(engineId))
+    })
+    return { ready: waitingFor.length === 0, waitingFor }
+}
+
+const diskLabel = (store: Store | undefined, id: string): string => {
+    const name = (store?.diskDB?.[id as any] as any)?.name
+    return name ? `'${name}' (${id})` : id
+}
+
+let resumeHandlers: Partial<Record<OperationKind, RetryHandler>> | null = null
+/** Resumable ops being re-run now (by boot recovery or a dock), never twice at once. */
+const activeResumes = new Set<string>()
+
+/** Tests only: forget the docked disks, handlers and active resumes of this Engine run. */
+export const resetResumeStateForTests = (): void => {
+    dockedThisBoot.clear()
+    activeResumes.clear()
+    resumeHandlers = null
+}
+
+/**
+ * Run a recovery retry handler inside the op (engine#497) in its own trace, and close the op
+ * from the result. A resumable op that the handler parked (RESUME_…) is left as parked; one
+ * the handler did not park is parked here (a real failure counts, a missing disk does not).
+ */
+const runRecoveryRetry = (
+    storeHandle: DocHandle<Store>,
+    op: Operation,
+    handler: RetryHandler,
+): Promise<void> => {
+    const cmdLogHandle = getCommandLogHandle()
+    const traceId = crypto.randomUUID()
+    const traceArgs = JSON.stringify({ ...op.args, recoveredOpId: op.id })
+    if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
+    activeResumes.add(op.id)
+    const current = () => storeHandle.doc()?.operationDB?.[op.id]
+    const statusNow = () => current()?.status
+    const parkedByRun = () => RESUME_TEXT.test(String(current()?.error ?? ''))
+    // Fire-and-forget: the retry runs in background; startup continues. It runs inside
+    // this trace, so the handler's errors reach us (backupInstance rethrows inside a
+    // trace) and the op is closed from the result, never left Pending without a reason.
+    return runWithTrace({ traceId, command: op.kind, args: traceArgs }, () => handler(op.args, storeHandle, op.id)).then(async () => {
+        if (engineStopping) return
+        const st = statusNow()
+        if ((st === 'Pending' || st === 'Running') && !(isResumableOp(current()) && parkedByRun())) {
+            updateOperation(storeHandle, op.id, { status: 'Done', progressPercent: 100, error: null, completedAt: Date.now() as Timestamp })
+        } else if (st === 'Done' && current()?.error === RETRY_MARKER) {
+            updateOperation(storeHandle, op.id, { error: null })
+        }
+        const bad = statusNow() === 'Failed' || isParkedOp(current())
+        const why = bad ? String(current()?.error ?? 'retry failed') : undefined
+        if (bad) log(chalk.red(`  ${op.id.slice(0, 8)} ${op.kind}: retry failed — ${why}`))
+        if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, bad ? 'error' : 'ok', why) }
+    }).catch(async err => {
+        const msg = err?.message ?? String(err)
+        log(chalk.red(`  ${op.id.slice(0, 8)} ${op.kind}: retry failed — ${msg}`))
+        if (engineStopping) {
+            // an interruption: boot recovery picks the op up again
+        } else if (isResumableOp(current())) {
+            if (!parkedByRun() && statusNow() !== 'Cancelled') {
+                const gate = resumeGate(storeHandle.doc(), current()!)
+                parkResumableOp(storeHandle, op.id, msg, { interrupted: !gate.ready })
+            }
+        } else if (statusNow() !== 'Cancelled') {
+            updateOperation(storeHandle, op.id, {
+                status: 'Failed',
+                error: `Retry failed: ${msg}`,
+                completedAt: Date.now() as Timestamp,
+            })
+        }
+        const text = String(current()?.error ?? `Retry failed: ${msg}`)
+        if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'error', text) }
+    }).finally(() => { activeResumes.delete(op.id) })
+}
+
+/**
+ * engine#497: resume this Engine's parked resumable ops that need `diskId` (all of them
+ * without one) and whose disks are all docked here now. Called when a disk finished its
+ * dock pass (noteDiskDocked). Returns the ids it started.
+ */
+export const resumeParkedOps = (storeHandle: DocHandle<Store>, diskId?: string, engineId: EngineID = localEngineId): string[] => {
+    if (!resumeHandlers) return []
+    const store = storeHandle.doc()
+    const started: string[] = []
+    for (const op of Object.values(store?.operationDB ?? {})) {
+        if (!op || !isResumableOp(op) || !isParkedOp(op)) continue
+        if (String(op.engineId) !== String(engineId) || activeResumes.has(op.id)) continue
+        if (op.kind === 'backupApp' && op.cause === 'scheduled-backup') continue
+        if (diskId && !resumeDisksOf(store, op).includes(String(diskId))) continue
+        if (!resumeGate(store, op, engineId).ready) continue
+        const handler = resumeHandlers[op.kind]
+        if (!handler) continue
+        log(chalk.blue(`resume: ${op.id.slice(0, 8)} ${op.kind}: its disks are docked; resuming it in the same operation (was: ${op.error})`))
+        updateOperation(storeHandle, op.id, { status: 'Pending', error: RETRY_MARKER })
+        void runRecoveryRetry(storeHandle, op, handler)
+        started.push(op.id)
+    }
+    return started
+}
+
+/** A disk finished its dock pass on this Engine: resume the parked ops that waited for it. */
+export const noteDiskDocked = (storeHandle: DocHandle<Store>, diskId: string): string[] => {
+    dockedThisBoot.add(String(diskId))
+    return resumeParkedOps(storeHandle, String(diskId))
+}
+
+/** A disk left this Engine: ops that need it wait for its next dock pass. */
+export const noteDiskUndocked = (diskId: string): void => { dockedThisBoot.delete(String(diskId)) }
+
 /**
  * A boot-recovery retry handler. It re-runs the op inside the same Operation
  * (recoveredOpId / existingOpId), so the op itself ends Done or Failed (engine#497).
@@ -431,6 +657,8 @@ export const recoverInterruptedOperations = async (
     engineId: EngineID = localEngineId,
 ): Promise<void> => {
     const store = storeHandle.doc()
+    // engine#497: the same handlers resume parked ops when their disks dock (noteDiskDocked)
+    resumeHandlers = retryHandlers
     if (!store.operationDB) return
 
     // operationDB is shared by all Engines. Only this Engine's own operations
@@ -482,9 +710,23 @@ export const recoverInterruptedOperations = async (
         const traceId = crypto.randomUUID()
         const traceArgs = JSON.stringify({ ...op.args, recoveredOpId: op.id })
 
-        if (strategy === 'retry' && handler) {
+        if (strategy === 'retry' && handler && isResumableOp(op)) {
+            // engine#497 stage 2: resumes in the same op once its disks have docked in this
+            // boot (the dock pass runs after recovery). Not counted: this is an interruption.
+            dropInterruptedCommand(storeHandle, op, { retryOwned: true })
+            if (activeResumes.has(op.id)) continue
+            const gate = resumeGate(store, op, engineId)
+            if (!gate.ready) {
+                const waitText = `resumes when ${gate.waitingFor.map(id => diskLabel(store, id)).join(' and ')} ${gate.waitingFor.length > 1 ? 'have' : 'has'} docked (interrupted by an Engine restart)`
+                log(chalk.blue(`  ${op.id.slice(0, 8)} ${op.kind}: resumable (phase ${op.args?.phase}); ${waitText}`))
+                updateOperation(storeHandle, op.id, { status: 'Pending', error: `${RESUME_WAITING}: ${waitText}`, completedAt: null })
+                continue
+            }
+            log(chalk.blue(`  ${op.id.slice(0, 8)} ${op.kind}: resuming (phase ${op.args?.phase}) in the same operation`))
+            updateOperation(storeHandle, op.id, { status: 'Pending', error: RETRY_MARKER })
+            void runRecoveryRetry(storeHandle, op, handler)
+        } else if (strategy === 'retry' && handler) {
             log(chalk.blue(`  ${op.id.slice(0, 8)} ${op.kind}: retrying (idempotent) in the same operation`))
-            if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
             // Mark as Pending before retry so it's visible in the store
             updateOperation(storeHandle, op.id, {
                 status: 'Pending',
@@ -493,33 +735,7 @@ export const recoverInterruptedOperations = async (
             // engine#497: recovery owns this re-run. Its queued command goes now, so the
             // startup replay does not run the same copy/move/backup a second time.
             dropInterruptedCommand(storeHandle, op, { retryOwned: true })
-            // Fire-and-forget: retry runs in background; startup continues. It runs inside
-            // this trace, so the handler's errors reach us (backupInstance rethrows inside a
-            // trace) and the op is closed from the result, never left Pending for the next boot.
-            const statusNow = () => storeHandle.doc()?.operationDB?.[op.id]?.status
-            runWithTrace({ traceId, command: op.kind, args: traceArgs }, () => handler(op.args, storeHandle, op.id)).then(async () => {
-                const st = statusNow()
-                if (st === 'Pending' || st === 'Running') {
-                    updateOperation(storeHandle, op.id, { status: 'Done', progressPercent: 100, error: null, completedAt: Date.now() as Timestamp })
-                } else if (st === 'Done' && storeHandle.doc()?.operationDB?.[op.id]?.error === RETRY_MARKER) {
-                    updateOperation(storeHandle, op.id, { error: null })
-                }
-                const failed = statusNow() === 'Failed'
-                const why = failed ? String(storeHandle.doc()?.operationDB?.[op.id]?.error ?? 'retry failed') : undefined
-                if (failed) log(chalk.red(`  ${op.id.slice(0, 8)} ${op.kind}: retry failed — ${why}`))
-                if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, failed ? 'error' : 'ok', why) }
-            }).catch(async err => {
-                const msg = err?.message ?? String(err)
-                log(chalk.red(`  ${op.id.slice(0, 8)} ${op.kind}: retry failed — ${msg}`))
-                if (statusNow() !== 'Cancelled') {
-                    updateOperation(storeHandle, op.id, {
-                        status: 'Failed',
-                        error: `Retry failed: ${msg}`,
-                        completedAt: Date.now() as Timestamp,
-                    })
-                }
-                if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'error', `Retry failed: ${msg}`) }
-            })
+            void runRecoveryRetry(storeHandle, op, handler)
         } else {
             log(chalk.yellow(`  ${op.id.slice(0, 8)} ${op.kind}: marking Failed (strategy: ${strategy}${strategy === 'retry' ? ', no handler' : ''})`))
             const base = strategy === 'retry'

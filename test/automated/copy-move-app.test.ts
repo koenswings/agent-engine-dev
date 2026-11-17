@@ -139,6 +139,27 @@ vi.mock('zx', async (importOriginal) => {
     }
 })
 
+// engine#497 (helper v20): the in-flight marker, verify-copy and the version check go
+// through InFlight.inFlightHelper; a fake records them (no sudo). verify-copy reports
+// FAKE_VERIFY.differences (default 0).
+import { inFlightHelper } from '../../src/data/InFlight.js'
+import { resetResumeStateForTests, noteDiskDocked, resetEngineStoppingForTests } from '../../src/data/Operations.js'
+const helperCalls: string[][] = []
+const FAKE_VERIFY = { differences: 0 }
+beforeEach(() => {
+    helperCalls.length = 0
+    FAKE_VERIFY.differences = 0
+    resetResumeStateForTests()
+    resetEngineStoppingForTests()
+    inFlightHelper.run = async (args: string[]) => {
+        helperCalls.push(args)
+        if (args[0] === 'verify-copy') return `differences=${FAKE_VERIFY.differences}\n${FAKE_VERIFY.differences ? 'diff=>f.st...... data/x\n' : ''}`
+        return ''
+    }
+    inFlightHelper.atLeast = async () => null
+})
+const helperVerbs = () => helperCalls.map(a => a[0])
+
 // ── Store helpers ─────────────────────────────────────────────────────────────
 
 const SOURCE_DISK_ID = 'DISK_source' as DiskID
@@ -298,8 +319,10 @@ describe('copyApp', () => {
         await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
         const newId = vi.mocked(processInstance).mock.calls[0][2]
         expect(vi.mocked(helper.instanceDataBytes).mock.calls).toEqual([['idea-test-1', INSTANCE_ID]])
+        const opId = Object.keys(handle.doc().operationDB)[0]
+        // engine#497: a local copy passes its op id, so the helper may continue into its own marked folder
         expect(vi.mocked(rsyncInstanceData).mock.calls.map(c => c[0])).toEqual([
-            { kind: 'copy', srcRoot: 'idea-test-1', srcId: INSTANCE_ID, dstRoot: 'idea-test-2', dstId: newId },
+            { kind: 'copy', srcRoot: 'idea-test-1', srcId: INSTANCE_ID, dstRoot: 'idea-test-2', dstId: newId, opId },
         ])
         expect(newId).toMatch(/^[a-z0-9]{19}$/)
         expect(typeof vi.mocked(rsyncInstanceData).mock.calls[0][2]).toBe('string')   // opId: cancellable
@@ -307,26 +330,74 @@ describe('copyApp', () => {
         expect(vi.mocked(mfs.ensureDir).mock.calls.map(c => String(c[0])).some(p => p.includes('/instances/'))).toBe(false)
     })
 
-    it('a failed instance copy removes the partial copy (new id) through the helper', async () => {
+    it('engine#497: a failed local instance copy KEEPS the partial copy under its marker (r36 delete withdrawn) and parks the op to resume', async () => {
         const { handle } = await makeHandle()
         const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
         const helper = await import('../../src/utils/appDataHelper.js')
-        vi.mocked(rsyncInstanceData).mockRejectedValueOnce(new Error('rsync cancelled (SIGTERM)'))
+        vi.mocked(rsyncInstanceData).mockRejectedValueOnce(new Error('rsync (idea-app-data copy exited with code 23: some files vanished)'))
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
         await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
         const spec = vi.mocked(rsyncInstanceData).mock.calls[0][0] as any
-        expect(vi.mocked(helper.deleteInstanceData).mock.calls).toEqual([['idea-test-2', spec.dstId]])
-        expect(spec.dstId).not.toBe(INSTANCE_ID)
+        expect(vi.mocked(helper.deleteInstanceData)).not.toHaveBeenCalled()
         expect(vi.mocked(helper.deleteRemoteInstanceData)).not.toHaveBeenCalled()
+        expect(spec.dstId).not.toBe(INSTANCE_ID)
+        const op = Object.values(handle.doc().operationDB)[0]
+        expect(op.status).toBe('Pending')
+        expect(op.error).toMatch(/^RESUME_PENDING \(1\/3\): rsync .*code 23/)
+        expect(op.args).toMatchObject({ targetInstanceId: spec.dstId, phase: 'copying', resumeFailures: '1' })
+        expect(helperCalls).toEqual([['mark-in-flight', 'idea-test-2', spec.dstId, op.id, String(localEngineId)]])
+        consoleSpy.mockRestore()
     })
 
-    it('sets operation status to Failed when rsync throws', async () => {
+    it('engine#497: the marker is written before the first byte (app master) and a failure there parks the op too', async () => {
         const { handle } = await makeHandle()
         const { rsyncDirectory } = await import('../../src/utils/rsync.js')
         vi.mocked(rsyncDirectory).mockRejectedValueOnce(new Error('disk full'))
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        const ops = Object.values(handle.doc().operationDB)
+        expect(ops[0].status).toBe('Pending')
+        expect(ops[0].error).toMatch(/^RESUME_PENDING \(1\/3\): disk full/)
+        expect(helperVerbs()).toEqual(['mark-in-flight'])
+        consoleSpy.mockRestore()
+    })
+
+    it('engine#497: a failure before the marker (helper older than v20) is a plain Failed, nothing written', async () => {
+        const { handle } = await makeHandle()
+        inFlightHelper.atLeast = async () => 'copyApp needs the app-data root helper v20 or later'
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
         await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
         const ops = Object.values(handle.doc().operationDB)
         expect(ops[0].status).toBe('Failed')
-        expect(ops[0].error).toContain('disk full')
+        expect(ops[0].error).toMatch(/^HELPER_OUTDATED: .*v20/)
+        expect(helperCalls).toEqual([])
+        consoleSpy.mockRestore()
+    })
+
+    it('engine#497: success = marker, copy with op id, verify, register by the owning op, then the marker goes', async () => {
+        const { handle } = await makeHandle()
+        const { processInstance } = await import('../../src/data/Disk.js')
+        const newId = await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        const op = Object.values(handle.doc().operationDB)[0]
+        expect(op.status).toBe('Done')
+        expect(op.args).toMatchObject({ targetInstanceId: newId, phase: 'done', copyName: 'my-kolibri-2' })
+        expect(helperVerbs()).toEqual(['mark-in-flight', 'verify-copy', 'clear-in-flight'])
+        expect(helperCalls[1]).toEqual(['verify-copy', 'idea-test-1', INSTANCE_ID, 'idea-test-2', newId])
+        expect(vi.mocked(processInstance).mock.calls[0].slice(2)).toEqual([newId, { inFlightOpId: op.id }])
+    })
+
+    it('engine#497: a copy that does not verify is not registered; the partial copy is kept and the op parks', async () => {
+        const { handle } = await makeHandle()
+        FAKE_VERIFY.differences = 2
+        const { processInstance } = await import('../../src/data/Disk.js')
+        const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+        await copyApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        const op = Object.values(handle.doc().operationDB)[0]
+        expect(op.status).toBe('Pending')
+        expect(op.error).toMatch(/^RESUME_PENDING \(1\/3\): VERIFY_FAILED: .* 2 item/)
+        expect(vi.mocked(processInstance)).not.toHaveBeenCalled()
+        expect(helperVerbs()).toEqual(['mark-in-flight', 'verify-copy'])
+        consoleSpy.mockRestore()
     })
 
     // Validation refusals throw (idea#168 r29@97), so the trace fails loud.
@@ -414,8 +485,9 @@ describe('moveApp', () => {
             handle,
             expect.objectContaining({ id: TARGET_DISK_ID }),
             INSTANCE_ID,
-            // kc8 step 104: the explicit keep-id claim from the move's source disk
-            { moveFrom: SOURCE_DISK_ID },
+            // kc8 step 104: the explicit keep-id claim from the move's source disk;
+            // engine#497: registered by the op that owns the target's in-flight marker
+            { moveFrom: SOURCE_DISK_ID, inFlightOpId: Object.keys(handle.doc().operationDB)[0] },
         )
     })
 
@@ -442,6 +514,7 @@ describe('moveApp', () => {
             expect.objectContaining({ id: INSTANCE_ID }),
             expect.objectContaining({ id: TARGET_DISK_ID }),
             'post-move',
+            { inFlightOpId: Object.keys(handle.doc().operationDB)[0] },
         )
         expect(order).toEqual(['down', 'process', 'start'])
         expect(Object.values(handle.doc().operationDB)[0].status).toBe('Done')
@@ -490,7 +563,7 @@ describe('moveApp', () => {
         const { startInstance } = await import('../../src/data/Instance.js')
         vi.mocked(rsyncInstanceData).mockRejectedValueOnce(new Error('rsync (idea-app-data copy exited with code 23: some files vanished)'))
         await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)).rejects.toMatchObject({ code: 'COPY_FAILED', message: expect.stringMatching(/^MOVE FAILED: /) })
-        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Failed')
+        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Pending')   // engine#497: parked, resumes
         expect(composeDownAtMock).not.toHaveBeenCalled()
         expect(vi.mocked(startInstance)).toHaveBeenCalled()
     })
@@ -523,7 +596,7 @@ describe('moveApp', () => {
         await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
         expect(vi.mocked(helper.instanceDataBytes).mock.calls).toEqual([['idea-test-1', INSTANCE_ID]])
         expect(vi.mocked(rsyncInstanceData).mock.calls.map(c => c[0])).toEqual([
-            { kind: 'copy', srcRoot: 'idea-test-1', srcId: INSTANCE_ID, dstRoot: 'idea-test-2', dstId: INSTANCE_ID },
+            { kind: 'copy', srcRoot: 'idea-test-1', srcId: INSTANCE_ID, dstRoot: 'idea-test-2', dstId: INSTANCE_ID, opId: Object.keys(handle.doc().operationDB)[0] },
         ])
         expect(typeof vi.mocked(rsyncInstanceData).mock.calls[0][2]).toBe('string')   // opId: cancellable
         // the instance folder is not pre-created as pi (the helper creates it as root)
@@ -531,14 +604,45 @@ describe('moveApp', () => {
         expect(vi.mocked(mfs.ensureDir).mock.calls.map(c => String(c[0])).some(p => p.includes('/instances/'))).toBe(false)
     })
 
-    it('a failed instance copy removes the partial target copy through the helper, never the source', async () => {
+    it('engine#497: a failed instance copy KEEPS the partial target under its marker (idea#168 delete withdrawn), never touches the source, parks the op', async () => {
         const { handle } = await makeHandle()
         const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
         const helper = await import('../../src/utils/appDataHelper.js')
         vi.mocked(rsyncInstanceData).mockRejectedValueOnce(new Error('rsync (idea-app-data copy exited with code 23: some files vanished)'))
         await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)).rejects.toMatchObject({ code: 'COPY_FAILED', message: expect.stringMatching(/^MOVE FAILED: /) })
-        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Failed')
-        expect(vi.mocked(helper.deleteInstanceData).mock.calls).toEqual([['idea-test-2', INSTANCE_ID]])
+        const op = Object.values(handle.doc().operationDB)[0]
+        expect(op.status).toBe('Pending')
+        expect(op.error).toMatch(/^RESUME_PENDING \(1\/3\): rsync/)
+        expect(op.args).toMatchObject({ targetInstanceId: INSTANCE_ID, phase: 'copying', resumeFailures: '1' })
+        expect(vi.mocked(helper.deleteInstanceData)).not.toHaveBeenCalled()
+        expect(handle.doc().instanceDB[INSTANCE_ID]?.storedOn).toBe(SOURCE_DISK_ID)
+        expect(helperVerbs()).toEqual(['mark-in-flight'])
+    })
+
+    it('engine#497: the source is removed only after the target verified; a verify failure keeps both and parks', async () => {
+        const { handle } = await makeHandle()
+        FAKE_VERIFY.differences = 1
+        const helper = await import('../../src/utils/appDataHelper.js')
+        const { processInstance } = await import('../../src/data/Disk.js')
+        await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)).rejects.toMatchObject({ code: 'COPY_FAILED' })
+        expect(Object.values(handle.doc().operationDB)[0].error).toMatch(/^RESUME_PENDING \(1\/3\): VERIFY_FAILED/)
+        expect(vi.mocked(processInstance)).not.toHaveBeenCalled()
+        expect(vi.mocked(helper.deleteInstanceData)).not.toHaveBeenCalled()
+        expect(composeDownAtMock).not.toHaveBeenCalled()
+    })
+
+    it('engine#497: a successful move clears the marker last, after the source is removed', async () => {
+        const { handle } = await makeHandle()
+        const helper = await import('../../src/utils/appDataHelper.js')
+        const order: string[] = []
+        vi.mocked(helper.deleteInstanceData).mockImplementationOnce(async () => { order.push('delete-source') })
+        const run = inFlightHelper.run
+        inFlightHelper.run = async (args) => { order.push(args[0]); return run(args) }
+        await moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)
+        expect(order).toEqual(['mark-in-flight', 'verify-copy', 'delete-source', 'clear-in-flight'])
+        const op = Object.values(handle.doc().operationDB)[0]
+        expect(op.status).toBe('Done')
+        expect(op.args.phase).toBe('done')
     })
 
     it('a helper refusal (e.g. the target folder already exists) removes nothing', async () => {
@@ -678,8 +782,8 @@ describe('moveApp', () => {
         const { startInstance } = await import('../../src/data/Instance.js')
         await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)).rejects.toMatchObject({ code: 'COPY_FAILED', message: expect.stringMatching(/^MOVE FAILED: io error/) })
         const ops = Object.values(handle.doc().operationDB)
-        expect(ops[0].status).toBe('Failed')
-        expect(ops[0].error).toContain('io error')
+        expect(ops[0].status).toBe('Pending')   // engine#497: parked (1/3), resumes at the next boot or dock
+        expect(ops[0].error).toMatch(/^RESUME_PENDING \(1\/3\): io error/)
         expect(vi.mocked(startInstance)).toHaveBeenCalled()
     })
 
@@ -698,7 +802,7 @@ describe('moveApp', () => {
         expect(t.status).toBe('error')
         expect(commandLogText(t.errorMessage)).toMatch(/^MOVE FAILED: .*code 23.*source kept$/)
         expect(t.errorCode).toBe('COPY_FAILED')
-        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Failed')
+        expect(Object.values(handle.doc().operationDB)[0].status).toBe('Pending')   // engine#497: parked, resumes
         consoleSpy.mockRestore()
     })
 })
@@ -779,7 +883,7 @@ describe('engine#497: boot recovery re-runs copyApp / moveApp inside the interru
             expect(Object.values(handle.doc().operationDB)).toHaveLength(1)
         })
 
-        it(`${kind}: a failed retry (rsync dies) ends the same op Failed and the next boot does not retry it`, async () => {
+        it(`${kind}: a failed retry (rsync dies, after the marker) parks the same op (1/3); the next boot waits for the dock pass instead of running it`, async () => {
             const { handle } = await makeHandle()
             interrupted(handle, kind)
             const { rsyncDirectory } = await import('../../src/utils/rsync.js')
@@ -787,13 +891,15 @@ describe('engine#497: boot recovery re-runs copyApp / moveApp inside the interru
             const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
             const handlers = await spyHandlers()
             await recoverInterruptedOperations(handle, handlers)
-            await vi.waitFor(() => expect(handle.doc().operationDB['op-x'].status).toBe('Failed'))
-            expect(handle.doc().operationDB['op-x'].error).toContain('io error')
+            await vi.waitFor(() => expect(handle.doc().operationDB['op-x'].error).toMatch(/^RESUME_PENDING \(1\/3\): io error/))
+            expect(handle.doc().operationDB['op-x'].status).toBe('Pending')
             expect(Object.values(handle.doc().operationDB)).toHaveLength(1)
             expect(queued(handle)).toEqual([])
-            await recoverInterruptedOperations(handle, handlers)
+            await recoverInterruptedOperations(handle, handlers)   // next boot: parked until its disks dock
             await new Promise(r => setTimeout(r, 20))
             expect(handlers[kind]).toHaveBeenCalledTimes(1)
+            expect(handle.doc().operationDB['op-x'].error).toMatch(/^RESUME_WAITING: resumes when 'source-disk'/)
+            expect(handle.doc().operationDB['op-x'].args.resumeFailures).toBe('1')
             consoleSpy.mockRestore()
         })
     }
