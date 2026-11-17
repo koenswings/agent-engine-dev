@@ -22,7 +22,7 @@ import { createServerStore } from './data/Store.js'
 import { assertStoreIdentityMatchesData, prepareStoreIdentity, refuseFleetStoreInIsolatedMode, storeIdentityPaths } from './data/StoreIdentity.js'
 import { enableStoreMonitor } from './monitors/storeMonitor.js'
 import { enableInstanceStatusMonitor } from './monitors/instanceStatusMonitor.js'
-import { recoverInterruptedOperations, archiveOldOperations } from './data/Operations.js'
+import { recoverInterruptedOperations, archiveOldOperations, markEngineStopping } from './data/Operations.js'
 import { startBackupScheduler } from './monitors/backupScheduler.js'
 import { startDataBytesMonitor } from './data/DataBytes.js'
 import { startPreUpdateQuarantine } from './monitors/preUpdateQuarantine.js'
@@ -227,6 +227,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired when you kill the app with ctrl + c.
         log('Shutting down automerge')
         log('*** SIGINT received ****');
+        markEngineStopping()   // engine#497: what fails from now on is an interruption, not a counted failure
         await ideaLocalPublisher?.stop().catch(() => {})
         await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)
@@ -235,6 +236,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // this will be fired by the Linux shutdown command
         log('Shutting down automerge')
         log('*** SIGTERM received ****');
+        markEngineStopping()   // engine#497: what fails from now on is an interruption, not a counted failure
         await ideaLocalPublisher?.stop().catch(() => {})
         await shutdownProcedure(repo, httpServer, mdnsHandle)
         process.exit(0)

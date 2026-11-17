@@ -20,6 +20,7 @@ import { config, disksRoot, systemDiskSkipSource } from '../data/Config.js'
 import { DocHandle } from '@automerge/automerge-repo';
 import { getCommandLogHandle, addTrace, closeTrace } from '../data/CommandLogStore.js';
 import { runWithTrace } from '../utils/CommandLogger.js';
+import { noteDiskUndocked } from '../data/Operations.js'
 import { recordDiskDetectionFailure, errorMessage } from './diskDetection.js';
 import { addStick, classifyFsType, stickBlockedBySiblings, removeStick, removeSticksOnDrive, usbStartupCleanup, usbStickOps, usbStickRoutingActive, syncUsbApps } from '../data/UsbSticks.js'
 import { lookForIdeaMeta, IdeaLookResult, isValidIdeaMetaFile, hasIgnoreMarker, hasOsRootfsLayout, safeMount, unmountAndRemove, mountCommandsActive, mountOps, mountPointOf } from './mounts.js';
@@ -876,6 +877,8 @@ const liveMountChangedReason = async (device: string): Promise<string | null> =>
 
 export const undockDisk = async (storeHandle: DocHandle<Store>, disk: Disk, opts: { waitInFlight?: boolean } = {}): Promise<UndockResult | void> => {
     markUndockPending(String(disk.id))
+    // engine#497: ops that need this disk resume only after its next dock pass
+    noteDiskUndocked(String(disk.id))
     try { return await undockDiskInner(storeHandle, disk, opts) } finally {
         clearUndockPending(String(disk.id))
         refreshDemoHbQuiet(storeHandle)

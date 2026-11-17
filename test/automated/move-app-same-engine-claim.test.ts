@@ -78,6 +78,12 @@ import { moveApp } from '../../src/data/CopyMoveApp.js'
 import { undockDisk } from '../../src/monitors/usbDeviceMonitor.js'
 import { config } from '../../src/data/Config.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
+// engine#497 (helper v20): marker, verify-copy and the version check, recorded (no sudo)
+import { inFlightHelper } from '../../src/data/InFlight.js'
+beforeEach(() => {
+    inFlightHelper.atLeast = async () => null
+    inFlightHelper.run = async (args: string[]) => args[0] === 'verify-copy' ? 'differences=0\n' : ''
+})
 
 DISKS_ROOT_P.v = DISKS_ROOT
 
@@ -178,9 +184,11 @@ describe('same-Engine moveApp re-homes the instance (kc8 step 104)', () => {
         await expect(moveApp(w.h, INST as any, w.source.id, w.target.id)).rejects.toThrow(/not registered on/)
         spy.mockRestore()
         expect(String(w.h.doc()!.instanceDB[INST].storedOn)).toBe(String(w.source.id))
-        expect(moveOp(w.h)?.status).toBe('Failed')
+        // engine#497 (Koen's rule): a real failure after the marker parks the op (1/3) and keeps the partial target
+        expect(moveOp(w.h)?.status).toBe('Pending')
+        expect(moveOp(w.h)?.error).toMatch(/^RESUME_PENDING \(1\/3\): moveApp: instance .* was not registered on/)
         expect(events).toEqual([`stop:${w.source.id}`, `start:${w.source.id}:storedOn=${w.source.id}`])
-        expect(await fs.pathExists(`${DISKS_ROOT}/${w.target.device}/instances/${INST}`)).toBe(false)
+        expect(await fs.pathExists(`${DISKS_ROOT}/${w.target.device}/instances/${INST}`)).toBe(true)
     })
 
     it('4. createOrUpdateInstance moveFrom claims only from that exact source disk', async () => {

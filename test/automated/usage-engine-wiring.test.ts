@@ -34,7 +34,8 @@ describe('Engine writes skip flags', () => {
         const src = read('src/data/CopyMoveApp.ts')
         expect(src).toMatch(/beginUsageSkip\('move'\)/)
         expect(src).toMatch(/endUsageSkip\('move'\)/)
-        expect(src.split("beginUsageSkip('move')")).toHaveLength(3)
+        // copyApp, moveApp, and engine#497's finishRegisteredMove (a resumed move's last steps)
+        expect(src.split("beginUsageSkip('move')")).toHaveLength(4)
     })
 })
 

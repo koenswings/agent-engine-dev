@@ -21,7 +21,19 @@
 # Usage (exact argument counts; no options are accepted from the caller):
 #   idea-app-data version
 #   idea-app-data size         <root> <id>
-#   idea-app-data copy         <srcRoot> <srcId> <dstRoot> <dstId>
+#   idea-app-data copy         <srcRoot> <srcId> <dstRoot> <dstId> [<opId>]
+#                                    (v20, engine#497: with <opId>, a NON-EMPTY destination is accepted
+#                                    only when instances/<dstId>.idea-op-in-flight marks that operation;
+#                                    rsync then continues into it, skipping files that are already complete)
+#   idea-app-data verify-copy  <srcRoot> <srcId> <dstRoot> <dstId>
+#                                    (v20: read-only rsync dry run source → destination; prints
+#                                    "differences=<n>" and up to 10 "diff=<item> <path>" lines; 0 = verified)
+#   idea-app-data mark-in-flight  <root> <id> <opId> <engineId>
+#                                    (v20: write instances/<id>.idea-op-in-flight, root 0644, NEXT TO the
+#                                    instance folder, never inside it: "opId=… engineId=… created=…".
+#                                    The same op again is ok; another op's marker is refused IN_FLIGHT)
+#   idea-app-data clear-in-flight <root> <id> <opId>
+#                                    (v20: remove that marker, only when it names <opId>; absent is ok)
 #   idea-app-data send         <srcRoot> <srcId> <host> <peerEngineId> <dstRoot> <dstId>
 #   idea-app-data receive      <dstRoot> <dstId> <rsync server args...>   (remote side of send only)
 #   idea-app-data delete       <root> <id>
@@ -79,6 +91,9 @@
 #   (v6, idea#406: device roots are partitions 1-9, RE_DEV ^sd[a-z][1-9]$; was [12])
 #   idea-app-data borg-init    <bdev> <id>
 #   idea-app-data borg-info    <bdev> <id>
+#   idea-app-data borg-break-lock <bdev> <id>   (v20, engine#497: borg break-lock of that one repository, for the
+#                                            Engine's own interrupted backup only (the Engine checks the owner and
+#                                            that no borg runs); borg create then continues from its checkpoint)
 #   idea-app-data borg-create  <bdev> <id> <archive> <srcRoot> [exclude…]   (v8, idea#443)
 #   idea-app-data borg-extract <bdev> <id> <archive> <strip> <dstRoot>   (v19, engine#468: the replaced
 #                                                                           instances/<id> goes to .idea-quarantine; see v19)
@@ -117,6 +132,12 @@
 #        cleanup via #273). When the move cannot be done the restore still succeeds, the folder
 #        stays in the staging folder and stdout gets replacedKept=<path>.
 #        The staging cleanup (also on a signal) never removes a .previous folder.
+#   v20 (engine#497, Koen's rule: interrupted copies RESUME): the in-flight marker
+#        instances/<id>.idea-op-in-flight (opId, owner engineId) is written before the first byte of a
+#        local copy/move and removed only after success. copy with <opId> continues into a non-empty
+#        destination only under a matching marker; without one it refuses as before. verify-copy checks
+#        the result. borg-break-lock frees a repository left locked by this Engine's killed backup.
+#        Every Engine skips registering or starting an instance folder that has a marker.
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
 # excludes may hold '/'):
@@ -211,7 +232,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=19
+readonly IDEA_APP_DATA_VERSION=20
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -305,6 +326,7 @@ RE_LEGACY_ID='^[a-z0-9][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$'
 RE_SLOT='^[a-z0-9][a-z0-9-]{0,63}$'
 RE_ARCHIVE='^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9-]{8,16}Z(-(hook|stop|cold))?$'
 RE_STAMP='^[0-9]{8}T[0-9]{6,15}Z$'
+RE_OPID='^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$'
 RE_STRIP='^[1-9]$'
 RE_IPV4='^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$'
 RE_HOST='^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$'
@@ -772,8 +794,8 @@ existing_dir() {   # existing_dir <path> <what>
 
 # A destination must not exist yet or be an empty real folder; created (0700, the
 # copy then gives it the source's owner and mode).
-prepare_dst() {
-    local d="$1"
+prepare_dst() {   # prepare_dst <dir> [<opId>]
+    local d="$1" op="${2:-}" cur
     if [[ -L "$d" ]]; then refuse "destination $d is a symlink"; fi
     if [[ -e "$d" ]]; then
         exact_path "$d" && [[ -d "$d" ]] || refuse "destination $d is not a real folder"
@@ -781,7 +803,15 @@ prepare_dst() {
         shopt -s nullglob dotglob
         entries=("$d"/*)
         shopt -u nullglob dotglob
-        (( ${#entries[@]} == 0 )) || refuse "destination $d already exists and is not empty"
+        if (( ${#entries[@]} != 0 )); then
+            # v20, engine#497: an interrupted copy of operation <opId> continues into its own
+            # half-written folder, and only under that operation's in-flight marker
+            [[ -n "$op" ]] || refuse "destination $d already exists and is not empty"
+            cur=$(marker_opid "$d$MARKER_SUFFIX") || refuse "destination $d already exists and is not empty (no in-flight marker for operation $op)"
+            [[ "$cur" == "$op" ]] || refuse "destination $d already exists and is not empty (its in-flight marker names operation $cur, not $op)"
+            echo "resume: $d is not empty; continuing operation $op under its in-flight marker" >&2
+            journal "resume into $d for operation $op"
+        fi
     else
         $MKDIR -m 0700 -- "$d" || refuse "cannot create destination $d"
     fi
@@ -866,6 +896,20 @@ borg_env() {
 }
 
 inst_dir() { echo "$1/instances/$2"; }   # inst_dir <R_DIR> <id>
+# v20, engine#497: the in-flight marker of instances/<id>, a sibling file (never inside the folder)
+MARKER_SUFFIX=.idea-op-in-flight
+marker_path() { echo "$1/instances/$2$MARKER_SUFFIX"; }   # marker_path <R_DIR> <id>
+check_opid() { [[ "$1" =~ $RE_OPID ]] || refuse "operation id '$1' does not match $RE_OPID"; }
+# Print the opId a marker names. Fails for anything but a regular, non-symlink, root-owned file.
+marker_opid() {   # marker_opid <path>
+    local m="$1" line
+    [[ -f "$m" && ! -L "$m" ]] || return 1
+    [[ "$($STAT -c %u -- "$m" 2>/dev/null)" == "$ROOT_UID" ]] || return 1
+    while IFS= read -r line; do
+        if [[ "$line" == opId=* ]]; then printf '%s\n' "${line#opId=}"; return 0; fi
+    done < "$m"
+    return 1
+}
 
 check_engine_id() { [[ "$1" =~ $RE_ENGINE ]] || refuse "Engine id '$1' does not match $RE_ENGINE"; }
 check_app() { [[ "$1" =~ $RE_APP && "$1" != *..* ]] || refuse "app id '$1' does not match $RE_APP (or holds '..')"; }
@@ -1098,7 +1142,10 @@ case "$SUB" in
         ;;
 
     copy)
-        need 4 $(($# - 1)) "<srcRoot> <srcId> <dstRoot> <dstId>"
+        given=$(($# - 1))
+        (( given == 4 || given == 5 )) || refuse "$SUB takes 4 or 5 argument(s) (<srcRoot> <srcId> <dstRoot> <dstId> [<opId>]), got $given"
+        COPY_OP=""
+        if (( given == 5 )); then COPY_OP="$6"; check_opid "$COPY_OP"; fi
         check_id "$3"; check_id "$5"
         resolve_root "$2" instances; S_DIR="$R_DIR"
         resolve_root "$4" instances; D_DIR="$R_DIR"
@@ -1109,12 +1156,82 @@ case "$SUB" in
         DST=$(inst_dir "$D_DIR" "$5")
         refuse_external_links "$SRC"
         take_locks "inst.$2.$3" "inst.$4.$5"
-        prepare_dst "$DST"
+        prepare_dst "$DST" "$COPY_OP"
         pin_cwd "$SRC"
         exec {DST_FD}<"$DST" || refuse "cannot open destination $DST"
         [[ "$($READLINK -- "/proc/$$/fd/$DST_FD")" == "$DST" ]] || refuse "destination $DST changed while it was opened"
         run_child $RSYNC "${RSYNC_OPTS[@]}" -- ./ "/proc/self/fd/$DST_FD/"
         exit $?
+        ;;
+
+    verify-copy)
+        need 4 $(($# - 1)) "<srcRoot> <srcId> <dstRoot> <dstId>"
+        check_id "$3"; check_id "$5"
+        resolve_root "$2" instances; S_DIR="$R_DIR"
+        resolve_root "$4" instances; D_DIR="$R_DIR"
+        [[ "$S_DIR" != "$D_DIR" || "$3" != "$5" ]] || refuse "source and destination are the same folder"
+        SRC=$(inst_dir "$S_DIR" "$3")
+        DST=$(inst_dir "$D_DIR" "$5")
+        existing_dir "$SRC" "source instance folder"
+        existing_dir "$DST" "destination instance folder"
+        refuse_external_links "$SRC"
+        take_locks "inst.$2.$3" "inst.$4.$5"
+        pin_cwd "$SRC"
+        # Read-only: a dry run (-n) with the copy's own options lists every item the copy
+        # would still change (quick check: size and mtime, owners, modes). Nothing listed = verified.
+        VOUT=$($RSYNC -aHAX --numeric-ids -x -n --itemize-changes --out-format='%i %n' -- ./ "$DST/") || exit $?
+        VN=0
+        VLIST=()
+        while IFS= read -r line; do
+            [[ -n "$line" ]] || continue
+            VN=$((VN + 1))
+            (( ${#VLIST[@]} < 10 )) && VLIST+=("$line")
+        done <<<"$VOUT"
+        echo "differences=$VN"
+        for line in "${VLIST[@]}"; do echo "diff=$line"; done
+        exit 0
+        ;;
+
+    mark-in-flight)
+        need 4 $(($# - 1)) "<root> <id> <opId> <engineId>"
+        check_id "$3"; check_opid "$4"; check_engine_id "$5"
+        resolve_root "$2" instances
+        PARENT="$R_DIR/instances"
+        existing_dir "$PARENT" "instances folder"
+        M=$(marker_path "$R_DIR" "$3")
+        take_locks "inst.$2.$3"
+        if [[ -e "$M" || -L "$M" ]]; then
+            CUR=$(marker_opid "$M") || refuse "in-flight marker $M is not a root-owned regular file"
+            [[ "$CUR" == "$4" ]] || refuse "IN_FLIGHT: $M already marks operation $CUR"
+            echo "ok: $M already marks operation $4"
+            exit 0
+        fi
+        MTMP="$PARENT/.$3$MARKER_SUFFIX.tmp.$$"
+        [[ ! -e "$MTMP" && ! -L "$MTMP" ]] || refuse "temporary marker $MTMP already exists"
+        printf 'opId=%s\nengineId=%s\ncreated=%s\n' "$4" "$5" "$($DATE -u +%Y-%m-%dT%H:%M:%SZ)" > "$MTMP" \
+            || { $RM -f -- "$MTMP"; refuse "cannot write the in-flight marker $M"; }
+        $CHMOD 0644 -- "$MTMP" || { $RM -f -- "$MTMP"; refuse "cannot chmod the in-flight marker $M"; }
+        $MV -T -- "$MTMP" "$M" || { $RM -f -- "$MTMP"; refuse "cannot put the in-flight marker $M in place"; }
+        echo "ok: $M marks operation $4 of Engine $5"
+        exit 0
+        ;;
+
+    clear-in-flight)
+        need 3 $(($# - 1)) "<root> <id> <opId>"
+        check_id "$3"; check_opid "$4"
+        resolve_root "$2" instances
+        existing_dir "$R_DIR/instances" "instances folder"
+        M=$(marker_path "$R_DIR" "$3")
+        if [[ ! -e "$M" && ! -L "$M" ]]; then
+            echo "ok: $M does not exist; nothing to clear"
+            exit 0
+        fi
+        CUR=$(marker_opid "$M") || refuse "in-flight marker $M is not a root-owned regular file"
+        [[ "$CUR" == "$4" ]] || refuse "IN_FLIGHT: $M marks operation $CUR, not $4"
+        take_locks "inst.$2.$3"
+        $RM -f -- "$M" || refuse "cannot remove the in-flight marker $M"
+        echo "ok: cleared $M"
+        exit 0
         ;;
 
     send)
@@ -1752,6 +1869,19 @@ case "$SUB" in
         [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
         borg_env
         run_child $BORG info --json --last 1 -- "$REPO"
+        exit $?
+        ;;
+
+    borg-break-lock)
+        need 2 $(($# - 1)) "<bdev> <id>"
+        check_id "$3"
+        resolve_root "$2" backup
+        REPO="$R_DIR/backups/$3"
+        existing_dir "$REPO" "repository folder"
+        [[ -f "$REPO/config" ]] || refuse "$REPO is not a Borg repository"
+        take_locks "repo.$2.$3"
+        borg_env
+        run_child $BORG break-lock -- "$REPO"
         exit $?
         ;;
 

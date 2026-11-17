@@ -18,6 +18,7 @@ import { updateDiskSize } from './DiskSize.js';
 import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 import { shouldAutoStart } from './AutoStart.js';
 import { isLegacyDottedInstanceId, LEGACY_DOTTED_INSTANCE_MESSAGE } from '../utils/instanceIds.js';
+import { inFlightRefusal, isInFlightMarkerName } from './InFlight.js';
 
 // Disks are multi-purpose  - they can be used for engines, apps, backups, etc.
 
@@ -381,6 +382,14 @@ export const processDisk = async (storeHandle: DocHandle<Store>, disk: Disk): Pr
     } catch (e: any) {
         log(`demo hb after processDisk: ${e.message ?? e}`)
     }
+    // engine#497: the dock pass is done; resume this Engine's interrupted copy/move/backup
+    // ops that waited for this disk (background; each resumes inside its own operation)
+    try {
+        const { noteDiskDocked } = await import('./Operations.js')
+        noteDiskDocked(storeHandle, String(disk.id))
+    } catch (e: any) {
+        log(`resume after processDisk ${disk.id}: ${e.message ?? e}`)
+    }
 }
 
 /**
@@ -527,10 +536,16 @@ export const processSystemDisk = async (storeHandle: DocHandle<Store>, disk: Dis
     const storedInstances = getInstancesOfDisk(store, disk)
     const actualInstances: Instance[] = []
 
+    // engine#497: an instance folder with an in-flight marker belongs to an interrupted
+    // copy/move; it is neither registered nor started, and its record (if any) is kept
+    const inFlightIds = new Set<string>()
     if (await $`test -d /instances`.then(() => true).catch(() => false)) {
-        const instanceIds = (await $`ls /instances`).stdout.split('\n').filter(Boolean)
+        const entries = (await $`ls /instances`).stdout.split('\n').filter(Boolean)
+        const instanceIds = entries.filter(e => !isInFlightMarkerName(e))
         log(`Instance ids on system disk: ${instanceIds}`)
         for (const instanceId of instanceIds) {
+            const refusal = await inFlightRefusal('', instanceId)
+            if (refusal) { inFlightIds.add(instanceId); log(`processSystemDisk: skipping ${instanceId}: ${refusal}`); continue }
             const instance = await processSystemInstance(storeHandle, disk, instanceId as InstanceID)
             if (instance) actualInstances.push(instance)
         }
@@ -538,6 +553,7 @@ export const processSystemDisk = async (storeHandle: DocHandle<Store>, disk: Dis
 
     // Remove instances no longer on disk
     storedInstances.forEach(storedInstance => {
+        if (inFlightIds.has(String(storedInstance.id))) return
         if (!actualInstances.some(i => i.id === storedInstance.id)) {
             removeInstance(storeHandle, disk, storedInstance.id)
         }
@@ -762,12 +778,16 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     const storedInstances = getInstancesOfDisk(store, disk)
     const actualInstances: Instance[] = []
 
+    const inFlightIds = new Set<string>()
     // Call processInstance for each folder found in <mountRoot>/instances
     if (await $`test -d ${mountRoot}/instances`.then(() => true).catch(() => false)) {
-        const instanceIds = (await $`ls ${mountRoot}/instances`).stdout.split('\n')
+        // engine#497: skip in-flight marker files; a marked folder is not registered or started
+        const instanceIds = (await $`ls ${mountRoot}/instances`).stdout.split('\n').filter(e => !isInFlightMarkerName(e))
         log(`Instance Ids found on disk ${disk.id}: ${instanceIds}`)
         for (let instanceId of instanceIds) {
             if (!(instanceId === "")) {
+                const refusal = await inFlightRefusal(mountRoot, instanceId)
+                if (refusal) { inFlightIds.add(instanceId); log(`processAppDisk: skipping ${instanceId} on disk ${disk.id}: ${refusal}`); continue }
                 const instance = await processInstance(storeHandle, disk, instanceId as InstanceID)
                 if (instance) {
                     actualInstances.push(instance)
@@ -779,8 +799,9 @@ export const processAppDisk = async (storeHandle: DocHandle<Store>, disk: Disk):
     log(`Actual instances: ${actualInstances.map(instance => instance.id)}`)
     log(`Stored instances: ${storedInstances.map(instance => instance.id)}`)
 
-    // Remove instances that are no longer on disk
+    // Remove instances that are no longer on disk (a marked, in-flight folder keeps its record)
     storedInstances.forEach((storedInstance) => {
+        if (inFlightIds.has(String(storedInstance.id))) return
         if (!actualInstances.some(actualInstance => actualInstance.id === storedInstance.id)) {
             removeInstance(storeHandle, disk, storedInstance.id)
         }
@@ -831,6 +852,13 @@ export const removeApp = async (store: Store, disk: Disk, appId: AppID): Promise
 }
 
 export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk, instanceId: InstanceID, opts: InstanceRegisterOptions = {}): Promise<Instance | undefined> => {
+    // engine#497: a folder under an in-flight marker is registered only by its own op
+    const refusal = await inFlightRefusal(await diskMountRoot(disk), String(instanceId), opts.inFlightOpId)
+    if (refusal) {
+        log(`processInstance: not registering ${instanceId} on disk ${disk.id}: ${refusal}`)
+        if (opts.inFlightOpId) throw new Error(refusal)
+        return undefined
+    }
     const instance = await createOrUpdateInstance(storeHandle, instanceId, disk, opts)
     if (instance) {
         // engine#418: never start an instance on a disk that is not its storedOn
@@ -840,7 +868,7 @@ export const processInstance = async (storeHandle: DocHandle<Store>, disk: Disk,
             log(`processInstance: not starting ${instanceId} on disk ${disk.id}; it is stored on ${storedOn ?? 'no disk'} (engine#418)`)
             return instance
         }
-        await tracedStartInstance(storeHandle, instance, disk)
+        await tracedStartInstance(storeHandle, instance, disk, opts.inFlightOpId)
     }
     return instance
 }
@@ -854,7 +882,7 @@ export const isStoredOn = (storedOn: DiskID | null | undefined, disk: Pick<Disk,
  * by disk docking appear in the Console command history, just like starts
  * issued explicitly via the 'startInstance' command.
  */
-const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
+const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, inFlightOpId?: string): Promise<void> => {
     // Never auto-start an instance the operator stopped (idea#176). processInstance
     // runs on every dock: boot, a real USB plug, the testMode/dev startup undock +
     // re-add of every disk, a spurious udev re-add, and move/restore/install
@@ -903,7 +931,9 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
         })
     }
     try {
-        await runWithTrace(traceCtx, () => startInstance(storeHandle, instance, disk, 'disk-docked'))
+        await runWithTrace(traceCtx, () => inFlightOpId
+            ? startInstance(storeHandle, instance, disk, 'disk-docked', { inFlightOpId })
+            : startInstance(storeHandle, instance, disk, 'disk-docked'))
         if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
     } catch (e: any) {
         if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', e.message ?? String(e))

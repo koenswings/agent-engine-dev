@@ -24,7 +24,7 @@ import { $, YAML, chalk, fs } from 'zx'
 import { log, print } from '../utils/utils.js'
 import { disksRoot, skipBorg } from '../data/Config.js'
 import { Disk, BackupConfig, isBackupDisk, processDisk, diskMountRoot, appDataRoot, joinMountRoot, backupOrphanLinks, syncBackupOrphanLinks } from '../data/Disk.js'
-import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast, ARCHIVE_MODE_HELPER_MIN, RESTORE_REPLACED_QUARANTINE_HELPER_MIN, parseBorgExtract, type BorgExtractResult } from '../utils/appDataHelper.js'
+import { AppDataRunner, runAppData, borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgProblem, helperAtLeast, ARCHIVE_MODE_HELPER_MIN, borgBreakLockArgs, RESUME_HELPER_MIN, RESTORE_REPLACED_QUARANTINE_HELPER_MIN, parseBorgExtract, type BorgExtractResult } from '../utils/appDataHelper.js'
 import { parseBackupExcludeList, parseBackupHookExcludeList, mergeBackupExcludeLists, BACKUP_EXCLUDE_HELPER_MIN } from '../utils/backupExclude.js'
 import { backupCleanupRunner, backupDiskFullError, cleanupIsEnabled } from '../utils/backupCleanup.js'
 import { backupArchiveName, type ArchiveMode } from '../utils/backupArchiveName.js'
@@ -34,7 +34,7 @@ import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
 import { defaultReadBootId } from '../usage/sampler.js'
 import { assertPreQuarantineHelper, quarantinePreRestore, sourceOnOtherEngine, instanceStartingHere, quarantineUnclaimedTarget } from '../data/RestorePreQuarantine.js'
-import { createOperation, updateOperation } from '../data/Operations.js'
+import { createOperation, updateOperation, setOperationArgs, isParkedOp, isResumableOp } from '../data/Operations.js'
 import { readBackupYamlState, setLinkLastBackup, editBackupYaml } from '../data/BackupYamlDoc.js'
 import { applyBackupResult, recordBackupResult, successResultCode, failureResultCode, isManualBackupCause } from '../data/BackupResults.js'
 import { DEFAULT_BACKUP_TIME } from '../utils/backupSchedule.js'
@@ -123,6 +123,48 @@ export const backupLockContents = (instanceId: string, extra: Record<string, unk
     bootId: staleBackupLock.readBootId(),
     ...extra,
 })
+
+/** engine#497: who wrote a .backup-in-progress (opId since this change; older locks have none). */
+export const readLockOwner = async (lockPath: string): Promise<{ opId: string | null, engineId: string | null }> => {
+    try {
+        const raw = JSON.parse(await fs.readFile(lockPath, 'utf-8'))
+        return { opId: raw?.opId ? String(raw.opId) : null, engineId: raw?.engineId ? String(raw.engineId) : null }
+    } catch {
+        return { opId: null, engineId: null }
+    }
+}
+
+/**
+ * engine#497: free the borg repository lock left by this Engine's own killed backup run
+ * (helper v20 borg-break-lock). Only when no borg process still uses the repository.
+ */
+const breakOwnBorgLock = async (repoPath: string, backupDevice: string, instanceId: InstanceID, opId: string): Promise<void> => {
+    let livePid: number | null = null
+    try {
+        livePid = await staleBackupLock.borgPidUsingRepo(repoPath)
+    } catch (e: any) {
+        throw new Error(`${BACKUP_STALE_LOCK}: cannot check for a live borg on ${repoPath} (${e?.message ?? e}); the backup is not resumed now`)
+    }
+    if (livePid != null) throw new Error(`${BACKUP_STALE_LOCK}: borg (pid ${livePid}) still uses ${repoPath}; the backup is not resumed now`)
+    if (skipBorg() || !await fs.pathExists(`${repoPath}/config`)) {
+        log(`Backup of ${instanceId}: resuming operation ${opId}; no borg repository lock to break${skipBorg() ? ' (skipBorg)' : ''}`)
+        return
+    }
+    const helper = await helperAtLeast(RESUME_HELPER_MIN, 'resuming an interrupted backup (borg-break-lock)')
+    if (helper) throw new Error(`HELPER_OUTDATED: ${helper}`)
+    await runAppData(borgBreakLockArgs(backupDevice, instanceId))
+    log(`Backup of ${instanceId}: resuming operation ${opId}; broke the repository lock of its interrupted borg run, borg continues from its checkpoint (engine#497)`)
+}
+
+/** engine#497: the unfinished resumable backup op of this Engine that owns the lock, if any. */
+const owningBackupOp = (store: Store | undefined, opId: string | null, instanceId: string): Operation | undefined => {
+    if (!opId) return undefined
+    const op = store?.operationDB?.[opId]
+    if (!op || op.kind !== 'backupApp' || !isResumableOp(op)) return undefined
+    if (op.status !== 'Pending' && op.status !== 'Running') return undefined
+    if (String(op.engineId) !== String(localEngineId) || String(op.args?.instanceId) !== String(instanceId)) return undefined
+    return op
+}
 
 const hasActiveBackupOrRestoreOp = (store: Store, instanceId: string): boolean =>
     Object.values(store.operationDB ?? {}).some(op =>
@@ -268,6 +310,15 @@ export const recordBackupStaleLocks = async (storeHandle: DocHandle<Store>, back
         for (const entry of await fs.readdir(backupsBase)) {
             const lockPath = `${backupsBase}/${entry}/${LOCK_FILE}`
             if (await fs.pathExists(lockPath)) {
+                // engine#497: the lock of this Engine's own interrupted backup op, which resumes
+                // when this dock pass ends (noteDiskDocked): not INTERRUPTED, not cleared
+                const owner = await readLockOwner(lockPath)
+                const owning = String(owner.engineId) === String(localEngineId)
+                    ? owningBackupOp(storeHandle.doc(), owner.opId, entry) : undefined
+                if (owning) {
+                    log(`Lock file for instance ${entry} on Backup Disk ${backupDisk.id} belongs to interrupted operation ${owning.id}; it resumes after this dock (engine#497)`)
+                    continue
+                }
                 found.push({ instanceId: entry as InstanceID, startedAt: await readLockStartedAt(lockPath), detectedAt })
                 log(`Lock file found for instance ${entry} on Backup Disk ${backupDisk.id} (engine#429)`)
             }
@@ -577,8 +628,19 @@ export const backupInstance = async (
         if (preUpdate && await fs.pathExists(lockPath)) {
             throw new Error(`${BACKUP_STALE_LOCK}: ${lockPath} is left from an earlier backup of ${instanceId}; it is not retried here (idea#446)`)
         }
-        await fs.writeFile(lockPath, JSON.stringify(backupLockContents(instanceId, preUpdate ? { reason: 'pre-update' } : {})))
+        // engine#497: this op resumes its own interrupted run (its lock, this Engine): free the
+        // repository lock the killed borg left; borg create then continues from its checkpoint
+        if (!preUpdate && existingOpId && await fs.pathExists(lockPath)) {
+            const owner = await readLockOwner(lockPath)
+            if (owner.opId === String(existingOpId) && String(owner.engineId) === String(localEngineId)) {
+                await breakOwnBorgLock(repoPath, backupDevice, instanceId, String(existingOpId))
+            }
+        }
+        await fs.writeFile(lockPath, JSON.stringify(backupLockContents(instanceId, { ...(preUpdate ? { reason: 'pre-update' } : {}), opId })))
         wroteLock = lockPath
+        // engine#497: from here an interrupted run resumes in this op (not for a scheduled or
+        // pre-update backup: idea#400 never retries a scheduled one, updateApp rolls back its own)
+        if (!preUpdate && cause !== 'scheduled-backup') setOperationArgs(storeHandle, opId, { phase: 'locked' })
 
         const wasRunningAtStart = instance.status === 'Running' && !preUpdate?.instanceStopped
         // idea#403: hooks exec into the App's containers, so they only run while the instance
@@ -846,6 +908,7 @@ export const runningBackupOnDisk = (store: Store, diskId: string): Operation | u
     Object.values(store.operationDB ?? {}).find(op =>
         op?.kind === 'backupApp' &&
         (op.status === 'Running' || op.status === 'Pending') &&
+        !isParkedOp(op) &&   // engine#497: a parked op waits for a dock; it does not hold the disk
         op.args?.backupDiskId === diskId) as Operation | undefined
 
 /**
