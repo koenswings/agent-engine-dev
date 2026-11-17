@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '20'
+export const APP_DATA_HELPER_VERSION = '21'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -114,6 +114,43 @@ export const parseVerifyCopy = (out: string): { differences: number, diffs: stri
     const n = Number(lines.find(l => l.startsWith('differences='))?.slice('differences='.length))
     if (!Number.isInteger(n) || n < 0) throw new Error(`idea-app-data verify-copy: no differences=<n> line in its output`)
     return { differences: n, diffs: lines.filter(l => l.startsWith('diff=')).map(l => l.slice(5)) }
+}
+// ── engine#503 (helper v21): Kolibri morango rebind as root ─────────────────
+/**
+ * Starting a Kolibri copy rebinds its morango instance id. The container owns
+ * data/kolibri/db.sqlite3 (root:root 0644), so the Engine (pi) cannot write it:
+ * the helper does it as root (kolibri-rebind, v21). Below v21 the start refuses
+ * with HELPER_OUTDATED.
+ */
+export const KOLIBRI_REBIND_HELPER_MIN = 21
+export const kolibriRebindArgs = (root: string, id: string): string[] => ['kolibri-rebind', checkRoot(root), checkId(id)]
+export interface KolibriRebindResult {
+    /** false when the instance has no data/kolibri/db.sqlite3 (nothing to rebind) */
+    dbPresent: boolean
+    /** the current row's id before the update; null when there was no current row */
+    previousId: string | null
+    /** the fresh id; null when there was no current row (nothing changed) */
+    morangoId: string | null
+    /** what the helper moved to .idea-quarantine (stale pid/cache, consumed markers) */
+    quarantined: string[]
+}
+/** kolibri-rebind output: kolibriDb=absent, or previousId= and morangoId= lines; quarantined=<path> lines. */
+export const parseKolibriRebind = (out: string): KolibriRebindResult => {
+    const lines = out.split('\n').map(l => l.trim()).filter(Boolean)
+    const value = (key: string): string | undefined => lines.find(l => l.startsWith(`${key}=`))?.slice(key.length + 1)
+    const quarantined = lines.filter(l => l.startsWith('quarantined=')).map(l => l.slice('quarantined='.length))
+    if (value('kolibriDb') === 'absent') return { dbPresent: false, previousId: null, morangoId: null, quarantined }
+    const next = value('morangoId')
+    if (next === undefined || !/^([0-9a-f]{32}|none)$/.test(next)) {
+        throw new Error(`idea-app-data kolibri-rebind: no morangoId=<32 hex>|none line in its output`)
+    }
+    const prev = value('previousId')
+    return {
+        dbPresent: true,
+        previousId: prev && prev !== 'none' ? prev : null,
+        morangoId: next === 'none' ? null : next,
+        quarantined,
+    }
 }
 /** send: the peer's address AND its Engine id (the helper pins the peer's host key by Engine id). */
 export const sendArgs = (srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string): string[] => {

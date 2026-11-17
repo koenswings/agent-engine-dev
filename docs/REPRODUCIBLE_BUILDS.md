@@ -137,4 +137,4 @@ exception approved by Steve), recorded in the retro records:
 
 Engine backups of those instances taken before the edit restore the old shared id unless
 the compose file is fixed again. The Engine's own copy path (`rebindKolibriMorangoInstanceId`,
-r40) is unchanged.
+r40) is unchanged; since engine#503 it runs as root in `idea-app-data kolibri-rebind` (helper v21).
