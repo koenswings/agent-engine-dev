@@ -110,7 +110,7 @@ describe('idea-app-data: argument checks', () => {
         const cases: [string, number][] = [
             ['version', 0], ['size', 2], ['verify-send', 7], ['mark-in-flight', 4], ['clear-in-flight', 3], ['verify-copy', 4], ['borg-break-lock', 2], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['quarantine-snapshot', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1], ['clean-verify', 3],
-            ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['kolibri-rebind', 2], ['peer-delete', 3], ['sync-peers', 2], ['clear-peers', 2], ['install-usage-key', 3],
+            ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['kolibri-rebind', 2], ['swap-quarantine', 2], ['peer-delete', 3], ['sync-peers', 2], ['clear-peers', 2], ['install-usage-key', 3],
         ]
         for (const [sub, n] of cases) {
             for (const count of [n - 1, n + 1]) {
@@ -1773,10 +1773,10 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v23 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine; v20 the engine#497 in-flight marker; v21 the engine#503 kolibri-rebind; v22 is engine#506; v23 the engine#497 (a) cross-Engine resume verbs)', async () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('23')
+    it('helper and Engine speak v25 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine; v20 the engine#497 in-flight marker; v21 the engine#503 kolibri-rebind; v23 the engine#497 (a) cross-Engine resume verbs; v24 the engine#506 swap-quarantine)', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('25')
         const r = await sb.run(['version'])
-        expect(r.stdout.trim()).toBe('idea-app-data 23')
+        expect(r.stdout.trim()).toBe('idea-app-data 25')
     })
 
     it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {

@@ -116,8 +116,8 @@ describe('restoreStartOutcome / postStartWarningMessage / parseBorgExtract (engi
         expect(replacedFolderNote({ replacedQuarantine: null, replacedKept: null })).toBeNull()
     })
 
-    it('Engine speaks helper v23 and an in-place restore still needs v19', () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('23')
+    it('Engine speaks helper v25 and an in-place restore still needs v19', () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('25')
         expect(RESTORE_REPLACED_QUARANTINE_HELPER_MIN).toBe(19)
     })
 })

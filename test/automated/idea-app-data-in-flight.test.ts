@@ -34,8 +34,8 @@ const ENGINE = 'idea01'
 const hasRealRsync = fs.existsSync(REAL_RSYNC)
 
 describe('idea-app-data v20: the in-flight marker (engine#497)', () => {
-    it('is version 21 (engine#503 builds on v20), and the Engine needs v20 to resume', () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('23')
+    it('is version 25 (engine#497 (a), engine#503 and engine#506 build on v20), and the Engine needs v20 to resume', () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('25')
         expect(RESUME_HELPER_MIN).toBe(20)
     })
 
