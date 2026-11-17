@@ -7,7 +7,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { dispatchAction, noteStepPreconditionProgress, randomStepPrecondition, type ActionContext } from './actions.js'
+import { dispatchAction, noteStepPreconditionProgress, randomStepPrecondition, readPoolSnapshot, type ActionContext, type PoolSnapshot } from './actions.js'
 import { DEFAULT_INFRA_INVARIANTS, evaluateInvariants } from './invariants.js'
 import {
     assembleWalkVideo,
@@ -56,14 +56,20 @@ export const pickDrawableTransition = async (
     state: string,
     transitions: Transition[],
     rng: () => number,
-    blockedReason: (action: string) => Promise<string | null>,
+    blockedReason: (action: string, to: string) => Promise<string | null>,
 ): Promise<{ transition: Transition; blocked: { action: string; reason: string }[] }> => {
+    // Keyed by edge (action + target state): App steps depend on the state they land in.
+    const key = (t: Transition) => `${t.action}\u0000${t.to}`
     const reasons = new Map<string, string | null>()
     for (const t of transitions) {
-        if (!reasons.has(t.action)) reasons.set(t.action, await blockedReason(t.action))
+        if (!reasons.has(key(t))) reasons.set(key(t), await blockedReason(t.action, t.to))
     }
-    const blocked = [...reasons].filter((e): e is [string, string] => e[1] !== null).map(([action, reason]) => ({ action, reason }))
-    const drawable = transitions.filter(t => reasons.get(t.action) === null)
+    const blocked: { action: string; reason: string }[] = []
+    for (const t of transitions) {
+        const reason = reasons.get(key(t))
+        if (reason != null && !blocked.some(b => b.action === t.action && b.reason === reason)) blocked.push({ action: t.action, reason })
+    }
+    const drawable = transitions.filter(t => reasons.get(key(t)) === null)
     if (!drawable.length) {
         throw new Error(`Markov: no drawable transition from '${state}' (${blocked.map(b => `${b.action}: ${b.reason}`).join('; ')})`)
     }
@@ -230,10 +236,15 @@ const runWalkWithSteps = async (
             action = step.action
         } else {
             // Markov only: steps whose precondition (an earlier step's result) is missing are not drawable.
-            const guardCtx = { opts: fullOpts, walker, poolEngines: pool, excludeEngines: exclude, fixtureInstance }
+            // One store read per draw (Markov 2: fixture disk/instance legitimately absent after eject/stop).
+            let snap: Promise<PoolSnapshot> | undefined
+            const guardCtx = {
+                opts: fullOpts, walker, poolEngines: pool, excludeEngines: exclude, fixtureInstance, fixtureInstances, fixtureDisk,
+                snapshot: () => (snap ??= readPoolSnapshot({ opts: fullOpts, poolEngines: pool, excludeEngines: exclude })),
+            }
             let picked: Awaited<ReturnType<typeof pickDrawableTransition>>
             try {
-                picked = await pickDrawableTransition(walker.current, stateDef.transitions, rng, a => randomStepPrecondition(guardCtx, a))
+                picked = await pickDrawableTransition(walker.current, stateDef.transitions, rng, (a, t) => randomStepPrecondition(guardCtx, a, process.env, t))
             } catch (err) {
                 aborted = true
                 abortReason = err instanceof Error ? err.message : String(err)
