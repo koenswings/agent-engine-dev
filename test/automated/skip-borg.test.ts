@@ -28,6 +28,9 @@ import { borgPresence } from '../../src/utils/appDataHelper.js'
 import { dataBytesQueue } from '../../src/data/DataBytes.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import { drainDataBytesQueue } from '../harness/drainDataBytes.js'
+// static: an earlier test calls vi.resetModules(); a dynamic import would get fresh Config/helper modules
+import { bootRetryHandlers } from '../../src/data/RecoveryRetry.js'
+import { recoverInterruptedOperations } from '../../src/data/Operations.js'
 
 const INST = 'inst-borg-1' as InstanceID
 
@@ -253,5 +256,60 @@ describe('backupInstance / restoreApp with testMode on', () => {
         expect(ops).toEqual(['Done', 'Failed'])
         expect(await fs.pathExists(lock), 'the next successful backup removes the stale lock').toBe(false)
         expect(h.doc()!.instanceDB[INST].lastBackup).toBeGreaterThan(0)
+    })
+})
+
+describe('engine#497: boot recovery re-runs an interrupted backupApp inside the same op (real handler)', () => {
+    const setup = async () => {
+        const h = await createMinimalStore()
+        const appDisk = makeDisk('borg-ad', appDevice, false)
+        const backupDisk = makeDisk('borg-bd', backupDevice, true)
+        h.change(doc => {
+            doc.diskDB[appDisk.id] = appDisk; doc.diskDB[backupDisk.id] = backupDisk
+            doc.operationDB['op-b'] = {
+                id: 'op-b', kind: 'backupApp', args: { instanceId: INST, backupDiskId: backupDisk.id }, cause: 'disk-docked', subject: null,
+                engineId: localEngineId, status: 'Running', progressPercent: 30, currentStep: null, totalSteps: null, stepLabel: null,
+                startedAt: 0 as Timestamp, completedAt: null, error: null,
+            } as any
+            ;(doc.engineDB[localEngineId] as any).commands = [`backupApp ${INST} ${backupDisk.id}`]
+        })
+        addInstance(h, appDisk.id)
+        const handlers = { backupApp: vi.fn(bootRetryHandlers.backupApp!) }
+        return { h, handlers, recover: () => recoverInterruptedOperations(h, handlers) }
+    }
+    const backupOps = (h: DocHandle<Store>) => Object.values(h.doc()!.operationDB ?? {}).filter((o: any) => o.kind === 'backupApp')
+
+    it('success: the same op ends Done (no second op), the queued command is dropped, the next boot does not retry it', async () => {
+        config.settings.skipBorg = undefined
+        const { h, handlers, recover } = await setup()
+        await recover()
+        expect([...((h.doc()!.engineDB[localEngineId] as any).commands ?? [])]).toEqual([])
+        await vi.waitFor(() => expect(h.doc()!.operationDB['op-b'].status).toBe('Done'))
+        expect(backupOps(h)).toHaveLength(1)
+        expect(h.doc()!.operationDB['op-b'].error).toBeNull()
+        await recover()
+        await new Promise(r => setTimeout(r, 20))
+        expect(handlers.backupApp).toHaveBeenCalledTimes(1)
+    })
+
+    it('failure is reported, not swallowed: the op ends Failed with the backup error, the next boot does not retry it', async () => {
+        config.settings.skipBorg = false
+        borgPresence.exists = () => false
+        const { h, handlers, recover } = await setup()
+        await recover()
+        await vi.waitFor(() => expect(h.doc()!.operationDB['op-b'].status).toBe('Failed'))
+        expect(h.doc()!.operationDB['op-b'].error).toMatch(/^Retry failed: .*\/usr\/bin\/borg is not installed/)
+        expect(backupOps(h)).toHaveLength(1)
+        await recover()
+        await new Promise(r => setTimeout(r, 20))
+        expect(handlers.backupApp).toHaveBeenCalledTimes(1)
+    })
+
+    it('an unknown Backup Disk ends the op Failed instead of leaving it Pending', async () => {
+        const { h, recover } = await setup()
+        h.change(doc => { delete (doc.diskDB as any)['borg-bd'] })
+        await recover()
+        await vi.waitFor(() => expect(h.doc()!.operationDB['op-b'].status).toBe('Failed'))
+        expect(h.doc()!.operationDB['op-b'].error).toMatch(/Backup Disk borg-bd is not known/)
     })
 })

@@ -204,6 +204,12 @@ export interface CopyAppOptions {
     dstId?: InstanceID
     /** Ephemeral copy byte progress for moveApp (engine#387). Not stored. */
     onByteProgress?: (p: { bytesDone: number, bytesTotal: number }) => void
+    /**
+     * Internal only (not on the CLI): boot recovery re-runs an interrupted copyApp inside
+     * its original Operation (engine#497). That op gets the status and progress updates
+     * instead of a new one, so it ends Done or Failed and is never retried again.
+     */
+    recoveredOpId?: string
 }
 
 /** Accumulate rsync --info=progress2 bytes across the app-master and instance stages. */
@@ -269,7 +275,7 @@ export const copyApp = async (
 
     // A cross-Engine move (idea#79) runs this copy inside its own moveApp operation
     const journal = opts.journalOpId ?? null
-    const opId = journal ?? createOperation(storeHandle, 'copyApp', {
+    const opId = journal ?? opts.recoveredOpId ?? createOperation(storeHandle, 'copyApp', {
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,
@@ -584,6 +590,15 @@ export const copyApp = async (
 
 // ── moveApp ───────────────────────────────────────────────────────────────────
 
+/** Options for moveApp (engine#497). */
+export interface MoveAppOptions {
+    /**
+     * Internal only (not on the CLI): boot recovery re-runs an interrupted local moveApp
+     * inside its original Operation, so that op ends Done or Failed and is not retried again.
+     */
+    recoveredOpId?: string
+}
+
 /**
  * Move an app instance from sourceDisk to targetDisk.
  * The instance retains its original InstanceID so backup links remain intact.
@@ -596,6 +611,7 @@ export const moveApp = async (
     sourceDiskId: DiskID,
     targetDiskId: DiskID,
     cause: OperationCause = 'console-command',
+    opts: MoveAppOptions = {},
 ): Promise<MoveResult | void> => {
     const store = storeHandle.doc()
 
@@ -604,6 +620,9 @@ export const moveApp = async (
     const { localEngineId: localId } = await import('./Engine.js')
     const tgt = getDisk(store, targetDiskId) as Disk | undefined
     if (tgt?.dockedTo && String(tgt.dockedTo) !== String(localId)) {
+        // engine#497: an interrupted local move whose target is now on another Engine is
+        // not turned into a cross-Engine move by recovery; the operator re-issues it.
+        if (opts.recoveredOpId) throw new Error(`moveApp: the target disk ${targetDiskId} is now docked to another Engine; the interrupted local move is not retried, re-issue the move`)
         const { moveAppCrossEngine } = await import('./MoveAppRemote.js')
         return moveAppCrossEngine(storeHandle, instanceName, sourceDiskId, targetDiskId, cause)
     }
@@ -621,7 +640,7 @@ export const moveApp = async (
         throw new Error(`moveApp: resource locked — another operation is already running on instance '${instanceName}' or one of its disks. Retry when it completes.`)
     }
 
-    const opId = createOperation(storeHandle, 'moveApp', {
+    const opId = opts.recoveredOpId ?? createOperation(storeHandle, 'moveApp', {
         instanceId: instance.id,
         sourceDiskId: sourceDisk.id,
         targetDiskId: targetDisk.id,

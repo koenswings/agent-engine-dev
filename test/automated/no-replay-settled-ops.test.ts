@@ -7,7 +7,7 @@
  * A missing op removes nothing. Generalises the engine#469 (#472) updateApp/restoreApp rule.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest'
+import { describe, it, expect, beforeEach, vi } from 'vitest'
 import { Repo, DocHandle } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
@@ -157,15 +157,16 @@ describe('engine#477 through recoverInterruptedOperations', () => {
         expect(queued()).toEqual([])
     })
 
-    it('a retried op is left Pending and keeps its command (replayed as before)', async () => {
+    it('engine#497: a retried op is owned by recovery: its command is dropped at once, the op ends Done', async () => {
         addOp('op-c', 'copyApp', 'Running', CASES[0].args)
-        queue([CASES[0].cmd])
+        queue([CASES[0].cmd, 'ls'])
         let resolveRetry!: () => void
         const retried = new Promise<void>(r => { resolveRetry = r })
         await recoverInterruptedOperations(h, { copyApp: () => retried }, ME as any)
         expect(h.doc().operationDB['op-c'].status).toBe('Pending')
-        expect(queued()).toEqual([CASES[0].cmd])
+        expect(queued()).toEqual(['ls'])
         resolveRetry()
+        await vi.waitFor(() => expect(h.doc().operationDB['op-c'].status).toBe('Done'))
     })
 
     it('an interrupted cross-Engine moveApp settled at boot is not replayed', async () => {
@@ -185,5 +186,85 @@ describe('engine#477 through recoverInterruptedOperations', () => {
         await recoverInterruptedOperations(h, {}, ME as any)
         expect(h.doc().operationDB['op-o'].status).toBe('Running')
         expect(queued()).toEqual([CASES[7].cmd])
+    })
+})
+
+describe('engine#497: boot recovery owns the retry of copyApp / moveApp / backupApp', () => {
+    const RETRY = CASES.filter(c => ['copyApp', 'moveApp', 'backupApp'].includes(c.kind))
+
+    for (const c of RETRY) {
+        it(`${c.kind}: a successful retry closes the op Done, drops the queued command, and a second pass never retries it`, async () => {
+            addOp(`op-${c.kind}`, c.kind, 'Running', c.args)
+            queue([c.cmd, 'ls'])
+            const handler = vi.fn(async (_a: Record<string, string>, _h: any, opId: string) => {
+                expect(opId).toBe(`op-${c.kind}`)
+                expect(queued()).toEqual(['ls'])   // dropped before the re-run starts
+            })
+            await recoverInterruptedOperations(h, { [c.kind]: handler } as any, ME as any)
+            await vi.waitFor(() => expect(h.doc().operationDB[`op-${c.kind}`].status).toBe('Done'))
+            const op = h.doc().operationDB[`op-${c.kind}`]
+            expect(op.error).toBeNull()
+            expect(op.completedAt).not.toBeNull()
+            expect(queued()).toEqual(['ls'])
+            expect(Object.keys(h.doc().operationDB)).toEqual([`op-${c.kind}`])   // no second op
+            await recoverInterruptedOperations(h, { [c.kind]: handler } as any, ME as any)   // next boot
+            await new Promise(r => setTimeout(r, 20))
+            expect(handler).toHaveBeenCalledTimes(1)
+        })
+
+        it(`${c.kind}: a failed retry (handler rejects) closes the op Failed and a second pass never retries it`, async () => {
+            addOp(`op-${c.kind}`, c.kind, 'Running', c.args)
+            queue([c.cmd])
+            const handler = vi.fn(async () => { throw new Error('disk gone') })
+            await recoverInterruptedOperations(h, { [c.kind]: handler } as any, ME as any)
+            await vi.waitFor(() => expect(h.doc().operationDB[`op-${c.kind}`].status).toBe('Failed'))
+            expect(h.doc().operationDB[`op-${c.kind}`].error).toBe('Retry failed: disk gone')
+            expect(queued()).toEqual([])
+            await recoverInterruptedOperations(h, { [c.kind]: handler } as any, ME as any)
+            await new Promise(r => setTimeout(r, 20))
+            expect(handler).toHaveBeenCalledTimes(1)
+        })
+    }
+
+    it('a handler that records Failed in the op itself and resolves (copyApp style) leaves it Failed with its own error', async () => {
+        addOp('op-c', 'copyApp', 'Running', CASES[0].args)
+        const handler = async (_a: any, hh: any, opId: string) => {
+            hh.change((d: any) => { d.operationDB[opId].status = 'Failed'; d.operationDB[opId].error = 'rsync died'; d.operationDB[opId].completedAt = 1 })
+        }
+        await recoverInterruptedOperations(h, { copyApp: handler } as any, ME as any)
+        await new Promise(r => setTimeout(r, 20))
+        expect(h.doc().operationDB['op-c'].status).toBe('Failed')
+        expect(h.doc().operationDB['op-c'].error).toBe('rsync died')
+    })
+
+    it('a handler that sets Done itself: the retry marker is cleared, a real Done text stays', async () => {
+        addOp('op-c', 'copyApp', 'Running', CASES[0].args)
+        addOp('op-m', 'moveApp', 'Running', CASES[1].args)
+        const done = (text: string | null) => async (_a: any, hh: any, opId: string) => {
+            hh.change((d: any) => { d.operationDB[opId].status = 'Done'; if (text) d.operationDB[opId].error = text })
+        }
+        await recoverInterruptedOperations(h, { copyApp: done(null), moveApp: done('MOVED, source not removed') } as any, ME as any)
+        await new Promise(r => setTimeout(r, 20))
+        expect(h.doc().operationDB['op-c'].error).toBeNull()
+        expect(h.doc().operationDB['op-m'].error).toBe('MOVED, source not removed')
+    })
+
+    it('a Cancelled op stays Cancelled when its retry rejects', async () => {
+        addOp('op-b', 'backupApp', 'Running', CASES[2].args)
+        const handler = async (_a: any, hh: any, opId: string) => {
+            hh.change((d: any) => { d.operationDB[opId].status = 'Cancelled' })
+            throw new Error('SIGTERM')
+        }
+        await recoverInterruptedOperations(h, { backupApp: handler } as any, ME as any)
+        await new Promise(r => setTimeout(r, 20))
+        expect(h.doc().operationDB['op-b'].status).toBe('Cancelled')
+    })
+
+    it('without retryOwned a Pending op keeps its command (dropInterruptedCommand unchanged for other callers)', () => {
+        const op = addOp('op-c', 'copyApp', 'Pending', CASES[0].args)
+        queue([CASES[0].cmd])
+        expect(dropInterruptedCommand(h, op as any)).toBeNull()
+        expect(dropInterruptedCommand(h, op as any, { retryOwned: true })).toBe(CASES[0].cmd)
+        expect(queued()).toEqual([])
     })
 })
