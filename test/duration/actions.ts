@@ -2730,37 +2730,74 @@ export const isStage2Live = (ops: FleetOps): boolean =>
  */
 export const MARKOV_REDOCK_AFTER: ReadonlySet<string> = new Set(['confirm_eject'])
 
+export interface MarkovRedockOpts {
+    /** Store must show every re-docked disk docked within this (DURATION_REDOCK_WAIT_MS, default 180 s). */
+    waitMs?: number
+    /** After confirm_eject: how long to wait for the eject to reach the store (DURATION_REDOCK_EJECT_WAIT_MS, default 60 s). */
+    ejectWaitMs?: number
+    pollMs?: number
+    /** Test seam: the fixture dock (default: infra_dock_fixture's Stage 2 path). */
+    dockFixtures?: (c: ActionContext) => Promise<ActionResult>
+    log?: (line: string) => void
+}
+
+/**
+ * Markov 4 (random-9040e73-markov-20261117d@15): #494 never re-docked live. The Console intent returns as
+ * soon as the eject dialog is confirmed (confirm_eject@11 took 1675 ms) and the Engine's eject reaches the
+ * shared store later (step 12, 1.2 s on, no longer listed Kolibri). #494 read the "after" store once, right
+ * away, saw no change and returned silently. Now, after confirm_eject, the store is polled until a disk that
+ * was docked before is gone (or ejectWaitMs runs out), and every outcome is logged, including
+ * "nothing to re-dock" with its reason.
+ */
 export const stage2MarkovRedock = async (
     ctx: ActionContext,
     before: PoolSnapshot | null,
-    leavingInfra: boolean,
-    opts: { waitMs?: number; pollMs?: number; dockFixtures?: (c: ActionContext) => Promise<ActionResult> } = {},
+    trigger: { afterEject: boolean; leavingInfra: boolean },
+    opts: MarkovRedockOpts = {},
 ): Promise<{ ok: boolean; note: string | null }> => {
     if (!isStage2Live(ctx.opts.ops)) return { ok: true, note: null }
+    const log = opts.log ?? ((l: string) => console.log(`[duration] ${l}`))
+    const say = (ok: boolean, note: string) => { log(note); return { ok, note } }
     const ops = ctx.opts.ops as FleetOps & { findDockedEngine: (id: string) => Promise<string | null> }
-    const usable = (e: string | null): e is string => !!e && !ctx.excludeEngines.includes(e) && !isNeverEngine(e)
+    const usable = (e: string | null | undefined): e is string => !!e && !ctx.excludeEngines.includes(e) && !isNeverEngine(e)
+    const pollMs = opts.pollMs ?? 2_000
+    const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
+    const why: string[] = []
     const want = new Set<string>()
-    if (before?.readable) {
-        const after = await readPoolSnapshot(ctx)
-        if (after.readable) {
-            for (const [d, e] of before.docked) {
-                if (!usable(e) || /system/i.test(d)) continue
-                const now = after.docked.get(d)
-                if (!usable(now ?? null)) want.add(d)
+    if (trigger.afterEject) {
+        if (!before?.readable) {
+            why.push('no readable store snapshot before confirm_eject — falling back to the fixture disks')
+        } else {
+            const ejectWaitMs = opts.ejectWaitMs ?? envBudget(process.env, 'DURATION_REDOCK_EJECT_WAIT_MS', 60_000)
+            const wasDocked = [...before.docked].filter(([d, e]) => usable(e) && !/system/i.test(d)).map(([d]) => d)
+            const t0 = Date.now()
+            let reads = 0
+            for (;;) {
+                const after = await readPoolSnapshot(ctx)
+                reads++
+                if (after.readable) for (const d of wasDocked) if (!usable(after.docked.get(d))) want.add(d)
+                if (want.size || Date.now() - t0 >= ejectWaitMs) break
+                await sleep(pollMs)
             }
+            why.push(want.size
+                ? `confirm_eject: store shows [${[...want].join(', ')}] gone after ${Date.now() - t0}ms (${reads} read(s))`
+                : `confirm_eject: no docked disk left the store within ${Date.now() - t0}ms (${reads} read(s); docked before: ${wasDocked.join(', ') || 'none'})`)
         }
     }
-    if (leavingInfra) {
-        for (const d of ctx.fixtureDisks) if (!usable(await ops.findDockedEngine(d))) want.add(d)
+    if (trigger.leavingInfra || (trigger.afterEject && !before?.readable)) {
+        const gone: string[] = []
+        for (const d of ctx.fixtureDisks) if (!usable(await ops.findDockedEngine(d))) { want.add(d); gone.push(d) }
+        why.push(`${trigger.leavingInfra ? `leaving infra (${ctx.from} → ${ctx.to})` : 'fallback'}: fixture disks not docked [${gone.join(', ')}]`)
     }
-    if (!want.size) return { ok: true, note: null }
+    if (!want.size) return say(true, `Markov re-dock after ${ctx.action}: nothing to re-dock (${why.join('; ')})`)
     const list = [...want]
+    log(`Markov re-dock after ${ctx.action}: re-docking [${list.join(', ')}] (${why.join('; ')})`)
     const notes: string[] = []
     try {
         const fixtures = list.filter(d => ctx.fixtureDisks.includes(d))
         if (fixtures.length) {
             const r = await (opts.dockFixtures ?? infraDockFixture)({ ...ctx, action: 'infra_dock_fixture' })
-            if (!r.ok) return { ok: false, note: `Markov re-dock of ${fixtures.join(', ')} failed: ${r.message ?? 'infra_dock_fixture not ok'}. No soft-pass.` }
+            if (!r.ok) return say(false, `Markov re-dock of ${fixtures.join(', ')} failed: ${r.message ?? 'infra_dock_fixture not ok'}. No soft-pass.`)
             if (r.dockedEngine !== undefined) ctx.walker.dockedEngine = r.dockedEngine
             notes.push(`fixtures via infra_dock_fixture: ${r.message ?? 'ok'}`)
         }
@@ -2779,10 +2816,9 @@ export const stage2MarkovRedock = async (
             }
         }
     } catch (e) {
-        return { ok: false, note: `Markov re-dock of ${list.join(', ')} failed: ${e instanceof Error ? e.message : String(e)}. No soft-pass.` }
+        return say(false, `Markov re-dock of ${list.join(', ')} failed: ${e instanceof Error ? e.message : String(e)}. No soft-pass.`)
     }
     const waitMs = opts.waitMs ?? envBudget(process.env, 'DURATION_REDOCK_WAIT_MS', 180_000)
-    const pollMs = opts.pollMs ?? 2_000
     const t0 = Date.now()
     let missing = list
     for (;;) {
@@ -2790,12 +2826,36 @@ export const stage2MarkovRedock = async (
         for (const d of missing) if (!usable(await ops.findDockedEngine(d))) next.push(d)
         missing = next
         if (!missing.length || Date.now() - t0 >= waitMs) break
-        await new Promise(r => setTimeout(r, pollMs))
+        await sleep(pollMs)
     }
     if (missing.length) {
-        return { ok: false, note: `Markov re-dock: store still shows ${missing.join(', ')} not docked on a pool engine after ${Date.now() - t0}ms (${notes.join('; ')}). No soft-pass.` }
+        return say(false, `Markov re-dock: store still shows ${missing.join(', ')} not docked on a pool engine after ${Date.now() - t0}ms (${notes.join('; ')}). No soft-pass.`)
     }
-    return { ok: true, note: `Markov re-dock [${list.join(', ')}] docked again in the store after ${Date.now() - t0}ms (${notes.join('; ')})` }
+    return say(true, `Markov re-dock [${list.join(', ')}] docked again in the store after ${Date.now() - t0}ms (${why.join('; ')}; ${notes.join('; ')})`)
+}
+
+/** Runner hook, before dispatch (Markov, Stage 2 live): the docked snapshot confirm_eject's diff starts from. */
+export const markovRedockBefore = async (
+    ctx: Pick<ActionContext, 'opts' | 'poolEngines' | 'excludeEngines' | 'action'>,
+    markov: boolean,
+): Promise<PoolSnapshot | null> => {
+    if (!markov || !isStage2Live(ctx.opts.ops) || !MARKOV_REDOCK_AFTER.has(ctx.action)) return null
+    return readPoolSnapshot(ctx).catch(() => null)
+}
+
+/** Runner hook, after an ok dispatch (Markov, Stage 2 live): re-dock what confirm_eject / leaving infra left undocked. */
+export const markovRedockAfter = async (
+    ctx: ActionContext,
+    markov: boolean,
+    before: PoolSnapshot | null,
+    layers: { from: string | null; to: string | null },
+    opts: MarkovRedockOpts = {},
+): Promise<{ ok: boolean; note: string | null }> => {
+    if (!markov || !isStage2Live(ctx.opts.ops)) return { ok: true, note: null }
+    const afterEject = MARKOV_REDOCK_AFTER.has(ctx.action)
+    const leavingInfra = layers.from === 'infra' && layers.to !== 'infra'
+    if (!afterEject && !leavingInfra) return { ok: true, note: null }
+    return stage2MarkovRedock(ctx, before, { afterEject, leavingInfra }, opts)
 }
 
 /** Markov draw guard bookkeeping: remember results later steps depend on (after an ok step). */

@@ -177,6 +177,9 @@ export interface DurationOptions {
     iterations: number
     fast: boolean
     ops: FleetOps
+    /** Markov Stage 2 re-dock budgets / test seams (actions.ts MarkovRedockOpts); live runs use the defaults. */
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    markovRedock?: { waitMs?: number; ejectWaitMs?: number; pollMs?: number; log?: (line: string) => void; dockFixtures?: (c: any) => Promise<any> }
     /**
      * When true (default), UI Intents use StubUiDriver / no-op (CI / missing-Intent).
      * When false, require opts.uiDriver (Playwright) — prefer `--live --ui` for real walks.
