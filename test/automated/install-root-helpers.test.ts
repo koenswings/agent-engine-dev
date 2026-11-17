@@ -185,8 +185,8 @@ describe('installRootHelpers applies the IGMP sysctl drop-in on every update (id
 })
 
 describe('idea#284 part 2: a no-change install-root-helpers run writes nothing and reloads nothing', () => {
-    const WRITES = /^sudo (install -o |cp |chmod |chown |rm |tee )|systemctl (reload|restart)|nmcli|sysctl -p|systemd-tmpfiles --create|^sudo visudo -c$|sshd -t$/
-    it('every managed file is checked; none is reinstalled; no sshd/NM reload, no sysctl -p, no tmpfiles, no visudo -c', async () => {
+    const WRITES = /^sudo (install -o |cp |chmod |chown |rm |tee )|systemctl (reload|restart)|nmcli|sysctl -p|systemd-tmpfiles --create|^sudo visudo -c$|sshd -t$|udevadm/
+    it('every managed file is checked; none is reinstalled; no sshd/NM reload, no sysctl -p, no tmpfiles, no visudo -c, no udevadm (engine#479)', async () => {
         const { exec, cmds } = recordingExec({ installed: ['rsync', 'borgbackup'], current: true, igmpLive: '1024', dhcpOut: 'nm unchanged\ndhcpcd unchanged\n' })
         const q = quiet()
         try { await installRootHelpers(exec, '/e') } finally { q.mockRestore() }
@@ -199,6 +199,7 @@ describe('idea#284 part 2: a no-change install-root-helpers run writes nothing a
             '/etc/tmpfiles.d/idea-usb.conf', '/etc/tmpfiles.d/idea-usage.conf', '/usr/local/sbin/idea-usage-settings',
             '/usr/local/sbin/idea-peer-gate', '/usr/local/sbin/idea-usage-export', '/etc/ssh/sshd_config.d/10-idea-peer.conf',
             '/usr/local/sbin/idea-dhcp-vendor-class', '/etc/sysctl.d/90-idea-igmp.conf',
+            '/etc/udev/rules.d/90-docking.rules',
         ])
         // the read-only checks still run
         expect(cmds).toContain('sudo /usr/local/sbin/idea-dhcp-vendor-class')

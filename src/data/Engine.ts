@@ -315,6 +315,7 @@ export const engineCapabilities = (
 }
 
 import { config } from './Config.js';
+import { UDEV_RULE_PATH, ENGINE_WATCH_DIR, SYS_BLOCK_DIR, RULE_DEVICE_PATTERN } from '../monitors/diskDetection.js';
 
 const getLocalEngineId = async (): Promise<EngineID> => {
   log(`Getting local engine id`)
@@ -970,8 +971,8 @@ export const installUdev = async (exec: any, enginePath: string) => {
   print(chalk.blue('Installing udev and udev rules...'));
   try {
     await exec`sudo apt install udev -y`;
-    await copyAsset(exec, enginePath, '90-docking.rules', '/etc/udev/rules.d')
-    // Root helpers, their packages (rsync, borgbackup), sudoers and peer access.
+    // Root helpers, their packages (rsync, borgbackup), sudoers and peer access, and
+    // the docking rule 90-docking.rules (installDockingRule, engine#479).
     // Same function as ./install-root-helpers, which every Engine update runs too.
     await installRootHelpers(exec, enginePath)
     await createDir(exec, '/disks', "0755", "0:0")
@@ -1037,7 +1038,8 @@ export const ensureAptPackages = async (exec: any, pkgs: string[]): Promise<stri
  * install AND every update (build-engine installUdev, ./install-root-helpers,
  * sync-engine): rsync + borgbackup, the sudoers files, /usr/local/sbin/idea-erase-disk,
  * /usr/local/sbin/idea-app-data, the peer-access parts and the DHCP vendor class
- * (idea#284), and the IGMP sysctl drop-in (idea#467). `install` overwrites
+ * (idea#284), the IGMP sysctl drop-in (idea#467) and the USB docking udev rule
+ * 90-docking.rules (engine#479, installDockingRule). `install` overwrites
  * the helpers with the checkout's copies, so an outdated helper is upgraded.
  * Ends by checking /usr/bin/borg and `idea-app-data version`; throws if either is wrong.
  */
@@ -1111,6 +1113,10 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
   // Engines get it from a normal update. Idempotent. Applying sysctl needs
   // root and is skipped when IDEA_IMAGE_BUILD=1 (chroot /proc is the build host).
   await installIgmpSysctl(exec, enginePath)
+  // USB docking rule (engine#479). Here, not only in build-engine installUdev, so an
+  // Engine update installs the current rule and the first start's disk-detection
+  // self-check passes without a reboot. Idempotent; reloads udev only on a change.
+  await installDockingRule(exec, enginePath)
   // Verify, so a broken install stops here and not at the first backup (exit 127)
   try {
     await exec`test -x ${BORG_PATH}`
@@ -1122,6 +1128,106 @@ export const installRootHelpers = async (exec: any, enginePath: string) => {
     throw new Error(`${APP_DATA_HELPER} reports '${got}' after install, expected 'idea-app-data ${APP_DATA_HELPER_VERSION}'`)
   }
   print(chalk.green(`  - root helpers OK: ${BORG_PATH}, ${got}`))
+}
+
+/** Shipped docking rule asset under script/build_image_assets (engine#479). */
+export const DOCKING_RULE_ASSET = '90-docking.rules'
+/** Where install-root-helpers keeps a replaced docking rule (never deleted; engine#479). */
+export const DOCKING_RULE_QUARANTINE_DIR = '/etc/idea/.udev-quarantine'
+
+/** UTC stamp for quarantine folders: 20261117T074400Z. */
+export const utcStamp = (d: Date): string => d.toISOString().replace(/[-:]/g, '').replace(/\.\d{3}Z$/, 'Z')
+
+/**
+ * Block devices the docking rule covers (sd[a-z], sd[a-z][1-9] in /sys/class/block)
+ * that have no /dev/engine/<name> link. Read-only, no root. A missing folder means
+ * none are linked yet; an unreadable /sys means nothing to report.
+ */
+export const linklessRuleDevices = (sysBlockDir: string = SYS_BLOCK_DIR, watchDir: string = ENGINE_WATCH_DIR): string[] => {
+  let devices: string[] = []
+  try { devices = fs.readdirSync(sysBlockDir).filter((d: string) => RULE_DEVICE_PATTERN.test(d)) } catch { return [] }
+  let present = new Set<string>()
+  try { present = new Set(fs.readdirSync(watchDir)) } catch { present = new Set() }
+  return devices.filter(d => !present.has(d)).sort()
+}
+
+export interface DockingRuleDeps {
+  /** Devices without a /dev/engine link, read after the reload (default linklessRuleDevices). */
+  linklessDevices?: () => string[]
+  now?: () => Date
+  /** Tests only: installed rule path (default /etc/udev/rules.d/90-docking.rules). */
+  rulePath?: string
+  /** Tests only: quarantine root (default /etc/idea/.udev-quarantine). */
+  quarantineDir?: string
+}
+
+export interface DockingRuleResult {
+  /** True when the rule file was (re)installed. */
+  changed: boolean
+  /** Where the previous rule was kept, when it existed and its content differed. */
+  quarantined: string | null
+  /** True when `udevadm control --reload-rules` ran. */
+  reloaded: boolean
+  /** Devices a `change` event was replayed for (only those without a /dev/engine link). */
+  triggered: string[]
+}
+
+/**
+ * engine#479: install script/build_image_assets/90-docking.rules into
+ * /etc/udev/rules.d on every install AND update (installRootHelpers), so the
+ * first Engine start after an update passes the disk-detection self-check
+ * without a reboot (before, only build-engine installUdev and boot.sh did this).
+ *
+ *   - current (same content, 0644 root:root): nothing is written or reloaded.
+ *   - differs: the old file is copied to /etc/idea/.udev-quarantine/<UTC>/ first
+ *     (never deleted; outside rules.d so udev never loads it), then replaced.
+ *   - missing: installed; nothing to quarantine.
+ *
+ * After a write: `udevadm control --reload-rules`, then a `change` event ONLY for
+ * covered devices that still have no /dev/engine link (e.g. sda3..sda9 under the
+ * old `sd?|sd?1|sd?2` rule), then `udevadm settle`. Devices that already have a link
+ * (docked disks, teacher sticks) get no event, so the USB device monitor sees no
+ * unlink/add for them and nothing is undocked or re-docked. This is a root install
+ * step run by the operator (install-root-helpers / sync-engine / build-engine) with
+ * pi's own sudo, like every other step here; the Engine process never runs udevadm
+ * as root, so no sudoers entry is needed. In an image build (IDEA_IMAGE_BUILD=1) the
+ * file is installed but udev is not touched (first boot loads it).
+ * A failed reload or trigger throws, so install-root-helpers fails loudly.
+ */
+export const installDockingRule = async (exec: any, enginePath: string, deps: DockingRuleDeps = {}): Promise<DockingRuleResult> => {
+  const src = `${enginePath}/script/build_image_assets/${DOCKING_RULE_ASSET}`
+  const dst = deps.rulePath ?? UDEV_RULE_PATH
+  const result: DockingRuleResult = { changed: false, quarantined: null, reloaded: false, triggered: [] }
+  print(chalk.blue(`  - Installing ${dst}...`))
+  if (await managedFileCurrent(exec, src, dst, '0644')) {
+    print(chalk.green(`  - ${dst} unchanged; no udev reload`))
+    return result
+  }
+  const differs = String((await exec`if sudo test -e ${dst} && ! sudo cmp -s ${src} ${dst}; then echo differs; fi`)?.stdout ?? '').trim() === 'differs'
+  if (differs) {
+    const dir = `${deps.quarantineDir ?? DOCKING_RULE_QUARANTINE_DIR}/${utcStamp((deps.now ?? (() => new Date()))())}`
+    await exec`sudo install -d -o root -g root -m 0700 ${dir}`
+    await exec`sudo cp -p ${dst} ${dir}/${DOCKING_RULE_ASSET}`
+    result.quarantined = `${dir}/${DOCKING_RULE_ASSET}`
+    print(chalk.blue(`  - previous ${dst} kept at ${result.quarantined}`))
+  }
+  await exec`sudo install -o root -g root -m 0644 ${src} ${dst}`
+  result.changed = true
+  if (process.env.IDEA_IMAGE_BUILD === '1') {
+    print(chalk.green(`  - ${dst} installed (image build; udev loads it at first boot)`))
+    return result
+  }
+  await exec`sudo udevadm control --reload-rules`
+  result.reloaded = true
+  const linkless = (deps.linklessDevices ?? (() => linklessRuleDevices()))()
+  if (linkless.length > 0) {
+    print(chalk.blue(`  - replaying a udev change event for ${linkless.join(', ')} (no /dev/engine link yet)`))
+    await exec`sudo udevadm trigger --action=change --subsystem-match=block ${linkless.map(d => `--name-match=/dev/${d}`)}`
+    await exec`sudo udevadm settle --timeout=30`
+    result.triggered = linkless
+  }
+  print(chalk.green(`  - ${dst} installed and udev rules reloaded`))
+  return result
 }
 
 /** The sshd drop-in that adds the root-owned peer key file (per-Pi Engine keys). */
