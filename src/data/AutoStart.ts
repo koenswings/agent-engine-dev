@@ -18,6 +18,9 @@
  * overwrites Stopped with Undocked, and the dock pass then resets Undocked to
  * Docked. The operation record survives that.
  *
+ * An instance is also not auto-started from its source disk while a resumable local move of
+ * it is in flight (engine#497 stage 3: moveInFlightFromSource).
+ *
  * Stops the Engine does itself as one step of a longer operation (backup-pre-stop,
  * post-copy, post-move, disk-undocked) are not operator stops: an instance
  * stopped that way and interrupted is still started again, as before. They also
@@ -79,10 +82,34 @@ export interface AutoStartDecision {
     userStop?: Operation
 }
 
+/** Phases of a resumable local move while the target holds its in-flight marker and the source is still the App (engine#497). */
+const MOVE_IN_FLIGHT_PHASES: ReadonlySet<string> = new Set(['copying', 'verified'])
+
+/**
+ * engine#497 stage 3 (c): the unfinished resumable moveApp that is moving `instance` away from
+ * the disk it is stored on, or undefined. Such a move wrote instances/<id>.idea-op-in-flight on
+ * its target (args.phase copying or verified) and has not registered the target yet. While it
+ * is Running or parked (Pending: RESUME_WAITING / RESUME_PENDING) the source is not started by
+ * the Engine itself; once the op is terminal (Done, Failed RESUME_GAVE_UP, Cancelled) it no
+ * longer holds the source back. Any Engine reads this from the shared store, so it also holds
+ * where the target disk (and its marker) is not docked.
+ */
+export const moveInFlightFromSource = (store: Store, instance: Instance): Operation | undefined => {
+    if (!instance?.storedOn) return undefined
+    return Object.values(store.operationDB ?? {}).find((op): op is Operation =>
+        !!op && op.kind === 'moveApp' && !op.move &&
+        (op.status === 'Running' || op.status === 'Pending') &&
+        MOVE_IN_FLIGHT_PHASES.has(String(op.args?.phase ?? '')) &&
+        String(op.args?.instanceId ?? '') === String(instance.id) &&
+        String(op.args?.sourceDiskId ?? '') === String(instance.storedOn))
+}
+
 /** May the Engine start this instance by itself (disk dock, re-add, registration)? */
 export const shouldAutoStart = (store: Store, instance: Instance): AutoStartDecision => {
     const stop = userStopInForce(store, instance)
     if (stop) return { start: false, reason: `stopped by the operator (${stop.cause}, operation ${String(stop.id).slice(0, 8)})`, userStop: stop }
+    const move = moveInFlightFromSource(store, instance)
+    if (move) return { start: false, reason: `a move of this instance is in flight (operation ${String(move.id).slice(0, 8)}, phase ${move.args?.phase}${move.status === 'Pending' ? `, ${String(move.error ?? '').split(':')[0] || 'Pending'}` : ''}); it resumes, and the source is started again only if the move gives up (engine#497)` }
     if (instance.status === 'Stopped') return { start: false, reason: 'status is Stopped' }
     return { start: true, reason: 'no operator stop in force' }
 }
