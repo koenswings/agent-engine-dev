@@ -40,7 +40,7 @@ const fakeDeps = (out: string | Error, outdated: string | null = null) => {
 describe('rebindKolibriMorangoInstanceId through the root helper (engine#503)', () => {
   it('needs helper v21 and runs exactly `kolibri-rebind <root> <id>`', async () => {
     expect(KOLIBRI_REBIND_HELPER_MIN).toBe(21)
-    expect(APP_DATA_HELPER_VERSION).toBe('21')
+    expect(APP_DATA_HELPER_VERSION).toBe('24')
     const f = fakeDeps(`previousId=${OLD}\nmorangoId=${NEW}\nquarantined=/disks/sdb2/.idea-quarantine/k1-rebind-marker-20261117T100000123456789Z\n`)
     expect(await rebindKolibriMorangoInstanceId('sdb2', 'k1', f.deps)).toBe(NEW)
     expect(f.mins).toEqual([21])
