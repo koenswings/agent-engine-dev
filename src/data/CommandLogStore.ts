@@ -15,6 +15,7 @@ import path from 'path'
 import { redactString } from '../utils/redact.js'
 import { config, commandLogArchiveMaxBytes } from './Config.js'
 import { stopPeriodicFlush } from '../repo.js'
+import { markOwnCommandLog } from './StoreScope.js'
 
 // ── Types (also exported for use in CommonTypes consumers) ───────────────────
 
@@ -85,6 +86,12 @@ export interface CommandLogStore {
   recentTraceIds: string[]  // insertion-ordered ring buffer, max MAX_TRACES entries
   /** #158: storeTag of the fleet whose Engine wrote this log; another tag = a foreign log, never served. */
   storeTag?: string
+  /**
+   * engine#471 (a): id of the Engine that writes this log. Engines no longer push
+   * their logs to each other; a peer that fetched this log on demand keeps it in
+   * sync with this Engine only (repo.ts storeScopedSharePolicy).
+   */
+  engineId?: string
 }
 
 // ── Constants ────────────────────────────────────────────────────────────────
@@ -144,11 +151,26 @@ export interface CommandLogStoreOptions {
   archiveMaxBytes?: number
   /** #158: this fleet's storeTag, stamped on every log this Engine creates (and backfilled on load). */
   storeTag?: string
+  /** engine#471 (a): this Engine's id, stamped on every log this Engine creates (and backfilled on load). */
+  engineId?: string
 }
 
 /** storeTag stamped on new command logs (#158); set by createCommandLogStore. */
 let _storeTag: string | undefined
-const tagged = (): CommandLogStore => ({ traces: {}, recentTraceIds: [], ...(_storeTag ? { storeTag: _storeTag } : {}) })
+/** engineId stamped on new command logs (engine#471 a); set by createCommandLogStore. */
+let _engineId: string | undefined
+const tagged = (): CommandLogStore => ({
+  traces: {}, recentTraceIds: [],
+  ...(_storeTag ? { storeTag: _storeTag } : {}),
+  ...(_engineId ? { engineId: _engineId } : {}),
+})
+
+/** repo.create + mark the doc as this repo's own log before any peer is told about it (engine#471 a). */
+const createOwn = (repo: Repo): DocHandle<CommandLogStore> => {
+  const handle = repo.create<CommandLogStore>(tagged())
+  markOwnCommandLog(repo, handle.documentId)
+  return handle
+}
 
 /**
  * Load the doc at `url`, giving up after `timeoutMs` (idea#145). Rejects when
@@ -198,12 +220,15 @@ export const createCommandLogStore = async (
   const urlFile = options.urlFile ?? defaultUrlFile()
   const timeoutMs = options.timeoutMs ?? COMMAND_LOG_LOAD_TIMEOUT_MS
   if (options.storeTag) _storeTag = options.storeTag
+  if (options.engineId) _engineId = options.engineId
 
   let handle: DocHandle<CommandLogStore>
 
   const existingUrl = fs.existsSync(urlFile) ? (await fs.readFile(urlFile, 'utf-8')).trim() : ''
   if (existingUrl) {
     log(`[commandLog] Loading existing CommandLogStore from ${existingUrl} (timeout ${timeoutMs} ms)`)
+    // engine#471 (a): ours (by our url file), so it is never announced to peers, also while loading
+    if (isValidAutomergeUrl(existingUrl)) markOwnCommandLog(repo, existingUrl)
     try {
       handle = await findCommandLogWithTimeout(repo, existingUrl, timeoutMs)
       log(`[commandLog] CommandLogStore loaded, state: ${handle.state}`)
@@ -220,6 +245,11 @@ export const createCommandLogStore = async (
   if (_storeTag && handle.doc() && !handle.doc().storeTag) {
     handle.change(d => { d.storeTag = _storeTag })
     log(`[commandLog] Stamped storeTag ${_storeTag} on ${handle.url}`)
+  }
+  // engine#471 (a): same backfill for the owner's engineId
+  if (_engineId && handle.doc() && !handle.doc().engineId) {
+    handle.change(d => { d.engineId = _engineId })
+    log(`[commandLog] Stamped engineId ${_engineId} on ${handle.url}`)
   }
   _handle = handle
   const today = localDay(options.now?.() ?? new Date())
@@ -319,7 +349,7 @@ const _rotate = async (repo: Repo, options: CommandLogStoreOptions): Promise<Doc
   const old = _handle
   const oldDay = _currentDay ?? 'unknown'
 
-  const fresh = repo.create<CommandLogStore>(tagged())
+  const fresh = createOwn(repo)
   await fresh.whenReady()
 
   // Snapshot + carry + switch with no await in between, so no write is lost.
@@ -460,7 +490,7 @@ const _createFresh = async (
   repo: Repo,
   urlFile: string
 ): Promise<DocHandle<CommandLogStore>> => {
-  const handle = repo.create<CommandLogStore>(tagged())
+  const handle = createOwn(repo)
   await handle.whenReady()
   await fs.ensureDir(path.dirname(urlFile))
   await fs.writeFile(urlFile, handle.url)

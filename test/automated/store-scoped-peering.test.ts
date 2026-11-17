@@ -20,6 +20,8 @@
  *     with the peer address, its store and ours;
  *   - a foreign store doc already on disk / loaded here is never announced or
  *     served (to our own Engines or to Consoles) and is left untouched;
+ *   - engine#471 (a): command logs are not pushed between our own Engines; a
+ *     Console (or an Engine) asking for one still gets it, relayed, and live;
  *   - mixed versions: an old Engine (no store tag in its peerId) is refused
  *     whether it dials us or we dial it; nothing it announces is accepted.
  * Loopback note: connectEngine never dials 127.0.0.1/localhost (self), so the
@@ -45,6 +47,7 @@ import { discoverEngines, engineTxtRecord, parseEngineDevice, selectStorePeers }
 import {
     storeTag, enginePeerId, parseEnginePeerId, peerVerdict, describeRefusal, refusalMessage, parseRefusalMessage,
     isForeignStoreDocContent, RefusalLog,
+    markOwnCommandLog, isOwnCommandLog, shareCommandLogWith, isCommandLogContent,
 } from '../../src/data/StoreScope.js'
 import { guardOutgoing, StoreScopedWebSocketClientAdapter } from '../../src/data/StoreScopedClientAdapter.js'
 import { config } from '../../src/data/Config.js'
@@ -403,7 +406,7 @@ describe('store-scoped peering between real Engine repos', () => {
     }, 60_000)
 
     it('a foreign store doc already here (loaded, or only on disk) is never announced or served, and is left untouched', async () => {
-        const L = newDocId()   // a plain doc of our fleet (like another Engine's command log): still relayed
+        const L = newDocId()   // a command log of our fleet written before engine#471 (no engineId, owner unknown): still relayed
         // a holds a copy of store Y (relayed before the fix): one loaded, Y2 only on disk
         const Y2 = newDocId()
         const a = await startEngine('a', X, { [X]: bx, [Y]: by, [Y2]: by, [L]: A.save(A.from<any>({ traces: {}, recentTraceIds: [] })) }, [X, Y, L])
@@ -411,7 +414,7 @@ describe('store-scoped peering between real Engine repos', () => {
         const c = await startEngine('c', X, { [X]: bx })
         await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
         await until(() => isEnginePeerOf(c, a), 10_000, 'c peered with a')
-        await until(() => hasDoc(c, L), 10_000, 'own-fleet doc relayed')       // generous sharing of fleet docs still works
+        await until(() => hasDoc(c, L), 10_000, 'own-fleet legacy log relayed')   // owner unknown: shared as before (engine#471 a)
         await sleep(1_500)
         expect(hasDoc(c, Y), 'foreign store doc must not be announced to our own Engine').toBe(false)
         // asked for explicitly: unavailable, from our own Engine and from a Console.
@@ -430,6 +433,49 @@ describe('store-scoped peering between real Engine repos', () => {
         await a.repo.flush()
         expect(onDisk(a.dir, Y) && onDisk(a.dir, Y2)).toBe(true)
     }, 90_000)
+
+    it('engine#471 (a): command logs are not pushed between Engines, but are still fetched on demand (also relayed for a Console)', async () => {
+        const OWN = newDocId()     // a's own log
+        const OTHER = newDocId()   // b's log, a copy that a fetched earlier
+        const P = newDocId()       // any other doc of our fleet: still shared generously
+        const log = (engineId: string) => A.save(A.from<any>({ traces: {}, recentTraceIds: [], engineId }))
+        {
+            const a = await startEngine('a', X, { [X]: bx, [OWN]: log('ENGINE_a'), [OTHER]: log('ENGINE_b'), [P]: A.save(A.from<any>({ label: 'p' })) }, [X, OWN, OTHER, P])
+            markOwnCommandLog(a.repo, OWN)   // as createCommandLogStore does for a's log (before any peer connects)
+            const c = await startEngine('c', X, { [X]: bx })
+            await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
+            await until(() => isEnginePeerOf(c, a), 10_000, 'c peered with a')
+            await until(() => hasDoc(c, P), 10_000, 'plain fleet doc shared')
+            await sleep(1_500)
+            expect(hasDoc(c, OWN), "a's own command log must not be pushed to another Engine").toBe(false)
+            expect(hasDoc(c, OTHER), "b's log must not be passed on to c (only kept in sync with b)").toBe(false)
+            // a Console on c asks for a's log (url from a's /api/command-log-url): c fetches it from a and answers
+            expect(await findWithTimeout(consoleClient(c.port).repo, X)).toBe('ready')
+            const con = consoleClient(c.port)
+            expect(await findWithTimeout(con.repo, OWN)).toBe('ready')
+            expect(await findWithTimeout(c.repo, OTHER)).toBe('ready')   // an Engine asking explicitly also gets it
+            // live: a's next write reaches the Console through c
+            const ah = await a.repo.find<any>(OWN)
+            ah.change((d: any) => { d.recentTraceIds.push('t-live') })
+            const ch = await con.repo.find<any>(OWN)
+            await until(() => (ch.doc()?.recentTraceIds ?? []).includes('t-live'), 10_000, 'live update relayed to the Console')
+        }
+    }, 90_000)
+
+    it('engine#471 (a): shareCommandLogWith: own log never, another Engine\'s only with its owner, legacy (no engineId) as before', () => {
+        expect(shareCommandLogWith({ engineId: 'ENGINE_a' }, 'ENGINE_a', 'ENGINE_b')).toBe(false)
+        expect(shareCommandLogWith({ engineId: 'ENGINE_b' }, 'ENGINE_a', 'ENGINE_b')).toBe(true)
+        expect(shareCommandLogWith({ engineId: 'ENGINE_b' }, 'ENGINE_a', 'ENGINE_c')).toBe(false)
+        expect(shareCommandLogWith({ engineId: 'ENGINE_b' }, 'ENGINE_a', undefined)).toBe(false)
+        expect(shareCommandLogWith({ engineId: 'odd id' }, 'ENGINE_a', 'odd_id')).toBe(true)   // peerId character rule
+        expect(shareCommandLogWith({}, 'ENGINE_a', 'ENGINE_c')).toBe(true)
+        expect(isCommandLogContent({ traces: {}, recentTraceIds: [] })).toBe(true)
+        expect(isCommandLogContent({ engineDB: {} })).toBe(false)
+        const r1 = {}, r2 = {}
+        markOwnCommandLog(r1, 'automerge:abc')
+        expect(isOwnCommandLog(r1, 'abc')).toBe(true)
+        expect(isOwnCommandLog(r2, 'abc'), 'per Engine (Repo), not per process').toBe(false)
+    })
 
     it('mixed versions: an old Engine (no store tag) is refused whether it dials us or we dial it', async () => {
         const a = await startEngine('a', X, { [X]: bx })
