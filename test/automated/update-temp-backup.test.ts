@@ -63,6 +63,14 @@ const deps = (over: Partial<UpdateDeps> = {}): Partial<UpdateDeps> => ({
         calls.push('tempRestore'); await fs.writeFile(`${tmp}/instances/i1/compose.yaml`, compose('1.0'))
         return `${tmp}/.idea-quarantine/i1-before-temp-restore-x`
     },
+    refreshTempBackups: async () => {
+        calls.push('tempRefresh')
+        const gone = new Set(deleted)
+        const list = created.filter(c => !gone.has(`i1/${c.stamp}`)).map(c => ({
+            instanceId: 'i1', stamp: c.stamp, path: `/.idea-temp-backups/i1/${c.stamp}`, sizeBytes: 1234 * 1024, complete: true,
+        }))
+        h.change(doc => { const e = doc.engineDB[ME as any]; if (e) (e as any).tempBackups = list })
+    },
     ...over,
 })
 const codeOf = async (p: Promise<unknown>) => { try { await p; return 'ok' } catch (e) { return String((e as Error).message) } }
@@ -89,7 +97,8 @@ afterEach(async () => { await fs.remove(tmp) })
 describe('engine#469 trigger', () => {
     it('major update, no linked Backup Disk: temporary backup inside the snapshot stop, gate satisfied, really deleted after Health', async () => {
         const r = await updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps())
-        expect(calls).toEqual(['stop', 'tempCreate', 'snapshot', 'reread', 'start', 'tempDelete'])
+        expect(calls).toEqual(['stop', 'tempCreate', 'tempRefresh', 'snapshot', 'reread', 'start', 'tempDelete', 'tempRefresh'])
+        expect((h.doc().engineDB[ME as any] as any).tempBackups).toEqual([])
         expect(created[0].excludes).toEqual(['data/keys'])   // the live compose's x-app.backup.exclude
         expect(created[0].archive).toMatch(/-stop$/)
         expect(deleted).toEqual([`i1/${created[0].stamp}`])
@@ -173,7 +182,7 @@ describe('engine#469 failures keep the temporary backup', () => {
             tempBackupCreate: async () => { calls.push('tempCreate'); throw new Error('idea-app-data temp-backup-create exited 3: TEMP_BACKUP_NO_SPACE: the temporary backup needs 9 bytes, free 1 bytes on the system disk') },
         })))
         expect(m).toBe('TEMP_BACKUP_NO_SPACE: the temporary backup needs 9 bytes, free 1 bytes on the system disk')
-        expect(calls).toEqual(['stop', 'tempCreate', 'tempDelete', 'start'])
+        expect(calls).toEqual(['stop', 'tempCreate', 'tempDelete', 'tempRefresh', 'start'])
         expect(inst().status).toBe('Running')
         expect(op().status).toBe('Failed')
         expect(op().args.tempBackupState).toBeUndefined()

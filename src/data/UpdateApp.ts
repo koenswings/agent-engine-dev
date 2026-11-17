@@ -152,6 +152,8 @@ export interface UpdateDeps {
     tempBackupDelete: (id: InstanceID, stamp: string) => Promise<void>
     /** engine#469: helper temp-backup-restore; resolves with the quarantined replaced folder (or 'none') */
     tempBackupRestore: (disk: Disk, id: InstanceID, stamp: string) => Promise<string>
+    /** Refresh Engine.tempBackups after a temp backup is created or deleted (and at boot). */
+    refreshTempBackups: () => Promise<void>
     reread: (disk: Disk, id: InstanceID) => Promise<void>
     /** engine#456: `updateOpId` owns instances/<id>/.idea-update-in-flight (any other start is refused) */
     start: (inst: Instance, disk: Disk, opts?: { updateOpId?: string, imagesLoaded?: boolean }) => Promise<void>
@@ -319,6 +321,7 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
         parseTempBackupCreate(await runAppData(tempBackupCreateArgs(await appDataRoot(disk), String(id), stamp, archive, excludes))),
     tempBackupDelete: async (id, stamp) => { await runAppData(tempBackupDeleteArgs(String(id), stamp)) },
     tempBackupRestore: async (disk, id, stamp) => lastLine(await runAppData(tempBackupRestoreArgs(await appDataRoot(disk), String(id), stamp))),
+    refreshTempBackups: async () => { const { refreshTempBackups } = await import('./TempBackups.js'); await refreshTempBackups(storeHandle) },
     reread: async (disk, id) => { await (await import('./Instance.js')).createOrUpdateInstance(storeHandle, id, disk) },
     start: async (inst, disk, opts) => (await import('./Instance.js')).startInstance(storeHandle, inst, disk, 'console-command', opts ?? {}),
     loadImages: (instDir, mountRoot, strict) => defaultLoadImages(instDir, mountRoot, strict),
@@ -727,11 +730,13 @@ export const updateApp = async (
                 const m = String((e as Error).message)
                 // A failed create never wrote COMPLETE, so it can never be restored: remove its folder.
                 await d.tempBackupDelete(inst.id, stamp).catch(de => log(`updateApp: ${inst.id}: removing the failed temporary backup ${stamp} failed: ${(de as Error).message}`))
+                await d.refreshTempBackups().catch(re => log(`updateApp: ${inst.id}: tempBackups refresh after a failed create: ${(re as Error).message}`))
                 const ns = m.match(/TEMP_BACKUP_NO_SPACE: [^\n]*/)
                 if (ns) throw new UpdateAppError('TEMP_BACKUP_NO_SPACE', ns[0].replace(/^TEMP_BACKUP_NO_SPACE: /, ''))
                 throw new UpdateAppError('TEMP_BACKUP_FAILED', `the temporary pre-update backup on the system disk failed: ${m}`)
             }
             setTempBackupOpArgs(storeHandle, opId, tempBackup, 'created')
+            await d.refreshTempBackups().catch(re => log(`updateApp: ${inst.id}: tempBackups refresh after create failed: ${(re as Error).message}`))
             log(`updateApp: ${inst.id}: temporary pre-update backup ${tempBackup.path} done (${tempBackup.sizeBytes} bytes, inside the snapshot stop)`)
         }
         try {
@@ -1177,6 +1182,7 @@ const finishCommitted = async (storeHandle: DocHandle<Store>, d: UpdateDeps, c: 
             storeHandle.change(doc => { const o = doc.operationDB?.[c.opId]; if (o) o.args.tempBackupWarning = warning })
             console.warn(`updateApp: ${id}: ${warning}`)
         }
+        await d.refreshTempBackups().catch(re => log(`updateApp: ${id}: tempBackups refresh after delete: ${(re as Error).message}`))
     }
     return { tempDeleted }
 }

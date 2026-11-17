@@ -53,7 +53,7 @@ const lastTrace = (h: DocHandle<CommandLogStore>): CommandTrace => {
 
 describe('engine#399: registry arg names', () => {
     const INSTANCE_COMMANDS = ['startInstance', 'runInstance', 'stopInstance', 'copyApp', 'moveApp', 'backupApp', 'restoreApp',
-        'listBackup', 'verifyBackup', 'clearBackupLock', 'addBackupLink', 'removeBackupLink', 'removeInstance', 'renameInstance']
+        'listBackup', 'verifyBackup', 'clearBackupLock', 'addBackupLink', 'removeBackupLink', 'removeInstance', 'renameInstance', 'deleteTempBackup']
 
     it('every command that takes an instance names its first arg instanceId', () => {
         for (const name of INSTANCE_COMMANDS) {
