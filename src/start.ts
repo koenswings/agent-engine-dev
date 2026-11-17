@@ -43,6 +43,8 @@ import { initCommandLogger } from './utils/CommandLogger.js'
 import { assertAppDataHelper, reportBorgAtStartup } from './utils/appDataHelper.js'
 import { startPeerAccess } from './data/PeerAccess.js'
 import { checkAndSetUndockedApps } from './data/UndockedApps.js'
+import { installStaleDocGuard, staleStoreExit } from './data/StaleDocGuard.js'
+import { startLoopStallMonitor } from './monitors/loopStallMonitor.js'
 export { checkAndSetUndockedApps }
 
 
@@ -51,6 +53,8 @@ export { checkAndSetUndockedApps }
 export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     log(`Hello from ${os.hostname()}!`)
+    // engine#512: name any long main-thread block (startup's sync work starved the peer links)
+    startLoopStallMonitor()
     log(`The current time is ${new Date()}`)
     log('Here is some information about the system:')
     log(`  Interfaces: ${JSON.stringify(os.networkInterfaces())}`)
@@ -139,8 +143,26 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     //     throttledSave()
     // })
 
+    // engine#512: a stale (outdated) store doc exits for a pm2 restart instead of running on
+    // half-alive; other stale docs are evicted and resync. The shutdown refs fill in below.
+    const live: { httpServer?: import('http').Server, mdnsHandle?: { end: () => Promise<void> }, ideaLocalPublisher?: IdeaLocalPublisher } = {}
+    const staleGuard = installStaleDocGuard(repo, {
+        storeDocId: String(storeDocId),
+        isPinned: (id) => id === String(getCommandLogHandle()?.documentId ?? ''),
+        onStaleStore: (reason) => {
+            markEngineStopping()   // engine#497: in-flight work is interrupted, boot recovery resumes it
+            void staleStoreExit(reason, {
+                shutdown: async () => {
+                    await live.ideaLocalPublisher?.stop().catch(() => {})
+                    await shutdownProcedure(repo, live.httpServer, live.mdnsHandle)
+                },
+            })
+        },
+    })
+
     log(`Initialising store`)
     const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, storeIdentity.templatePath)
+    staleGuard.watchStoreHandle(storeHandle)
 
     // backupCleanup capability: one helper version check, never fatal (idea#400 §3.1).
     // Must run before createOrUpdateEngine writes Engine.capabilities.
@@ -210,6 +232,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
     // idea#203: http://idea.local (port 80) must reach this Engine's Console even when httpPort is not 80
     const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle, config.settings.ideaLocalHttpPort ?? 80, { engineId: String(localEngineId) })
+    live.httpServer = httpServer
 
     // Start the instances monitor (engine#428: heal late PORT_NOT_READY starts)
     log(chalk.bgMagenta('STARTING INSTANCES MONITOR'))
@@ -256,10 +279,12 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         await sleep(1000)
         log(chalk.bgMagenta('STARTING MULTICAST DNS MONITOR'))
         mdnsHandle = enableMulticastDNSEngineMonitor(storeHandle, repo)
+        live.mdnsHandle = mdnsHandle
         // idea#203: every Engine competes for the shared name idea.local (one holder, takeover)
         if (config.settings.ideaLocal !== false) {
             log(chalk.bgMagenta('STARTING idea.local PUBLISHER'))
             ideaLocalPublisher = enableIdeaLocalPublisher()
+            live.ideaLocalPublisher = ideaLocalPublisher
         }
     }
 

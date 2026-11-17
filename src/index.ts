@@ -1,6 +1,7 @@
 import { log } from './utils/utils.js';
 import { startEngine } from "./start.js";
 import { chalk } from "zx";
+import { staleStoreExitPending } from './data/StaleDocGuard.js';
 
 const main = async () => {
     try {
@@ -11,6 +12,8 @@ const main = async () => {
     } catch (error) {
         log(chalk.red('Error starting engine'));
         console.error(error);
+        // engine#512: a stale store doc already started a clean exit with its own code (75)
+        if (staleStoreExitPending()) return;
         process.exit(1); // Exit with an error code if startup fails
     }
 

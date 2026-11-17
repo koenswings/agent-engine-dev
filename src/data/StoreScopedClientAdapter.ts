@@ -16,6 +16,17 @@
  *
  * Also: a sync/request for a foreign store doc (docGuard) is never sent; it goes out
  * as `doc-unavailable` instead, and such a message from the peer is not processed.
+ *
+ * engine#512: send() never throws. automerge-repo 2.3.1 answers a sync message INSIDE
+ * handle.update(), after A.receiveSyncMessage has advanced the doc; the stock adapter
+ * throws `Websocket not ready (n)` when the socket is CONNECTING/CLOSING/CLOSED (e.g. just
+ * dropped by the #168 watchdog), the throw escapes the update callback and the DocHandle
+ * keeps the pre-receive doc, which Automerge has marked outdated: every later sync and
+ * every local change on that doc then fails with "Attempting to change an outdated
+ * document" until the process restarts (idea04 16:54:30, idea01 since 12:05 on 11-17).
+ * Such a send is dropped instead (logged once per socket, counted in droppedSends).
+ * Automerge sync is idempotent: the sync state resets on peer-disconnected and the
+ * peer resyncs after the reconnect, so nothing is lost.
  */
 
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
@@ -48,6 +59,7 @@ export interface StoreScopedClientOptions {
 const PEEK_MAX_BYTES = 4096
 
 const WS_CONNECTING = 0
+const WS_OPEN = 1
 const WS_CLOSED = 3
 
 /**
@@ -85,6 +97,10 @@ export class StoreScopedWebSocketClientAdapter extends WebSocketClientAdapter {
     refusal?: ClientRefusal
     /** #168: sockets dropped by the watchdog because nothing was heard. */
     forcedReconnects = 0
+    /** engine#512: sends dropped because the socket was not OPEN (or the send itself threw). */
+    droppedSends = 0
+    /** The socket the last drop was logged for: one log line per socket, not per message. */
+    #dropLoggedFor: unknown = undefined
     #liveness: WsLiveness
 
     constructor(url: string, opts: StoreScopedClientOptions) {
@@ -158,7 +174,22 @@ export class StoreScopedWebSocketClientAdapter extends WebSocketClientAdapter {
         if (this.refusal) return
         if (message.type !== 'join' && !this.#admitted) return
         const out = guardOutgoing(message, this.#docGuard)
-        if (out && this.#ephemeralDedupe.shouldSend(out)) super.send(out)
+        if (!out) return
+        // engine#512: never throw from here (see the header). A missing socket is already a
+        // silent no-op in the stock adapter; a socket that is not OPEN is dropped here.
+        const socket: any = this.socket
+        if (socket && socket.readyState !== WS_OPEN) { this.#dropSend(out, `socket not open (readyState ${socket.readyState})`); return }
+        if (!this.#ephemeralDedupe.shouldSend(out)) return
+        try { super.send(out) } catch (e: any) { this.#dropSend(out, e?.message ?? String(e)) }
+    }
+
+    #dropSend(message: Message, why: string): void {
+        this.droppedSends++
+        const socket = this.socket ?? null
+        if (this.#dropLoggedFor === socket) return
+        this.#dropLoggedFor = socket
+        const doc = (message as any).documentId ? ` doc ${(message as any).documentId}` : ''
+        log(`WS ${this.url}: dropping ${message.type}${doc} and further sends on this socket: ${why}; the peer resyncs after the reconnect (engine#512, ${this.droppedSends} dropped so far)`)
     }
 
     /** Idempotent: removeNetworkAdapter calls it again after a refusal already closed the socket. */
