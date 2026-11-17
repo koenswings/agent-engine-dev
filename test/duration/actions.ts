@@ -2711,6 +2711,93 @@ export const stage2FixtureAbsent = async (
     return null
 }
 
+/** Stage 2 live harness (Stage2FleetOps over RealFleetOps): the Markov re-dock and fixture guards apply. */
+export const isStage2Live = (ops: FleetOps): boolean =>
+    (ops as FleetOps & { stage?: number }).stage === 2 &&
+    typeof (ops as FleetOps & { findDockedEngine?: unknown }).findDockedEngine === 'function'
+
+/**
+ * Markov 3 (random-9040e73-markov-20261117c@15) root-cause fix: in a Stage 2 random walk the pool is put
+ * back as soon as a step leaves a disk undocked, so the next draw never lands on a missing disk card.
+ * Disks to re-dock = docked before confirm_eject and not after it (MARKOV_REDOCK_AFTER: the only operator
+ * edge whose effect is an undock), plus every fixture disk when the walk leaves the infra layer
+ * (infra_undock_fixtures → return_to_start). Other steps that drop a disk (none known) are not repaired
+ * silently: the #493 guards keep their steps undrawable and the step's own checks stay loud. Inside the infra layer undocked fixtures are the state under test (infra_dock_fixture).
+ * Fixture disks go through infra_dock_fixture's own Stage 2 path (home Pi, Docked+mounted left alone,
+ * moved copies kept, URLs resynced, Nextcloud readiness); any other role disk through dockFixture on its
+ * home Pi (an Empty is reset there, so state that lived on it is forgotten). Then the store must show
+ * every one of them docked on a pool engine before the walk draws again — otherwise the step fails loud.
+ */
+export const MARKOV_REDOCK_AFTER: ReadonlySet<string> = new Set(['confirm_eject'])
+
+export const stage2MarkovRedock = async (
+    ctx: ActionContext,
+    before: PoolSnapshot | null,
+    leavingInfra: boolean,
+    opts: { waitMs?: number; pollMs?: number; dockFixtures?: (c: ActionContext) => Promise<ActionResult> } = {},
+): Promise<{ ok: boolean; note: string | null }> => {
+    if (!isStage2Live(ctx.opts.ops)) return { ok: true, note: null }
+    const ops = ctx.opts.ops as FleetOps & { findDockedEngine: (id: string) => Promise<string | null> }
+    const usable = (e: string | null): e is string => !!e && !ctx.excludeEngines.includes(e) && !isNeverEngine(e)
+    const want = new Set<string>()
+    if (before?.readable) {
+        const after = await readPoolSnapshot(ctx)
+        if (after.readable) {
+            for (const [d, e] of before.docked) {
+                if (!usable(e) || /system/i.test(d)) continue
+                const now = after.docked.get(d)
+                if (!usable(now ?? null)) want.add(d)
+            }
+        }
+    }
+    if (leavingInfra) {
+        for (const d of ctx.fixtureDisks) if (!usable(await ops.findDockedEngine(d))) want.add(d)
+    }
+    if (!want.size) return { ok: true, note: null }
+    const list = [...want]
+    const notes: string[] = []
+    try {
+        const fixtures = list.filter(d => ctx.fixtureDisks.includes(d))
+        if (fixtures.length) {
+            const r = await (opts.dockFixtures ?? infraDockFixture)({ ...ctx, action: 'infra_dock_fixture' })
+            if (!r.ok) return { ok: false, note: `Markov re-dock of ${fixtures.join(', ')} failed: ${r.message ?? 'infra_dock_fixture not ok'}. No soft-pass.` }
+            if (r.dockedEngine !== undefined) ctx.walker.dockedEngine = r.dockedEngine
+            notes.push(`fixtures via infra_dock_fixture: ${r.message ?? 'ok'}`)
+        }
+        for (const d of list.filter(x => !ctx.fixtureDisks.includes(x))) {
+            const f = stage2Fixture(d)
+            await ctx.opts.ops.dockFixture(f.host, d)
+            if (f.diskTypes?.[0] === 'empty') {
+                // dockFixture resets an Empty: what the walk had put on it is gone.
+                if (d === STAGE2_ROLE_MAP.backup) ctx.walker.backupTaken = false
+                if (d === 'duration-empty-002') ctx.walker.empty002HoldsApp = false
+                const copy = ctx.walker.stage2CopyInstanceId?.trim()
+                if (copy && before?.instances.get(copy)?.diskId === d) ctx.walker.stage2CopyInstanceId = null
+                notes.push(`${d} re-docked on ${f.host} (reset to Empty)`)
+            } else {
+                notes.push(`${d} re-docked on ${f.host}`)
+            }
+        }
+    } catch (e) {
+        return { ok: false, note: `Markov re-dock of ${list.join(', ')} failed: ${e instanceof Error ? e.message : String(e)}. No soft-pass.` }
+    }
+    const waitMs = opts.waitMs ?? envBudget(process.env, 'DURATION_REDOCK_WAIT_MS', 180_000)
+    const pollMs = opts.pollMs ?? 2_000
+    const t0 = Date.now()
+    let missing = list
+    for (;;) {
+        const next: string[] = []
+        for (const d of missing) if (!usable(await ops.findDockedEngine(d))) next.push(d)
+        missing = next
+        if (!missing.length || Date.now() - t0 >= waitMs) break
+        await new Promise(r => setTimeout(r, pollMs))
+    }
+    if (missing.length) {
+        return { ok: false, note: `Markov re-dock: store still shows ${missing.join(', ')} not docked on a pool engine after ${Date.now() - t0}ms (${notes.join('; ')}). No soft-pass.` }
+    }
+    return { ok: true, note: `Markov re-dock [${list.join(', ')}] docked again in the store after ${Date.now() - t0}ms (${notes.join('; ')})` }
+}
+
 /** Markov draw guard bookkeeping: remember results later steps depend on (after an ok step). */
 export const noteStepPreconditionProgress = (walker: WalkerState, action: string): void => {
     if (action === 'backup_instance') walker.backupTaken = true
