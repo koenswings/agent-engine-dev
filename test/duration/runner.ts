@@ -7,7 +7,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { MARKOV_REDOCK_AFTER, dispatchAction, isStage2Live, noteStepPreconditionProgress, randomStepPrecondition, readPoolSnapshot, stage2MarkovRedock, type ActionContext, type PoolSnapshot } from './actions.js'
+import { dispatchAction, markovRedockAfter, markovRedockBefore, noteStepPreconditionProgress, randomStepPrecondition, readPoolSnapshot, type ActionContext, type PoolSnapshot } from './actions.js'
 import { DEFAULT_INFRA_INVARIANTS, evaluateInvariants } from './invariants.js'
 import {
     assembleWalkVideo,
@@ -277,13 +277,9 @@ const runWalkWithSteps = async (
         let ok = true
         let message: string | undefined
         let invResults: StructuredLogEntry['invariants'] = []
-        // Markov 3: Stage 2 random walks put an ejected disk back before the next draw (never cover-all).
-        const redockArmed = !useExplicit && isStage2Live(fullOpts.ops)
+        // Markov 3/4: Stage 2 random walks put an ejected disk back before the next draw (never cover-all).
         const fromLayer = scenario.states[from]?.layer ?? null
-        let redockBefore: PoolSnapshot | null = null
-        if (redockArmed && MARKOV_REDOCK_AFTER.has(action)) {
-            redockBefore = await readPoolSnapshot({ opts: fullOpts, poolEngines: pool, excludeEngines: exclude }).catch(() => null)
-        }
+        const redockBefore = await markovRedockBefore(ctx, !useExplicit)
 
         try {
             const result = await dispatchAction(ctx)
@@ -297,9 +293,8 @@ const runWalkWithSteps = async (
             const dest = scenario.states[walker.current]
             if (dest?.layer) walker.layer = dest.layer
 
-            const leavingInfra = fromLayer === 'infra' && (dest?.layer ?? null) !== 'infra'
-            if (ok && redockArmed && (redockBefore || leavingInfra)) {
-                const r = await stage2MarkovRedock(ctx, redockBefore, leavingInfra)
+            if (ok) {
+                const r = await markovRedockAfter(ctx, !useExplicit, redockBefore, { from: fromLayer, to: dest?.layer ?? null }, fullOpts.markovRedock)
                 if (r.note) message = message ? `${message}; ${r.note}` : r.note
                 if (!r.ok) ok = false
             }

@@ -9,7 +9,7 @@
  * drawn step checked against what its Console intent needs (disk card / instance row / running App).
  */
 import { describe, expect, it } from 'vitest'
-import { FakeFleetOps, randomStepPrecondition, readPoolSnapshot, stage2MarkovRedock, noteStepPreconditionProgress } from '../duration/actions.js'
+import { FakeFleetOps, markovRedockAfter, markovRedockBefore, randomStepPrecondition, readPoolSnapshot, stage2MarkovRedock, noteStepPreconditionProgress } from '../duration/actions.js'
 import { pickDrawableTransition, runDeterministicWalk, runWalk } from '../duration/runner.js'
 import { loadScenario, makeRng } from '../duration/scenario.js'
 import { STAGE2_FIXTURES, STAGE2_ROLE_MAP } from '../duration/stage2.js'
@@ -33,14 +33,23 @@ class Stage2Model {
     disks: Record<string, Disk> = {}
     insts: Record<string, Inst> = {}
     docks: string[] = []
+    /** Live store lag (Markov 4): a Console eject reaches the shared store only after N more store reads. */
+    pending: { disk: string; reads: number } | null = null
+    reads = 0
     constructor() {
         for (const f of STAGE2_FIXTURES) this.disks[f.diskId] = { id: f.diskId, dockedTo: f.host, diskTypes: [...(f.diskTypes ?? [])] }
         this.insts[KI] = { id: KI, status: 'Running', diskId: KOL, port: 18080 }
         this.insts[NCI] = { id: NCI, status: 'Running', diskId: NC, port: 61820 }
         this.insts[KXI] = { id: KXI, status: 'Running', diskId: NC, port: 18380 }
     }
-    async readStore(engineId: string) { return { engineId, engineDB: {}, diskDB: structuredClone(this.disks), instanceDB: structuredClone(this.insts) } }
-    async findDockedEngine(id: string) { return this.disks[id]?.dockedTo ?? null }
+    tick() {
+        this.reads++
+        if (this.pending && --this.pending.reads <= 0) { const d = this.pending.disk; this.pending = null; this.undock(d) }
+    }
+    /** What a Console confirm_eject does: the Engine ejects, the store sees it `lag` reads later. */
+    consoleEject(lag: number) { const t = this.ejectTarget(); if (t) { if (lag <= 0) this.undock(t); else this.pending = { disk: t, reads: lag } } }
+    async readStore(engineId: string) { this.tick(); return { engineId, engineDB: {}, diskDB: structuredClone(this.disks), instanceDB: structuredClone(this.insts) } }
+    async findDockedEngine(id: string) { this.tick(); return this.disks[id]?.dockedTo ?? null }
     undock(id: string) {
         const d = this.disks[id]
         if (!d) return
@@ -75,14 +84,16 @@ const dockFixtures = (model: Stage2Model) => async () => {
     for (const d of FIXTURE_DISKS) if (!model.disks[d]!.dockedTo) { await model.dockFixture(STAGE2_FIXTURES.find(f => f.diskId === d)!.host, d); docked.push(d) }
     return { ok: true, message: `Stage 2 homes: docked ${docked.join(', ') || 'none'}`, layer: 'infra' as const }
 }
-const FAST = { waitMs: 50, pollMs: 5 }
+const FAST = { waitMs: 50, ejectWaitMs: 40, pollMs: 5, log: () => {} }
+const EJECT = { afterEject: true, leavingInfra: false }
+const INFRA_EXIT = { afterEject: false, leavingInfra: true }
 
 describe('stage2MarkovRedock', () => {
     it('Markov 3 state: confirm_eject took the Kolibri disk → re-docked, store shows it docked, instance back', async () => {
         const m = new Stage2Model()
         const before = await readPoolSnapshot(ctxOf(m))
         m.undock(KOL)
-        const r = await stage2MarkovRedock(ctxOf(m), before, false, { ...FAST, dockFixtures: dockFixtures(m) })
+        const r = await stage2MarkovRedock(ctxOf(m), before, EJECT, { ...FAST, dockFixtures: dockFixtures(m) })
         expect(r.ok).toBe(true)
         expect(r.note).toMatch(/Markov re-dock \[duration-kolibri-grade5a-001\] docked again in the store/)
         expect(m.disks[KOL]!.dockedTo).toBe('idea01')
@@ -91,8 +102,9 @@ describe('stage2MarkovRedock', () => {
     it('nothing undocked: no-op (no dock call)', async () => {
         const m = new Stage2Model()
         const before = await readPoolSnapshot(ctxOf(m))
-        const r = await stage2MarkovRedock(ctxOf(m), before, false, { ...FAST, dockFixtures: dockFixtures(m) })
-        expect(r).toEqual({ ok: true, note: null })
+        const r = await stage2MarkovRedock(ctxOf(m), before, EJECT, { ...FAST, dockFixtures: dockFixtures(m) })
+        expect(r.ok).toBe(true)
+        expect(r.note).toMatch(/nothing to re-dock \(confirm_eject: no docked disk left the store within \d+ms/)
         expect(m.docks).toEqual([])
     })
     it('an ejected Empty (Backup Disk) is re-docked on its home Pi, reset, and the walk forgets the backup', async () => {
@@ -101,7 +113,7 @@ describe('stage2MarkovRedock', () => {
         const walker = walkerOf({ backupTaken: true, empty002HoldsApp: true })
         const before = await readPoolSnapshot(ctxOf(m, walker))
         m.undock(STAGE2_ROLE_MAP.backup)
-        const r = await stage2MarkovRedock(ctxOf(m, walker), before, false, FAST)
+        const r = await stage2MarkovRedock(ctxOf(m, walker), before, EJECT, FAST)
         expect(r.ok).toBe(true)
         expect(r.note).toMatch(/duration-empty-002 re-docked on idea04 \(reset to Empty\)/)
         expect(walker.backupTaken).toBe(false)
@@ -110,7 +122,7 @@ describe('stage2MarkovRedock', () => {
     it('leaving the infra layer with fixtures undocked: re-docks them', async () => {
         const m = new Stage2Model()
         m.undock(KOL); m.undock(NC)
-        const r = await stage2MarkovRedock(ctxOf(m), null, true, { ...FAST, dockFixtures: dockFixtures(m) })
+        const r = await stage2MarkovRedock(ctxOf(m), null, INFRA_EXIT, { ...FAST, dockFixtures: dockFixtures(m) })
         expect(r.ok).toBe(true)
         expect(m.disks[KOL]!.dockedTo).toBe('idea01')
         expect(m.disks[NC]!.dockedTo).toBe('idea03')
@@ -119,7 +131,7 @@ describe('stage2MarkovRedock', () => {
         const m = new Stage2Model()
         const before = await readPoolSnapshot(ctxOf(m))
         m.undock(KOL)
-        const r = await stage2MarkovRedock(ctxOf(m), before, false, { ...FAST, dockFixtures: async () => ({ ok: true, message: 'lied' }) })
+        const r = await stage2MarkovRedock(ctxOf(m), before, EJECT, { ...FAST, dockFixtures: async () => ({ ok: true, message: 'lied' }) })
         expect(r.ok).toBe(false)
         expect(r.note).toMatch(/store still shows duration-kolibri-grade5a-001 not docked.*No soft-pass/)
     })
@@ -127,7 +139,7 @@ describe('stage2MarkovRedock', () => {
         const m = new Stage2Model()
         const before = await readPoolSnapshot(ctxOf(m))
         m.undock(KOL)
-        const r = await stage2MarkovRedock(ctxOf(m), before, false, { ...FAST, dockFixtures: async () => { throw new Error('dock helper down') } })
+        const r = await stage2MarkovRedock(ctxOf(m), before, EJECT, { ...FAST, dockFixtures: async () => { throw new Error('dock helper down') } })
         expect(r).toMatchObject({ ok: false })
         expect(r.note).toMatch(/dock helper down.*No soft-pass/)
     })
@@ -136,12 +148,34 @@ describe('stage2MarkovRedock', () => {
         m.disks['golden'] = { id: 'golden', dockedTo: 'idea02' }
         const before = await readPoolSnapshot(ctxOf(m))
         m.disks['golden']!.dockedTo = null
-        expect(await stage2MarkovRedock(ctxOf(m), before, false, FAST)).toEqual({ ok: true, note: null })
+        const r = await stage2MarkovRedock(ctxOf(m), before, EJECT, FAST)
+        expect(r.ok).toBe(true)
+        expect(r.note).toMatch(/nothing to re-dock/)
+        expect(m.docks).toEqual([])
+    })
+    it('Markov 4: the eject reaches the store several reads later → polled, then re-docked (the #494 single read missed it)', async () => {
+        const m = new Stage2Model()
+        const before = await readPoolSnapshot(ctxOf(m))
+        m.consoleEject(7) // > one pool read (3 engines): a single "after" snapshot still shows Kolibri docked
+        const lines: string[] = []
+        const r = await stage2MarkovRedock(ctxOf(m), before, EJECT, { ...FAST, ejectWaitMs: 1_000, log: l => lines.push(l), dockFixtures: dockFixtures(m) })
+        expect(r.ok).toBe(true)
+        expect(r.note).toMatch(/confirm_eject: store shows \[duration-kolibri-grade5a-001\] gone after \d+ms \([3-9] read\(s\)\)/)
+        expect(lines.some(l => /re-docking \[duration-kolibri-grade5a-001\]/.test(l))).toBe(true)
+        expect(m.disks[KOL]!.dockedTo).toBe('idea01')
+    })
+    it('no readable snapshot before confirm_eject: falls back to the fixture disks, logged', async () => {
+        const m = new Stage2Model()
+        m.undock(KOL)
+        const r = await stage2MarkovRedock(ctxOf(m), null, EJECT, { ...FAST, dockFixtures: dockFixtures(m) })
+        expect(r.ok).toBe(true)
+        expect(r.note).toMatch(/no readable store snapshot before confirm_eject.*fallback: fixture disks not docked \[duration-kolibri-grade5a-001\]/)
+        expect(m.disks[KOL]!.dockedTo).toBe('idea01')
     })
     it('Fake / Stage 1 ops: never re-docks', async () => {
         const ops = new FakeFleetOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
         const ctx = { ...(ctxOf(new Stage2Model()) as object), opts: { ops } } as never
-        expect(await stage2MarkovRedock(ctx, null, true, FAST)).toEqual({ ok: true, note: null })
+        expect(await stage2MarkovRedock(ctx, null, INFRA_EXIT, FAST)).toEqual({ ok: true, note: null })
     })
 })
 
@@ -154,11 +188,15 @@ describe('runner wiring: Markov re-docks after confirm_eject; deterministic walk
             op_overview: { layer: 'operator', transitions: [{ to: 'op_eject', weight: 1, action: 'eject_disk' }] },
         },
     }
-    /** Stage 2 model whose UI-stub confirm_eject really ejects (the store change a live Console eject makes). */
-    const modelOps = () => {
+    /**
+     * Stage 2 model behind the REAL runner loop (runWalk). The UI stub cannot click, so the Console eject is
+     * confirmed right after the runner's before-snapshot (store reads 1-3) and reaches the store `lag` reads
+     * later, like the live shared store (Markov 4: confirm_eject returned before the store saw the eject).
+     */
+    const modelOps = (lag: number) => {
         const m = new Stage2Model()
         const fake = new FakeFleetOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
-        let reads = 0
+        let started = false
         const ops = Object.assign(fake, {
             stage: 2,
             findDockedEngine: (id: string) => m.findDockedEngine(id),
@@ -166,25 +204,34 @@ describe('runner wiring: Markov re-docks after confirm_eject; deterministic walk
             undockFixtures: (e: string[], id: string) => m.undockFixtures(e, id),
             stage2DockedAndMounted: async (e: string, id: string) => (await m.findDockedEngine(id)) === e,
             readStore: async (e: string) => {
-                // 4 pool reads = the before-snapshot (3) + first after read: eject happens "during" the step.
-                if (++reads === 4) m.undock(m.ejectTarget()!)
+                // reads 1-3 = the runner's before-snapshot; the Console eject is confirmed right after it.
+                if (!started && m.reads === 3) { started = true; m.consoleEject(lag) }
                 return m.readStore(e)
             },
         })
         return { m, ops }
     }
     const opts = { fast: true, stubUi: true, skipStability: true, settleTimeoutMs: 50 } as const
-    it('Markov: confirm_eject → Kolibri re-docked before the next draw', async () => {
-        process.env.DURATION_REDOCK_WAIT_MS = '50'
-        const { m, ops } = modelOps()
-        const r = await runWalk({ ...opts, scenario: scen, iterations: 1, ops: ops as never, rng: makeRng(1) })
-        delete process.env.DURATION_REDOCK_WAIT_MS
-        expect(m.docks).toContain(KOL)
-        expect(m.disks[KOL]!.dockedTo).toBe('idea01')
-        expect(r.logs[0]!.message).toMatch(/Markov re-dock \[duration-kolibri-grade5a-001\]/)
+    const redockOpts = { waitMs: 200, ejectWaitMs: 2_000, pollMs: 2, log: () => {} }
+    for (const lag of [0, 7, 40]) {
+        it(`real runner loop, store lag ${lag} reads: confirm_eject → re-dock fires, Kolibri docked before the next draw`, async () => {
+            const { m, ops } = modelOps(lag)
+            const r = await runWalk({ ...opts, scenario: scen, iterations: 2, ops: ops as never, rng: makeRng(1), markovRedock: redockOpts })
+            expect(r.aborted).toBe(false)
+            expect(m.docks).toContain(KOL)
+            expect(m.disks[KOL]!.dockedTo).toBe('idea01')
+            expect(r.logs[0]!.action).toBe('confirm_eject')
+            expect(r.logs[0]!.message).toMatch(/Markov re-dock \[duration-kolibri-grade5a-001\] docked again in the store/)
+            expect(r.logs[1]!.action).toBe('eject_disk')
+        })
+    }
+    it('real runner loop: eject never reaches the store → logged "nothing to re-dock" with the reason', async () => {
+        const { ops } = modelOps(1_000_000)
+        const r = await runWalk({ ...opts, scenario: scen, iterations: 1, ops: ops as never, rng: makeRng(1), markovRedock: { ...redockOpts, ejectWaitMs: 30 } })
+        expect(r.logs[0]!.message).toMatch(/Markov re-dock after confirm_eject: nothing to re-dock \(confirm_eject: no docked disk left the store/)
     })
     it('deterministic walk: confirm_eject runs as written, no re-dock', async () => {
-        const { m, ops } = modelOps()
+        const { m, ops } = modelOps(0)
         const walk = { kind: 'walk', name: 'w', scenario: scen, steps: [{ from: 'op_eject', to: 'op_overview', action: 'confirm_eject' }] } as never
         const r = await runDeterministicWalk(walk, { ...opts, ops: ops as never, rng: makeRng(1) })
         expect(m.docks).toEqual([])
@@ -220,7 +267,7 @@ const intentNeeds = (m: Stage2Model, walker: WalkerState, action: string, to: st
 /** The store change each step makes (Engine + harness), as far as the guards and intents can see it. */
 const applyEffect = (m: Stage2Model, walker: WalkerState, action: string): void => {
     switch (action) {
-        case 'confirm_eject': { const t = m.ejectTarget(); if (t) m.undock(t); break }
+        case 'confirm_eject': m.consoleEject(7); break // lands in the store 7 reads later (Markov 4)
         case 'stop_instance': if (m.insts[KI]!.status !== 'Undocked') m.insts[KI]!.status = 'Stopped'; break
         case 'start_instance': if (m.insts[KI]!.status !== 'Undocked') m.insts[KI]!.status = 'Running'; break
         case 'make_backup_disk': m.disks[STAGE2_ROLE_MAP.backup]!.diskTypes = ['backup']; break
@@ -260,19 +307,18 @@ const dryRun = async (redock: boolean) => {
             counts[action] = (counts[action] ?? 0) + 1
             const need = intentNeeds(m, walker, action, to)
             if (need) problems.push(`draw ${i + 1} ${from} --${action}--> ${to}: ${need}`)
-            const before = action === 'confirm_eject' ? await readPoolSnapshot(base as never) : null
+            const ctx = { ...base, from, to, action, fixtureDisks: FIXTURE_DISKS } as never
+            // the runner's own hooks (runner.ts calls exactly these two around dispatchAction)
+            const before = await markovRedockBefore(ctx, redock)
             applyEffect(m, walker, action)
             walker.current = to
             walker.layer = scenario.states[to]?.layer ?? null
             walker.step = i + 1
             noteStepPreconditionProgress(walker, action)
-            const leavingInfra = state.layer === 'infra' && scenario.states[to]?.layer !== 'infra'
-            if (redock && (before || leavingInfra)) {
-                const ctx = { ...base, from, to, action, fixtureDisks: FIXTURE_DISKS } as never
-                const r = await stage2MarkovRedock(ctx, before, leavingInfra, { ...FAST, dockFixtures: dockFixtures(m) })
-                if (!r.ok) problems.push(`draw ${i + 1} re-dock: ${r.note}`)
-                if (r.note) redocks++
-            }
+            const r = await markovRedockAfter(ctx, redock, before, { from: state.layer ?? null, to: scenario.states[to]?.layer ?? null }, { ...FAST, ejectWaitMs: 1_000, dockFixtures: dockFixtures(m) })
+            if (!r.ok) problems.push(`draw ${i + 1} re-dock: ${r.note}`)
+            if (r.note && /docked again/.test(r.note)) redocks++
+            if (!redock) for (let k = 0; k < 8; k++) m.tick() // control: let the eject land anyway
             // outside the infra layer every partition is docked again before the next draw
             if (walker.layer !== 'infra') {
                 const missing = Object.values(m.disks).filter(d => !d.dockedTo).map(d => d.id)
