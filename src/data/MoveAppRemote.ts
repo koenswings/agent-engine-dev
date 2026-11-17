@@ -689,6 +689,18 @@ export const moveCommandOutcome = (result: MoveResult): void => {
 
 // ── verifyMoveTarget (runs on the TARGET Engine) ─────────────────────────────
 
+/**
+ * engine#511 Finding 4: the move op `opId` has ended (Done, Failed or Cancelled). A queued
+ * `verifyMoveTarget` or `startInstance … --op` for it (a stale copy replayed at the target's boot)
+ * must not run, and nothing may change a finished op's move result. An op this Engine does not
+ * know (yet) is not finished: the command runs as before.
+ */
+export const moveOpFinished = (store: Store | undefined, opId: string): string | null => {
+    const op = (store?.operationDB as any)?.[String(opId)]
+    const st = String(op?.status ?? '')
+    return st === 'Done' || st === 'Failed' || st === 'Cancelled' ? st : null
+}
+
 export interface VerifyDeps {
     localEngineId: () => Promise<string>
     targetBytes: (disk: Disk, id: InstanceID) => Promise<number>
@@ -750,7 +762,17 @@ export const verifyMoveTarget = async (
     }
     const write = (v: MoveVerify) => {
         stopProgress(v.ok === true)
-        storeHandle.change(doc => { const op = doc.operationDB?.[opId] as any; if (op?.move) op.move.verify = { ...v } })
+        const ended = moveOpFinished(storeHandle.doc(), opId)
+        if (ended) {
+            log(`verifyMoveTarget: operation ${opId} is already ${ended}; its move result is left unchanged (engine#511)`)
+            return v
+        }
+        storeHandle.change(doc => {
+            const op = doc.operationDB?.[opId] as any
+            // engine#511 Finding 4: never mutate a finished op's move result
+            if (!op?.move || op.status === 'Done' || op.status === 'Failed' || op.status === 'Cancelled') return
+            op.move.verify = { ...v }
+        })
         return v
     }
     try {

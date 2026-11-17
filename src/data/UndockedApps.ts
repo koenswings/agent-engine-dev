@@ -34,7 +34,7 @@ import { $ } from 'zx'
 import { DocHandle } from '@automerge/automerge-repo'
 import { log } from '../utils/utils.js'
 import { EngineID, InstanceID } from './CommonTypes.js'
-import { isUserStopped, lastStopOperation, shouldAutoStart, userStopInForce } from './AutoStart.js'
+import { isUserStopped, lastStopOperation, shouldAutoStart, userStopInForce, moveInFlightFromSource } from './AutoStart.js'
 import { Instance, Status } from './Instance.js'
 import { Store } from './Store.js'
 import { localEngineId } from './Engine.js'
@@ -162,6 +162,13 @@ export const checkAndSetUndockedApps = async (
                 if (stopOp) {
                     log(`Setting status of instance ${instanceId} to Stopped (operator stop ${String(stopOp.id).slice(0, 8)} by ${stopOp.cause} is in force; no container on this Engine)`)
                     inst.status = 'Stopped' as Status
+                    return
+                }
+                // engine#511 Finding 2: the held-stopped source of a parked move on a skipped system
+                // disk is docked (no dock pass follows to say so): it is Stopped, not Undocked (Q2)
+                if (noDockPass && moveInFlightFromSource(doc, inst)) {
+                    log(`checkAndSetUndockedApps: ${instanceId} is the stopped source of an unfinished move on the system disk (systemDiskSkip); setting it Stopped, not Undocked`)
+                    if (inst.status !== 'Stopped') inst.status = 'Stopped' as Status
                     return
                 }
                 log(`Setting status of instance ${instanceId} to Undocked (no container on this Engine)`)

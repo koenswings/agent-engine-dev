@@ -19,16 +19,19 @@ import { fs } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { localEngineId } from '../../src/data/Engine.js'
 import { InstanceID, DiskID, DiskName, EngineID, Timestamp, AppID } from '../../src/data/CommonTypes.js'
-import { disksRoot } from '../../src/data/Config.js'
+import { disksRoot, config } from '../../src/data/Config.js'
 import { setRootDeviceForTests } from '../../src/data/Disk.js'
-import { moveAppCrossEngine, verifyMoveTarget, MoveDeps, moveCommandOutcome } from '../../src/data/MoveAppRemote.js'
+import { moveAppCrossEngine, verifyMoveTarget, MoveDeps, moveCommandOutcome, moveOpFinished } from '../../src/data/MoveAppRemote.js'
+import { checkAndSetUndockedApps } from '../../src/data/UndockedApps.js'
+import { handleCommand } from '../../src/utils/commandUtils.js'
+import { commands } from '../../src/data/Commands.js'
 import { crossResumeRefusal } from '../../src/data/CopyMoveApp.js'
 import { MOVE_CROSS_ENGINE_CAPABILITY, MOVE_FAILURE_CODES } from '../../src/data/MoveAppShapes.js'
 import { setPortReadyProgress, resetPortReadyProgressForTests } from '../../src/data/PortReadyProgress.js'
 import {
     recoverInterruptedOperations, noteDiskDocked, resetResumeStateForTests, resumePeerParkedOps, peerResumeProbe,
     peerInterruption, peerTargetReady, setOperationArgs, markEngineStopping, resetEngineStoppingForTests,
-    isResumableOp, isParkedOp, RETRY_MARKER, PEER_RESUME_RETRY_MS, RetryHandler,
+    isResumableOp, isParkedOp, RETRY_MARKER, PEER_RESUME_RETRY_MS, RetryHandler, resumeGate, skippedSystemDiskHere,
 } from '../../src/data/Operations.js'
 import { CROSS_ENGINE_RESUME_CAPABILITY, peerInFlight, isPeerLinkFailure, engineCanResume } from '../../src/data/InFlight.js'
 import { engineCapabilities } from '../../src/data/Engine.js'
@@ -451,5 +454,178 @@ describe('engine#497 stage 3 (a): cross-Engine resume (the source owns the resum
         expect((h.doc().operationDB['op-old'] as any).move.code).toBe('INTERRUPTED')
         expect(RETRY_MARKER).toBe('Retrying after interrupted run')
         expect(MOVE_FAILURE_CODES).toEqual(expect.arrayContaining(['RESUME_PARKED', 'RESUME_GAVE_UP']))
+    })
+})
+
+// ── engine#511 Part B findings (two-Pi proof 2026-11-17) ─────────────────────
+describe('engine#511 Finding 2: a cross-Engine move whose SOURCE is the system disk', () => {
+    const savedSkip = config.settings.systemDiskSkip
+    beforeEach(async () => {
+        peer.up = true
+        peer.markers.clear(); peer.folders.clear(); peer.pushes.length = 0
+        peer.copyScript.length = 0; peer.verifyScript.length = 0
+        startInstanceMock.mockClear()
+        resetResumeStateForTests()
+        resetEngineStoppingForTests()
+        setRootDeviceForTests('mmcblk-not-a-test-disk')
+        await fs.ensureDir(`${disksRoot()}/${SRC_DEV}/instances`)
+        peerResumeProbe.address = (id: string) => (id === String(TGT) && peer.up) ? TGT_ADDR : undefined
+        peerInFlight.clear = async (_host, _e, _root, id, opId) => { if (peer.markers.get(id) === opId) peer.markers.delete(id) }
+        vi.spyOn(console, 'error').mockImplementation(() => {})
+    })
+    afterEach(async () => {
+        config.settings.systemDiskSkip = savedSkip
+        vi.restoreAllMocks()
+        resetPortReadyProgressForTests()
+        resetEngineStoppingForTests()
+        setRootDeviceForTests(null)
+        await fs.remove(`${disksRoot()}/${SRC_DEV}`)
+    })
+    const systemSource = (h: DocHandle<Store>) => h.change(d => { (d.diskDB as any)[SRC_DISK].diskTypes = ['system'] })
+
+    it('skippedSystemDiskHere: only this Engine\'s docked system disk, and only with systemDiskSkip', () => {
+        const sys = { device: 'sda2', dockedTo: SRC, diskTypes: ['system'] }
+        expect(skippedSystemDiskHere(sys, SRC as EngineID, true)).toBe(true)
+        expect(skippedSystemDiskHere(sys, SRC as EngineID, false)).toBe(false)                         // kits: it docks like any disk
+        expect(skippedSystemDiskHere({ ...sys, diskTypes: ['app'] }, SRC as EngineID, true)).toBe(false)
+        expect(skippedSystemDiskHere({ ...sys, dockedTo: TGT }, SRC as EngineID, true)).toBe(false)       // another Engine's system disk
+        expect(skippedSystemDiskHere({ ...sys, device: null }, SRC as EngineID, true)).toBe(false)
+    })
+
+    it('systemDiskSkip=true (M2 on idea03): source cut mid-push → after the reboot it does NOT wait for a dock that never comes; it resumes when the peer target is ready → Done/MOVED, same op and folder', async () => {
+        config.settings.systemDiskSkip = true
+        const h = makeStore({ status: 'Running' })
+        systemSource(h)
+        const w = wire(h)
+        peer.copyScript.push('cut')
+        await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
+        const op = theOp(h)
+        expect(op.status).toBe('Running')
+        // reboot; the peer is not connected yet (it re-dials after the boot)
+        resetEngineStoppingForTests()
+        resetResumeStateForTests()
+        peer.up = false
+        await recoverInterruptedOperations(h, w.handlers)
+        expect(theOp(h).status).toBe('Pending')
+        // waits only for the target, never for the skipped system disk
+        expect(theOp(h).error).toMatch(/^RESUME_WAITING: resumes when 'tgt' \(disk-tgt\) has docked/)
+        expect(theOp(h).error).not.toMatch(/'src'/)
+        expect(resumeGate(h.doc(), theOp(h)).waitingFor).toEqual([TGT_DISK])
+        // the peer reconnects: the peer watch resumes it, with no dock pass of the system disk
+        peer.up = true
+        expect(resumePeerParkedOps(h)).toEqual([op.id])
+        await until(() => theOp(h).status === 'Done', 'the resumed move to end Done')
+        expect(Object.keys(h.doc().operationDB)).toEqual([op.id])
+        expect(theOp(h).move).toMatchObject({ code: 'MOVED', verified: true })
+        expect(peer.pushes.map(p => p.resumedInto)).toEqual([false, true])
+        expect(peer.markers.size).toBe(0)
+        expect(w.removeSource).toHaveBeenCalledTimes(1)
+        expect(w.startSource).not.toHaveBeenCalled()
+    })
+
+    it('systemDiskSkip=true and the peer already connected at boot: it resumes from boot recovery at once', async () => {
+        config.settings.systemDiskSkip = true
+        const h = makeStore({ status: 'Running' })
+        systemSource(h)
+        const w = wire(h)
+        peer.copyScript.push('cut')
+        await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
+        const op = theOp(h)
+        resetEngineStoppingForTests()
+        resetResumeStateForTests()
+        await recoverInterruptedOperations(h, w.handlers)
+        await until(() => theOp(h).status === 'Done', 'the move resumed by boot recovery to end Done')
+        expect(theOp(h).id).toBe(op.id)
+        expect(theOp(h).move.code).toBe('MOVED')
+        expect(w.copy).toHaveBeenCalledTimes(2)
+    })
+
+    it('systemDiskSkip=false (a kit): the system disk docks through processDisk like any disk, so the resume waits for its dock pass and then ends Done', async () => {
+        config.settings.systemDiskSkip = false
+        const h = makeStore({ status: 'Running' })
+        systemSource(h)
+        const w = wire(h)
+        peer.copyScript.push('cut')
+        await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
+        const op = theOp(h)
+        resetEngineStoppingForTests()
+        resetResumeStateForTests()
+        await recoverInterruptedOperations(h, w.handlers)
+        expect(theOp(h).error).toMatch(/^RESUME_WAITING: resumes when 'src' \(disk-src\) has docked/)
+        expect(resumePeerParkedOps(h)).toEqual([])                         // the peer alone is not enough
+        expect(noteDiskDocked(h, SRC_DISK)).toEqual([op.id])              // the system disk's dock pass
+        await until(() => theOp(h).status === 'Done', 'the resumed move to end Done')
+        expect(theOp(h).move.code).toBe('MOVED')
+        expect(peer.pushes.map(p => p.resumedInto)).toEqual([false, true])
+    })
+
+    it('systemDiskSkip=true: boot marks the held-stopped source of a parked move Stopped, not Undocked (no dock pass follows); other instances keep the old rule', async () => {
+        const h = makeStore({ status: 'Running' })
+        systemSource(h)
+        h.change(d => {
+            (d.instanceDB as any)[INST].status = 'Stopped'
+            ;(d.operationDB as any)['op-park'] = {
+                id: 'op-park', kind: 'moveApp', engineId: SRC, status: 'Pending', error: 'RESUME_WAITING: resumes when …',
+                args: { instanceId: INST, sourceDiskId: SRC_DISK, targetDiskId: TGT_DISK, crossEngine: 'true', crossResume: '1', phase: 'copying', wasRunning: '1' },
+                move: { phase: 'copying', sourceInstanceId: INST },
+            }
+            ;(d.instanceDB as any)['inst-other'] = { ...JSON.parse(JSON.stringify((d.instanceDB as any)[INST])), id: 'inst-other', name: 'other', status: 'Stopped' }
+            // the move's own stop of its source (not an operator stop), as on idea03 in M2; and one for the other instance
+            for (const id of [INST, 'inst-other']) {
+                (d.operationDB as any)[`stop-${id}`] = { id: `stop-${id}`, kind: 'stopApp', engineId: SRC, status: 'Done', error: null, cause: 'post-move', startedAt: 5, args: { instanceId: id } }
+            }
+        })
+        await checkAndSetUndockedApps(h, SRC as EngineID, async () => false, { systemDiskSkip: true })
+        expect(h.doc().instanceDB[INST]?.status).toBe('Stopped')
+        expect((h.doc().instanceDB as any)['inst-other'].status).toBe('Undocked')
+    })
+})
+
+describe('engine#511 Finding 4: stale queued verify / --op start of a finished move', () => {
+    const doneOp = (h: DocHandle<Store>, status: 'Done' | 'Failed') => h.change(d => {
+        (d.operationDB as any)['op-done'] = {
+            id: 'op-done', kind: 'moveApp', engineId: SRC, status, error: null,
+            args: { instanceId: INST, sourceDiskId: SRC_DISK, targetDiskId: TGT_DISK, crossEngine: 'true', crossResume: '1', phase: status === 'Done' ? 'done' : 'failed' },
+            move: { phase: status === 'Done' ? 'done' : 'failed', code: status === 'Done' ? 'MOVED' : 'RESUME_GAVE_UP', verified: status === 'Done',
+                verify: { ok: true, code: null, bytes: BYTES, detail: null, at: 1 } },
+        }
+    })
+    afterEach(() => { resetPortReadyProgressForTests(); vi.restoreAllMocks() })
+
+    it('moveOpFinished: Done / Failed / Cancelled only; an unknown op is not finished', () => {
+        const h = makeStore()
+        expect(moveOpFinished(h.doc(), 'nope')).toBeNull()
+        doneOp(h, 'Done')
+        expect(moveOpFinished(h.doc(), 'op-done')).toBe('Done')
+        h.change(d => { (d.operationDB as any)['op-done'].status = 'Pending' })
+        expect(moveOpFinished(h.doc(), 'op-done')).toBeNull()
+    })
+
+    it('the M1 replay: a verify that runs (or ends) after the op is Done never rewrites its move.verify (was VERIFY_NOT_RUNNING over a MOVED op)', async () => {
+        const h = makeStore()
+        doneOp(h, 'Done')
+        const before = JSON.stringify((h.doc().operationDB as any)['op-done'].move)
+        const v = await verifyMoveTarget(h, 'op-done', INST, String(BYTES), 'true', { localEngineId: async () => String(TGT), targetBytes: async () => BYTES, timeoutMs: 30, pollMs: 5 })
+        expect(v).toMatchObject({ ok: false, code: 'VERIFY_NOT_RUNNING' })   // its own answer
+        expect(JSON.stringify((h.doc().operationDB as any)['op-done'].move)).toBe(before)  // the store is untouched
+        // a verify started while the op was live and answering after it ended: also untouched
+        h.change(d => { (d.operationDB as any)['op-done'].status = 'Running' })
+        const p = verifyMoveTarget(h, 'op-done', INST, String(BYTES), 'true', { localEngineId: async () => String(TGT), targetBytes: async () => BYTES, timeoutMs: 60, pollMs: 5 })
+        h.change(d => { (d.operationDB as any)['op-done'].status = 'Failed' })
+        await p
+        expect(JSON.stringify((h.doc().operationDB as any)['op-done'].move)).toBe(before)
+    })
+
+    it('a boot-replayed `verifyMoveTarget` / `startInstance … --op` for a Done or Failed op does nothing (handleCommand on the target)', async () => {
+        for (const status of ['Done', 'Failed'] as const) {
+            startInstanceMock.mockClear()
+            const h = makeStore()
+            doneOp(h, status)
+            const before = JSON.stringify((h.doc().operationDB as any)['op-done'].move)
+            await handleCommand(commands, h, 'engine', `verifyMoveTarget op-done ${INST} ${BYTES} true`)
+            await handleCommand(commands, h, 'engine', `startInstance ${INST} ${SRC_DISK} --cause cross-engine-cmd --op op-done`)
+            expect(JSON.stringify((h.doc().operationDB as any)['op-done'].move), status).toBe(before)
+            expect(startInstanceMock, status).not.toHaveBeenCalled()
+        }
     })
 })

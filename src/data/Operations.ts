@@ -21,6 +21,7 @@ import { uuid } from '../utils/utils.js'
 import { getCommandLogHandle, addTrace, closeTrace } from './CommandLogStore.js'
 import { runWithTrace, flushTrace } from '../utils/CommandLogger.js'
 import { engineCanResume, isPeerLinkFailure } from './InFlight.js'
+import { config } from './Config.js'
 
 // ── Recovery strategy per operation kind ─────────────────────────────────────
 
@@ -550,6 +551,14 @@ export const peerTargetReady = (store: Store | undefined, op: Operation, diskId:
 }
 
 /**
+ * engine#511 Finding 2: this Engine's system disk while `systemDiskSkip` is set: the record says it
+ * is docked here (device set, 'system' marker), but the USB monitor skips it, so no dock pass ever
+ * reports it. Without systemDiskSkip the system disk docks through processDisk like any disk.
+ */
+export const skippedSystemDiskHere = (d: any, engineId: EngineID = localEngineId, systemDiskSkip: boolean = !!config.settings.systemDiskSkip): boolean =>
+    systemDiskSkip && !!d?.device && String(d.dockedTo) === String(engineId) && (d.diskTypes ?? []).includes('system')
+
+/**
  * Ready when every disk the op needs that is (or was) on this Engine has finished a dock pass
  * here since the Engine started. Boot recovery runs before the USB monitor docks anything, so
  * a resumable op always waits for its dock pass (the source App is started by that pass and
@@ -564,6 +573,10 @@ export const resumeGate = (store: Store | undefined, op: Operation, engineId: En
         // docked to another Engine: only this Engine resumes its op, when the disk is back here
         // (engine#497 (a): or, for a cross-Engine op's target, when it is ready on a peer)
         if (peerTargetReady(store, op, id, engineId)) return false
+        // engine#511 Finding 2: with systemDiskSkip this Engine's own system disk never gets a dock
+        // pass (so never noteDiskDocked), yet it is always present. It counts as docked here, so an
+        // op that needs it resumes at boot / on a peer reconnect instead of waiting for ever.
+        if (skippedSystemDiskHere(d, engineId)) return false
         return !(dockedThisBoot.has(id) && d.device && String(d.dockedTo) === String(engineId))
     })
     return { ready: waitingFor.length === 0, waitingFor }

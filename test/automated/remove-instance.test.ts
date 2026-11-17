@@ -11,7 +11,7 @@ import os from 'node:os'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../src/data/Engine.js'
 import {
-    removeInstance, RemoveDeps, defaultInstanceDir, composeDownAt,
+    removeInstance, RemoveDeps, defaultInstanceDir, composeDownAt, unfinishedMoveOf,
     removeContainersByComposeProject,
 } from '../../src/data/RemoveInstance.js'
 import { resourceLock, instanceKey } from '../../src/utils/ResourceLock.js'
@@ -75,6 +75,38 @@ describe('removeInstance', () => {
         expect(src).not.toMatch(/path\.join\(await diskMountRoot/)
         expect(src).not.toMatch(/idea-quarantine\/\$\{/)
         expect(src).not.toMatch(/idea-quarantine\/[^'"\n]*\*/)
+    })
+    it('engine#511: BUSY_MOVE while a move/copy of the instance is unfinished (parked Pending RESUME_*, or Running) and holds no lock; allowed again once it ends', async () => {
+        add('src1', 'parked', 'd1', 'Stopped')
+        const park = (status: string, error: string | null, kind = 'moveApp') => h.change(doc => {
+            (doc.operationDB as any)['op-p'] = {
+                id: 'op-p', kind, engineId: ME, status, error,
+                args: { instanceId: 'src1', sourceDiskId: 'd1', targetDiskId: 'far', crossEngine: 'true', crossResume: '1', phase: 'copying', wasRunning: '1' },
+                ...(kind === 'moveApp' ? { move: { phase: 'copying', sourceInstanceId: 'src1' } } : {}),
+            }
+        })
+        expect(resourceLock.getLockInfo(instanceKey('src1' as any))).toBeFalsy()   // a parked op holds no lock
+        for (const [status, error, kind] of [
+            ['Pending', 'RESUME_WAITING: resumes when …', 'moveApp'],
+            ['Pending', 'RESUME_PENDING (1/3): VERIFY_NOT_RUNNING: …', 'moveApp'],
+            ['Running', null, 'moveApp'],
+            ['Pending', 'RESUME_WAITING: resumes when …', 'copyApp'],
+        ] as const) {
+            park(status, error, kind)
+            await expect(removeInstance(h, 'src1', ME, deps()), `${kind} ${status}`).rejects.toThrow(/^BUSY_MOVE: instance 'parked' is the source of unfinished/)
+            expect(calls).toEqual([])
+            expect(h.doc().instanceDB['src1' as any]).toBeDefined()
+        }
+        // a Running instance with a parked move: BUSY_MOVE, not RUNNING
+        h.change(doc => { (doc.instanceDB as any)['src1'].status = 'Running' })
+        expect(await codeOf(removeInstance(h, 'src1', ME, deps()))).toBe('BUSY_MOVE')
+        h.change(doc => { (doc.instanceDB as any)['src1'].status = 'Stopped' })
+        for (const end of ['Done', 'Failed', 'Cancelled']) {
+            h.change(doc => { (doc.operationDB as any)['op-p'].status = end })
+            expect(unfinishedMoveOf(h.doc(), 'src1'), end).toBeNull()
+        }
+        await removeInstance(h, 'src1', ME, deps())
+        expect(h.doc().instanceDB['src1' as any]).toBeUndefined()
     })
     it('refusals: NOT_FOUND, NOT_LOCAL, AMBIGUOUS, RUNNING', async () => {
         add('far1', 'x', 'far'); add('a', 'dup', 'd1'); add('b', 'dup', 'd1'); add('run', 'r', 'd1', 'Running')
