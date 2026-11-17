@@ -733,3 +733,79 @@ describe('recoverInterruptedOperations', () => {
         expect(handle.doc().operationDB['op3'].status).toBe('Done')
     })
 })
+
+describe('engine#497: boot recovery re-runs copyApp / moveApp inside the interrupted op (real handlers)', () => {
+    beforeEach(() => {
+        vi.clearAllMocks()
+        composeDownAtMock.mockReset()
+        composeDownAtMock.mockImplementation(async () => undefined)
+        pruneUnusedInstanceNetworksMock.mockReset()
+        pruneUnusedInstanceNetworksMock.mockImplementation(async () => ({ removed: [], skipped: [], errors: [] }))
+    })
+    afterEach(() => { vi.restoreAllMocks() })
+
+    const interrupted = (handle: DocHandle<Store>, kind: 'copyApp' | 'moveApp') => handle.change(doc => {
+        doc.operationDB['op-x'] = {
+            id: 'op-x', kind, args: { instanceId: INSTANCE_ID, sourceDiskId: SOURCE_DISK_ID, targetDiskId: TARGET_DISK_ID },
+            cause: 'console-command', subject: null, engineId: localEngineId,
+            status: 'Running', progressPercent: 40, currentStep: 3, totalSteps: 6, stepLabel: 'Syncing instance data',
+            startedAt: 0 as Timestamp, completedAt: null, error: null,
+        }
+        ;(doc.engineDB[localEngineId] as any).commands = [`${kind} my-kolibri ${SOURCE_DISK_ID} ${TARGET_DISK_ID}`]
+    })
+    const queued = (handle: DocHandle<Store>) => [...(((handle.doc().engineDB[localEngineId] as any).commands) ?? [])].map(String)
+    const spyHandlers = async () => {
+        const { bootRetryHandlers } = await import('../../src/data/RecoveryRetry.js')
+        return { copyApp: vi.fn(bootRetryHandlers.copyApp!), moveApp: vi.fn(bootRetryHandlers.moveApp!) }
+    }
+
+    for (const kind of ['copyApp', 'moveApp'] as const) {
+        it(`${kind}: a successful retry ends the same op Done (no new op), drops the queued command, and the next boot does not retry it`, async () => {
+            const { handle } = await makeHandle()
+            interrupted(handle, kind)
+            const handlers = await spyHandlers()
+            await recoverInterruptedOperations(handle, handlers)
+            expect(queued(handle)).toEqual([])
+            await vi.waitFor(() => expect(handle.doc().operationDB['op-x'].status).toBe('Done'))
+            const ops = Object.values(handle.doc().operationDB)
+            expect(ops).toHaveLength(1)
+            expect(ops[0].progressPercent).toBe(100)
+            expect(ops[0].error).toBeNull()
+            if (kind === 'moveApp') expect(handle.doc().instanceDB[INSTANCE_ID].storedOn).toBe(TARGET_DISK_ID)
+            else expect(Object.keys(handle.doc().instanceDB)).toHaveLength(1)   // processInstance is mocked; no extra op either way
+            await recoverInterruptedOperations(handle, handlers)   // next boot
+            await new Promise(r => setTimeout(r, 20))
+            expect(handlers[kind]).toHaveBeenCalledTimes(1)
+            expect(Object.values(handle.doc().operationDB)).toHaveLength(1)
+        })
+
+        it(`${kind}: a failed retry (rsync dies) ends the same op Failed and the next boot does not retry it`, async () => {
+            const { handle } = await makeHandle()
+            interrupted(handle, kind)
+            const { rsyncDirectory } = await import('../../src/utils/rsync.js')
+            vi.mocked(rsyncDirectory).mockRejectedValueOnce(new Error('io error'))
+            const consoleSpy = vi.spyOn(console, 'error').mockImplementation(() => {})
+            const handlers = await spyHandlers()
+            await recoverInterruptedOperations(handle, handlers)
+            await vi.waitFor(() => expect(handle.doc().operationDB['op-x'].status).toBe('Failed'))
+            expect(handle.doc().operationDB['op-x'].error).toContain('io error')
+            expect(Object.values(handle.doc().operationDB)).toHaveLength(1)
+            expect(queued(handle)).toEqual([])
+            await recoverInterruptedOperations(handle, handlers)
+            await new Promise(r => setTimeout(r, 20))
+            expect(handlers[kind]).toHaveBeenCalledTimes(1)
+            consoleSpy.mockRestore()
+        })
+    }
+
+    it('moveApp: a target now docked to another Engine is not turned into a cross-Engine move; the op ends Failed', async () => {
+        const { handle } = await makeHandle()
+        interrupted(handle, 'moveApp')
+        handle.change(doc => { doc.diskDB[TARGET_DISK_ID].dockedTo = 'ENGINE_remote-1' as EngineID })
+        const handlers = await spyHandlers()
+        await recoverInterruptedOperations(handle, handlers)
+        await vi.waitFor(() => expect(handle.doc().operationDB['op-x'].status).toBe('Failed'))
+        expect(handle.doc().operationDB['op-x'].error).toMatch(/^Retry failed: moveApp: the target disk .* is now docked to another Engine/)
+        expect(Object.values(handle.doc().operationDB)).toHaveLength(1)
+    })
+})

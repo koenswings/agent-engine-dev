@@ -19,6 +19,7 @@ import { localEngineId } from './Engine.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
 import { getCommandLogHandle, addTrace, closeTrace } from './CommandLogStore.js'
+import { runWithTrace, flushTrace } from '../utils/CommandLogger.js'
 
 // ── Recovery strategy per operation kind ─────────────────────────────────────
 
@@ -369,15 +370,23 @@ const queuedMatchesOp = (store: Store | undefined, op: Operation, tokens: string
  * Rule, for every Operation kind: once boot recovery has left the op in a final state
  * (Done, Failed or Cancelled, read back from the store), remove the first queued command
  * that created it (QUEUED_COMMAND_OF), the one that was running. A later identical command
- * someone queued on purpose stays. An op recovery left Pending or Running (a retry in
- * progress) keeps its command, as before. An op that is not in the store removes nothing.
- * Returns the removed command, or null.
+ * someone queued on purpose stays. An op that is not in the store removes nothing.
+ *
+ * engine#497: an op recovery is retrying (Pending/Running) is owned by recovery, which
+ * re-runs it inside the same op; pass { retryOwned: true } so its queued command goes
+ * too and the startup replay cannot run it a second time. Without retryOwned a
+ * Pending/Running op keeps its command. Returns the removed command, or null.
  */
-export const dropInterruptedCommand = (storeHandle: DocHandle<Store>, op: Operation | null | undefined): string | null => {
+export const dropInterruptedCommand = (
+    storeHandle: DocHandle<Store>,
+    op: Operation | null | undefined,
+    opts: { retryOwned?: boolean } = {},
+): string | null => {
     if (!op?.id) return null
     const store = storeHandle.doc()
     const current = store?.operationDB?.[op.id]
-    if (!current || !SETTLED.includes(current.status)) return null
+    if (!current) return null
+    if (!SETTLED.includes(current.status) && !opts.retryOwned) return null
     if (!QUEUED_COMMAND_OF[current.kind]) return null
     const engineId = current.engineId ?? op.engineId
     if (!engineId) return null
@@ -390,9 +399,19 @@ export const dropInterruptedCommand = (storeHandle: DocHandle<Store>, op: Operat
         removed = String(list[i])
         list.splice(i, 1)
     })
-    if (removed) log(`recovery: ${op.id.slice(0, 8)} ${current.kind} (${current.status}): removed its queued command '${removed}' so the startup replay does not run it again`)
+    if (removed) log(`recovery: ${op.id.slice(0, 8)} ${current.kind} (${current.status}): removed its queued command '${removed}' so the startup replay does not run it again${opts.retryOwned ? ' (boot recovery retries it in this op)' : ''}`)
     return removed
 }
+
+/** Text a retried op carries while boot recovery re-runs it (engine#497). */
+export const RETRY_MARKER = 'Retrying after interrupted run'
+
+/**
+ * A boot-recovery retry handler. It re-runs the op inside the same Operation
+ * (recoveredOpId / existingOpId), so the op itself ends Done or Failed (engine#497).
+ * It must reject on failure; recoverInterruptedOperations then closes the op Failed.
+ */
+export type RetryHandler = (args: Record<string, string>, storeHandle: DocHandle<Store>, opId: string) => Promise<void>
 
 /**
  * Called during engine startup. Scans operationDB for any operation left in
@@ -402,12 +421,13 @@ export const dropInterruptedCommand = (storeHandle: DocHandle<Store>, op: Operat
  *   - 'retry': re-queues the operation by calling the provided retry handler
  *   - 'fail':  marks as Failed; operator must re-issue manually
  *
- * The retry handler map is passed in from start.ts to avoid circular imports.
- * Each handler receives the original operation args and the storeHandle.
+ * The retry handler map is passed in from start.ts (RecoveryRetry.ts) to avoid circular
+ * imports. Each handler receives the original operation args, the storeHandle and the
+ * operation id; it re-runs the work inside that operation (engine#497).
  */
 export const recoverInterruptedOperations = async (
     storeHandle: DocHandle<Store>,
-    retryHandlers: Partial<Record<OperationKind, (args: Record<string, string>, storeHandle: DocHandle<Store>) => Promise<void>>>,
+    retryHandlers: Partial<Record<OperationKind, RetryHandler>>,
     engineId: EngineID = localEngineId,
 ): Promise<void> => {
     const store = storeHandle.doc()
@@ -463,24 +483,42 @@ export const recoverInterruptedOperations = async (
         const traceArgs = JSON.stringify({ ...op.args, recoveredOpId: op.id })
 
         if (strategy === 'retry' && handler) {
-            log(chalk.blue(`  ${op.id.slice(0, 8)} ${op.kind}: retrying (idempotent)`))
+            log(chalk.blue(`  ${op.id.slice(0, 8)} ${op.kind}: retrying (idempotent) in the same operation`))
             if (cmdLogHandle) addTrace(cmdLogHandle, { traceId, command: op.kind, args: traceArgs, startedAt: Date.now(), completedAt: null, status: 'running', errorMessage: null })
             // Mark as Pending before retry so it's visible in the store
             updateOperation(storeHandle, op.id, {
                 status: 'Pending',
-                error: 'Retrying after interrupted run',
+                error: RETRY_MARKER,
             })
-            // Fire-and-forget: retry runs in background; startup continues
-            handler(op.args, storeHandle).then(() => {
-                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'ok')
-            }).catch(err => {
-                log(chalk.red(`  ${op.id.slice(0, 8)} ${op.kind}: retry failed — ${err.message}`))
-                updateOperation(storeHandle, op.id, {
-                    status: 'Failed',
-                    error: `Retry failed: ${err.message}`,
-                    completedAt: Date.now() as Timestamp,
-                })
-                if (cmdLogHandle) closeTrace(cmdLogHandle, traceId, 'error', `Retry failed: ${err.message}`)
+            // engine#497: recovery owns this re-run. Its queued command goes now, so the
+            // startup replay does not run the same copy/move/backup a second time.
+            dropInterruptedCommand(storeHandle, op, { retryOwned: true })
+            // Fire-and-forget: retry runs in background; startup continues. It runs inside
+            // this trace, so the handler's errors reach us (backupInstance rethrows inside a
+            // trace) and the op is closed from the result, never left Pending for the next boot.
+            const statusNow = () => storeHandle.doc()?.operationDB?.[op.id]?.status
+            runWithTrace({ traceId, command: op.kind, args: traceArgs }, () => handler(op.args, storeHandle, op.id)).then(async () => {
+                const st = statusNow()
+                if (st === 'Pending' || st === 'Running') {
+                    updateOperation(storeHandle, op.id, { status: 'Done', progressPercent: 100, error: null, completedAt: Date.now() as Timestamp })
+                } else if (st === 'Done' && storeHandle.doc()?.operationDB?.[op.id]?.error === RETRY_MARKER) {
+                    updateOperation(storeHandle, op.id, { error: null })
+                }
+                const failed = statusNow() === 'Failed'
+                const why = failed ? String(storeHandle.doc()?.operationDB?.[op.id]?.error ?? 'retry failed') : undefined
+                if (failed) log(chalk.red(`  ${op.id.slice(0, 8)} ${op.kind}: retry failed — ${why}`))
+                if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, failed ? 'error' : 'ok', why) }
+            }).catch(async err => {
+                const msg = err?.message ?? String(err)
+                log(chalk.red(`  ${op.id.slice(0, 8)} ${op.kind}: retry failed — ${msg}`))
+                if (statusNow() !== 'Cancelled') {
+                    updateOperation(storeHandle, op.id, {
+                        status: 'Failed',
+                        error: `Retry failed: ${msg}`,
+                        completedAt: Date.now() as Timestamp,
+                    })
+                }
+                if (cmdLogHandle) { await flushTrace(traceId); closeTrace(cmdLogHandle, traceId, 'error', `Retry failed: ${msg}`) }
             })
         } else {
             log(chalk.yellow(`  ${op.id.slice(0, 8)} ${op.kind}: marking Failed (strategy: ${strategy}${strategy === 'retry' ? ', no handler' : ''})`))

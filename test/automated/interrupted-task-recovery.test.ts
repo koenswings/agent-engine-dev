@@ -108,7 +108,8 @@ describe('recoverInterruptedOperations', () => {
         expect(copyHandler).toHaveBeenCalledOnce()
         expect(copyHandler).toHaveBeenCalledWith(
             { instanceId: 'INST_1', sourceDiskId: 'DISK_src', targetDiskId: 'DISK_tgt' },
-            handle
+            handle,
+            'op1',   // engine#497: the retry runs inside the interrupted op
         )
     })
 

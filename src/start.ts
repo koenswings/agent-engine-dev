@@ -34,8 +34,7 @@ import { refreshClientCards, startClientCardPoll } from './data/ClientCards.js'
 import { refreshClientImages } from './data/ClientImages.js'
 import './data/FlashCard.js'
 import { diskFsRoot } from './data/Disk.js'
-import { copyApp, moveApp } from './data/CopyMoveApp.js'
-import { backupInstance } from './monitors/backupMonitor.js'
+import { bootRetryHandlers } from './data/RecoveryRetry.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
 import { createCommandLogStore, getCommandLogHandle, shutdownRepo, startCommandLogRotation } from './data/CommandLogStore.js'
 import { startMemoryMonitor } from './monitors/memoryMonitor.js'
@@ -191,22 +190,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         .catch(e => log(`updateAvailable refresh at boot failed: ${e}`))
 
     // Crash recovery: retry idempotent interrupted ops; mark others Failed
-    await recoverInterruptedOperations(storeHandle, {
-        copyApp: async (args, handle) => {
-            await copyApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any, 'crash-recovery')
-        },
-        moveApp: async (args, handle) => {
-            await moveApp(handle, args.instanceId as any, args.sourceDiskId as any, args.targetDiskId as any, 'crash-recovery')
-        },
-        backupApp: async (args, handle) => {
-            const store = handle.doc()
-            const backupDisk = store.diskDB[args.backupDiskId]
-            if (backupDisk) {
-                await backupInstance(handle, args.instanceId as any, backupDisk as any, undefined, 'crash-recovery')
-            }
-        },
-        // restoreApp: strategy='fail', no retry handler needed
-    })
+    // engine#497: each retry runs inside the interrupted op and rejects on failure (RecoveryRetry.ts)
+    await recoverInterruptedOperations(storeHandle, bootRetryHandlers)
 
     // Create the command log store and initialise the console patcher
     log(chalk.bgMagenta('STARTING COMMAND LOG STORE'))
