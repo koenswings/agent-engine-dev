@@ -139,6 +139,55 @@ export const isForeignCommandLogContent = (ownStoreDocId: string, doc: unknown):
     return typeof d.storeTag === 'string' && d.storeTag !== storeTag(ownStoreDocId)
 }
 
+/** A command log by shape (`{ traces, recentTraceIds }`, CommandLogStore.ts). */
+export const isCommandLogContent = (doc: unknown): boolean => {
+    const d = doc as any
+    return !!d && typeof d === 'object' && typeof d.traces === 'object' && d.traces !== null && Array.isArray(d.recentTraceIds)
+}
+
+/**
+ * engine#471 (a): doc ids of an Engine's own command logs (current, rotated out,
+ * and the one named in command-log-url.txt while it loads). Marked before the
+ * doc is created or loaded, so it is never announced to a peer, not even in the
+ * window before its content can be read.
+ */
+const _ownCommandLogs = new WeakMap<object, Set<string>>()
+const bareId = (documentId: string) => String(documentId).replace(/^automerge:/, '')
+/** Kept per Repo (one per Engine), so several Engines in one process (tests) do not share the list. */
+export const markOwnCommandLog = (repo: object, documentId: string): void => {
+    let ids = _ownCommandLogs.get(repo)
+    if (!ids) _ownCommandLogs.set(repo, ids = new Set())
+    ids.add(bareId(documentId))
+}
+export const isOwnCommandLog = (repo: object, documentId: string): boolean => _ownCommandLogs.get(repo)?.has(bareId(documentId)) ?? false
+
+/** The engineId as it appears in an Engine peerId (enginePeerId's character rule). */
+export const peerIdEngineId = (engineId: string): string => String(engineId).replace(/[^A-Za-z0-9_.:-]/g, '_')
+
+/**
+ * engine#471 (a): may this Engine sync the loaded command log `doc` with the
+ * same-store Engine `peerEngineId` without being asked?
+ *   - our own log: no. Engines stop pushing their command logs to each other
+ *     (Koen 2026-11-16). A Console still reads any Engine's log on demand: it
+ *     finds the url via that Engine's /api/command-log-url and asks the Engine it
+ *     is connected to, which requests it from its peers (see below) and answers.
+ *   - another Engine's log (fetched here on demand): only with its owner, the
+ *     Engine named in its engineId, so the copy stays live (also after a
+ *     reconnect) without being passed on to every other Engine.
+ *   - a log without engineId (written before engine#471, owner unknown): yes, as
+ *     before, so an on-demand copy still catches up with its owner. These are
+ *     only loaded when asked for, and every Engine's log gets an engineId at its
+ *     next start (backfill) or rotation.
+ * A doc that is not loaded yet (a request in flight) is not judged here: the
+ * caller lets the request go out, which is how the on-demand fetch works.
+ */
+export const shareCommandLogWith = (doc: unknown, ownEngineId: string | undefined, peerEngineId: string | undefined): boolean => {
+    const owner = (doc as any)?.engineId
+    if (typeof owner !== 'string' || !owner) return true
+    if (ownEngineId && peerIdEngineId(owner) === peerIdEngineId(ownEngineId)) return false
+    return !!peerEngineId && peerIdEngineId(owner) === peerEngineId
+}
+
 /**
  * Is `documentId` another fleet's store doc that is loaded in `repo`? A doc that is
  * not loaded cannot be judged, and cannot be sent either (a sync reply needs the

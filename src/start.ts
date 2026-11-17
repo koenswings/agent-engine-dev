@@ -210,7 +210,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     // Create the command log store and initialise the console patcher
     log(chalk.bgMagenta('STARTING COMMAND LOG STORE'))
-    const commandLogHandle = await createCommandLogStore(repo, { storeTag: storeTag(storeDocId) })
+    const commandLogHandle = await createCommandLogStore(repo, { storeTag: storeTag(storeDocId), engineId: String(localEngineId) })
     initCommandLogger(commandLogHandle)
     // idea#183: fresh CommandLog doc each local day, previous one archived
     startCommandLogRotation(repo)

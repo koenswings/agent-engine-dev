@@ -3,7 +3,7 @@ import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { ThreadedWebSocketServerAdapter } from "./wsServerThread.js";
 import { PortNumber } from "./data/CommonTypes.js";
 import { deepPrint, log, error } from './utils/utils.js'
-import { enginePeerId, isForeignStoreDoc, peerVerdict, storeTag } from './data/StoreScope.js'
+import { enginePeerId, isCommandLogContent, isForeignStoreDoc, isOwnCommandLog, peerVerdict, shareCommandLogWith, storeTag } from './data/StoreScope.js'
 export { isForeignStoreDoc }
 
 
@@ -89,16 +89,31 @@ export const shouldAnnounceTo = (meta: PeerMetadata | undefined): boolean => met
  *     the adapters never let through, would get nothing either);
  *   - never announce another fleet's store doc, even to our own Engines: copies
  *     relayed here before this fix stay on disk untouched (quarantine is separate)
- *     but are not passed on.
+ *     but are not passed on;
+ *   - engine#471 (a): never announce our own command log, and keep another Engine's
+ *     log (fetched on demand) in sync only with its owner (shareCommandLogWith).
+ *     A doc that is not loaded yet is let through, so a request for a log we do
+ *     not hold still goes out to our Engines (the Console's on-demand fetch).
  * Storage-less clients (Console, CLI) still get nothing unasked, as before.
  */
-export const storeScopedSharePolicy = (repo: Repo, ownStoreDocId: string) => {
+export const storeScopedSharePolicy = (repo: Repo, ownStoreDocId: string, ownEngineId?: string) => {
     const ownTag = storeTag(ownStoreDocId)
     return async (peerId: PeerId, documentId?: string): Promise<boolean> => {
         const meta = repo.peerMetadataByPeerId[peerId]
         if (!shouldAnnounceTo(meta)) return false
-        if (peerVerdict(ownTag, peerId, meta).kind !== 'same-store') return false
-        return !(documentId && isForeignStoreDoc(repo, ownStoreDocId, documentId))
+        const verdict = peerVerdict(ownTag, peerId, meta)
+        if (verdict.kind !== 'same-store') return false
+        if (!documentId) return true
+        if (isForeignStoreDoc(repo, ownStoreDocId, documentId)) return false
+        // engine#471 (a): command logs are not pushed between Engines (StoreScope.shareCommandLogWith)
+        if (isOwnCommandLog(repo, documentId)) return false
+        const handle = (repo.handles as Record<string, any>)[documentId]
+        if (handle?.isReady?.()) {
+            let doc: unknown
+            try { doc = handle.doc() } catch { doc = undefined }
+            if (isCommandLogContent(doc)) return shareCommandLogWith(doc, ownEngineId, verdict.engineId)
+        }
+        return true
     }
 }
 
@@ -134,7 +149,7 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber, iden
         peerId,
         sharePolicy: (p, d) => sharePolicy(p, d)
     });
-    sharePolicy = storeScopedSharePolicy(repo, identity.storeDocId)
+    sharePolicy = storeScopedSharePolicy(repo, identity.storeDocId, identity.engineId)
     network.setDocGuard((documentId) => isForeignStoreDoc(repo, identity.storeDocId, documentId))
     log(`[store-scope] Engine peerId ${peerId}: syncing only with Engines of store ${storeTag(identity.storeDocId)}`)
 
