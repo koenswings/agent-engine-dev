@@ -45,6 +45,7 @@ import { startPeerAccess } from './data/PeerAccess.js'
 import { checkAndSetUndockedApps } from './data/UndockedApps.js'
 import { installStaleDocGuard, staleStoreExit } from './data/StaleDocGuard.js'
 import { startLoopStallMonitor } from './monitors/loopStallMonitor.js'
+import { armStaleStoreTestHook } from './data/StaleStoreTestHook.js'
 export { checkAndSetUndockedApps }
 
 
@@ -357,6 +358,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         archiveOldOperations(storeHandle).catch(e => print(chalk.red(`archive operations: ${e}`)))
         peerAccess.onHeartbeat().catch(e => print(chalk.red(`peer access heartbeat: ${e}`)))
     })
+
+    // engine#512 Pi proof only (one-shot, env + marker file; see StaleStoreTestHook.ts)
+    armStaleStoreTestHook(storeHandle, () => { writeLastSeen(storeHandle, String(localEngineId), Date.now(), 0, true) })
 
 
 }

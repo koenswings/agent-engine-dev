@@ -16,6 +16,8 @@
  */
 import { describe, it, expect, afterEach } from 'vitest'
 import { spawnSync } from 'node:child_process'
+import fs from 'node:fs'
+import os from 'node:os'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { WebSocketServer } from 'ws'
@@ -29,6 +31,7 @@ import {
     staleStoreExit, resetStaleStoreExit, STALE_STORE_EXIT_CODE, StaleDocGuard,
 } from '../../src/data/StaleDocGuard.js'
 import { PairAdapter, link, pump } from '../harness/pairAdapter.js'
+import { armStaleStoreTestHook, TEST_STALE_STORE_ENV, TEST_STALE_STORE_DELAY_ENV } from '../../src/data/StaleStoreTestHook.js'
 
 const sleep = (ms: number) => new Promise(r => setTimeout(r, ms))
 const until = async (f: () => boolean, ms: number) => {
@@ -350,4 +353,37 @@ describe('engine#512 part 3: stale doc guard', () => {
         expect(r.stdout).toContain('shutdown ran')
         expect(r.status).toBe(STALE_STORE_EXIT_CODE)
     }, 70_000)
+})
+
+// ── the one-shot Pi-proof hook ──────────────────────────────────────────────────
+
+describe('engine#512: stale-store test hook (Pi proof switch)', () => {
+    afterEach(() => resetStaleStoreExit())
+    it('not armed without the env var, or when the marker file is missing', async () => {
+        const repo = new Repo({ network: [] })
+        const h = repo.create<{ n: number }>({ n: 0 })
+        expect(armStaleStoreTestHook(h, () => {}, {})).toBeNull()
+        expect(armStaleStoreTestHook(h, () => {}, { [TEST_STALE_STORE_ENV]: path.join(os.tmpdir(), `nope-${Date.now()}`) })).toBeNull()
+        await repo.shutdown().catch(() => {})
+    })
+    it('fires once: consumes the marker, marks the store outdated, the write hits the guard → exit 75 path', async () => {
+        const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'idea-512-hook-'))
+        const marker = path.join(dir, 'stale-once')
+        fs.writeFileSync(marker, '')
+        const repo = new Repo({ network: [] })
+        const h = repo.create<{ n: number }>({ n: 0 })
+        const reasons: string[] = []
+        const g = installStaleDocGuard(repo, { storeDocId: h.documentId, onStaleStore: r => reasons.push(r), sweepMs: 0 })
+        g.watchStoreHandle(h)
+        expect(armStaleStoreTestHook(h, () => { h.change(d => { d.n = 1 }) }, { [TEST_STALE_STORE_ENV]: marker, [TEST_STALE_STORE_DELAY_ENV]: '10' })).toBe(marker)
+        expect(await until(() => reasons.length === 1, 3000)).toBe(true)
+        expect(reasons[0]).toMatch(/a local write to the store: Attempting to change an outdated document/)
+        expect(fs.existsSync(marker)).toBe(false)
+        expect(fs.existsSync(`${marker}.fired`)).toBe(true)
+        // a restart with the env still set does not fire again
+        expect(armStaleStoreTestHook(h, () => {}, { [TEST_STALE_STORE_ENV]: marker })).toBeNull()
+        g.stop()
+        fs.rmSync(dir, { recursive: true, force: true })
+        await repo.shutdown().catch(() => {})
+    })
 })
