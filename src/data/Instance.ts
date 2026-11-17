@@ -13,6 +13,7 @@ import { appForInstance, instanceUsbSync } from './InstanceApp.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
 import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
 import { inFlightRefusal } from './InFlight.js'
+import { updateInFlightRefusal } from './UpdateInFlight.js'
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
 import { createAppId, parseAppId } from "./App.js";
@@ -298,6 +299,14 @@ export interface Instance {
   updateAvailable?: UpdateAvailable | null;
   /** App ID before the last successful updateApp ("Updated from 0.15.5", idea#76); null/absent otherwise. */
   previousAppId?: AppID | null;
+  /**
+   * engine#456 (Q3, Console contract with Pixel): true from the moment an updateApp's verify step
+   * passed (the point of no return) until its settle step exits 0. The instance stays Running on the
+   * new version; the op ended MIGRATIONS_PENDING / SETTLE_FAILED (or is still running work / settle).
+   * Resume is a plain `updateApp <id> <current version>`. Absent otherwise.
+   * Optional: do not add to store-template.json.
+   */
+  updatePending?: boolean;
   /**
    * idea#396: when the Health gate last passed. `at` is wall ms if the clock was
    * trusted then, otherwise null. Cleared after a successful (or no-op)
@@ -1521,6 +1530,10 @@ export type StartInstanceOpts = {
   deferStoreStatus?: boolean
   /** engine#497: the op that owns this folder's in-flight marker; any other start is refused */
   inFlightOpId?: string
+  /** engine#456: the updateApp op that owns instances/<id>/.idea-update-in-flight; any other start is refused */
+  updateOpId?: string
+  /** engine#456: LoadImages already ran before Prepare; do not repeat it inside Start */
+  imagesLoaded?: boolean
 }
 
 /** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
@@ -1530,12 +1543,15 @@ export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance,
     // is started only by the op that owns the marker
     const inFlight = await inFlightRefusal(await diskMountRoot(disk), String(instance.id), opts.inFlightOpId)
     if (inFlight) throw new Error(`startInstance: ${inFlight}`)
+    // engine#456 Q4: a folder in the middle of a staged update starts only for the owning updateApp
+    const updating = await updateInFlightRefusal(`${await diskMountRoot(disk)}/instances/${instance.id}`, String(instance.id), opts.updateOpId)
+    if (updating) throw new Error(`startInstance: ${updating}`)
     // engine#381: a deferred start skips refresh-from-compose so it cannot claim storedOn.
     if (opts.deferStoreStatus) {
       return startInstanceTracked(storeHandle, instance, disk, cause, opts)
     }
     const inst = await refreshInstanceFromCompose(storeHandle, instance, disk)
-    return startInstanceTracked(storeHandle, inst, disk, cause)
+    return startInstanceTracked(storeHandle, inst, disk, cause, opts)
   })())
 
 const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command', opts: StartInstanceOpts = {}): Promise<void> => {
@@ -1703,7 +1719,7 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
     const composeFile = await $`cat ${mountRoot}/instances/${instance.id}/compose.yaml`
     const compose = YAML.parse(composeFile.stdout)
     const services = compose.services
-    if (!skipImageLoad()) {
+    if (!opts.imagesLoaded && !skipImageLoad()) {
       // Load images from pre-saved tar files on the disk (no internet required).
       // Always on in production; tests turn it on with settings.skipImageLoad = false (idea#81).
       // Unpinned: a missing tar or a failed load does not stop the start (idea#109):
@@ -1717,13 +1733,13 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
       for (const serviceName in services) {
         await preloadServiceImageFromTar(services[serviceName].image, mountRoot, startWarning)
       }
-    } else {
+    } else if (!opts.imagesLoaded) {
       // Tests by default: fixtures have no tar files — Docker pulls the image at create time if not cached
       log(`skipImageLoad: skipping image load from tar; Docker will pull images as needed`)
     }
     // idea#322/#445: a digest-pinned image must be present as repo@digest before compose
     // create (pull_policy: never). Tag-only refs are not checked, as before.
-    if (!skipImageLoad()) {
+    if (!opts.imagesLoaded && !skipImageLoad()) {
       for (const serviceName in services) await verifyServiceImageDigest(services[serviceName].image, { requirePresent: false })
     }
 
@@ -1855,15 +1871,12 @@ export const writeEngineHostEnv = async (
 }
 
 /**
- * Create the containers of an instance (`docker compose create`) and set it to
- * Pauzed. Errors propagate to the caller (idea#109): startInstance turns them
- * into Error status and a failed command-log trace.
+ * The per-start .env values every compose call of an instance needs: IDEA_HOSTNAME /
+ * IDEA_HOST_IPS (#163), IDEA_NEXTCLOUD_URL (#169), hostname / ip (#217). Shared by
+ * createInstanceContainers and the updateApp prepare step (engine#456: prepare gets the same
+ * directory preparation as Start).
  */
-export const createInstanceContainers = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
-  const store: Store = storeHandle.doc()
-  const mountRoot = await diskMountRoot(disk)
-  log(`Creating the containers for the services of the app instance`)
-
+export const writeStartHostEnv = async (store: Store, instance: Instance, mountRoot: string): Promise<void> => {
   // Every app, every start: tell the instance which Pi it runs on
   // (IDEA_HOSTNAME / IDEA_HOST_IPS, agent-engine-dev#163). Rewritten on each
   // start, so the values follow a moved or copied disk to its new Pi.
@@ -1880,6 +1893,18 @@ export const createInstanceContainers = async (storeHandle: DocHandle<Store>, in
   // hostname / ip for every app's compose (${hostname}, ${ip}): main's #217
   // writeEngineHostEnv, which replaced this PR's Nextcloud-only block.
   await writeEngineHostEnv(envPath, getLocalEngine(store).hostname, instance.id, hostNetworkInterfaces())
+}
+
+/**
+ * Create the containers of an instance (`docker compose create`) and set it to
+ * Pauzed. Errors propagate to the caller (idea#109): startInstance turns them
+ * into Error status and a failed command-log trace.
+ */
+export const createInstanceContainers = async (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk): Promise<void> => {
+  const store: Store = storeHandle.doc()
+  const mountRoot = await diskMountRoot(disk)
+  log(`Creating the containers for the services of the app instance`)
+  await writeStartHostEnv(store, instance, mountRoot)
 
   log(`Creating containers of app instance '${instance.id}' on disk ${disk.id} of engine ${localEngineId}.`)
   try {

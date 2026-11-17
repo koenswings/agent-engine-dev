@@ -81,7 +81,7 @@ describe('updateApp (#230)', () => {
         health = ['starting', 'unhealthy', 'healthy']
         const r = await updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps())
         expect(r).toMatchObject({ instanceId: 'i1', fromAppId: 'kolibri-1.0', toAppId: 'kolibri-1.1', snapshotPath: `${tmp}/.pre-update/i1`, snapshotBytes: 4096 })
-        expect(r.steps).toEqual(['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health'])
+        expect(r.steps).toEqual(['Fetch', 'Check', 'Snapshot', 'Swap', 'LoadImages', 'Start', 'Health'])   // engine#456: LoadImages runs for every App
         expect(calls).toEqual(['stop', 'snapshot', 'reread', 'start', 'probe'])   // probe: fallback main-URL check
         expect(inst().instanceOf).toBe('kolibri-1.1')
         expect(await fs.readFile(`${tmp}/instances/i1/.env`, 'utf8')).toBe('port=50001\n')
@@ -91,7 +91,7 @@ describe('updateApp (#230)', () => {
         expect(h.doc().diskDB['d1' as any].quarantineBytes).toBe(1024)
         const op = Object.values(h.doc().operationDB).find(o => o.kind === 'updateApp')!
         expect(op.status).toBe('Done')
-        expect(new Set(msgs.map(m => m.step))).toEqual(new Set(['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health']))
+        expect(new Set(msgs.map(m => m.step))).toEqual(new Set(['Fetch', 'Check', 'Snapshot', 'Swap', 'LoadImages', 'Start', 'Health']))
         expect(Object.keys(msgs[0]).sort()).toEqual(['bytesDone', 'bytesTotal', 'engineId', 'instanceId', 'step', 'type'])
         expect(msgs[0].type).toBe('idea/updateProgress')
     })

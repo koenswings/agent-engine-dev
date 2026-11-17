@@ -1,15 +1,15 @@
 /**
  * update-interim-456.test.ts (engine#456 interim slice)
  *
- * (A) Fetch→Check refuses a bundle that declares any x-app.update stage
- *     (prepare, verify, work, settle) with UPDATE_STAGES_UNSUPPORTED, before
- *     Snapshot or Swap. `update: null` is absent; `update: {}` has no stages.
+ * (A) Since the #456 runner (update-runner-456.test.ts) Check no longer refuses a declared
+ *     stage: it validates the step shape (UPDATE_CONTRACT_INVALID) and keeps
+ *     UPDATE_STAGES_UNSUPPORTED only for an unknown stage key, before Snapshot or Swap.
+ *     `update: null` is absent; `update: {}` has no stages.
  * (B) An unversioned instance (SHA / date) may be offered and allowed only the
  *     first tagged major (1.x, including Nextcloud 1.7-31.0.1 / idea#374), and
  *     is never offered or allowed 2.0+. SHA → 1.7 stays classified as a major.
  *
- * This slice does not run the stages, add a reboot wrapper, clean images, or
- * treat 1.7 as step 0.
+ * The runner itself is tested in update-runner-456.test.ts.
  */
 import { describe, it, beforeEach, afterEach, expect } from 'vitest'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
@@ -51,17 +51,21 @@ describe('declaredUpdateStages (engine#456 A)', () => {
     })
 })
 
-describe('UPDATE_STAGES_UNSUPPORTED at Check (engine#456 A)', () => {
-    it('refuses a bundle that declares prepare, and names the stage', () => {
-        const err = checkUpdate(facts({ xAppUpdate: { prepare } }))
-        expect(err?.code).toBe('UPDATE_STAGES_UNSUPPORTED')
-        expect(err?.message).toBe('UPDATE_STAGES_UNSUPPORTED: this Engine does not yet run x-app.update stages: prepare (nothing was changed)')
+describe('x-app.update at Check (engine#456 A, runner)', () => {
+    it('a well-formed prepare / verify / work / settle is no longer refused', () => {
+        expect(checkUpdate(facts({ xAppUpdate: { prepare } }))).toBeNull()
+        expect(checkUpdate(facts({ xAppUpdate: { prepare, verify, work, settle } }))).toBeNull()
     })
 
-    it('names every declared stage (prepare, verify, work, settle)', () => {
-        const err = checkUpdate(facts({ xAppUpdate: { prepare, verify, work, settle } }))
+    it('an unknown stage key is still UPDATE_STAGES_UNSUPPORTED', () => {
+        const err = checkUpdate(facts({ xAppUpdate: { prepare, migrate: { service: 'nextcloud-app', command: '/x', timeout: 5 } } }))
         expect(err?.code).toBe('UPDATE_STAGES_UNSUPPORTED')
-        expect(err?.message).toContain('prepare, verify, work, settle')
+        expect(err?.message).toBe('UPDATE_STAGES_UNSUPPORTED: this Engine does not run x-app.update stage migrate (it runs prepare, verify, work, settle); nothing was stopped or changed')
+    })
+
+    it('a wrong shape is UPDATE_CONTRACT_INVALID, before MAJOR_NOT_ALLOWED, even without --allow-major', () => {
+        const err = checkUpdate(facts({ allowMajor: false, xAppUpdate: { prepare: { ...prepare, timeout: undefined } } }))
+        expect(err?.code).toBe('UPDATE_CONTRACT_INVALID')
     })
 
     it('does not refuse update: null or update: {}', () => {
@@ -70,14 +74,9 @@ describe('UPDATE_STAGES_UNSUPPORTED at Check (engine#456 A)', () => {
         expect(checkUpdate(facts({}))).toBeNull()
     })
 
-    it('refuses before MAJOR_NOT_ALLOWED, even without --allow-major', () => {
-        const err = checkUpdate(facts({ allowMajor: false, xAppUpdate: { prepare } }))
-        expect(err?.code).toBe('UPDATE_STAGES_UNSUPPORTED')
-    })
-
-    it('is not offered: offerable is false when any stage is declared, true for null/{}', () => {
-        expect(offerable({ currentAppId: 'nextcloud-1.8-31.0.14', newAppId: 'nextcloud-2.0-32.0.15', sumsValid: true, xAppUpdate: { prepare } })).toBe(false)
-        expect(offerable({ currentAppId: 'nextcloud-1.0', newAppId: 'nextcloud-1.1', sumsValid: true, xAppUpdate: { settle } })).toBe(false)
+    it('is offered: offerable no longer looks at declared stages', () => {
+        expect(offerable({ currentAppId: 'nextcloud-1.8-31.0.14', newAppId: 'nextcloud-2.0-32.0.15', sumsValid: true, xAppUpdate: { prepare } })).toBe(true)
+        expect(offerable({ currentAppId: 'nextcloud-1.0', newAppId: 'nextcloud-1.1', sumsValid: true, xAppUpdate: { settle } })).toBe(true)
         expect(offerable({ currentAppId: 'nextcloud-1.0', newAppId: 'nextcloud-1.1', sumsValid: true, xAppUpdate: null })).toBe(true)
         expect(offerable({ currentAppId: 'nextcloud-1.0', newAppId: 'nextcloud-1.1', sumsValid: true, xAppUpdate: {} })).toBe(true)
     })
@@ -206,17 +205,25 @@ describe('updateApp refuses declared stages before Snapshot (engine#456 A)', () 
     })
     afterEach(async () => { await fs.remove(tmp) })
 
-    it('a bundle that declares prepare is refused at Check; no stop, snapshot, or swap; compose is unchanged', async () => {
+    it('a bundle with an invalid x-app.update is refused at Check; no stop, snapshot, or swap; compose is unchanged', async () => {
         await fs.outputFile(`${tmp}/apps/kolibri-1.1/compose.yaml`, compose('1.1',
-            '  update:\n    prepare:\n      service: web\n      command: /idea/hooks/prep.sh\n      timeout: 60\n'))
+            '  update:\n    prepare:\n      service: web\n      command: /idea/hooks/prep.sh\n'))
         await fs.outputFile(`${tmp}/apps/kolibri-1.1/.env`, 'port=1\n')
         const before = await fs.readFile(`${tmp}/instances/i1/compose.yaml`, 'utf8')
         const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps()))
-        expect(m).toBe('UPDATE_STAGES_UNSUPPORTED: this Engine does not yet run x-app.update stages: prepare (nothing was changed)')
+        expect(m).toBe('UPDATE_CONTRACT_INVALID: x-app.update prepare.timeout is required (seconds, 1 s – 6 h); nothing was stopped or changed')
         expect(calls).toEqual([])
         expect(await fs.readFile(`${tmp}/instances/i1/compose.yaml`, 'utf8')).toBe(before)
         expect((h.doc().instanceDB['i1' as any] as any).instanceOf).toBe('kolibri-1.0')
         expect(Object.values(h.doc().operationDB)).toEqual([])
+    })
+
+    it('a step whose service is not in the new compose is refused at Check', async () => {
+        await fs.outputFile(`${tmp}/apps/kolibri-1.1/compose.yaml`, compose('1.1',
+            '  update:\n    prepare:\n      service: kolibri\n      command: /idea/hooks/prep.sh\n      timeout: 60\n'))
+        const m = await codeOf(updateApp(h, 'i1', 'kolibri-1.1', ME, {}, deps()))
+        expect(m).toBe('UPDATE_CONTRACT_INVALID: x-app.update prepare.service kolibri is not a service of the new compose; nothing was stopped or changed')
+        expect(calls).toEqual([])
     })
 
     it('update: {} is not refused and the hop can proceed', async () => {

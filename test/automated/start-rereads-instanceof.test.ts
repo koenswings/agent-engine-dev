@@ -92,7 +92,8 @@ describe('startInstance re-reads instanceOf from compose.yaml (idea#473)', () =>
         const src = fs.readFileSync('src/data/Instance.ts', 'utf8')
         // The wrapper refreshes first, then hands the updated record to the tracked start.
         expect(src).toMatch(/const inst = await refreshInstanceFromCompose\(storeHandle, instance, disk\)/)
-        expect(src).toMatch(/return startInstanceTracked\(storeHandle, inst, disk, cause\)/)
+        // engine#456 added an optional opts argument (updateOpId, imagesLoaded)
+        expect(src).toMatch(/return startInstanceTracked\(storeHandle, inst, disk, cause(, opts)?\)/)
         expect(startInstance.name).toBe('startInstance')
     })
 })

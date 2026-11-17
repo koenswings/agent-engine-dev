@@ -16,8 +16,13 @@ import { appIdentity } from './AppIdParse.js'
 import { APP_HEALTH_TIMEOUT_S } from './AppHealthTimeout.js'
 import { isUpgrade, isMajorChange, isUnversioned, parseVersion } from './Version.js'
 
-export type UpdateStep = 'Fetch' | 'Check' | 'Snapshot' | 'Swap' | 'Start' | 'Health'
-export const UPDATE_STEPS: readonly UpdateStep[] = ['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health']
+/**
+ * engine#456 (Console contract agreed with Pixel, 2026-11-17): a fixed list of 12 steps keyed on
+ * names (totalSteps 12). LoadImages runs for every App; Prepare, Verify, Work and Settle run only
+ * when the NEW bundle declares them in x-app.update (a step that is not declared is skipped).
+ */
+export type UpdateStep = 'Fetch' | 'Check' | 'Backup' | 'Snapshot' | 'Swap' | 'LoadImages' | 'Prepare' | 'Start' | 'Health' | 'Verify' | 'Work' | 'Settle'
+export const UPDATE_STEPS: readonly UpdateStep[] = ['Fetch', 'Check', 'Backup', 'Snapshot', 'Swap', 'LoadImages', 'Prepare', 'Start', 'Health', 'Verify', 'Work', 'Settle']
 
 export type UpdateRefusal =
     | 'NOT_DOCKED' | 'BUSY' | 'SOURCE_MISSING' | 'DIFFERENT_APP' | 'NOT_NEWER'
@@ -31,22 +36,37 @@ export type UpdateRefusal =
     | 'INVALID_EXCLUDE'
     // idea#479: id checked before any compose or Docker action
     | 'INVALID_INSTANCE_ID'
-    // engine#456 interim: a bundle declares x-app.update stages this Engine does not yet run
+    // engine#456: x-app.update names a stage key this Engine does not know
     | 'UPDATE_STAGES_UNSUPPORTED'
+    // engine#456: a declared prepare / verify / work / settle has the wrong shape (refused at Check)
+    | 'UPDATE_CONTRACT_INVALID'
+    // engine#456: the instance has a committed update whose work / settle has not finished
+    | 'UPDATE_PENDING'
+    // engine#456: step outcomes. PREPARE_FAILED / VERIFY_FAILED roll back (the result is ROLLED_BACK);
+    // MIGRATIONS_PENDING / SETTLE_FAILED end the operation after the point of no return (no rollback).
+    | 'PREPARE_FAILED' | 'VERIFY_FAILED' | 'MIGRATIONS_PENDING' | 'SETTLE_FAILED'
     // engine#469: the temporary pre-update backup on the system disk (no Backup Disk linked)
     | 'TEMP_BACKUP_NO_SPACE' | 'TEMP_BACKUP_FAILED'
 
 /** Error text starts with the code; the two rollback outcomes use the console#168 wording. */
 export const ROLLED_BACK_PREFIX = 'ROLLED BACK:'
 export const ROLLBACK_FAILED_PREFIX = 'ROLLBACK FAILED:'
+/**
+ * engine#456 (Q6, mirrors #468's RESTORE_START_FAILED): the data was restored but the old version
+ * did not start. The instance is left Stopped with this statusCondition prefix.
+ */
+export const ROLLBACK_START_FAILED_PREFIX = 'ROLLBACK START FAILED:'
 
 export class UpdateAppError extends Error {
     /** engine#442: the old version could not be restarted after a pre-swap failure. */
     restartFailed?: true
     /** Published on the command-log trace so the Console can pick its wording. */
     traceResult?: { restartFailed: true }
-    constructor(public code: UpdateRefusal | 'ROLLED_BACK' | 'ROLLBACK_FAILED', text: string, opts?: { restartFailed?: true }) {
-        super(code === 'ROLLED_BACK' ? `${ROLLED_BACK_PREFIX} ${text}` : code === 'ROLLBACK_FAILED' ? `${ROLLBACK_FAILED_PREFIX} ${text}` : `${code}: ${text}`)
+    constructor(public code: UpdateRefusal | 'ROLLED_BACK' | 'ROLLBACK_FAILED' | 'ROLLBACK_START_FAILED', text: string, opts?: { restartFailed?: true }) {
+        super(code === 'ROLLED_BACK' ? `${ROLLED_BACK_PREFIX} ${text}`
+            : code === 'ROLLBACK_FAILED' ? `${ROLLBACK_FAILED_PREFIX} ${text}`
+            : code === 'ROLLBACK_START_FAILED' ? `${ROLLBACK_START_FAILED_PREFIX} ${text}`
+            : `${code}: ${text}`)
         if (opts?.restartFailed) {
             this.restartFailed = true
             this.traceResult = { restartFailed: true }
@@ -95,9 +115,11 @@ export interface CheckFacts {
     backupMethod?: 'stop' | 'hook' | 'none'
     /**
      * engine#456: the new bundle's x-app.update. Absent, null, or {} means no stages.
-     * A declared prepare / verify / work / settle is refused until those stages run.
+     * A declared prepare / verify / work / settle must have the agreed shape (parseUpdateContract).
      */
     xAppUpdate?: unknown
+    /** engine#456: the service names of the NEW bundle's compose (a step's service must be one of them). */
+    newServices?: string[]
 }
 
 /**
@@ -141,6 +163,81 @@ export const declaredUpdateStages = (update: unknown): UpdateStageKey[] => {
     const o = update as Record<string, unknown>
     return UPDATE_STAGE_KEYS.filter(k => o[k] != null)
 }
+
+/** engine#456 (Q5): every step timeout (and settle's interval) is required and must be 1 s – 6 h. */
+export const UPDATE_STEP_MIN_S = 1
+export const UPDATE_STEP_MAX_S = 6 * 60 * 60
+
+/** One declared step: prepare / verify / work take {service, user?, command, timeout}; settle adds interval. */
+export interface UpdateStepSpec {
+    service: string
+    /** docker --user / -u exactly as written ("0", "33", "www-data", "33:33"); absent = the image default */
+    user?: string
+    /** one absolute path inside the container; argv is exactly [command] */
+    command: string
+    /** seconds, 1 s – 6 h */
+    timeout: number
+    /** settle only: seconds between runs, 1 s – 6 h and not above timeout */
+    interval?: number
+}
+export type UpdateContract = Partial<Record<UpdateStageKey, UpdateStepSpec>>
+
+const STEP_FIELDS = new Set(['service', 'user', 'command', 'timeout', 'interval'])
+const USER_RE = /^[A-Za-z0-9_][A-Za-z0-9_.-]{0,31}(:[A-Za-z0-9_][A-Za-z0-9_.-]{0,31})?$/
+const ABS_COMMAND_RE = /^\/[A-Za-z0-9_.\/@+-]+$/
+
+const boundedSeconds = (v: unknown): boolean =>
+    typeof v === 'number' && Number.isInteger(v) && v >= UPDATE_STEP_MIN_S && v <= UPDATE_STEP_MAX_S
+
+/**
+ * engine#456 §1: parse and check x-app.update of the NEW bundle. Absent, null and {} mean no
+ * steps (today's path). An unknown stage key refuses UPDATE_STAGES_UNSUPPORTED; a declared step
+ * with the wrong shape, a service not in the new compose (when `services` is given), a command that
+ * is not one absolute path, or a missing / out-of-range timeout or interval refuses
+ * UPDATE_CONTRACT_INVALID. Pure; nothing is stopped or changed when it refuses.
+ */
+export const parseUpdateContract = (update: unknown, services?: string[]): { ok: true, contract: UpdateContract } | { ok: false, error: UpdateAppError } => {
+    const bad = (why: string) => ({ ok: false as const, error: new UpdateAppError('UPDATE_CONTRACT_INVALID', `x-app.update ${why}; nothing was stopped or changed`) })
+    if (update == null) return { ok: true, contract: {} }
+    if (typeof update !== 'object' || Array.isArray(update)) return bad('must be a map of prepare / verify / work / settle')
+    const o = update as Record<string, unknown>
+    const unknown = Object.keys(o).filter(k => !(UPDATE_STAGE_KEYS as readonly string[]).includes(k))
+    if (unknown.length) {
+        return { ok: false, error: new UpdateAppError('UPDATE_STAGES_UNSUPPORTED', `this Engine does not run x-app.update stage ${unknown.join(', ')} (it runs ${UPDATE_STAGE_KEYS.join(', ')}); nothing was stopped or changed`) }
+    }
+    const contract: UpdateContract = {}
+    for (const k of UPDATE_STAGE_KEYS) {
+        const v = o[k]
+        if (v == null) continue
+        if (typeof v !== 'object' || Array.isArray(v)) return bad(`${k} must be a map {service, user?, command, timeout${k === 'settle' ? ', interval' : ''}}`)
+        const s = v as Record<string, unknown>
+        const extra = Object.keys(s).filter(f => !STEP_FIELDS.has(f) || (f === 'interval' && k !== 'settle'))
+        if (extra.length) return bad(`${k} has unknown field ${extra.join(', ')}`)
+        if (typeof s.service !== 'string' || !s.service) return bad(`${k}.service is missing`)
+        if (services && !services.includes(s.service)) return bad(`${k}.service ${s.service} is not a service of the new compose`)
+        let user: string | undefined
+        if (s.user != null) {
+            user = typeof s.user === 'number' && Number.isInteger(s.user) && s.user >= 0 ? String(s.user) : typeof s.user === 'string' ? s.user : ''
+            if (!USER_RE.test(user)) return bad(`${k}.user must be a user name or id (optionally :group)`)
+        }
+        if (typeof s.command !== 'string' || !ABS_COMMAND_RE.test(s.command) || s.command.split('/').includes('..')) return bad(`${k}.command must be one absolute path`)
+        if (s.timeout == null) return bad(`${k}.timeout is required (seconds, ${UPDATE_STEP_MIN_S} s – 6 h)`)
+        if (!boundedSeconds(s.timeout)) return bad(`${k}.timeout must be whole seconds from ${UPDATE_STEP_MIN_S} to ${UPDATE_STEP_MAX_S} (6 h)`)
+        const spec: UpdateStepSpec = { service: s.service, command: s.command, timeout: s.timeout as number }
+        if (user !== undefined) spec.user = user
+        if (k === 'settle') {
+            if (s.interval == null) return bad('settle.interval is required (seconds)')
+            if (!boundedSeconds(s.interval)) return bad(`settle.interval must be whole seconds from ${UPDATE_STEP_MIN_S} to ${UPDATE_STEP_MAX_S} (6 h)`)
+            if ((s.interval as number) > spec.timeout) return bad('settle.interval must not be above settle.timeout')
+            spec.interval = s.interval as number
+        }
+        contract[k] = spec
+    }
+    return { ok: true, contract }
+}
+
+/** True when the contract declares any step. */
+export const contractHasSteps = (c: UpdateContract): boolean => UPDATE_STAGE_KEYS.some(k => !!c[k])
 
 export const BACKUP_MAX_AGE_MS = 60 * 60 * 1000
 
@@ -192,13 +289,9 @@ export const checkUpdate = (f: CheckFacts): UpdateAppError | null => {
     if (identity) return new UpdateAppError('DIFFERENT_APP', identity)
     const cur = appIdentity(f.currentAppId, f.currentXApp), nxt = appIdentity(f.newAppId, f.newXApp)
     if (!isUpgrade(cur.version, nxt.version)) return new UpdateAppError('NOT_NEWER', `${nxt.version} is not newer than ${cur.version}`)
-    const stages = declaredUpdateStages(f.xAppUpdate)
-    if (stages.length) {
-        return new UpdateAppError(
-            'UPDATE_STAGES_UNSUPPORTED',
-            `this Engine does not yet run x-app.update stages: ${stages.join(', ')} (nothing was changed)`,
-        )
-    }
+    // engine#456: before anything stops, the declared steps must have the agreed shape
+    const contract = parseUpdateContract(f.xAppUpdate, f.newServices)
+    if (!contract.ok) return contract.error
     if (!unversionedMayTakeTarget(cur.version, nxt.version)) {
         return new UpdateAppError(
             'MAJOR_NOT_ALLOWED',
@@ -222,7 +315,7 @@ export const offerable = (f: Pick<CheckFacts, 'currentAppId' | 'newAppId' | 'sum
     const cur = appIdentity(f.currentAppId, f.currentXApp), nxt = appIdentity(f.newAppId, f.newXApp)
     if (cur.name !== nxt.name) return false
     if (!isUpgrade(cur.version, nxt.version)) return false
-    if (declaredUpdateStages(f.xAppUpdate).length) return false
+    // engine#456: staged bundles are offered; Check validates their x-app.update before anything stops
     if (!unversionedMayTakeTarget(cur.version, nxt.version)) return false
     return !isMajorChange(cur.version, nxt.version) || majorAllowedByUpdatesFrom(cur.version, f.updatesFrom)
 }

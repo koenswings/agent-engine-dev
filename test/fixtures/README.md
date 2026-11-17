@@ -42,3 +42,11 @@ Add a new directory following the same structure. Keep fixtures minimal:
   builds its own temporary disk with a `services/<image>.tar` (idea#81)
 - Use the `sample` app name or another clearly synthetic name
 - Use `${port}` for published ports (never a fixed host port) and add the test label
+
+## update-456/ (engine#456 updateApp runner)
+
+From Kid's app-nextcloud branches (engine#456 comment-456, step shapes fitted to the design):
+
+- `compose-nextcloud-2.0.yaml`: `kid/nc-2.0` `2b6e459` compose.yaml reduced to the service names, images and the x-app identity plus the verbatim `update:` block (prepare / verify / work / settle).
+- `idea_usage-v1.0.0-nc31.tar.gz`: the 1.8 bundle's `bundled-apps/idea_usage-v1.0.0.tar.gz` (`main` `8d15206`, sha256 `d50e96c5…`, Nextcloud max-version 31), the old tree prepare must replace.
+- `idea_usage-v1.0.0-nc31-32.tar.gz`: the 2.0 bundle's tarball of the same name (`kid/nc-2.0`, sha256 `daec5296…`, Nextcloud 31–32), the one prepare stages.
