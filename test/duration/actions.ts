@@ -2560,16 +2560,33 @@ export const stage2MoveAppPins = (
  *   backup_instance     (live) needs a docked Backup Disk linking the instance (make_backup_disk first).
  *   backup_schedule     (live) needs a docked Backup Disk (make_backup_disk first).
  *   restore_from_backup (live) needs a docked Backup Disk and an archive from a backup_instance of this run.
+ * Markov 2 (random-9040e73-markov-20261116b@16): eject_disk + confirm_eject@10-11 ejected the Kolibri fixture
+ * disk, then copy_app@16 hit its preflight "source disk … is not docked on any pool engine". Only
+ * infra_dock_fixture re-docks it, so in a random walk the fixture can legitimately be absent. Stage 2 live
+ * (stage2FixtureAbsent):
+ *   copy_app / move_app     source instance on a docked pool disk and a docked target (preflightCopyMoveSamePi).
+ *   start_instance, stop_instance, rename_instance, open_app, backup_instance
+ *                           the instance they act on must be on a docked pool disk (not Undocked).
+ *   App steps (open_kolibri_as_*, open_nextcloud_as_*, open_wikipedia_as_*, kolibri_* / nc_* / wiki_* states),
+ *   open_app                that App's instance Running with a store port (pinAppsForStep; a stopped App cannot be opened).
+ *   copy_app / move_app / restore_from_backup  the instance the Console settles on: live + port (pinAppsForStep).
+ *   infra_move_disk         the fixture disk docked on a pool engine (stage2MoveSource).
  */
 export const randomStepPrecondition = async (
-    ctx: Pick<ActionContext, 'opts' | 'walker' | 'poolEngines' | 'excludeEngines' | 'fixtureInstance'>,
+    ctx: Pick<ActionContext, 'opts' | 'walker' | 'poolEngines' | 'excludeEngines' | 'fixtureInstance'> &
+        Partial<Pick<ActionContext, 'fixtureInstances'>> & { snapshot?: () => Promise<PoolSnapshot> },
     action: string,
     env: NodeJS.ProcessEnv = process.env,
+    to?: string,
 ): Promise<string | null> => {
     if (action === 'move_app') {
-        if (!isStage2(ctx) || env.DURATION_COPY_INSTANCE_ID?.trim() || ctx.walker.stage2CopyInstanceId?.trim()) return null
-        return 'no copy_app instance recorded yet (Stage 2 move_app moves that copy; never the Kolibri fixture)'
+        if (isStage2(ctx) && !env.DURATION_COPY_INSTANCE_ID?.trim() && !ctx.walker.stage2CopyInstanceId?.trim()) {
+            return 'no copy_app instance recorded yet (Stage 2 move_app moves that copy; never the Kolibri fixture)'
+        }
     }
+    // Markov 2 (random-9040e73-markov-20261116b@16): fixture disk / instance legitimately absent (eject, stop, …).
+    const absent = await stage2FixtureAbsent(ctx, action, to, env)
+    if (absent) return absent
     if (action !== 'backup_instance' && action !== 'backup_schedule' && action !== 'restore_from_backup') return null
     if (!hasBackupProbe(ctx as ActionContext)) return null
     const linked = action === 'backup_instance' ? ctx.fixtureInstance : undefined
@@ -2578,6 +2595,118 @@ export const randomStepPrecondition = async (
     }
     if (action === 'restore_from_backup' && !ctx.walker.backupTaken) {
         return 'no backup_instance archive taken in this run yet (restore needs one)'
+    }
+    return null
+}
+
+/** One store read for a Markov draw: docked disks (→ engine) and instance rows across the pool views. */
+export interface PoolSnapshot {
+    readable: boolean
+    docked: Map<string, string>
+    instances: Map<string, { diskId: string | null; status: string; port?: number }>
+}
+
+export const readPoolSnapshot = async (
+    ctx: Pick<ActionContext, 'opts' | 'poolEngines' | 'excludeEngines'>,
+): Promise<PoolSnapshot> => {
+    const snap: PoolSnapshot = { readable: false, docked: new Map(), instances: new Map() }
+    for (const eng of ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))) {
+        let view: SemanticStoreView
+        try {
+            view = await ctx.opts.ops.readStore(eng)
+        } catch {
+            continue
+        }
+        snap.readable = true
+        for (const d of Object.values(view.diskDB ?? {})) {
+            if (d.dockedTo && !snap.docked.has(d.id)) snap.docked.set(d.id, d.dockedTo)
+        }
+        for (const [id, i] of Object.entries(view.instanceDB ?? {})) {
+            const prev = snap.instances.get(id)
+            // Unique store: other engines keep an Undocked copy of the row; the live row wins.
+            if (!prev || (prev.status === 'Undocked' && i.status !== 'Undocked')) {
+                snap.instances.set(id, { diskId: i.diskId, status: i.status, ...(i.port ? { port: i.port } : {}) })
+            }
+        }
+    }
+    return snap
+}
+
+/** Steps that act on one instance through the Console (dispatcher default: the fixture instance). */
+export const INSTANCE_TARGET_ACTIONS: ReadonlySet<string> = new Set([
+    'start_instance', 'stop_instance', 'rename_instance', 'open_app', 'backup_instance',
+])
+
+/**
+ * Markov 2 guard (Stage 2 live only): why this step cannot run now because a fixture disk or instance it
+ * needs is legitimately absent at this point of a random walk, or null. Each rule mirrors the pre-Intent
+ * fail-loud check the step would hit (or, for the instance steps, prevents a hollow pass on a missing
+ * instance). No readable store → null (the step's own check stays the judge).
+ */
+export const stage2FixtureAbsent = async (
+    ctx: Pick<ActionContext, 'opts' | 'walker' | 'poolEngines' | 'excludeEngines' | 'fixtureInstance'> &
+        Partial<Pick<ActionContext, 'fixtureInstances' | 'fixtureDisk'>> & { snapshot?: () => Promise<PoolSnapshot> },
+    action: string,
+    to: string | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> => {
+    if (!isStage2(ctx) || typeof (ctx.opts.ops as FleetOps & { findDockedEngine?: unknown }).findDockedEngine !== 'function') return null
+    const fixtureInstances = ctx.fixtureInstances ?? {}
+    const appUses = appsUsedByStep({ action, to }).map(a =>
+        fixtureInstanceFor({ fixtureInstances } as ActionContext, a))
+    const isCopyMove = action === 'copy_app' || action === 'move_app'
+    if (!appUses.length && !isCopyMove && !INSTANCE_TARGET_ACTIONS.has(action) &&
+        action !== 'restore_from_backup' && action !== 'infra_move_disk') return null
+    const snap = await (ctx.snapshot ? ctx.snapshot() : readPoolSnapshot(ctx))
+    if (!snap.readable) return null
+    const dockedOn = (diskId: string | null | undefined): string | null => {
+        const e = diskId ? snap.docked.get(diskId) : undefined
+        return e && !ctx.excludeEngines.includes(e) && !isNeverEngine(e) ? e : null
+    }
+    const where = (id: string): string => {
+        const r = snap.instances.get(id)
+        if (!r) return `${id} not in the store`
+        return `${id} ${r.status} on disk ${r.diskId ?? 'none'}${dockedOn(r.diskId) ? ` @${dockedOn(r.diskId)}` : ' (not docked on a pool engine)'}`
+    }
+    const live = (id: string): boolean => {
+        const r = snap.instances.get(id)
+        return !!r && r.status !== 'Undocked' && !!dockedOn(r.diskId)
+    }
+    if (action === 'infra_move_disk') {
+        const disk = ctx.fixtureDisk
+        return disk && !dockedOn(disk) ? `fixture disk ${disk} not docked on a pool engine (infra_dock_fixture first)` : null
+    }
+    // App opened in a tab: Running with a store port (pinAppsForStep throws on no live row / no port).
+    for (const u of appUses) {
+        const r = snap.instances.get(u.instanceId)
+        if (!live(u.instanceId) || r?.status !== 'Running' || !r.port) {
+            return `${u.app} ${where(u.instanceId)} — not Running on a docked pool disk (eject/stop earlier in the walk)`
+        }
+    }
+    let acted: string
+    try {
+        acted = action === 'move_app'
+            ? (env.DURATION_COPY_INSTANCE_ID?.trim() || ctx.walker.stage2CopyInstanceId?.trim() || '')
+            : actedInstanceId(action, undefined, ctx.fixtureInstance, env)
+    } catch {
+        return null // restore_from_backup env mismatch: the step itself fails loud
+    }
+    if (!acted) return null
+    if ((INSTANCE_TARGET_ACTIONS.has(action) || isCopyMove || action === 'restore_from_backup') && !live(acted)) {
+        return `${where(acted)} — the instance this step acts on is absent (eject earlier in the walk; infra_dock_fixture first)`
+    }
+    if (action === 'open_app' || action === 'restore_from_backup' || isCopyMove) {
+        const r = snap.instances.get(acted)
+        if (!r?.port) return `${where(acted)} has no store port (pinAppsForStep would refuse)`
+        if (action === 'open_app' && r.status !== 'Running') return `${where(acted)} — not Running (open_app opens its App)`
+    }
+    if (isCopyMove) {
+        const pinEnvFor = action === 'move_app'
+            ? { ...env, DURATION_COPY_INSTANCE_ID: acted, DURATION_COPY_TARGET_DISK: env.DURATION_COPY_TARGET_DISK?.trim() || STAGE2_ROLE_MAP.moveApp }
+            : env
+        const pair = await predictCopyMovePair(ctx as ActionContext, { instanceId: acted }, pinEnvFor)
+        if (!pair.sourceEngine) return `${action} source disk ${pair.sourceDiskId} of ${acted} not docked on a pool engine`
+        if (!pair.targetDiskId || !pair.targetEngine) return `${action}: no docked target disk ≠ ${pair.sourceDiskId}`
     }
     return null
 }
