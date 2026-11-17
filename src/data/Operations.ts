@@ -305,37 +305,92 @@ export const cancelOperation = (
 
 // ── Startup crash recovery ────────────────────────────────────────────────────
 
-/** Kinds whose interrupted run boot recovery settles (rolled back or Failed INTERRUPTED) and never re-runs. */
-export const NO_REPLAY_AFTER_RECOVERY: readonly OperationKind[] = ['updateApp', 'restoreApp']
+/**
+ * engine#477: how a queued command is matched to the Operation it created.
+ * `command` is the queued command's first word, `ref` says what its first argument
+ * names: the op's instance (id or name), its disk (id or name), or a raw target id
+ * (flash / initialise / Backup Disk candidate). removeDemo's arguments are its
+ * instance ids as a set (the bare form has none). null: no queued command creates
+ * this kind (legacy upgradeApp, not-implemented upgradeEngine).
+ */
+type ReplayRef = 'instance' | 'disk' | 'target' | 'instanceList'
+export const QUEUED_COMMAND_OF: Record<OperationKind, { command: string; ref: ReplayRef; arg?: string } | null> = {
+    copyApp:        { command: 'copyApp', ref: 'instance' },
+    moveApp:        { command: 'moveApp', ref: 'instance' },
+    backupApp:      { command: 'backupApp', ref: 'instance' },
+    restoreApp:     { command: 'restoreApp', ref: 'instance' },
+    updateApp:      { command: 'updateApp', ref: 'instance' },
+    startApp:       { command: 'startInstance', ref: 'instance' },
+    stopApp:        { command: 'stopInstance', ref: 'instance' },
+    flashCard:      { command: 'flashCard', ref: 'target', arg: 'candidateId' },
+    initialiseDisk: { command: 'initialiseDisk', ref: 'target', arg: 'candidateId' },
+    makeBackupDisk: { command: 'makeBackupDisk', ref: 'target', arg: 'targetId' },
+    setupDemo:      { command: 'setupDemo', ref: 'disk', arg: 'targetDiskId' },
+    removeDemo:     { command: 'removeDemo', ref: 'instanceList', arg: 'instanceIds' },
+    upgradeApp:     null,
+    upgradeEngine:  null,
+}
+
+/** Operation states boot recovery leaves as final: the op's command must not run again. */
+const SETTLED: readonly OperationStatus[] = ['Done', 'Failed', 'Cancelled']
+
+const queuedMatchesOp = (store: Store | undefined, op: Operation, tokens: string[]): boolean => {
+    const spec = QUEUED_COMMAND_OF[op.kind]
+    if (!spec || tokens[0] !== spec.command) return false
+    const args = (op.args ?? {}) as Record<string, string>
+    if (spec.ref === 'instanceList') {
+        const want = String(args[spec.arg!] ?? '').split(',').filter(Boolean).sort()
+        const got = tokens.slice(1).filter(t => !t.startsWith('--')).sort()
+        return want.length === got.length && want.every((v, i) => v === got[i])
+    }
+    const refs = new Set<string>()
+    if (spec.ref === 'instance') {
+        const id = String(args.instanceId ?? '')
+        if (id) refs.add(id)
+        if (args.instanceName) refs.add(String(args.instanceName))
+        const name = id ? store?.instanceDB?.[id as any]?.name : undefined
+        if (name) refs.add(String(name))
+    } else {
+        const id = String(args[spec.arg!] ?? '')
+        if (id) refs.add(id)
+        const name = id ? (store?.diskDB?.[id as any] as any)?.name : undefined
+        if (spec.ref === 'disk' && name) refs.add(String(name))
+    }
+    return refs.size > 0 && refs.has(tokens[1] ?? '')
+}
 
 /**
- * engine#469 Pi proof step 8: a queued command leaves engineDB[x].commands only when it finishes,
- * so the command of an operation the Engine died in is still queued at boot and the startup replay
- * runs it again (an updateApp took a second temporary backup and rolled back again, on every boot).
- * Once boot recovery has settled such an operation, remove the first queued '<kind> <instance> ...'
- * command for its instance (id or name), the one that was running. A later identical command
- * someone queued on purpose stays. Returns the removed command, or null.
+ * engine#477 (generalises engine#469 Pi proof step 8): a queued command leaves
+ * engineDB[x].commands only when it finishes, so the command of an operation the Engine
+ * died in is still queued at boot and the startup replay would run it again (an updateApp
+ * took a second temporary backup and rolled back again, on every boot; a flashCard would
+ * re-flash a card on its own after a power cut).
+ *
+ * Rule, for every Operation kind: once boot recovery has left the op in a final state
+ * (Done, Failed or Cancelled, read back from the store), remove the first queued command
+ * that created it (QUEUED_COMMAND_OF), the one that was running. A later identical command
+ * someone queued on purpose stays. An op recovery left Pending or Running (a retry in
+ * progress) keeps its command, as before. An op that is not in the store removes nothing.
+ * Returns the removed command, or null.
  */
-export const dropInterruptedCommand = (storeHandle: DocHandle<Store>, op: Operation): string | null => {
-    if (!NO_REPLAY_AFTER_RECOVERY.includes(op.kind)) return null
-    const id = String(op.args?.instanceId ?? '')
-    if (!id) return null
+export const dropInterruptedCommand = (storeHandle: DocHandle<Store>, op: Operation | null | undefined): string | null => {
+    if (!op?.id) return null
     const store = storeHandle.doc()
-    const name = store?.instanceDB?.[id as any]?.name
-    const refs = new Set([id, ...(name ? [String(name)] : [])])
+    const current = store?.operationDB?.[op.id]
+    if (!current || !SETTLED.includes(current.status)) return null
+    if (!QUEUED_COMMAND_OF[current.kind]) return null
+    const engineId = current.engineId ?? op.engineId
+    if (!engineId) return null
     let removed: string | null = null
     storeHandle.change(doc => {
-        const list = doc.engineDB[op.engineId as any]?.commands as unknown[] | undefined
+        const list = doc.engineDB[engineId as any]?.commands as unknown[] | undefined
         if (!list) return
-        const i = list.findIndex(c => {
-            const t = (typeof c === 'string' ? c : String(c ?? '')).trim().split(/\s+/)
-            return t[0] === op.kind && refs.has(t[1] ?? '')
-        })
+        const i = list.findIndex(c => queuedMatchesOp(store, current, (typeof c === 'string' ? c : String(c ?? '')).trim().split(/\s+/)))
         if (i === -1) return
         removed = String(list[i])
         list.splice(i, 1)
     })
-    if (removed) log(`recovery: ${op.id.slice(0, 8)} ${op.kind}: removed its queued command '${removed}' so the startup replay does not run it again`)
+    if (removed) log(`recovery: ${op.id.slice(0, 8)} ${current.kind} (${current.status}): removed its queued command '${removed}' so the startup replay does not run it again`)
     return removed
 }
 
@@ -394,6 +449,7 @@ export const recoverInterruptedOperations = async (
                 if (m) { m.phase = verified ? 'done' : 'failed'; m.code = verified ? 'SOURCE_NOT_REMOVED' : 'INTERRUPTED'; m.resultText = text }
             })
             updateOperation(storeHandle, op.id, { status: verified ? 'Done' : 'Failed', error: text, completedAt: Date.now() as Timestamp })
+            dropInterruptedCommand(storeHandle, op)
             continue
         }
         // idea#400 (Steve, Q2): a scheduled backup is never retried after a restart.
