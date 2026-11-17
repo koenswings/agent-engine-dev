@@ -557,7 +557,7 @@ describe('moveApp', () => {
         expect(Object.values(handle.doc().operationDB)[0].status).toBe('Done')
     })
 
-    it('does not take the source project down when the copy fails, so rollback can restart the source', async () => {
+    it('does not take the source project down when the copy fails; the parked move keeps the source stopped (engine#497 stage 3 c)', async () => {
         const { handle } = await makeHandle('Running')
         const { rsyncInstanceData } = await import('../../src/utils/rsync.js')
         const { startInstance } = await import('../../src/data/Instance.js')
@@ -565,7 +565,9 @@ describe('moveApp', () => {
         await expect(moveApp(handle, 'my-kolibri' as any, SOURCE_DISK_ID, TARGET_DISK_ID)).rejects.toMatchObject({ code: 'COPY_FAILED', message: expect.stringMatching(/^MOVE FAILED: /) })
         expect(Object.values(handle.doc().operationDB)[0].status).toBe('Pending')   // engine#497: parked, resumes
         expect(composeDownAtMock).not.toHaveBeenCalled()
-        expect(vi.mocked(startInstance)).toHaveBeenCalled()
+        // engine#497 stage 3 (c): the move is in flight under its marker, so the source is not
+        // started again now; it is started again only if the move gives up
+        expect(vi.mocked(startInstance)).not.toHaveBeenCalled()
     })
 
     it('removes the source instance directory as root through the helper after a successful move (idea#168)', async () => {
@@ -775,7 +777,7 @@ describe('moveApp', () => {
         expect(handle.doc().operationDB['op-r'].error).toContain("Retry failed: moveApp: Instance 'nonexistent' not found")
     })
 
-    it('sets Failed and restarts source instance when rsync throws', async () => {
+    it('parks (1/3) when rsync throws and keeps the source stopped while the move is in flight (engine#497 stage 3 c)', async () => {
         const { handle } = await makeHandle('Running')
         const { rsyncDirectory } = await import('../../src/utils/rsync.js')
         vi.mocked(rsyncDirectory).mockRejectedValueOnce(new Error('io error'))
@@ -784,7 +786,7 @@ describe('moveApp', () => {
         const ops = Object.values(handle.doc().operationDB)
         expect(ops[0].status).toBe('Pending')   // engine#497: parked (1/3), resumes at the next boot or dock
         expect(ops[0].error).toMatch(/^RESUME_PENDING \(1\/3\): io error/)
-        expect(vi.mocked(startInstance)).toHaveBeenCalled()
+        expect(vi.mocked(startInstance)).not.toHaveBeenCalled()
     })
 
     it('via handleCommand: a mid-move rsync failure ends the moveApp trace as error with COPY_FAILED (idea#475)', async () => {

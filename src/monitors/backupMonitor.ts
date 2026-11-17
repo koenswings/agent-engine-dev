@@ -34,7 +34,7 @@ import { ensureAppFilesOnTarget } from '../data/RestoreAppFiles.js'
 import { localEngineId } from '../data/Engine.js'
 import { defaultReadBootId } from '../usage/sampler.js'
 import { assertPreQuarantineHelper, quarantinePreRestore, sourceOnOtherEngine, instanceStartingHere, quarantineUnclaimedTarget } from '../data/RestorePreQuarantine.js'
-import { createOperation, updateOperation, setOperationArgs, isParkedOp, isResumableOp } from '../data/Operations.js'
+import { createOperation, updateOperation, setOperationArgs, isParkedOp, isResumableOp, isEngineStopping, parkResumableOp, type ParkOutcome } from '../data/Operations.js'
 import { readBackupYamlState, setLinkLastBackup, editBackupYaml } from '../data/BackupYamlDoc.js'
 import { applyBackupResult, recordBackupResult, successResultCode, failureResultCode, isManualBackupCause } from '../data/BackupResults.js'
 import { DEFAULT_BACKUP_TIME } from '../utils/backupSchedule.js'
@@ -154,6 +154,29 @@ const breakOwnBorgLock = async (repoPath: string, backupDevice: string, instance
     if (helper) throw new Error(`HELPER_OUTDATED: ${helper}`)
     await runAppData(borgBreakLockArgs(backupDevice, instanceId))
     log(`Backup of ${instanceId}: resuming operation ${opId}; broke the repository lock of its interrupted borg run, borg continues from its checkpoint (engine#497)`)
+}
+
+/**
+ * engine#497 stage 3 (b): why a failed resumable backup run was an interruption (the Backup Disk
+ * or the App Disk left this Engine, or is no longer mounted), or null when the failure is real.
+ * Never throws.
+ */
+export const backupInterruption = async (storeHandle: DocHandle<Store>, instanceId: InstanceID, backupDiskId: DiskID): Promise<string | null> => {
+    try {
+        const store = storeHandle.doc()
+        const label = (d: Disk | undefined, id: string) => d?.name ? `'${d.name}' (${id})` : id
+        const backup = store?.diskDB?.[backupDiskId] as Disk | undefined
+        if (!backup?.device || !isDockedOnEngine(backup, String(localEngineId))) return `Backup Disk ${label(backup, String(backupDiskId))} is no longer docked on this Engine`
+        if (!await fs.pathExists(backupDir(backup.device, instanceId))) return `Backup Disk ${label(backup, String(backupDiskId))} is no longer mounted`
+        const appDiskId = store?.instanceDB?.[instanceId]?.storedOn
+        const app = appDiskId ? store?.diskDB?.[appDiskId] as Disk | undefined : undefined
+        if (!appDiskId) return null
+        if (!app || !isDockedOnEngine(app, String(localEngineId))) return `App Disk ${label(app, String(appDiskId))} is no longer docked on this Engine`
+        if (!await fs.pathExists(joinMountRoot(await diskMountRoot(app), 'instances', instanceId))) return `App Disk ${label(app, String(appDiskId))} is no longer mounted`
+        return null
+    } catch (e: any) {
+        return `the disks cannot be read (${e?.message ?? e})`
+    }
 }
 
 /** engine#497: the unfinished resumable backup op of this Engine that owns the lock, if any. */
@@ -823,21 +846,45 @@ export const backupInstance = async (
             hookWarning: !!hookWarning,
             cleanupHelperOutdated: !!cleanupWarning && String(cleanupWarning).startsWith('HELPER_OUTDATED'),
         }))
+        // engine#497 stage 3 (b): a resumable run records that it finished (no longer locked)
+        if (storeHandle.doc()?.operationDB?.[opId]?.args?.phase === 'locked') setOperationArgs(storeHandle, opId, { phase: 'done' })
         updateOperation(storeHandle, opId, {
             status: 'Done',
             progressPercent: 100,
+            error: null,
             completedAt: Date.now() as Timestamp,
         })
         log(chalk.green(`Backup of instance ${instanceId} completed successfully${hookWarning ? ` (${hookWarning})` : ''}`))
 
     } catch (e: any) {
-        updateOperation(storeHandle, opId, {
-            status: 'Failed',
-            error: e.message ?? String(e),
-            completedAt: Date.now() as Timestamp,
-        })
-        log(chalk.red(`Backup of instance ${instanceId} failed: ${e.message ?? e}`))
-        recordBackupResult(storeHandle, instanceId, methodUsed, failureResultCode(String(e?.message ?? e)))
+        // engine#497 stage 3 (b): a resumable run (args.phase locked: a direct backup, not
+        // scheduled, not pre-update) that is INTERRUPTED (the Engine stopping, the Backup Disk or
+        // App Disk gone) is not Failed: it stays Running for boot recovery (Engine stopping) or
+        // parks RESUME_WAITING (not counted) and resumes in this op at the next dock, ending Done.
+        // A real failure keeps the existing result: Failed (boot recovery counts it on a resume run).
+        const reason = e?.message ?? String(e)
+        let parked: ParkOutcome | null = null
+        const resumableRun = !preUpdate && cause !== 'scheduled-backup'
+            && storeHandle.doc()?.operationDB?.[opId]?.args?.phase === 'locked'
+            && storeHandle.doc()?.operationDB?.[opId]?.status !== 'Cancelled'
+        if (resumableRun) {
+            if (isEngineStopping()) {
+                parked = 'left'
+                log(chalk.yellow(`Backup of instance ${instanceId} interrupted: the Engine is stopping (${reason}); operation ${opId} resumes after the restart (engine#497)`))
+            } else {
+                const gone = await backupInterruption(storeHandle, instanceId, backupDisk.id)
+                if (gone) parked = parkResumableOp(storeHandle, opId, `${gone}: ${reason}`, { interrupted: true })
+            }
+        }
+        if (!parked) {
+            updateOperation(storeHandle, opId, {
+                status: 'Failed',
+                error: reason,
+                completedAt: Date.now() as Timestamp,
+            })
+            log(chalk.red(`Backup of instance ${instanceId} failed: ${reason}`))
+            recordBackupResult(storeHandle, instanceId, methodUsed, failureResultCode(String(reason)))
+        }
         // Always restart instance if this run stopped it (even on failure)
         if (didStop) {
             try {

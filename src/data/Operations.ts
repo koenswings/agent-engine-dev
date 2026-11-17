@@ -466,6 +466,21 @@ const stripResumePrefixes = (reason: string): string => {
 export type ParkOutcome = 'left' | 'waiting' | 'pending' | 'gaveUp'
 
 /**
+ * engine#497 stage 3 (c): what a kind does once its op gave up (RESUME_GAVE_UP). moveApp
+ * registers one (CopyMoveApp.ts) that starts the source again if the move had stopped it.
+ * Runs in the background; its errors are logged, never thrown into the op.
+ */
+export type ResumeGaveUpHook = (storeHandle: DocHandle<Store>, op: Operation) => Promise<void>
+export const resumeGaveUpHooks: Partial<Record<OperationKind, ResumeGaveUpHook>> = {}
+
+const runGaveUpHook = (storeHandle: DocHandle<Store>, id: string): void => {
+    const op = storeHandle.doc()?.operationDB?.[id]
+    const hook = op ? resumeGaveUpHooks[op.kind] : undefined
+    if (!op || !hook) return
+    void hook(storeHandle, op).catch((e: any) => log(chalk.red(`resume: ${id.slice(0, 8)} ${op.kind}: after giving up: ${e?.message ?? e}`)))
+}
+
+/**
  * Close a run of a resumable op that did not finish. `interrupted` (its disks are gone):
  * Pending RESUME_WAITING, not counted. Otherwise a real failure: args.resumeFailures + 1,
  * Pending `RESUME_PENDING (n/3): <reason>`, and at RESUME_LIMIT Failed
@@ -494,6 +509,7 @@ export const parkResumableOp = (
     }
     updateOperation(storeHandle, id, { status: 'Failed', error: `${RESUME_GAVE_UP}: ${why}`, completedAt: Date.now() as Timestamp })
     log(chalk.red(`resume: ${id.slice(0, 8)} ${op.kind} gave up after ${n} failures: ${why}; the partial target and its marker are kept`))
+    runGaveUpHook(storeHandle, id)
     return 'gaveUp'
 }
 
