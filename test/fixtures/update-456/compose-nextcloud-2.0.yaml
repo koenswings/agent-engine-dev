@@ -1,0 +1,44 @@
+# Reduced from koenswings/app-nextcloud kid/nc-2.0 2b6e459 compose.yaml (engine#456 fixture):
+# service names, images and the x-app identity + update block only, verbatim values.
+services:
+  nextcloud-app:
+    image: nextcloud:32.0.15-apache@sha256:db18aaa3a58302d7363dc59905c310f6df5141800bc8f336ab9cdec5577c6211
+    pull_policy: never
+  nextcloud-db:
+    image: koenswings/nextcloud-mariadb:1.0-11.7.2-MariaDB-ubu2404@sha256:53097b4b57324f966a7d718bb4bbaff8b8bad626cb677ea46b9a0c12cc53d412
+    pull_policy: never
+  code:
+    image: koenswings/nextcloud-code:1.0-24.04.13.2@sha256:8ca1ed448f542feaf2aed81e475520724db5231a15f46e002275f5255d2a447d
+    pull_policy: never
+x-app:
+  name: nextcloud
+  version: 2.0-32.0.15
+  instanceName: nextcloud
+  healthCheck:
+    path: /status.php
+    expect: '"maintenance":false,"needsDbUpgrade":false'
+  healthTimeout: 600
+  updatesFrom:
+    - 1
+  update:
+    prepare:
+      service: nextcloud-app
+      user: "0"
+      command: /idea/hooks/prep-custom-apps-for-upgrade.sh
+      timeout: 600
+    verify:
+      service: nextcloud-app
+      user: "33"
+      command: /idea/hooks/verify-update.sh
+      timeout: 120
+    work:
+      service: nextcloud-app
+      user: "33"
+      command: /idea/hooks/work-update.sh
+      timeout: 3600
+    settle:
+      service: nextcloud-app
+      user: "33"
+      command: /idea/hooks/settle-update.sh
+      interval: 60
+      timeout: 3600
