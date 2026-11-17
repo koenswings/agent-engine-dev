@@ -12,7 +12,7 @@ EVID=/home/walker/duration-evidence/$RUN
 git -C "$REPO" diff --quiet || { echo "REFUSE: dirty harness tree"; exit 3; }
 SHA=$(git -C "$REPO" rev-parse HEAD)
 git -C "$REPO" branch -r --contains "$SHA" | grep -q origin/ || { echo "REFUSE: $SHA not pushed"; exit 3; }
-CONSOLE_PIN=762f8052872a27542692ca72577ce8162a4a508e  # Console main (console#229): Engine-first major-update backup; plain temp-backup wording
+CONSOLE_PIN=3d81cfd2dead3ac7dd20c5eee05b40578e8df400  # Console intents main (console#240): reboot_engine/switch_engine close overlays before the operator-layout wait (console#239)
 [ "$(git -C /home/walker/agent-console-dev rev-parse HEAD)" = "$CONSOLE_PIN" ] || { echo "REFUSE: console intents checkout is not $CONSOLE_PIN"; exit 3; }
 git -C /home/walker/agent-console-dev diff --quiet || { echo "REFUSE: dirty console intents tree"; exit 3; }
 mkdir -p "$EVID"; [ -f "$EVID/run.pid" ] && kill -0 "$(cat "$EVID/run.pid")" 2>/dev/null && { echo "REFUSE: already running"; exit 4; }
@@ -27,12 +27,13 @@ export DURATION_LAN_HOSTS=\${DURATION_LAN_HOSTS:-idea01=192.168.0.138,idea03=192
 export DURATION_CONSOLE_INTENTS=/home/walker/agent-console-dev/e2e/intents
 export DURATION_STAGE=2
 export DURATION_EXPECTED_CONSOLE_SHA=$CONSOLE_PIN
-# Product pin = intents pin = 762f8052872a27542692ca72577ce8162a4a508e (console#229 on main).
-# Asset name + md5 from a NODE_ENV=production box build of 762f805 (console#222 forces
-# Vite production mode). Main script in dist/index.html: index-BlAamcPF.js, 554263 bytes.
+# Split mode: intents pin = 3d81cfd (console#240, e2e/ and test/ only); product pin = 481a09a0db7a92f249f926a468e59ed8f0ce05e0 (console#232 on main).
+# Asset name + md5 from a NODE_ENV=production box build of 481a09a (console#222 forces
+# Vite production mode). Main script in dist/index.html: index-BkS_cVyn.js, 554263 bytes.
 # Atlas should confirm the pool-served dist matches before the live walk (engine#462).
-export DURATION_CONSOLE_PRODUCT_SHA=762f8052872a27542692ca72577ce8162a4a508e
-export DURATION_CONSOLE_PRODUCT_ASSET=index-BlAamcPF.js
+# The fix is CSS-only: also confirm served index-VWl7e4cw.css md5 2c3519080de31dccacd54bfa64ff1158.
+export DURATION_CONSOLE_PRODUCT_SHA=481a09a0db7a92f249f926a468e59ed8f0ce05e0
+export DURATION_CONSOLE_PRODUCT_ASSET=index-BkS_cVyn.js
 export DURATION_CONSOLE_PRODUCT_ASSET_MD5=0beedcb75e74d01121a7f94858406b2f
 export DURATION_EXPECTED_STORE_ID=2VroE
 export DURATION_POST_OP_SETTLE_MS=\${DURATION_POST_OP_SETTLE_MS:-300000}

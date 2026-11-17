@@ -7,7 +7,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { dispatchAction, type ActionContext } from './actions.js'
+import { MARKOV_REDOCK_AFTER, dispatchAction, isStage2Live, noteStepPreconditionProgress, randomStepPrecondition, readPoolSnapshot, stage2MarkovRedock, type ActionContext, type PoolSnapshot } from './actions.js'
 import { DEFAULT_INFRA_INVARIANTS, evaluateInvariants } from './invariants.js'
 import {
     assembleWalkVideo,
@@ -45,6 +45,35 @@ const pickTransition = (transitions: Transition[], rng: () => number): Transitio
         if (r <= 0) return t
     }
     return transitions[transitions.length - 1]!
+}
+
+/**
+ * Markov draw with the precondition guard (idea#168 Markov 9040e73@8): edges whose step cannot run
+ * yet (randomStepPrecondition) are taken out and the weighted draw runs over the rest — one rng()
+ * call as before, so a run with nothing blocked keeps its seeded sequence. All edges blocked → throw.
+ */
+export const pickDrawableTransition = async (
+    state: string,
+    transitions: Transition[],
+    rng: () => number,
+    blockedReason: (action: string, to: string) => Promise<string | null>,
+): Promise<{ transition: Transition; blocked: { action: string; reason: string }[] }> => {
+    // Keyed by edge (action + target state): App steps depend on the state they land in.
+    const key = (t: Transition) => `${t.action}\u0000${t.to}`
+    const reasons = new Map<string, string | null>()
+    for (const t of transitions) {
+        if (!reasons.has(key(t))) reasons.set(key(t), await blockedReason(t.action, t.to))
+    }
+    const blocked: { action: string; reason: string }[] = []
+    for (const t of transitions) {
+        const reason = reasons.get(key(t))
+        if (reason != null && !blocked.some(b => b.action === t.action && b.reason === reason)) blocked.push({ action: t.action, reason })
+    }
+    const drawable = transitions.filter(t => reasons.get(key(t)) === null)
+    if (!drawable.length) {
+        throw new Error(`Markov: no drawable transition from '${state}' (${blocked.map(b => `${b.action}: ${b.reason}`).join('; ')})`)
+    }
+    return { transition: pickTransition(drawable, rng), blocked }
 }
 
 const nowIso = () => new Date().toISOString()
@@ -186,6 +215,7 @@ const runWalkWithSteps = async (
 
         let to: string
         let action: string
+        let drawNote: string | undefined
         if (useExplicit) {
             const step = opts.steps![i]!
             const walkStepNo = stepNumberBase + i + 1
@@ -205,9 +235,26 @@ const runWalkWithSteps = async (
             to = step.to
             action = step.action
         } else {
-            const transition = pickTransition(stateDef.transitions, rng)
-            to = transition.to
-            action = transition.action
+            // Markov only: steps whose precondition (an earlier step's result) is missing are not drawable.
+            // One store read per draw (Markov 2: fixture disk/instance legitimately absent after eject/stop).
+            let snap: Promise<PoolSnapshot> | undefined
+            const guardCtx = {
+                opts: fullOpts, walker, poolEngines: pool, excludeEngines: exclude, fixtureInstance, fixtureInstances, fixtureDisk,
+                snapshot: () => (snap ??= readPoolSnapshot({ opts: fullOpts, poolEngines: pool, excludeEngines: exclude })),
+            }
+            let picked: Awaited<ReturnType<typeof pickDrawableTransition>>
+            try {
+                picked = await pickDrawableTransition(walker.current, stateDef.transitions, rng, (a, t) => randomStepPrecondition(guardCtx, a, process.env, t))
+            } catch (err) {
+                aborted = true
+                abortReason = err instanceof Error ? err.message : String(err)
+                break
+            }
+            to = picked.transition.to
+            action = picked.transition.action
+            if (picked.blocked.length) {
+                drawNote = `Markov: not drawable yet: ${picked.blocked.map(b => `${b.action} (${b.reason})`).join(', ')}`
+            }
         }
 
         const from = walker.current
@@ -230,6 +277,13 @@ const runWalkWithSteps = async (
         let ok = true
         let message: string | undefined
         let invResults: StructuredLogEntry['invariants'] = []
+        // Markov 3: Stage 2 random walks put an ejected disk back before the next draw (never cover-all).
+        const redockArmed = !useExplicit && isStage2Live(fullOpts.ops)
+        const fromLayer = scenario.states[from]?.layer ?? null
+        let redockBefore: PoolSnapshot | null = null
+        if (redockArmed && MARKOV_REDOCK_AFTER.has(action)) {
+            redockBefore = await readPoolSnapshot({ opts: fullOpts, poolEngines: pool, excludeEngines: exclude }).catch(() => null)
+        }
 
         try {
             const result = await dispatchAction(ctx)
@@ -242,6 +296,13 @@ const runWalkWithSteps = async (
 
             const dest = scenario.states[walker.current]
             if (dest?.layer) walker.layer = dest.layer
+
+            const leavingInfra = fromLayer === 'infra' && (dest?.layer ?? null) !== 'infra'
+            if (ok && redockArmed && (redockBefore || leavingInfra)) {
+                const r = await stage2MarkovRedock(ctx, redockBefore, leavingInfra)
+                if (r.note) message = message ? `${message}; ${r.note}` : r.note
+                if (!r.ok) ok = false
+            }
 
             const layer: Layer | null = walker.layer
             const specs = [
@@ -310,6 +371,9 @@ const runWalkWithSteps = async (
                 message = stab.abortReason ?? 'stability probe threshold exceeded'
             }
         }
+
+        if (ok) noteStepPreconditionProgress(walker, action)
+        if (drawNote) message = message ? `${message}; ${drawNote}` : drawNote
 
         walker.step = stepNumberBase + i + 1
         const entry: StructuredLogEntry = {

@@ -9,7 +9,7 @@
 import { isIdea02Target } from './walkHost.js'
 import { settleAfterLongOp, poolInstanceIds, type PostOpSettleIo } from './postOpSettle.js'
 import { opStartBudget, WAIT_OP_ACTIONS, opAppearBudgetMs, opDoneBudgetMs, waitOperationTerminal, type WaitOperationFn } from './opWait.js'
-import { STAGE2_ADD_FILES_DISK_ID, STAGE2_MOVE_TARGET_HOST, STAGE2_ROLE_MAP, stage2HomeOf } from './stage2.js'
+import { STAGE2_ADD_FILES_DISK_ID, STAGE2_MOVE_TARGET_HOST, STAGE2_ROLE_MAP, stage2ConfirmEraseVerdict, stage2Fixture, stage2HomeOf, stage2MountedSiblings, type Stage2Status, type Stage2StatusFixture } from './stage2.js'
 import type {
     DurationOptions,
     FleetOps,
@@ -658,6 +658,83 @@ export const stage2RedockSharedEraseDisk = async (ctx: ActionContext): Promise<s
         { purgeStoreInstances: true },
     )
     return note
+}
+
+/** kc9 FAIL@105: what the Stage 2 confirm_erase pre-check found on the Erase partition's home Pi. */
+export interface Stage2ConfirmErasePre { diskId: string; home: string; parent: string; siblings: Stage2StatusFixture[] }
+type Stage2StatusReader = { stage2Status?: (engineId: string) => Promise<Stage2Status> }
+
+/**
+ * kc9 FAIL@105 (Engine 9040e73): every Stage 2 Empty is a partition on a two-partition SSD
+ * (idea03: Nextcloud p1 + empty-001 p2). Erase wipes the WHOLE disk, so since #188 (323accd,
+ * 2026-10-16) the Engine refuses before touching anything. r86t (Engine f194fb5, before #188)
+ * "passed" only because the Intent counts a closed dialog as success: f194fb5 undocked the
+ * target and deleted its row before idea-erase-disk refused the mounted sibling.
+ *
+ * Before the Intent (Stage 2 live only): read stage2-dock status on the home Pi. Mounted siblings
+ * on the target's disk → the step expects the Engine's refusal. Target alone on its disk → fail
+ * loud before clicking: a real erase rewrites the GPT without the PARTLABEL stage2-dock.sh needs.
+ * Returns null when not Stage 2 or the ops cannot read stage2-dock status (fake/stub runs).
+ */
+export const stage2ConfirmErasePrecheck = async (ctx: ActionContext): Promise<Stage2ConfirmErasePre | null> => {
+    if (!isStage2(ctx)) return null
+    const ops = ctx.opts.ops as FleetOps & Stage2StatusReader
+    if (typeof ops.stage2Status !== 'function') return null
+    const diskId = eraseDiskTargetId()
+    const home = stage2HomeOf(diskId)
+    const { parent, siblings } = stage2MountedSiblings(await ops.stage2Status(home), diskId)
+    if (!siblings.length) {
+        throw new Error(
+            `Stage 2 confirm_erase: ${diskId} is alone on /dev/${parent} on ${home}, so the Engine would really erase it. ` +
+                `idea-erase-disk rewrites the GPT without PARTLABEL ${stage2Fixture(diskId).partLabel}, and stage2-dock.sh could not find the fixture again. ` +
+                `Extend the harness (post-erase relabel/redock) before a real Stage 2 erase. Nothing was clicked.`,
+        )
+    }
+    return { diskId, home, parent, siblings }
+}
+
+/**
+ * kc9 FAIL@105: after the confirm_erase Intent on a shared SSD. Pass only when the Engine gave its
+ * exact shared-disk refusal AND nothing changed (target still docked on its home and Empty; target
+ * and every sibling still mounted). Then close the Console error dialog so the walk goes on from
+ * op_disk. The erase partition is not re-docked: it was never touched.
+ */
+export const stage2ConfirmEraseAfter = async (
+    ctx: ActionContext,
+    pre: Stage2ConfirmErasePre,
+    result: { ok: boolean; message?: string },
+    driver: { dismissEraseError?: () => Promise<string> },
+): Promise<{ ok: boolean; message: string }> => {
+    const v = stage2ConfirmEraseVerdict(result, pre.diskId, pre.parent, pre.siblings)
+    if (v.kind === 'fail') return { ok: false, message: v.note }
+    const st = diskEmptiness(await ctx.opts.ops.readStore(pre.home), pre.diskId)
+    if (!st.empty || st.dockedTo !== pre.home) {
+        return { ok: false, message: `${v.note}; but after the refusal the store shows ${describeDisk(st)} (expected docked on ${pre.home} and Empty)` }
+    }
+    const ops = ctx.opts.ops as FleetOps & Stage2StatusReader
+    const after = stage2MountedSiblings(await ops.stage2Status!(pre.home), pre.diskId)
+    if (!after.target.mounted) {
+        return { ok: false, message: `${v.note}; but ${pre.diskId} (${after.target.kname}) is no longer mounted on ${pre.home} after the refusal` }
+    }
+    const gone = pre.siblings.filter(s => !after.siblings.some(a => a.partLabel === s.partLabel))
+    if (gone.length) {
+        return { ok: false, message: `${v.note}; but sibling(s) ${gone.map(s => s.partLabel).join(', ')} are no longer mounted on ${pre.home} after the refusal` }
+    }
+    let dismissed = 'no dismissEraseError on this driver'
+    if (typeof driver.dismissEraseError === 'function') {
+        try {
+            dismissed = await driver.dismissEraseError()
+        } catch (e) {
+            return { ok: false, message: `${v.note}; ${e instanceof Error ? e.message : String(e)}` }
+        }
+    }
+    return {
+        ok: true,
+        message:
+            `${v.note}; nothing changed (${describeDisk(st)}, ${after.target.kname} still mounted at ${after.target.mounted}, ` +
+            `${after.siblings.map(s => `${s.kname} at ${s.mounted}`).join(', ')} still mounted); ${dismissed}; ` +
+            `Stage 2 gap: real whole-disk erase not covered`,
+    }
 }
 
 /**
@@ -2168,6 +2245,36 @@ export const hasBackupProbe = (ctx: ActionContext): boolean =>
     typeof (ctx.opts.ops as BackupOps).probeBackupDisk === 'function'
 
 /**
+ * Backup Disks docked on a pool engine (never idea02 / excluded), shared store: any view.
+ * With instanceId: only disks that link it (or carry no backupLinks list), as the Console's
+ * InstanceRow requires before it shows Back up.
+ */
+export const dockedBackupDisks = async (
+    ctx: Pick<ActionContext, 'opts' | 'poolEngines' | 'excludeEngines'>,
+    instanceId?: string,
+): Promise<{ id: string; engine: string }[]> => {
+    const pool = ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))
+    const candidates: { id: string; engine: string }[] = []
+    const seen = new Set<string>()
+    for (const eng of pool) {
+        let view: SemanticStoreView
+        try {
+            view = await ctx.opts.ops.readStore(eng)
+        } catch {
+            continue
+        }
+        for (const d of Object.values(view.diskDB)) {
+            if (seen.has(d.id) || !d.dockedTo || !d.diskTypes?.includes('backup')) continue
+            if (!pool.includes(d.dockedTo)) continue
+            if (instanceId && d.backupLinks && !d.backupLinks.includes(instanceId)) continue
+            seen.add(d.id)
+            candidates.push({ id: d.id, engine: d.dockedTo })
+        }
+    }
+    return candidates
+}
+
+/**
  * r30 preflight before the backup_instance Intent (live only). Console 0760c01
  * InstanceRow shows `backup-instance-<id>` only for a Backup Disk that is docked on the
  * SAME engine as the instance's disk and links the instance (InstanceList
@@ -2199,23 +2306,7 @@ export const ensureBackupDiskForInstance = async (
         )
     }
     // Backup Disks linked to the instance, docked on a pool engine (shared store: any view).
-    const candidates: { id: string; engine: string }[] = []
-    const seen = new Set<string>()
-    for (const eng of pool) {
-        let view: SemanticStoreView
-        try {
-            view = await ctx.opts.ops.readStore(eng)
-        } catch {
-            continue
-        }
-        for (const d of Object.values(view.diskDB)) {
-            if (seen.has(d.id) || !d.dockedTo || !d.diskTypes?.includes('backup')) continue
-            if (!pool.includes(d.dockedTo)) continue
-            if (d.backupLinks && !d.backupLinks.includes(instanceId)) continue
-            seen.add(d.id)
-            candidates.push({ id: d.id, engine: d.dockedTo })
-        }
-    }
+    const candidates = await dockedBackupDisks(ctx, instanceId)
     if (!candidates.length) {
         throw new Error(
             `backup_instance: no docked Backup Disk linked to ${instanceId} on any pool engine ` +
@@ -2455,6 +2546,261 @@ export const stage2MoveAppPins = (
     if (!envInst) set.DURATION_COPY_INSTANCE_ID = instanceId
     if (!envTarget) set.DURATION_COPY_TARGET_DISK = targetDiskId
     return { instanceId, targetDiskId, set }
+}
+
+/**
+ * Markov (--scenario random) draw guard, idea#168 Markov 9040e73@8: a random walk drew move_app
+ * before any copy_app had recorded a disposable instance and aborted before the Intent. A step whose
+ * harness precondition is an earlier step's result is not drawable until that result exists; the
+ * walker resamples among the other edges (runner.ts). Each rule mirrors the fail-loud check the
+ * dispatcher would hit, so a Fake / Stage 1 run (where those checks do not fire) draws exactly as before.
+ * Deterministic walks (cover-all, cover-registered-intents, …) never call this: they still fail loud.
+ * Returns why the step cannot be drawn now, or null when it can.
+ *   move_app            (Stage 2) needs the copy_app instance (walker.stage2CopyInstanceId) or DURATION_COPY_INSTANCE_ID.
+ *   backup_instance     (live) needs a docked Backup Disk linking the instance (make_backup_disk first).
+ *   backup_schedule     (live) needs a docked Backup Disk (make_backup_disk first).
+ *   restore_from_backup (live) needs a docked Backup Disk and an archive from a backup_instance of this run.
+ * Markov 2 (random-9040e73-markov-20261116b@16): eject_disk + confirm_eject@10-11 ejected the Kolibri fixture
+ * disk, then copy_app@16 hit its preflight "source disk … is not docked on any pool engine". Only
+ * infra_dock_fixture re-docks it, so in a random walk the fixture can legitimately be absent. Stage 2 live
+ * (stage2FixtureAbsent):
+ *   copy_app / move_app     source instance on a docked pool disk and a docked target (preflightCopyMoveSamePi).
+ *   start_instance, stop_instance, rename_instance, open_app, backup_instance
+ *                           the instance they act on must be on a docked pool disk (not Undocked).
+ *   App steps (open_kolibri_as_*, open_nextcloud_as_*, open_wikipedia_as_*, kolibri_* / nc_* / wiki_* states),
+ *   open_app                that App's instance Running with a store port (pinAppsForStep; a stopped App cannot be opened).
+ *   copy_app / move_app / restore_from_backup  the instance the Console settles on: live + port (pinAppsForStep).
+ *   infra_move_disk         the fixture disk docked on a pool engine (stage2MoveSource).
+ */
+export const randomStepPrecondition = async (
+    ctx: Pick<ActionContext, 'opts' | 'walker' | 'poolEngines' | 'excludeEngines' | 'fixtureInstance'> &
+        Partial<Pick<ActionContext, 'fixtureInstances'>> & { snapshot?: () => Promise<PoolSnapshot> },
+    action: string,
+    env: NodeJS.ProcessEnv = process.env,
+    to?: string,
+): Promise<string | null> => {
+    if (action === 'move_app') {
+        if (isStage2(ctx) && !env.DURATION_COPY_INSTANCE_ID?.trim() && !ctx.walker.stage2CopyInstanceId?.trim()) {
+            return 'no copy_app instance recorded yet (Stage 2 move_app moves that copy; never the Kolibri fixture)'
+        }
+    }
+    // Markov 2 (random-9040e73-markov-20261116b@16): fixture disk / instance legitimately absent (eject, stop, …).
+    const absent = await stage2FixtureAbsent(ctx, action, to, env)
+    if (absent) return absent
+    if (action !== 'backup_instance' && action !== 'backup_schedule' && action !== 'restore_from_backup') return null
+    if (!hasBackupProbe(ctx as ActionContext)) return null
+    const linked = action === 'backup_instance' ? ctx.fixtureInstance : undefined
+    if (!(await dockedBackupDisks(ctx, linked)).length) {
+        return `no docked Backup Disk${linked ? ` linked to ${linked}` : ''} on the pool yet (make_backup_disk first)`
+    }
+    if (action === 'restore_from_backup' && !ctx.walker.backupTaken) {
+        return 'no backup_instance archive taken in this run yet (restore needs one)'
+    }
+    return null
+}
+
+/** One store read for a Markov draw: docked disks (→ engine) and instance rows across the pool views. */
+export interface PoolSnapshot {
+    readable: boolean
+    docked: Map<string, string>
+    instances: Map<string, { diskId: string | null; status: string; port?: number }>
+}
+
+export const readPoolSnapshot = async (
+    ctx: Pick<ActionContext, 'opts' | 'poolEngines' | 'excludeEngines'>,
+): Promise<PoolSnapshot> => {
+    const snap: PoolSnapshot = { readable: false, docked: new Map(), instances: new Map() }
+    for (const eng of ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))) {
+        let view: SemanticStoreView
+        try {
+            view = await ctx.opts.ops.readStore(eng)
+        } catch {
+            continue
+        }
+        snap.readable = true
+        for (const d of Object.values(view.diskDB ?? {})) {
+            if (d.dockedTo && !snap.docked.has(d.id)) snap.docked.set(d.id, d.dockedTo)
+        }
+        for (const [id, i] of Object.entries(view.instanceDB ?? {})) {
+            const prev = snap.instances.get(id)
+            // Unique store: other engines keep an Undocked copy of the row; the live row wins.
+            if (!prev || (prev.status === 'Undocked' && i.status !== 'Undocked')) {
+                snap.instances.set(id, { diskId: i.diskId, status: i.status, ...(i.port ? { port: i.port } : {}) })
+            }
+        }
+    }
+    return snap
+}
+
+/** Steps that act on one instance through the Console (dispatcher default: the fixture instance). */
+export const INSTANCE_TARGET_ACTIONS: ReadonlySet<string> = new Set([
+    'start_instance', 'stop_instance', 'rename_instance', 'open_app', 'backup_instance',
+])
+
+/**
+ * Markov 2 guard (Stage 2 live only): why this step cannot run now because a fixture disk or instance it
+ * needs is legitimately absent at this point of a random walk, or null. Each rule mirrors the pre-Intent
+ * fail-loud check the step would hit (or, for the instance steps, prevents a hollow pass on a missing
+ * instance). No readable store → null (the step's own check stays the judge).
+ */
+export const stage2FixtureAbsent = async (
+    ctx: Pick<ActionContext, 'opts' | 'walker' | 'poolEngines' | 'excludeEngines' | 'fixtureInstance'> &
+        Partial<Pick<ActionContext, 'fixtureInstances' | 'fixtureDisk'>> & { snapshot?: () => Promise<PoolSnapshot> },
+    action: string,
+    to: string | undefined,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> => {
+    if (!isStage2(ctx) || typeof (ctx.opts.ops as FleetOps & { findDockedEngine?: unknown }).findDockedEngine !== 'function') return null
+    const fixtureInstances = ctx.fixtureInstances ?? {}
+    const appUses = appsUsedByStep({ action, to }).map(a =>
+        fixtureInstanceFor({ fixtureInstances } as ActionContext, a))
+    const isCopyMove = action === 'copy_app' || action === 'move_app'
+    if (!appUses.length && !isCopyMove && !INSTANCE_TARGET_ACTIONS.has(action) &&
+        action !== 'restore_from_backup' && action !== 'infra_move_disk') return null
+    const snap = await (ctx.snapshot ? ctx.snapshot() : readPoolSnapshot(ctx))
+    if (!snap.readable) return null
+    const dockedOn = (diskId: string | null | undefined): string | null => {
+        const e = diskId ? snap.docked.get(diskId) : undefined
+        return e && !ctx.excludeEngines.includes(e) && !isNeverEngine(e) ? e : null
+    }
+    const where = (id: string): string => {
+        const r = snap.instances.get(id)
+        if (!r) return `${id} not in the store`
+        return `${id} ${r.status} on disk ${r.diskId ?? 'none'}${dockedOn(r.diskId) ? ` @${dockedOn(r.diskId)}` : ' (not docked on a pool engine)'}`
+    }
+    const live = (id: string): boolean => {
+        const r = snap.instances.get(id)
+        return !!r && r.status !== 'Undocked' && !!dockedOn(r.diskId)
+    }
+    if (action === 'infra_move_disk') {
+        const disk = ctx.fixtureDisk
+        return disk && !dockedOn(disk) ? `fixture disk ${disk} not docked on a pool engine (infra_dock_fixture first)` : null
+    }
+    // App opened in a tab: Running with a store port (pinAppsForStep throws on no live row / no port).
+    for (const u of appUses) {
+        const r = snap.instances.get(u.instanceId)
+        if (!live(u.instanceId) || r?.status !== 'Running' || !r.port) {
+            return `${u.app} ${where(u.instanceId)} — not Running on a docked pool disk (eject/stop earlier in the walk)`
+        }
+    }
+    let acted: string
+    try {
+        acted = action === 'move_app'
+            ? (env.DURATION_COPY_INSTANCE_ID?.trim() || ctx.walker.stage2CopyInstanceId?.trim() || '')
+            : actedInstanceId(action, undefined, ctx.fixtureInstance, env)
+    } catch {
+        return null // restore_from_backup env mismatch: the step itself fails loud
+    }
+    if (!acted) return null
+    if ((INSTANCE_TARGET_ACTIONS.has(action) || isCopyMove || action === 'restore_from_backup') && !live(acted)) {
+        return `${where(acted)} — the instance this step acts on is absent (eject earlier in the walk; infra_dock_fixture first)`
+    }
+    if (action === 'open_app' || action === 'restore_from_backup' || isCopyMove) {
+        const r = snap.instances.get(acted)
+        if (!r?.port) return `${where(acted)} has no store port (pinAppsForStep would refuse)`
+        if (action === 'open_app' && r.status !== 'Running') return `${where(acted)} — not Running (open_app opens its App)`
+    }
+    if (isCopyMove) {
+        const pinEnvFor = action === 'move_app'
+            ? { ...env, DURATION_COPY_INSTANCE_ID: acted, DURATION_COPY_TARGET_DISK: env.DURATION_COPY_TARGET_DISK?.trim() || STAGE2_ROLE_MAP.moveApp }
+            : env
+        const pair = await predictCopyMovePair(ctx as ActionContext, { instanceId: acted }, pinEnvFor)
+        if (!pair.sourceEngine) return `${action} source disk ${pair.sourceDiskId} of ${acted} not docked on a pool engine`
+        if (!pair.targetDiskId || !pair.targetEngine) return `${action}: no docked target disk ≠ ${pair.sourceDiskId}`
+    }
+    return null
+}
+
+/** Stage 2 live harness (Stage2FleetOps over RealFleetOps): the Markov re-dock and fixture guards apply. */
+export const isStage2Live = (ops: FleetOps): boolean =>
+    (ops as FleetOps & { stage?: number }).stage === 2 &&
+    typeof (ops as FleetOps & { findDockedEngine?: unknown }).findDockedEngine === 'function'
+
+/**
+ * Markov 3 (random-9040e73-markov-20261117c@15) root-cause fix: in a Stage 2 random walk the pool is put
+ * back as soon as a step leaves a disk undocked, so the next draw never lands on a missing disk card.
+ * Disks to re-dock = docked before confirm_eject and not after it (MARKOV_REDOCK_AFTER: the only operator
+ * edge whose effect is an undock), plus every fixture disk when the walk leaves the infra layer
+ * (infra_undock_fixtures → return_to_start). Other steps that drop a disk (none known) are not repaired
+ * silently: the #493 guards keep their steps undrawable and the step's own checks stay loud. Inside the infra layer undocked fixtures are the state under test (infra_dock_fixture).
+ * Fixture disks go through infra_dock_fixture's own Stage 2 path (home Pi, Docked+mounted left alone,
+ * moved copies kept, URLs resynced, Nextcloud readiness); any other role disk through dockFixture on its
+ * home Pi (an Empty is reset there, so state that lived on it is forgotten). Then the store must show
+ * every one of them docked on a pool engine before the walk draws again — otherwise the step fails loud.
+ */
+export const MARKOV_REDOCK_AFTER: ReadonlySet<string> = new Set(['confirm_eject'])
+
+export const stage2MarkovRedock = async (
+    ctx: ActionContext,
+    before: PoolSnapshot | null,
+    leavingInfra: boolean,
+    opts: { waitMs?: number; pollMs?: number; dockFixtures?: (c: ActionContext) => Promise<ActionResult> } = {},
+): Promise<{ ok: boolean; note: string | null }> => {
+    if (!isStage2Live(ctx.opts.ops)) return { ok: true, note: null }
+    const ops = ctx.opts.ops as FleetOps & { findDockedEngine: (id: string) => Promise<string | null> }
+    const usable = (e: string | null): e is string => !!e && !ctx.excludeEngines.includes(e) && !isNeverEngine(e)
+    const want = new Set<string>()
+    if (before?.readable) {
+        const after = await readPoolSnapshot(ctx)
+        if (after.readable) {
+            for (const [d, e] of before.docked) {
+                if (!usable(e) || /system/i.test(d)) continue
+                const now = after.docked.get(d)
+                if (!usable(now ?? null)) want.add(d)
+            }
+        }
+    }
+    if (leavingInfra) {
+        for (const d of ctx.fixtureDisks) if (!usable(await ops.findDockedEngine(d))) want.add(d)
+    }
+    if (!want.size) return { ok: true, note: null }
+    const list = [...want]
+    const notes: string[] = []
+    try {
+        const fixtures = list.filter(d => ctx.fixtureDisks.includes(d))
+        if (fixtures.length) {
+            const r = await (opts.dockFixtures ?? infraDockFixture)({ ...ctx, action: 'infra_dock_fixture' })
+            if (!r.ok) return { ok: false, note: `Markov re-dock of ${fixtures.join(', ')} failed: ${r.message ?? 'infra_dock_fixture not ok'}. No soft-pass.` }
+            if (r.dockedEngine !== undefined) ctx.walker.dockedEngine = r.dockedEngine
+            notes.push(`fixtures via infra_dock_fixture: ${r.message ?? 'ok'}`)
+        }
+        for (const d of list.filter(x => !ctx.fixtureDisks.includes(x))) {
+            const f = stage2Fixture(d)
+            await ctx.opts.ops.dockFixture(f.host, d)
+            if (f.diskTypes?.[0] === 'empty') {
+                // dockFixture resets an Empty: what the walk had put on it is gone.
+                if (d === STAGE2_ROLE_MAP.backup) ctx.walker.backupTaken = false
+                if (d === 'duration-empty-002') ctx.walker.empty002HoldsApp = false
+                const copy = ctx.walker.stage2CopyInstanceId?.trim()
+                if (copy && before?.instances.get(copy)?.diskId === d) ctx.walker.stage2CopyInstanceId = null
+                notes.push(`${d} re-docked on ${f.host} (reset to Empty)`)
+            } else {
+                notes.push(`${d} re-docked on ${f.host}`)
+            }
+        }
+    } catch (e) {
+        return { ok: false, note: `Markov re-dock of ${list.join(', ')} failed: ${e instanceof Error ? e.message : String(e)}. No soft-pass.` }
+    }
+    const waitMs = opts.waitMs ?? envBudget(process.env, 'DURATION_REDOCK_WAIT_MS', 180_000)
+    const pollMs = opts.pollMs ?? 2_000
+    const t0 = Date.now()
+    let missing = list
+    for (;;) {
+        const next: string[] = []
+        for (const d of missing) if (!usable(await ops.findDockedEngine(d))) next.push(d)
+        missing = next
+        if (!missing.length || Date.now() - t0 >= waitMs) break
+        await new Promise(r => setTimeout(r, pollMs))
+    }
+    if (missing.length) {
+        return { ok: false, note: `Markov re-dock: store still shows ${missing.join(', ')} not docked on a pool engine after ${Date.now() - t0}ms (${notes.join('; ')}). No soft-pass.` }
+    }
+    return { ok: true, note: `Markov re-dock [${list.join(', ')}] docked again in the store after ${Date.now() - t0}ms (${notes.join('; ')})` }
+}
+
+/** Markov draw guard bookkeeping: remember results later steps depend on (after an ok step). */
+export const noteStepPreconditionProgress = (walker: WalkerState, action: string): void => {
+    if (action === 'backup_instance') walker.backupTaken = true
 }
 
 /** Sets harness-owned env vars; returns the restore function. */
@@ -3466,6 +3812,20 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
         }
     }
+    // kc9 FAIL@105: Stage 2 confirm_erase on a shared SSD expects the Engine's refusal (see stage2ConfirmErasePrecheck).
+    let eraseShared: Stage2ConfirmErasePre | null = null
+    if (ctx.action === 'confirm_erase') {
+        try {
+            eraseShared = await stage2ConfirmErasePrecheck(ctx)
+            if (eraseShared) {
+                const n = `confirm_erase expects the shared-disk refusal: ${eraseShared.diskId} shares /dev/${eraseShared.parent} on ${eraseShared.home} with mounted ${eraseShared.siblings.map(s => `${s.kname} (${s.partLabel})`).join(', ')}`
+                preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${n}` : n
+            }
+        } catch (e) {
+            const err = e instanceof Error ? e.message : String(e)
+            return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
+        }
+    }
     // Prefer A r22 FAIL@93: add_files_role ≠ make_files_disk. Never "already satisfied"
     // by the make_files_disk Files Disk; never soft-pass. Restore an app-only disk onto
     // the Console engine (Kolibri back from infra_move_disk@62, or
@@ -3678,6 +4038,10 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     let message = result.message ?? `${result.mode}: ${ctx.action}`
     if (preStartSettleNote) {
         message = `${message}; ${preStartSettleNote}`
+    }
+    if (eraseShared) {
+        const r = await stage2ConfirmEraseAfter(ctx, eraseShared, result, driver)
+        return { ok: r.ok, message: preStartSettleNote ? `${r.message}; ${preStartSettleNote}` : r.message, layer }
     }
     // r55 post-use: the App tabs this step used must be on the store URLs, and each used instance must
     // still be Running and owned by its own container on its own Pi (Stage 2; Intent ok only).

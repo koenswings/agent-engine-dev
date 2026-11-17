@@ -188,7 +188,10 @@ describe('roles + move-only target (READY §4.4)', () => {
         expect(() => stage2MoveTargetPartition('idea01', NC)).toThrow(/never move onto idea01/)
         expect(() => stage2MoveTargetPartition('idea03', K)).toThrow(/must be idea04/)
         expect(() => stage2MoveTargetPartition('idea04', E3)).toThrow(/move target itself/)
-        expect(stage2NotCovered(COVER_ALL)).toEqual([{ step: at('infra_move_disk'), action: 'infra_move_disk', semantics: STAGE2_GAPS[0]!.semantics }])
+        expect(stage2NotCovered(COVER_ALL)).toEqual([
+            { step: at('infra_move_disk'), action: 'infra_move_disk', semantics: STAGE2_GAPS[0]!.semantics },
+            { step: at('confirm_erase'), action: 'confirm_erase', semantics: STAGE2_GAPS[1]!.semantics },
+        ])
         expect(STAGE2_GAPS[0]!.semantics).toMatch(/network copy.*duration-empty-003/)
     })
     it('no walk step leaves an SSD half-ejected (whole-SSD only for reboots, redocked in-step)', () => {
