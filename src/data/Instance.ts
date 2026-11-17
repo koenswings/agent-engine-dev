@@ -11,6 +11,7 @@ import { composeFileEnv } from './FilesMount.js'
 import { appForInstance, instanceUsbSync } from './InstanceApp.js'
 import { Store, getDisk, getEngine, getLocalEngine, getInstancesOfEngine, } from "./Store.js";
 import { Disk, diskMountRoot, diskFsRoot, deviceMountRoot } from "./Disk.js";
+import { inFlightRefusal } from './InFlight.js'
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
 import { createAppId, parseAppId } from "./App.js";
@@ -790,6 +791,11 @@ export interface InstanceRegisterOptions {
    * move's own source); any other storedOn keeps the engine#381 refusal.
    */
   moveFrom?: DiskID
+  /**
+   * engine#497: the op that owns the folder's in-flight marker (a resumed local copy/move).
+   * Without it a marked folder is not registered (processInstance) and not started.
+   */
+  inFlightOpId?: string
 }
 
 const RECLAIM_BLOCKING_STATES = new Set(['Running', 'Starting'])
@@ -1507,11 +1513,19 @@ export const refreshInstanceFromCompose = async (
 }
 
 /** When true, compose/port-ready run on `disk` but instanceDB status, port, lastStarted and Error are not written (engine#381: keep-id move during Checking). */
-export type StartInstanceOpts = { deferStoreStatus?: boolean }
+export type StartInstanceOpts = {
+  deferStoreStatus?: boolean
+  /** engine#497: the op that owns this folder's in-flight marker; any other start is refused */
+  inFlightOpId?: string
+}
 
 /** #179: every start is tracked in flight on its disk so an eject waits for it to settle. */
 export const startInstance = (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk, cause: OperationCause = 'console-command', opts: StartInstanceOpts = {}): Promise<void> =>
   trackInFlight(String(disk.id), `startInstance ${instance.id}`, (async () => {
+    // engine#497: an instance folder under an in-flight marker (an interrupted copy/move)
+    // is started only by the op that owns the marker
+    const inFlight = await inFlightRefusal(await diskMountRoot(disk), String(instance.id), opts.inFlightOpId)
+    if (inFlight) throw new Error(`startInstance: ${inFlight}`)
     // engine#381: a deferred start skips refresh-from-compose so it cannot claim storedOn.
     if (opts.deferStoreStatus) {
       return startInstanceTracked(storeHandle, instance, disk, cause, opts)

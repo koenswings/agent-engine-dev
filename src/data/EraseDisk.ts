@@ -10,6 +10,7 @@
  * remount). Production USB (/dev/sdX) still uses idea-erase-disk unchanged.
  */
 
+import { isParkedOp } from './Operations.js'
 import os from 'os'
 import path from 'path'
 import { $, chalk, fs, YAML } from 'zx'
@@ -271,7 +272,7 @@ export const eraseBlocker = async (store: Store, disk: Disk | null): Promise<str
     if (!disk) return null
     // Running backup to/from this disk
     for (const op of Object.values(store.operationDB ?? {})) {
-        if ((op.status === 'Running' || op.status === 'Pending') && op.kind === 'backupApp') {
+        if ((op.status === 'Running' || op.status === 'Pending') && op.kind === 'backupApp' && !isParkedOp(op)) {
             const bid = op.args?.backupDiskId
             const iid = op.args?.instanceId
             if (bid === disk.id) return `try again later: a backup is running on this disk`

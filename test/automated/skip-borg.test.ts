@@ -30,7 +30,8 @@ import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import { drainDataBytesQueue } from '../harness/drainDataBytes.js'
 // static: an earlier test calls vi.resetModules(); a dynamic import would get fresh Config/helper modules
 import { bootRetryHandlers } from '../../src/data/RecoveryRetry.js'
-import { recoverInterruptedOperations } from '../../src/data/Operations.js'
+import { recoverInterruptedOperations, noteDiskDocked, noteDiskUndocked, resetResumeStateForTests, resetEngineStoppingForTests } from '../../src/data/Operations.js'
+import { staleBackupLock, recordBackupStaleLocks } from '../../src/monitors/backupMonitor.js'
 
 const INST = 'inst-borg-1' as InstanceID
 
@@ -105,6 +106,8 @@ beforeEach(async () => {
     process.env.FAKE_BORG_LOG = borgLog
     config.settings.testMode = true
     vi.spyOn(console, 'info').mockImplementation(() => {})
+    resetResumeStateForTests()
+    resetEngineStoppingForTests()
 })
 
 afterEach(async () => {
@@ -311,5 +314,126 @@ describe('engine#497: boot recovery re-runs an interrupted backupApp inside the 
         await recover()
         await vi.waitFor(() => expect(h.doc()!.operationDB['op-b'].status).toBe('Failed'))
         expect(h.doc()!.operationDB['op-b'].error).toMatch(/Backup Disk borg-bd is not known/)
+    })
+})
+
+describe('engine#497 stage 2: an interrupted backup resumes in its own op (borg break-lock for our own lock only)', () => {
+    const LOCK = () => `${DISKS_ROOT}/${backupDevice}/backups/${INST}/.backup-in-progress`
+    const REPO = () => `${DISKS_ROOT}/${backupDevice}/backups/${INST}`
+    /** The store and disk after a power cut mid borg-create: op Running (phase locked), our lock, the repo. */
+    const cut = async (lock: Record<string, unknown> = { opId: 'op-b', engineId: String(localEngineId) }) => {
+        const h = await createMinimalStore()
+        const appDisk = makeDisk('borg-ad', appDevice, false)
+        const backupDisk = makeDisk('borg-bd', backupDevice, true)
+        h.change(doc => {
+            doc.diskDB[appDisk.id] = appDisk; doc.diskDB[backupDisk.id] = backupDisk
+            doc.operationDB['op-b'] = {
+                id: 'op-b', kind: 'backupApp', args: { instanceId: INST, backupDiskId: backupDisk.id, phase: 'locked' }, cause: 'console-command', subject: null,
+                engineId: localEngineId, status: 'Running', progressPercent: 40, currentStep: 2, totalSteps: 5, stepLabel: 'Running Borg',
+                startedAt: 0 as Timestamp, completedAt: null, error: null,
+            } as any
+            ;(doc.engineDB[localEngineId] as any).commands = [`backupApp ${INST} ${backupDisk.id}`]
+        })
+        addInstance(h, appDisk.id)
+        await fs.ensureDir(REPO())
+        await fs.writeFile(`${REPO()}/config`, '[repository]\n')
+        await fs.writeFile(LOCK(), JSON.stringify({ instanceId: INST, startedAt: Date.now() - 60_000, bootId: 'old-boot', ...lock }))
+        return { h, appDisk, backupDisk }
+    }
+    const boot = async (h: DocHandle<Store>) => {
+        resetResumeStateForTests()
+        await recoverInterruptedOperations(h, bootRetryHandlers)
+    }
+
+    beforeEach(() => {
+        config.settings.skipBorg = false
+        process.env.FAKE_HELPER_VERSION = '20'
+        staleBackupLock.borgPidUsingRepo = async () => null
+    })
+    afterEach(() => {
+        delete process.env.FAKE_HELPER_VERSION
+        staleBackupLock.borgPidUsingRepo = async () => null
+    })
+
+    it('cut → boot → dock: the same op breaks its own borg lock, borg create runs once, the op ends Done, one op only', async () => {
+        const { h, backupDisk } = await cut()
+        await boot(h)
+        expect(h.doc()!.operationDB['op-b'].status).toBe('Pending')
+        expect(h.doc()!.operationDB['op-b'].error).toMatch(/^RESUME_WAITING: resumes when /)
+        expect([...((h.doc()!.engineDB[localEngineId] as any).commands ?? [])]).toEqual([])
+        // the dock stale-lock flow: our own op's lock is not INTERRUPTED and not cleared
+        await recordBackupStaleLocks(h, backupDisk)
+        expect(await fs.pathExists(LOCK())).toBe(true)
+        expect((h.doc()!.instanceDB[INST] as any).lastResult?.result).not.toBe('INTERRUPTED')
+        noteDiskDocked(h, 'borg-ad')
+        noteDiskDocked(h, 'borg-bd')
+        await vi.waitFor(() => expect(h.doc()!.operationDB['op-b'].status).toBe('Done'))
+        expect(h.doc()!.operationDB['op-b'].error).toBeNull()
+        const c = await calls()
+        const brk = c.findIndex(l => l === `borg-break-lock ${backupDevice} ${INST}`)
+        const create = c.findIndex(l => l.startsWith(`borg-create ${backupDevice} ${INST}`))
+        expect(brk).toBeGreaterThanOrEqual(0)
+        expect(create).toBeGreaterThan(brk)
+        expect(c.filter(l => l.startsWith('borg-create'))).toHaveLength(1)
+        expect(Object.values(h.doc()!.operationDB).filter((o: any) => o.kind === 'backupApp')).toHaveLength(1)
+        expect(await fs.pathExists(LOCK())).toBe(false)
+    })
+
+    it('a lock of another op or another Engine is never broken: an orphan stays INTERRUPTED / cleared by the existing flow', async () => {
+        const { h, backupDisk } = await cut({ opId: 'op-someone-else', engineId: String(localEngineId) })
+        h.change(doc => { (doc.operationDB['op-b'] as any).status = 'Failed' })
+        await recordBackupStaleLocks(h, backupDisk)
+        expect((h.doc()!.instanceDB[INST] as any).lastResult?.result).toBe('INTERRUPTED')
+        expect(await fs.pathExists(LOCK())).toBe(false)   // engine#429: stale, cleared
+        const { h: h2 } = await cut({ opId: 'op-b', engineId: 'ENGINE_other' })
+        await boot(h2)
+        noteDiskDocked(h2, 'borg-ad')
+        noteDiskDocked(h2, 'borg-bd')
+        await vi.waitFor(() => expect(h2.doc()!.operationDB['op-b'].status).toBe('Done'))
+        expect((await calls()).some(l => l.startsWith('borg-break-lock'))).toBe(false)
+    })
+
+    it('a live borg on the repository is never broken: the resume is a counted failure, the lock stays', async () => {
+        const { h } = await cut()
+        staleBackupLock.borgPidUsingRepo = async () => 4242
+        await boot(h)
+        noteDiskDocked(h, 'borg-ad')
+        noteDiskDocked(h, 'borg-bd')
+        await vi.waitFor(() => expect(h.doc()!.operationDB['op-b'].error).toMatch(/^RESUME_PENDING \(1\/3\): BACKUP_STALE_LOCK: borg \(pid 4242\) still uses/))
+        expect((await calls()).some(l => l.startsWith('borg-break-lock') || l.startsWith('borg-create'))).toBe(false)
+        expect(await fs.pathExists(LOCK())).toBe(true)
+    })
+
+    it('three real failures: RESUME_PENDING (1/3), (2/3), then Failed RESUME_GAVE_UP; the lock is kept for the operator', async () => {
+        const { h } = await cut()
+        const refuse = path.join(binDir, 'refuse-create')
+        await fs.writeFile(refuse, '')
+        process.env.FAKE_BORG_REFUSE_CREATE = refuse
+        await boot(h)
+        noteDiskDocked(h, 'borg-ad')
+        noteDiskDocked(h, 'borg-bd')
+        await vi.waitFor(() => expect(h.doc()!.operationDB['op-b'].error).toMatch(/^RESUME_PENDING \(1\/3\): .*borg-create refused/))
+        noteDiskUndocked('borg-bd'); noteDiskDocked(h, 'borg-bd')
+        await vi.waitFor(() => expect(h.doc()!.operationDB['op-b'].error).toMatch(/^RESUME_PENDING \(2\/3\)/))
+        await boot(h)
+        noteDiskDocked(h, 'borg-ad')
+        noteDiskDocked(h, 'borg-bd')
+        await vi.waitFor(() => expect(h.doc()!.operationDB['op-b'].status).toBe('Failed'))
+        expect(h.doc()!.operationDB['op-b'].error).toMatch(/^RESUME_GAVE_UP: .*borg-create refused/)
+        expect(h.doc()!.operationDB['op-b'].args.resumeFailures).toBe('3')
+        expect((await calls()).filter(l => l.startsWith('borg-create'))).toHaveLength(3)
+        expect(await fs.pathExists(LOCK())).toBe(true)
+    })
+
+    it('a scheduled backup is still never retried (idea#400): Failed INTERRUPTED at boot, no break-lock', async () => {
+        const { h } = await cut()
+        h.change(doc => { (doc.operationDB['op-b'] as any).cause = 'scheduled-backup' })
+        await boot(h)
+        expect(h.doc()!.operationDB['op-b'].status).toBe('Failed')
+        expect(h.doc()!.operationDB['op-b'].error).toMatch(/^INTERRUPTED: /)
+        noteDiskDocked(h, 'borg-ad')
+        noteDiskDocked(h, 'borg-bd')
+        await new Promise(r => setTimeout(r, 30))
+        expect((await calls()).some(l => l.startsWith('borg-'))).toBe(false)
     })
 })

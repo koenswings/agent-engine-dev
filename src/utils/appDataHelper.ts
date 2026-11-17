@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '19'
+export const APP_DATA_HELPER_VERSION = '20'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -90,8 +90,31 @@ export const verifyStampNow = (at: Date = new Date()): string => {
 // ── Helper arguments (subcommand first) ──────────────────────────────────────
 
 export const sizeArgs = (root: string, id: string): string[] => ['size', checkRoot(root), checkId(id)]
-export const copyArgs = (srcRoot: string, srcId: string, dstRoot: string, dstId: string): string[] =>
-    ['copy', checkRoot(srcRoot), checkId(srcId), checkRoot(dstRoot), checkId(dstId)]
+export const copyArgs = (srcRoot: string, srcId: string, dstRoot: string, dstId: string, opId?: string): string[] =>
+    ['copy', checkRoot(srcRoot), checkId(srcId), checkRoot(dstRoot), checkId(dstId), ...(opId ? [checkOpId(opId)] : [])]
+
+// ── engine#497 (helper v20): resumable local copies ──────────────────────────
+/** Local copy/move resume (in-flight marker, copy into its own half-written folder, verify-copy, borg-break-lock). */
+export const RESUME_HELPER_MIN = 20
+const OPID_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/
+export const checkOpId = (opId: string): string => {
+    if (!OPID_TOKEN.test(opId)) throw new Error(`'${opId}' is not an operation id the app-data helper accepts`)
+    return opId
+}
+export const markInFlightArgs = (root: string, id: string, opId: string, engineId: string): string[] =>
+    ['mark-in-flight', checkRoot(root), checkId(id), checkOpId(opId), checkEngineId(engineId)]
+export const clearInFlightArgs = (root: string, id: string, opId: string): string[] =>
+    ['clear-in-flight', checkRoot(root), checkId(id), checkOpId(opId)]
+export const verifyCopyArgs = (srcRoot: string, srcId: string, dstRoot: string, dstId: string): string[] =>
+    ['verify-copy', checkRoot(srcRoot), checkId(srcId), checkRoot(dstRoot), checkId(dstId)]
+export const borgBreakLockArgs = (bdev: string, id: string): string[] => ['borg-break-lock', checkRoot(bdev), checkId(id)]
+/** verify-copy output: differences=<n> and up to 10 diff=<item> <path> lines. */
+export const parseVerifyCopy = (out: string): { differences: number, diffs: string[] } => {
+    const lines = out.split('\n').map(l => l.trim()).filter(Boolean)
+    const n = Number(lines.find(l => l.startsWith('differences='))?.slice('differences='.length))
+    if (!Number.isInteger(n) || n < 0) throw new Error(`idea-app-data verify-copy: no differences=<n> line in its output`)
+    return { differences: n, diffs: lines.filter(l => l.startsWith('diff=')).map(l => l.slice(5)) }
+}
 /** send: the peer's address AND its Engine id (the helper pins the peer's host key by Engine id). */
 export const sendArgs = (srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string): string[] => {
     if (!/^[A-Za-z0-9][A-Za-z0-9.-]{0,252}$/.test(host)) throw new Error(`'${host}' is not a host the app-data helper accepts`)

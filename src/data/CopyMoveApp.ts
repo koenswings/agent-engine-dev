@@ -29,7 +29,8 @@ import { stopInstance, startInstance, applyBackupMethod } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
 import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
-import { createOperation, updateOperation } from './Operations.js'
+import { createOperation, updateOperation, setOperationArgs, parkResumableOp } from './Operations.js'
+import { markInFlight, clearInFlight, verifyInstanceCopy, resumeHelperProblem } from './InFlight.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { sendCommand } from '../utils/commandUtils.js'
 import { getEngineAddress } from './Network.js'
@@ -238,6 +239,44 @@ export const accumulateCopyByteProgress = (
     return { stage, finish }
 }
 
+// ── engine#497: resumable local copies (Koen's rule) ─────────────────────────
+
+/**
+ * Why a failed local copy/move counts as an interruption (a disk left this Engine or
+ * is no longer mounted), or null when the failure is real and counts towards the limit.
+ */
+export const copyInterruption = async (storeHandle: DocHandle<Store>, diskIds: string[]): Promise<string | null> => {
+    const { localEngineId } = await import('./Engine.js')
+    for (const id of diskIds) {
+        const d = getDisk(storeHandle.doc(), id as DiskID) as Disk | undefined
+        const label = d?.name ? `'${d.name}' (${id})` : id
+        if (!d?.device || String(d.dockedTo) !== String(localEngineId)) return `disk ${label} is no longer docked on this Engine`
+        try {
+            if (!await fs.pathExists(`${await diskMountRoot(d)}/instances`)) return `disk ${label} is no longer mounted`
+        } catch {
+            return `disk ${label} cannot be read`
+        }
+    }
+    return null
+}
+
+/** Park a resumable op after a failed run: kept marked, resumed at the next boot or dock (engine#497). */
+const parkCopyMove = async (storeHandle: DocHandle<Store>, opId: string, diskIds: string[], e: unknown): Promise<void> => {
+    const reason = (e as any)?.message ?? String(e)
+    const gone = await copyInterruption(storeHandle, diskIds)
+    parkResumableOp(storeHandle, opId, gone ? `${gone}: ${reason}` : reason, { interrupted: !!gone })
+}
+
+/** VERIFY_FAILED unless the copy matches its source (helper verify-copy). */
+const verifyCopyOrThrow = async (sourceRoot: string, srcId: string, targetRoot: string, dstId: string, who: string): Promise<void> => {
+    const v = await verifyInstanceCopy(sourceRoot, srcId, targetRoot, dstId)
+    if (v.differences > 0) {
+        throw new Error(`VERIFY_FAILED: the copy instances/${dstId} on ${targetRoot} differs from its source in ${v.differences} item(s)` +
+            `${v.diffs.length ? `: ${v.diffs.join('; ')}` : ''}`)
+    }
+    log(`${who}: the copy instances/${dstId} on ${targetRoot} matches its source (idea-app-data verify-copy)`)
+}
+
 // ── copyApp ───────────────────────────────────────────────────────────────────
 
 /**
@@ -284,9 +323,16 @@ export const copyApp = async (
     let copyError: Error | null = null
     beginUsageSkip('move')
 
-    const newInstanceId = (opts.dstId ?? uuid()) as InstanceID
+    // engine#497: a resumed local copy continues into the folder and id it recorded
+    const resumedArgs = (!journal && opts.recoveredOpId
+        ? storeHandle.doc()?.operationDB?.[opts.recoveredOpId]?.args
+        : undefined) as Record<string, string> | undefined
+    const newInstanceId = (opts.dstId ?? resumedArgs?.targetInstanceId ?? uuid()) as InstanceID
     const preserveId = Boolean(opts.dstId) && String(opts.dstId) === String(instance.id)
     let wasRunning = false
+    // engine#497: set once instances/<new id>.idea-op-in-flight is written. From then on a
+    // failure keeps the partial copy (marked) and parks the op to resume; nothing is deleted.
+    let markerWritten = false
     let sourceRestarted = false
     // idea#168 r36: the folder this copy creates on the target disk. A failed copy
     // removes it, else the next dock of that disk registers the partial folder as a
@@ -317,6 +363,10 @@ export const copyApp = async (
         : undefined
     // The peer: its address now, and its Engine id (key and host key pinned by id)
     const peer: PeerEngine | undefined = isCrossEngine ? { host: remoteAddress!, engineId: String(targetDisk.dockedTo) } : undefined
+    // engine#497 stage 2: a same-Engine copy resumes after an interruption (in-flight marker,
+    // same folder and id, verify). Cross-Engine copies keep the idea#79 rules (stage 3).
+    // (dstId is the copy step of a cross-Engine move, which keeps its own rules)
+    const resumable = !journal && !isCrossEngine && !opts.dstId
 
     // ── step definitions ──────────────────────────────────────────────────────
     const COPY_STEPS = [
@@ -331,7 +381,25 @@ export const copyApp = async (
         updateOperation(storeHandle, opId, { currentStep: step, totalSteps: COPY_STEPS.length, stepLabel: COPY_STEPS[step] })
 
     try {
+        if (resumable) {
+            const helperIssue = await resumeHelperProblem('copyApp on this Engine (resumable copy, engine#497)')
+            if (helperIssue) throw new Error(`HELPER_OUTDATED: ${helperIssue}`)
+            if (resumedArgs?.targetInstanceId && resumedArgs.phase) {
+                log(`copyApp: resuming operation ${opId} (phase ${resumedArgs.phase}) into instances/${newInstanceId} on '${targetDisk.name}'`)
+            }
+            // engine#497: registered before the Engine stopped; only the marker is left
+            const registered = storeHandle.doc()?.instanceDB?.[newInstanceId]
+            if (resumedArgs?.targetInstanceId && (resumedArgs.phase === 'registered' || String(registered?.storedOn ?? '') === String(targetDisk.id))) {
+                await clearInFlight(targetRoot, newInstanceId, opId)
+                setOperationArgs(storeHandle, opId, { phase: 'done' })
+                updateOperation(storeHandle, opId, { status: 'Done', progressPercent: 100, error: null, completedAt: Date.now() as Timestamp })
+                log(chalk.green(`copyApp: done — instance ${newInstanceId} was already registered on '${targetDisk.name}'; cleared its in-flight marker`))
+                return newInstanceId
+            }
+        }
+
         // 1. Stop source instance if running
+        if (resumedArgs?.wasRunning === '1') wasRunning = true
         if (instance.status === 'Running' || instance.status === 'Starting') {
             wasRunning = true
             log(`copyApp: stopping instance '${instanceName}' for consistent snapshot`)
@@ -346,7 +414,11 @@ export const copyApp = async (
         if (!isCrossEngine) {
             // Instance data is sized as root by the app-data helper (idea#168): pi cannot
             // read all of it (root 0600 sessions, MariaDB 0700 folders).
-            const needed = await directoryBytes(appMasterSrc) + await instanceDataBytes(sourceRoot, instance.id)
+            let needed = await directoryBytes(appMasterSrc) + await instanceDataBytes(sourceRoot, instance.id)
+            // engine#497: a resumed copy only needs what is not on the target yet
+            if (resumable && resumedArgs?.targetInstanceId) {
+                try { needed = Math.max(0, needed - await instanceDataBytes(targetRoot, newInstanceId)) } catch { /* nothing copied yet */ }
+            }
             const available = await availableBytes(await diskFsRoot(targetDisk))
             if (available < needed) {
                 throw new Error(
@@ -366,6 +438,13 @@ export const copyApp = async (
             await fs.ensureDir(`${targetMountRoot}/apps`)
             await fs.ensureDir(`${targetMountRoot}/instances`)
             await fs.ensureDir(`${targetMountRoot}/services`)
+        }
+
+        // engine#497: record the target and write its in-flight marker before the first byte
+        if (resumable) {
+            setOperationArgs(storeHandle, opId, { targetInstanceId: String(newInstanceId), phase: 'copying', wasRunning: wasRunning ? '1' : '0' })
+            await markInFlight(targetRoot, newInstanceId, opId, String(localEngineId))
+            markerWritten = true
         }
 
         // 4. rsync app master (idempotent — skips if already present and identical)
@@ -394,24 +473,33 @@ export const copyApp = async (
         //    sends to pi@<remote>, where that Engine's helper receives it (rrsync -wo).
         setCopyStep(3)
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
-        createdInstanceDest = instanceDest
+        // a resumable copy is kept (marked) on failure; only a cross-Engine one is removed
+        if (!resumable) createdInstanceDest = instanceDest
         log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest} (idea-app-data ${isCrossEngine ? 'send' : 'copy'})`)
         const instanceByteProgress = copyBytes.stage(instanceBytes)
         await rsyncInstanceData(
             peer
                 ? { kind: 'send', srcRoot: sourceRoot, srcId: instance.id, host: peer.host, peerEngineId: peer.engineId, dstRoot: targetRoot, dstId: newInstanceId }
-                : { kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: newInstanceId },
+                : { kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: newInstanceId, ...(resumable ? { opId } : {}) },
             (p) => {
                 updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(p.progressPercent * 0.30) })
                 instanceByteProgress(p)
             }, opId)
+
+        // engine#497: verify against the source before the copy gets its own name and port
+        if (resumable) {
+            await verifyCopyOrThrow(sourceRoot, String(instance.id), targetRoot, String(newInstanceId), 'copyApp')
+            setOperationArgs(storeHandle, opId, { phase: 'verified' })
+        }
 
         // 5a. Give the copy its own name and port (idea#168 r35). The rsync
         //     copied the original's compose.yaml (x-app.instanceName) and .env
         //     (port=). The copy gets a unique name (<name>-2, -3, …; see
         //     uniqueCopyName) and no port, so startInstance allocates one that is
         //     neither listening nor owned by another instance in the store.
-        const copyName = opts.keepName ? instance.name : uniqueCopyName(storeHandle.doc(), String(instance.name))
+        const copyName = opts.keepName ? instance.name
+            : ((resumedArgs?.copyName as InstanceName | undefined) || uniqueCopyName(storeHandle.doc(), String(instance.name)))
+        if (resumable) setOperationArgs(storeHandle, opId, { copyName: String(copyName) })
         const prepared = await preparedCopyFiles(instanceSrc, copyName)
         const preparedNames = Object.keys(prepared) as (keyof typeof prepared)[]
         if (preparedNames.length > 0) {
@@ -542,12 +630,22 @@ export const copyApp = async (
         } else {
             // Local: use existing processInstance flow
             log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)
-            await processInstance(storeHandle, targetDisk, newInstanceId)
+            // engine#497: the copy's own op may register (and start) its marked folder
+            if (resumable) {
+                await processInstance(storeHandle, targetDisk, newInstanceId, { inFlightOpId: opId })
+                setOperationArgs(storeHandle, opId, { phase: 'registered' })
+                await clearInFlight(targetRoot, newInstanceId, opId)
+                markerWritten = false
+                setOperationArgs(storeHandle, opId, { phase: 'done' })
+            } else {
+                await processInstance(storeHandle, targetDisk, newInstanceId)
+            }
         }
 
         if (!journal) updateOperation(storeHandle, opId, {
             status: 'Done',
             progressPercent: 100,
+            ...(resumable ? { error: null } : {}),
             completedAt: Date.now() as Timestamp,
         })
         log(chalk.green(`copyApp: done — new instance ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id})`))
@@ -556,14 +654,18 @@ export const copyApp = async (
         // Don't overwrite Cancelled status (set by cancelOperation before SIGTERM completes)
         copyError = e instanceof Error ? e : new Error(String(e))
         const currentStatus = storeHandle.doc()?.operationDB?.[opId]?.status
-        if (currentStatus !== 'Cancelled' && !journal) {
+        if (markerWritten) {
+            // engine#497 (Koen's rule; r36 delete-on-failure withdrawn for local copies): the
+            // partial copy stays, under its marker, and the op resumes at the next boot or dock
+            if (currentStatus !== 'Cancelled') await parkCopyMove(storeHandle, opId, [String(sourceDisk.id), String(targetDisk.id)], e)
+        } else if (currentStatus !== 'Cancelled' && !journal) {
             updateOperation(storeHandle, opId, {
                 status: 'Failed',
                 error: e.message ?? String(e),
                 completedAt: Date.now() as Timestamp,
             })
         }
-        console.error(chalk.red(`copyApp: failed — ${e.message ?? e}`))
+        console.error(chalk.red(`copyApp: failed — ${e.message ?? e}${markerWritten ? ` (the partial copy instances/${newInstanceId} is kept under its in-flight marker; the operation resumes)` : ''}`))
         // Remove the partial copy unless a *new* id was already registered (fresh
         // id, so the folder holds only what this op wrote). When preserveId, the
         // existing instanceDB[id] is the source row — still delete only the target
@@ -589,6 +691,71 @@ export const copyApp = async (
 }
 
 // ── moveApp ───────────────────────────────────────────────────────────────────
+
+/**
+ * engine#497: finish a resumed local move that registered the instance on the target
+ * before the Engine stopped: start it there if it ran before, remove the source folder
+ * (and the app master when no other instance on the source needs it), clear the marker.
+ */
+const finishRegisteredMove = async (storeHandle: DocHandle<Store>, opId: string, args: Record<string, string>): Promise<void> => {
+    const store = storeHandle.doc()
+    const id = String(args.instanceId) as InstanceID
+    const sourceDisk = getDisk(store, args.sourceDiskId as DiskID) as Disk | undefined
+    const targetDisk = getDisk(store, args.targetDiskId as DiskID) as Disk | undefined
+    if (!sourceDisk?.device) throw new Error(`moveApp: source disk ${args.sourceDiskId} is not docked; the move resumes when it is`)
+    if (!targetDisk?.device) throw new Error(`moveApp: target disk ${args.targetDiskId} is not docked; the move resumes when it is`)
+    const instance = getInstance(store, id)
+    if (!instance || String(instance.storedOn) !== String(targetDisk.id)) {
+        throw new Error(`moveApp: instance ${id} is not registered on '${targetDisk.name}' (${targetDisk.id}); cannot finish the move`)
+    }
+    const lockKeys = [instanceKey(id), diskKey(sourceDisk.id), diskKey(targetDisk.id)]
+    if (!resourceLock.acquireAll(lockKeys, 'moveApp')) {
+        throw new Error(`moveApp: resource locked — another operation is already running on instance '${id}' or one of its disks`)
+    }
+    beginUsageSkip('move')
+    try {
+        updateOperation(storeHandle, opId, { status: 'Running' })
+        const helperIssue = await resumeHelperProblem('moveApp on this Engine (resumable move, engine#497)')
+        if (helperIssue) throw new Error(`HELPER_OUTDATED: ${helperIssue}`)
+        log(`moveApp: resuming operation ${opId} after registration: finishing the move of ${id} to '${targetDisk.name}'`)
+        const sourceRoot = await appDataRoot(sourceDisk)
+        const targetRoot = await appDataRoot(targetDisk)
+        if (args.wasRunning === '1' && instance.status !== 'Running') {
+            log(`moveApp: starting moved instance ${id} on '${targetDisk.name}'`)
+            await startInstance(storeHandle, instance, targetDisk, 'post-move', { inFlightOpId: opId })
+        }
+        const sourceMountRoot = await diskMountRoot(sourceDisk)
+        if (await fs.pathExists(`${sourceMountRoot}/instances/${id}`)) {
+            log(`moveApp: removing source instance directory ${sourceMountRoot}/instances/${id} (idea-app-data delete)`)
+            try {
+                await deleteInstanceData(sourceRoot, id)
+            } catch (e: any) {
+                log(chalk.yellow(`moveApp: could not remove ${sourceMountRoot}/instances/${id}: ${e.message}. Remove the leftover folder by hand.`))
+            }
+        }
+        const appId = String(instance.instanceOf)
+        const appMasterSrc = `${sourceMountRoot}/apps/${appId}`
+        const stillNeedsAppMaster = getInstancesOfDisk(storeHandle.doc(), sourceDisk).some(i => i.instanceOf === appId)
+        if (!stillNeedsAppMaster && await fs.pathExists(appMasterSrc)) {
+            log(`moveApp: removing app master ${appMasterSrc} (no other instances on source disk)`)
+            await fs.remove(appMasterSrc)
+        }
+        await clearInFlight(targetRoot, id, opId)
+        setOperationArgs(storeHandle, opId, { phase: 'done' })
+        updateOperation(storeHandle, opId, { status: 'Done', progressPercent: 100, error: null, completedAt: Date.now() as Timestamp })
+        log(chalk.green(`moveApp: done — instance ${id} moved to '${targetDisk.name}' (${targetDisk.id}); resumed after registration`))
+    } catch (e: any) {
+        if (storeHandle.doc()?.operationDB?.[opId]?.status !== 'Cancelled') {
+            await parkCopyMove(storeHandle, opId, [String(sourceDisk.id), String(targetDisk.id)], e)
+        }
+        console.error(chalk.red(`moveApp: failed — ${e.message ?? e} (the operation resumes)`))
+        if (e instanceof MoveError) throw e
+        throw new MoveError('COPY_FAILED', moveFailedText(e?.message ?? String(e)))
+    } finally {
+        resourceLock.releaseAll(lockKeys)
+        endUsageSkip('move')
+    }
+}
 
 /** Options for moveApp (engine#497). */
 export interface MoveAppOptions {
@@ -627,6 +794,16 @@ export const moveApp = async (
         return moveAppCrossEngine(storeHandle, instanceName, sourceDiskId, targetDiskId, cause)
     }
 
+    // engine#497: a resumed move that already registered the instance on the target only
+    // finishes (start there, remove the source, clear the marker)
+    const resumedArgs = (opts.recoveredOpId ? store?.operationDB?.[opts.recoveredOpId]?.args : undefined) as Record<string, string> | undefined
+    if (opts.recoveredOpId && resumedArgs?.phase) {
+        const storedOnNow = store?.instanceDB?.[(resumedArgs.instanceId ?? '') as InstanceID]?.storedOn
+        if (resumedArgs.phase === 'registered' || String(storedOnNow ?? '') === String(resumedArgs.targetDiskId)) {
+            return finishRegisteredMove(storeHandle, opts.recoveredOpId, resumedArgs)
+        }
+    }
+
     const v = await validate(store, instanceName, sourceDiskId, targetDiskId, 'move')
     // Validation refusals throw (idea#168 r29@97), so the command trace or
     // crash-recovery retry ends as error instead of silently succeeding.
@@ -648,12 +825,11 @@ export const moveApp = async (
     }, cause, { type: 'instance', id: instance.id })
     beginUsageSkip('move')
 
-    let wasRunning = false
-    // idea#168: set once the helper copy into the target started, cleared when the
-    // instance is registered there. A failed move removes this partial copy, else a
-    // retry is refused (the helper needs an absent or empty destination) and the next
-    // dock of the target disk would register the partial folder.
-    let partialTarget = false
+    let wasRunning = resumedArgs?.wasRunning === '1'
+    // engine#497 (Koen's rule): set once instances/<id>.idea-op-in-flight is written on the
+    // target. The idea#168 removal of a partial target is withdrawn for local moves: a
+    // failure keeps the partial copy under its marker and parks the op to resume.
+    let markerWritten = false
 
     // ── step definitions ──────────────────────────────────────────────────────
     const MOVE_STEPS = [
@@ -669,6 +845,10 @@ export const moveApp = async (
         updateOperation(storeHandle, opId, { currentStep: step, totalSteps: MOVE_STEPS.length, stepLabel: MOVE_STEPS[step] })
 
     try {
+        const helperIssue = await resumeHelperProblem('moveApp on this Engine (resumable move, engine#497)')
+        if (helperIssue) throw new Error(`HELPER_OUTDATED: ${helperIssue}`)
+        if (resumedArgs?.phase) log(`moveApp: resuming operation ${opId} (phase ${resumedArgs.phase}) into instances/${instance.id} on '${targetDisk.name}'`)
+
         // 1. Stop source instance if running
         if (instance.status === 'Running' || instance.status === 'Starting') {
             wasRunning = true
@@ -681,7 +861,11 @@ export const moveApp = async (
 
         // 2. Check free space
         setMoveStep(1)
-        const needed = await directoryBytes(appMasterSrc) + await instanceDataBytes(sourceRoot, instance.id)
+        let needed = await directoryBytes(appMasterSrc) + await instanceDataBytes(sourceRoot, instance.id)
+        // engine#497: a resumed move only needs what is not on the target yet
+        if (resumedArgs?.phase) {
+            try { needed = Math.max(0, needed - await instanceDataBytes(targetRoot, instance.id)) } catch { /* nothing copied yet */ }
+        }
         const available = await availableBytes(await diskFsRoot(targetDisk))
         if (available < needed) {
             throw new Error(
@@ -696,6 +880,12 @@ export const moveApp = async (
         await fs.ensureDir(`${targetMountRoot}/instances`)
         await fs.ensureDir(`${targetMountRoot}/services`)
 
+        // engine#497: record the target and write its in-flight marker before the first byte
+        const { localEngineId: engineIdNow } = await import('./Engine.js')
+        setOperationArgs(storeHandle, opId, { targetInstanceId: String(instance.id), phase: 'copying', wasRunning: wasRunning ? '1' : '0' })
+        await markInFlight(targetRoot, instance.id, opId, String(engineIdNow))
+        markerWritten = true
+
         // 4. rsync app master
         setMoveStep(2)
         const appMasterDest = `${targetMountRoot}/apps/${appId}`
@@ -709,11 +899,13 @@ export const moveApp = async (
         setMoveStep(3)
         const instanceDest = `${targetMountRoot}/instances/${instance.id}`
         log(`moveApp: syncing instance data ${instanceSrc} → ${instanceDest} (idea-app-data copy)`)
-        partialTarget = true
-        await rsyncInstanceData({ kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: instance.id },
+        await rsyncInstanceData({ kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: instance.id, opId },
             ({ progressPercent }) => {
                 updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(progressPercent * 0.30) })
             }, opId)
+        // engine#497: the source is removed only after the target verified
+        await verifyCopyOrThrow(sourceRoot, String(instance.id), targetRoot, String(instance.id), 'moveApp')
+        setOperationArgs(storeHandle, opId, { phase: 'verified' })
 
         // 5b. rsync service image tars needed by this instance
         //     services/ holds the Docker image tars that startInstance loads via
@@ -760,12 +952,12 @@ export const moveApp = async (
         // kc8 step 104: claim the id explicitly (moveFrom). Without it the engine#381
         // guard refused the claim, storedOn stayed on the source while the instance
         // was started from the target, and ejecting the target never stopped it.
-        await processInstance(storeHandle, targetDisk, instance.id, { moveFrom: sourceDisk.id })
+        await processInstance(storeHandle, targetDisk, instance.id, { moveFrom: sourceDisk.id, inFlightOpId: opId })
         const storedOnNow = storeHandle.doc()?.instanceDB?.[instance.id]?.storedOn
         if (String(storedOnNow) !== String(targetDisk.id)) {
             throw new Error(`moveApp: instance ${instance.id} was not registered on '${targetDisk.name}' (${targetDisk.id}); storedOn is ${storedOnNow ?? 'none'}`)
         }
-        partialTarget = false
+        setOperationArgs(storeHandle, opId, { phase: 'registered' })
 
         // idea#474: processInstance does not auto-start a just-stopped instance
         // (shouldAutoStart skips status Stopped). If it was running before the
@@ -776,7 +968,7 @@ export const moveApp = async (
             const moved = getInstance(storeHandle.doc(), instance.id)
             if (moved) {
                 log(`moveApp: starting moved instance '${instanceName}' on '${targetDisk.name}'`)
-                await startInstance(storeHandle, moved, targetDisk, 'post-move')
+                await startInstance(storeHandle, moved, targetDisk, 'post-move', { inFlightOpId: opId })
             }
         }
 
@@ -804,9 +996,15 @@ export const moveApp = async (
             log(`moveApp: keeping app master ${appMasterSrc} (other instances still use it)`)
         }
 
+        // engine#497: the marker goes only after success
+        await clearInFlight(targetRoot, instance.id, opId)
+        markerWritten = false
+        setOperationArgs(storeHandle, opId, { phase: 'done' })
+
         updateOperation(storeHandle, opId, {
             status: 'Done',
             progressPercent: 100,
+            error: null,
             completedAt: Date.now() as Timestamp,
         })
         try { await pruneUnusedInstanceNetworks(instance.id) } catch (e: any) {
@@ -817,30 +1015,20 @@ export const moveApp = async (
     } catch (e: any) {
         // Don't overwrite Cancelled status (set by cancelOperation before SIGTERM completes)
         const currentStatus = storeHandle.doc()?.operationDB?.[opId]?.status
-        if (currentStatus !== 'Cancelled') {
+        if (markerWritten) {
+            // engine#497 (Koen's rule; the idea#168 removal of the partial target is withdrawn
+            // for local moves): the partial copy stays under its marker; the op resumes later
+            if (currentStatus !== 'Cancelled') await parkCopyMove(storeHandle, opId, [String(sourceDisk.id), String(targetDisk.id)], e)
+        } else if (currentStatus !== 'Cancelled') {
             updateOperation(storeHandle, opId, {
                 status: 'Failed',
                 error: e.message ?? String(e),
                 completedAt: Date.now() as Timestamp,
             })
         }
-        console.error(chalk.red(`moveApp: failed — ${e.message ?? e}`))
+        console.error(chalk.red(`moveApp: failed — ${e.message ?? e}${markerWritten ? ` (the partial copy on '${targetDisk.name}' is kept under its in-flight marker; the operation resumes)` : ''}`))
 
-        // Remove the partial copy on the target (idea#168) while the instance is still
-        // registered on the source disk. Never the source: the helper refuses a copy
-        // onto the same root, so target root ≠ source root. Not after a helper
-        // refusal: it wrote nothing, and a folder that was already there (e.g. an
-        // earlier restore of this instance onto the target) is not ours to remove.
         const stillOnSource = String(storeHandle.doc()?.instanceDB?.[instance.id]?.storedOn) === String(sourceDisk.id)
-        const helperRefused = /idea-app-data [\w-]+ refused: /.test(String(e?.message ?? ''))
-        if (partialTarget && stillOnSource && !helperRefused && targetRoot !== sourceRoot) {
-            try {
-                await deleteInstanceData(targetRoot, instance.id)
-                log(`moveApp: removed the partial copy of ${instance.id} on '${targetDisk.name}'`)
-            } catch (cleanupErr: any) {
-                console.error(chalk.red(`moveApp: could not remove the partial copy of ${instance.id} on '${targetDisk.name}': ${cleanupErr?.message ?? cleanupErr}`))
-            }
-        }
 
         // On failure, restart the source only if we stopped it and it is still
         // registered there (idea#474: after a successful register, a later

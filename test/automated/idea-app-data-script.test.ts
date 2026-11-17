@@ -108,7 +108,7 @@ describe('idea-app-data: argument checks', () => {
 
     it('refuses the wrong argument count for every subcommand', async () => {
         const cases: [string, number][] = [
-            ['version', 0], ['size', 2], ['copy', 4], ['send', 6], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['quarantine-snapshot', 2],
+            ['version', 0], ['size', 2], ['send', 6], ['mark-in-flight', 4], ['clear-in-flight', 3], ['verify-copy', 4], ['borg-break-lock', 2], ['delete', 2], ['quarantine', 2], ['snapshots', 1], ['quarantine-snapshot', 2],
             ['borg-init', 2], ['borg-info', 2], ['borg-extract', 5], ['borg-extract-verify', 4], ['borg-compact', 2], ['quarantine-backups', 1], ['clean-verify', 3],
             ['ensure-dirs', 1], ['erase-slot', 2], ['put-files', 3], ['peer-delete', 3], ['sync-peers', 2], ['clear-peers', 2], ['install-usage-key', 3],
         ]
@@ -119,6 +119,9 @@ describe('idea-app-data: argument checks', () => {
                 refused(r, new RegExp(`${sub} takes exactly ${n} argument`))
             }
         }
+        // engine#497 (v20): copy takes an optional <opId>
+        refused(await sb.run(['copy', 'x', 'x', 'x']), /copy takes 4 or 5 argument/)
+        refused(await sb.run(['copy', 'x', 'x', 'x', 'x', 'x', 'x']), /copy takes 4 or 5 argument/)
         refused(await sb.run(['receive', 'sdb1', 'id1', '--server']), /receive takes <dstRoot> <dstId> and the rsync server arguments/)
         refused(await sb.run(['borg-create', 'x', 'x', 'x']), /borg-create takes at least 4 argument/)
         refused(await sb.run(['snapshot', 'x']), /snapshot takes at least 2 argument/)
@@ -1743,10 +1746,10 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v19 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine)', async () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('19')
+    it('helper and Engine speak v20 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine; v20 the engine#497 in-flight marker)', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('20')
         const r = await sb.run(['version'])
-        expect(r.stdout.trim()).toBe('idea-app-data 19')
+        expect(r.stdout.trim()).toBe('idea-app-data 20')
     })
 
     it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {

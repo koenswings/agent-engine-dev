@@ -9,9 +9,11 @@
  *   3. copyApp restarts the original BEFORE the copy starts (call order).
  *   4. The copy gets a unique name (<name>-2, -3, …) in compose.yaml and the store.
  *   5. copyApp resolves the instance id-first; an ambiguous name is refused.
- *   6. A failed copy removes its partial folder on the target disk (local and
- *      over ssh) and leaves no registered instance (idea#168 r36: a partial
- *      folder registered as a second "kolibri" on the next dock).
+ *   6. A failed cross-Engine copy removes its partial folder on the target disk
+ *      (over ssh) and leaves no registered instance (idea#168 r36: a partial
+ *      folder registered as a second "kolibri" on the next dock). engine#497
+ *      (Koen's rule) withdrew this for a LOCAL copy: its partial folder is kept
+ *      under an in-flight marker (which blocks registration) and the op resumes.
  *
  * Real files in pretend disks under IDEA_DISKS_ROOT (idea-test-6x). rsync is
  * replaced by fs.copy (links copied as links, like rsync -a), and so is the
@@ -253,6 +255,16 @@ const linkDataOffDisk = async () => {
     await fs.symlink(`${outside}/idea166-kolibri-live/data/kolibri`, `${origDir()}/data/kolibri`)
 }
 
+// engine#497 (helper v20): marker, verify-copy and the version check go through
+// InFlight.inFlightHelper; recorded here (no sudo, no marker file on the pretend disks)
+import { inFlightHelper } from '../../src/data/InFlight.js'
+const inFlightCalls: string[][] = []
+beforeEach(() => {
+    inFlightCalls.length = 0
+    inFlightHelper.atLeast = async () => null
+    inFlightHelper.run = async (args: string[]) => { inFlightCalls.push(args); return args[0] === 'verify-copy' ? 'differences=0\n' : '' }
+})
+
 const copyDirs = async (): Promise<string[]> =>
     (await fs.readdir(`${tgtRoot()}/instances`).catch(() => [] as string[]))
 
@@ -444,22 +456,23 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
 
     const R36_RSYNC = 'rsync exited with code 23: rsync: [sender] send_files failed to open "/disks/idea-test-61/instances/kolibri-grade5a-001/data/kolibri/sessions/kolibrie9es3": Permission denied (13)'
 
-    it('a failed local copy removes its partial folder, registers no instance, ends Failed and restarts the source', async () => {
+    it('engine#497: a failed local copy KEEPS its partial folder under its in-flight marker, registers no instance, parks the op and restarts the source', async () => {
         h = await makeHandle('Running')
         failure.rsync = R36_RSYNC
         await copyApp(h, ORIG as any, SRC, TGT)
-        expect(await copyDirs()).toEqual([])                               // no partial folder left
+        const newId = instanceTransfers[0].dstId
+        expect(await copyDirs()).toEqual([newId])                          // the partial folder is kept (r36 delete withdrawn)
         expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])            // nothing registered
         const op = Object.values(h.doc().operationDB)[0] as any
-        expect(op.status).toBe('Failed')
-        expect(op.error).toBe(R36_RSYNC)
+        expect(op.status).toBe('Pending')
+        expect(op.error).toBe(`RESUME_PENDING (1/3): ${R36_RSYNC}`)
+        expect(op.args).toMatchObject({ targetInstanceId: newId, phase: 'copying', resumeFailures: '1' })
         expect(order).toEqual([`stop:${ORIG}`, `start:${ORIG}`])           // source back up, copy never processed
-        // it failed IN the instance copy, and the partial copy was removed through the helper
+        // it failed IN the instance copy; nothing was removed, the marker was written first
         expect(instanceTransfers.map(t => t.kind)).toEqual(['copy'])
-        expect(helperDeletes).toEqual([[TGT_DEV, instanceTransfers[0].dstId]])
-        // a later dock of the target disk finds nothing to register
-        expect(await fs.pathExists(`${tgtRoot()}/instances`)).toBe(true)
-        expect((await fs.readdir(`${tgtRoot()}/instances`)).length).toBe(0)
+        expect(instanceTransfers[0].opId).toBe(op.id)
+        expect(helperDeletes).toEqual([])
+        expect(inFlightCalls).toEqual([['mark-in-flight', TGT_DEV, newId, op.id, String(localEngineId)]])
     })
 
     it('a failed cross-engine copy removes the partial folder on the remote with that Engine\'s helper (ssh … sudo -n idea-app-data delete <root> <id>)', async () => {
@@ -525,7 +538,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         const [newId] = await copyDirs()
         expect(newId).toBeTruthy()
         expect(h.doc().instanceDB[newId as InstanceID]).toBeTruthy()
-        expect((Object.values(h.doc().operationDB)[0] as any).error).toBe('docker compose up failed')
+        expect((Object.values(h.doc().operationDB)[0] as any).error).toBe('RESUME_PENDING (1/3): docker compose up failed')   // engine#497: resumes
 
         // a refusal (unknown target) fails before the folder exists: nothing created, nothing removed
         failure.process = null
