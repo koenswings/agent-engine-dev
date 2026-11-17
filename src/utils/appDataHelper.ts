@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '21'
+export const APP_DATA_HELPER_VERSION = '24'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -150,6 +150,63 @@ export const parseKolibriRebind = (out: string): KolibriRebindResult => {
         previousId: prev && prev !== 'none' ? prev : null,
         morangoId: next === 'none' ? null : next,
         quarantined,
+    }
+}
+// ── engine#506 (helper v24): files the new bundle dropped, out of the instance at Swap ──
+/**
+ * updateApp's Swap copies the new bundle over instances/<id>/. Files the old bundle had and
+ * the new one dropped are moved (never removed) to <root>/.idea-quarantine/<id>-swap-dropped-<stamp>/
+ * by the helper as root (swap-quarantine, v24), because .idea-quarantine is root 0700. Below v24
+ * updateApp warns and leaves them in place.
+ */
+export const SWAP_QUARANTINE_HELPER_MIN = 24
+/** At most this many paths per call, each at most this long (the helper's SWAP_PATHS_MAX / SWAP_PATH_MAX_LEN). */
+export const SWAP_PATHS_MAX = 4096
+export const SWAP_PATH_MAX_LEN = 1024
+/**
+ * Why the helper would refuse this instance-relative path, or null when it accepts it. The same
+ * rules as swap-quarantine's pass 1 (the helper checks again; this only keeps the Engine from
+ * sending a line that would refuse the whole call).
+ */
+export const swapPathProblem = (rel: string): string | null => {
+    if (!rel) return 'empty'
+    if (rel.length > SWAP_PATH_MAX_LEN) return `longer than ${SWAP_PATH_MAX_LEN} characters`
+    if (/[\x00-\x1f\x7f\\]/.test(rel)) return 'holds a control character or a backslash'
+    if (rel.startsWith('/')) return 'absolute'
+    if (rel.endsWith('/') || rel.includes('//')) return "has a trailing '/' or '//'"
+    const parts = rel.split('/')
+    if (parts.some(p => p === '.' || p === '..')) return "has a '.' or '..' component"
+    if (parts[0] === 'data') return 'instance data (data/)'
+    if (parts[0].startsWith('.idea-')) return 'an Engine marker (.idea-*)'
+    if (parts.length === 1 && (rel === '.env' || rel === 'SHA256SUMS' || rel === 'compose.yaml')) return `the instance's ${rel}`
+    return null
+}
+export const swapQuarantineArgs = (root: string, id: string): string[] => ['swap-quarantine', checkRoot(root), checkId(id)]
+/** stdin for swap-quarantine: one path per line; throws on a path the helper would refuse. */
+export const swapQuarantineInput = (paths: string[]): string => {
+    if (paths.length > SWAP_PATHS_MAX) throw new Error(`swap-quarantine takes at most ${SWAP_PATHS_MAX} paths, got ${paths.length}`)
+    for (const p of paths) {
+        const why = swapPathProblem(p)
+        if (why) throw new Error(`'${p}' is not a path swap-quarantine accepts (${why})`)
+    }
+    return paths.map(p => `${p}\n`).join('')
+}
+export interface SwapQuarantineResult {
+    /** the quarantine folder the files went to; null when nothing was there to move */
+    quarantine: string | null
+    moved: string[]
+    /** listed, but already gone from the instance folder */
+    absent: string[]
+}
+/** swap-quarantine output: absent=<path> lines, quarantine=<folder|none>, moved=<path> lines. */
+export const parseSwapQuarantine = (out: string): SwapQuarantineResult => {
+    const lines = out.split('\n').filter(Boolean)
+    const q = lines.find(l => l.startsWith('quarantine='))?.slice('quarantine='.length)
+    if (q === undefined || !(q === 'none' || q.startsWith('/'))) throw new Error('idea-app-data swap-quarantine: no quarantine=<folder>|none line in its output')
+    return {
+        quarantine: q === 'none' ? null : q,
+        moved: lines.filter(l => l.startsWith('moved=')).map(l => l.slice('moved='.length)),
+        absent: lines.filter(l => l.startsWith('absent=')).map(l => l.slice('absent='.length)),
     }
 }
 /** send: the peer's address AND its Engine id (the helper pins the peer's host key by Engine id). */
