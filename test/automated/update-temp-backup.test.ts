@@ -239,7 +239,10 @@ describe('engine#469 failures keep the temporary backup', () => {
         const m = await codeOf(updateApp(h, 'i1', 'kolibri-2.0', ME, { allowMajor: true }, deps({
             start: async () => { starts++; h.change(d => { (d.instanceDB['i1' as any] as any).status = starts === 1 ? 'Running' : 'Error' }) },
         })))
-        expect(m).toMatch(/^ROLLBACK FAILED: /)
+        // engine#456 Q6: data restored, old version did not start: ROLLBACK_START_FAILED, not "the rollback failed"
+        expect(m).toMatch(/^ROLLBACK START FAILED: Health failed: .* kolibri-1\.0 and its data were restored from .*; the old version did not start: /)
+        expect(inst().status).toBe('Stopped')
+        expect(inst().statusCondition).toMatch(/^ROLLBACK START FAILED:/)
         expect(calls).not.toContain('tempRestore')
     })
     it('the delete after Health fails: the update is still Done; the backup is reported as left', async () => {

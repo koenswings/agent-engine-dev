@@ -68,8 +68,11 @@ import {
     UpdateAppError, UpdateStep, UPDATE_STEPS, checkUpdate, healthGate, healthTimeoutSeconds, rollbackPlan,
     parseHealthCheck, healthBodyOk, estimateUpdateMinutes, fallbackUp, fallbackHealthTimeoutSeconds,
     HealthSample, ContainerHealth, offerable, compareVersions, isMajorChange, backupIsDue,
-    declaredUpdateStages,
+    declaredUpdateStages, parseUpdateContract, contractHasSteps, UpdateContract, UpdateStepSpec,
 } from './UpdateAppPolicy.js'
+import { writeUpdateInFlight, clearUpdateInFlight } from './UpdateInFlight.js'
+import { runUpdateStep, StepContext, StepRun, stepFailureText } from './UpdateStepRunner.js'
+import type { UpdateStageKey } from './UpdateAppPolicy.js'
 import { appIdentity } from './AppIdParse.js'
 import { stampComposeInstanceIdentity } from './InstanceCopy.js'
 import { isUnfinishedFetch } from './UpdateFetch.js'
@@ -94,6 +97,8 @@ export interface UpdateProgress {
     type: typeof UPDATE_PROGRESS_TYPE; engineId: string; instanceId: string; step: UpdateStep; bytesDone: number; bytesTotal: number
     /** #263: set while a cross-Engine Fetch waits (thermal pause), absent otherwise */
     fetchPaused?: FetchPaused
+    /** engine#456: the step's last `ERROR:` / `not yet:` line (≤ 200 characters), absent otherwise */
+    phaseNote?: string
 }
 export interface FetchPaused { reason: 'thermal'; bytesDone: number; bytesTotal: number; since: number }
 
@@ -108,8 +113,10 @@ export interface UpdateResult {
     snapshotExcludes: string[]
     /** idea#448: the backup updateApp took itself (null when none was due) */
     preUpdateBackup: { backupDiskId: string, method: BackupMethod, duringStop: boolean } | null
-    /** engine#469: the temporary backup on the system disk (null when none was made); deleted after Health */
+    /** engine#469: the temporary backup on the system disk (null when none was made); deleted after full success (engine#456) */
     tempBackup: { path: string, sizeBytes: number, deleted: boolean } | null
+    /** engine#456: true when this run only finished a committed update (work + settle) */
+    resumed?: boolean
 }
 export interface SnapshotsInfo { snapshots: PreUpdateSnapshot[], preUpdateBytes: number | null, quarantineBytes: number | null }
 
@@ -148,7 +155,21 @@ export interface UpdateDeps {
     /** Refresh Engine.tempBackups after a temp backup is created or deleted (and at boot). */
     refreshTempBackups: () => Promise<void>
     reread: (disk: Disk, id: InstanceID) => Promise<void>
-    start: (inst: Instance, disk: Disk) => Promise<void>
+    /** engine#456: `updateOpId` owns instances/<id>/.idea-update-in-flight (any other start is refused) */
+    start: (inst: Instance, disk: Disk, opts?: { updateOpId?: string, imagesLoaded?: boolean }) => Promise<void>
+    /**
+     * engine#456 LoadImages: `docker image load` the swapped compose's service images from the
+     * disk's services/*.tar (Instance.ts pinned-tar logic, idea#322/#445), never a pull. `strict`
+     * (a bundle with x-app.update): a missing or stale image throws (PREPARE_FAILED, rollback).
+     */
+    loadImages: (instDir: string, mountRoot: string, strict: boolean) => Promise<void>
+    /**
+     * engine#456: the per-start .env values and the Files / USB override Start uses, for the
+     * prepare one-off. Resolves with the extra compose files (absolute) after compose.yaml.
+     */
+    stepComposeFiles: (inst: Instance, disk: Disk, writeEnv: boolean) => Promise<string[]>
+    /** engine#456: run one x-app.update step (UpdateStepRunner.ts) */
+    runStep: (kind: UpdateStageKey, spec: UpdateStepSpec, ctx: StepContext, opts?: { timeoutS?: number }) => Promise<StepRun>
     health: (id: InstanceID) => Promise<Omit<HealthSample, 'elapsedMs'>>
     /** GET an x-app.healthCheck URL (idea#76); null when it does not answer */
     probe: (url: string) => Promise<{ status: number, body: string } | null>
@@ -219,6 +240,37 @@ export const copyBundle = async (src: string, dst: string): Promise<void> => {
     }
 }
 
+/**
+ * engine#456 LoadImages (§1 gap, §10): load the swapped compose's service images from the App
+ * Disk's services/*.tar with the Start path's pinned-tar logic (preloadServiceImageFromTar,
+ * verifyServiceImageDigest). Offline: never a pull. Without x-app.update a missing tar stays a
+ * warning, as in Start today; with x-app.update (`strict`) any warning, a stale tar or an image
+ * that is not local afterwards throws. Tests skip it like Start does (skipImageLoad).
+ */
+export const defaultLoadImages = async (instDir: string, mountRoot: string, strict: boolean): Promise<void> => {
+    const { skipImageLoad } = await import('./Config.js')
+    if (skipImageLoad()) { log(`updateApp: LoadImages: skipImageLoad is set; not loading images from ${mountRoot}/services`); return }
+    const I = await import('./Instance.js')
+    const compose = YAML.parse(await fs.readFile(path.join(instDir, 'compose.yaml'), 'utf8'))
+    const images = [...new Set(Object.values(compose?.services ?? {}).map((s: any) => String(s?.image ?? '')).filter(Boolean))]
+    const problems: string[] = []
+    for (const image of images) {
+        const warnings: string[] = []
+        // a stale pinned tar throws here (quarantined, never loaded)
+        await I.preloadServiceImageFromTar(image, mountRoot, async (msg) => { log(`updateApp: LoadImages: ${msg}`); warnings.push(msg) })
+        if (image.includes('@')) {
+            // pinned: the pin itself must be local and match (idea#322/#445); a warning about a stale
+            // tar while the pin is already local is not a problem with the image
+            await I.verifyServiceImageDigest(image, { requirePresent: strict })
+        } else if (strict) {
+            // unpinned: the tar must have loaded, and the tag must be local afterwards
+            problems.push(...warnings)
+            if (!(await I.inspectServiceImage(image)).id) problems.push(`Service image ${image} is not local after the load`)
+        }
+    }
+    if (problems.length) throw new Error(problems.join('; '))
+}
+
 export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => ({
     helperProblem: () => helperAtLeast(UPDATE_HELPER_MIN, 'updateApp'),
     mountRoot: (disk) => diskMountRoot(disk),
@@ -271,7 +323,24 @@ export const defaultUpdateDeps = (storeHandle: DocHandle<Store>): UpdateDeps => 
     tempBackupRestore: async (disk, id, stamp) => lastLine(await runAppData(tempBackupRestoreArgs(await appDataRoot(disk), String(id), stamp))),
     refreshTempBackups: async () => { const { refreshTempBackups } = await import('./TempBackups.js'); await refreshTempBackups(storeHandle) },
     reread: async (disk, id) => { await (await import('./Instance.js')).createOrUpdateInstance(storeHandle, id, disk) },
-    start: async (inst, disk) => (await import('./Instance.js')).startInstance(storeHandle, inst, disk),
+    start: async (inst, disk, opts) => (await import('./Instance.js')).startInstance(storeHandle, inst, disk, 'console-command', opts ?? {}),
+    loadImages: (instDir, mountRoot, strict) => defaultLoadImages(instDir, mountRoot, strict),
+    stepComposeFiles: async (inst, disk, writeEnv) => {
+        const I = await import('./Instance.js')
+        const mountRoot = await diskMountRoot(disk)
+        const store = storeHandle.doc()
+        const fresh = (store.instanceDB[inst.id] as Instance) ?? inst
+        if (writeEnv) {
+            const instDir = joinMountRoot(mountRoot, 'instances', String(inst.id))
+            if (!await fs.pathExists(path.join(instDir, '.env'))) await fs.writeFile(path.join(instDir, '.env'), '')
+            await I.writeStartHostEnv(store, fresh, mountRoot)
+        }
+        const env = await (await import('./FilesMount.js')).composeFileEnv(store, fresh)
+        if (!env?.COMPOSE_FILE) return []
+        const instDir = joinMountRoot(mountRoot, 'instances', String(inst.id))
+        return env.COMPOSE_FILE.split(':').filter(f => f && f !== 'compose.yaml').map(f => path.resolve(instDir, f))
+    },
+    runStep: (kind, spec, ctx, opts) => runUpdateStep(kind, spec, ctx, opts),
     health: async (id) => {
         const ids = (await docker(['ps', '-aq', '--filter', `label=com.docker.compose.project=${id}`])).split('\n').map(s => s.trim()).filter(Boolean)
         if (!ids.length) return aggregateHealth([])
@@ -382,6 +451,17 @@ export const readXApp = async (composePath: string): Promise<Record<string, any>
     catch { return {} }
 }
 
+/** engine#456: the service names of a compose file; [] when unreadable. */
+export const readComposeServices = async (composePath: string): Promise<string[]> => {
+    try {
+        const sv = YAML.parse(await fs.readFile(composePath, 'utf8'))?.services
+        return sv && typeof sv === 'object' && !Array.isArray(sv) ? Object.keys(sv) : []
+    } catch { return [] }
+}
+
+/** engine#456: the plain updateApp that resumes a committed update (Console reuses the Update action). */
+export const resumeCommand = (inst: Pick<Instance, 'id' | 'instanceOf'>): string => `updateApp ${inst.id} ${inst.instanceOf}`
+
 /**
  * idea#448 (Steve): the new bundle must not ship a path in the snapshot exclude list. Swap
  * copies the bundle over the instance folder, so such a path would overwrite the identity
@@ -489,6 +569,16 @@ export const updateApp = async (
     const helper = await d.helperProblem()
     if (helper) throw new UpdateAppError('HELPER_OUTDATED', helper)
 
+    // engine#456 §10: while a committed update has not settled, the only update accepted is the
+    // plain resume `updateApp <id> <current version>` (no --source, no --allow-major).
+    if (inst.updatePending) {
+        const cur = String(inst.instanceOf)
+        const curVersion = appIdentity(cur, await readXApp(path.join(joinMountRoot(await d.mountRoot(disk), 'instances', String(inst.id)), 'compose.yaml'))).version
+        const isResume = (newAppId === cur || newAppId === curVersion) && !opts.allowMajor && !opts.sourceDiskId
+        if (!isResume) throw new UpdateAppError('UPDATE_PENDING', `finish the current update first: send ${resumeCommand(inst)} (no --source, no --allow-major) to run its work and settle steps again`)
+        return resumeUpdate(storeHandle, d, inst, disk, engineId)
+    }
+
     const key = instanceKey(inst.id)
     const gotLock = resourceLock.acquire(key, 'updateApp')
     if (gotLock) beginUsageSkip('update')
@@ -526,6 +616,7 @@ export const updateApp = async (
         // each App; splitting `kiwix-release-1.0` at a digit read the kit's kiwix@release-1.0 as kiwix-release@1.0.
         const liveXApp = await readXApp(path.join(instDir, 'compose.yaml'))
         const xapp = bundle ? await readXApp(path.join(bundle.dir, 'compose.yaml')) : {}
+        const newServices = bundle ? await readComposeServices(path.join(bundle.dir, 'compose.yaml')) : undefined
         const backupDue = backupIsDue(String(inst.instanceOf), newAppId, backupAgeMs, liveXApp, xapp)
         const backupDisk = backupDue ? linkedBackupDisk(store, engineId, inst) : null
         // engine#469: due, nothing to back up to, and something to back up: a temporary backup on
@@ -541,6 +632,7 @@ export const updateApp = async (
             shortDisks: [] as string[],
             updatesFrom: xapp.updatesFrom,
             xAppUpdate: xapp.update,
+            newServices,
             backupPlanned: !!backupDisk || tempBackupPlanned,
             backupMethod: liveBackupMethod,
         }
@@ -595,6 +687,10 @@ export const updateApp = async (
         // idea#458: the pre-update backup method comes from the LIVE compose (a backup of the
         // current instance), never from the new bundle.
         progress('Check')
+        // engine#456: checkUpdate has validated it; the steps come from the NEW bundle only
+        const parsed = parseUpdateContract(xapp.update, newServices)
+        const contract: UpdateContract = parsed.ok ? parsed.contract : {}
+        const staged = contractHasSteps(contract)
 
         const fromAppId = inst.instanceOf
         const opId = createOperation(storeHandle, 'updateApp', { instanceId: String(inst.id), diskId: String(disk.id), fromAppId: String(fromAppId), toAppId: newAppId }, 'console-command', { type: 'instance', id: inst.id })
@@ -602,6 +698,9 @@ export const updateApp = async (
         updateOperation(storeHandle, opId, { status: 'Running' })
         const setStep = (step: UpdateStep) => updateOperation(storeHandle, opId, { currentStep: UPDATE_STEPS.indexOf(step), totalSteps: UPDATE_STEPS.length, stepLabel: step })
         let step: UpdateStep = 'Snapshot'
+        // engine#456: set once verify passed and args.committed is persisted (no rollback after it)
+        let committed = false
+        let markerWritten = false
         let snap: SnapshotResult | null = null
         let stopped = false
         let preUpdateBackup: UpdateResult['preUpdateBackup'] = null
@@ -641,9 +740,11 @@ export const updateApp = async (
             log(`updateApp: ${inst.id}: temporary pre-update backup ${tempBackup.path} done (${tempBackup.sizeBytes} bytes, inside the snapshot stop)`)
         }
         try {
-            if (hookFirst) await takeBackup(false)
-            // ── Snapshot
-            setStep('Snapshot'); progress('Snapshot', 0, dataBytes)
+            // ── Backup (engine#456: its own step; a hook backup runs before anything stops)
+            if (hookFirst) { setStep('Backup'); progress('Backup'); await takeBackup(false) }
+            // ── Snapshot (a stop-mode or temporary backup runs inside the one Snapshot stop, under Backup)
+            const backupInStop = (!!backupDisk && !hookFirst) || tempBackupPlanned
+            if (backupInStop) { setStep('Backup'); progress('Backup') } else { setStep('Snapshot'); progress('Snapshot', 0, dataBytes) }
             if (wasUp) { stopped = true; await d.stop(inst, disk) }
             await waitContainersGone(d, inst.id)
             // engine#449: env-gated test hook, read per call. Fail pre-swap after
@@ -651,6 +752,7 @@ export const updateApp = async (
             if (shouldFailUpdateRestart(inst.id)) throw new Error(TEST_FAIL_UPDATE_FAILURE_MESSAGE)
             if (backupDisk && !hookFirst) await takeBackup(true)
             if (tempBackupPlanned) await takeTempBackup()
+            if (backupInStop) { setStep('Snapshot'); progress('Snapshot', 0, dataBytes) }
             try { snap = await d.snapshot(disk, inst.id, snapExcludes) } catch (e) {
                 const m = String((e as Error).message)
                 const ns = m.match(/NO_SPACE: [^\n]*/)
@@ -669,6 +771,8 @@ export const updateApp = async (
             const oldX = await readXApp(liveComposePath)
             const oldDemo = oldX.demo === true ? true as const : undefined
             const targetApps = joinMountRoot(instRoot, 'apps', newAppId)
+            // engine#456 Q4: from here until verify passes, no other start may run this folder
+            if (staged) { await writeUpdateInFlight(instDir, opId, engineId); markerWritten = true }
             if (bundle!.dir !== targetApps) await d.copyBundle(bundle!.dir, targetApps)
             await d.copyBundle(bundle!.dir, instDir)
             const composePath = path.join(instDir, 'compose.yaml')
@@ -676,10 +780,31 @@ export const updateApp = async (
             await d.reread(disk, inst.id)
             done.push('Swap')
             if (oldDemo) await refreshDemoPackWarning(storeHandle, instDir, bundle!.dir, inst.id)
+            const fromVersion = appIdentity(String(fromAppId), liveXApp).version
+            const toVersion = appIdentity(newAppId, xapp).version
+            const stepCtx = async (writeEnv: boolean): Promise<StepContext> => ({
+                instanceDir: instDir, project: composeProjectFor(String(inst.id)), fromVersion, toVersion,
+                extraComposeFiles: await d.stepComposeFiles((storeHandle.doc().instanceDB[inst.id] as Instance) ?? inst, disk, writeEnv),
+            })
+            const setNote = (s: UpdateStep, note: string | null) => setPhaseNote(storeHandle, d, opId, engineId, String(inst.id), s, note)
+            // ── LoadImages (engine#456: every App; offline, never a pull)
+            step = 'LoadImages'; setStep('LoadImages'); progress('LoadImages')
+            try { await d.loadImages(instDir, instRoot, staged) } catch (e) {
+                throw new UpdateAppError('PREPARE_FAILED', `the service images could not be loaded from the disk: ${(e as Error).message}`)
+            }
+            done.push('LoadImages')
+            // ── Prepare (one-off container, the App's own containers stay down)
+            if (contract.prepare) {
+                step = 'Prepare'; setStep('Prepare'); progress('Prepare')
+                const r = await d.runStep('prepare', contract.prepare, await stepCtx(true))
+                setNote('Prepare', r.note)
+                if (!stepOk(r)) throw new UpdateAppError('PREPARE_FAILED', stepFailureText('prepare', contract.prepare, r))
+                done.push('Prepare')
+            }
             // ── Start
             step = 'Start'; setStep('Start'); progress('Start')
             const fresh = storeHandle.doc().instanceDB[inst.id] as Instance
-            await d.start(fresh, disk)
+            await d.start(fresh, disk, { ...(staged ? { updateOpId: opId } : {}), imagesLoaded: true })
             const after = storeHandle.doc().instanceDB[inst.id]
             if (!after || after.status === 'Error') throw new Error(`start failed: ${after?.statusCondition ?? 'instance record missing'}`)
             done.push('Start')
@@ -706,25 +831,24 @@ export const updateApp = async (
                 await d.sleep(d.pollMs)
             }
             done.push('Health')
-            // engine#469: past the health gate the temporary backup is really deleted (Koen's exception).
-            let tempDeleted = false
-            if (tempBackup) {
-                const tbr: TempBackupRef = tempBackup
-                try {
-                    await d.tempBackupDelete(inst.id, tbr.stamp)
-                    tempDeleted = true
-                    setTempBackupOpArgs(storeHandle, opId, tbr, 'deleted')
-                    log(`updateApp: ${inst.id}: temporary pre-update backup ${tbr.path} deleted after the health gate`)
-                } catch (e) {
-                    setTempBackupOpArgs(storeHandle, opId, tbr, 'delete-failed')
-                    // Like backupApp's args.postStartWarning (engine#468): the update stays Done, the operation
-                    // and the trace (console.warn lands in it) say the space was not given back.
-                    const warning = tempBackupWarningMessage(tbr.path, (e as Error).message)
-                    storeHandle.change(doc => { const o = doc.operationDB?.[opId]; if (o) o.args.tempBackupWarning = warning })
-                    console.warn(`updateApp: ${inst.id}: ${warning}`)
-                }
-                await d.refreshTempBackups().catch(re => log(`updateApp: ${inst.id}: tempBackups refresh after delete: ${(re as Error).message}`))
+            // ── Verify (in the running service; never runs when Health failed)
+            if (contract.verify) {
+                step = 'Verify'; setStep('Verify'); progress('Verify')
+                const r = await d.runStep('verify', contract.verify, await stepCtx(false))
+                setNote('Verify', r.note)
+                if (!stepOk(r)) throw new UpdateAppError('VERIFY_FAILED', stepFailureText('verify', contract.verify, r))
+                done.push('Verify')
             }
+            // ── point of no return (E2): persisted BEFORE work starts, so boot recovery never rolls back after it
+            storeHandle.change(doc => {
+                const o = doc.operationDB?.[opId]
+                if (o) { o.args.committed = 'true'; o.args.committedAt = String(d.now()); o.args.fromVersion = fromVersion; o.args.toVersion = toVersion }
+            })
+            committed = true
+            if (markerWritten) {
+                await clearUpdateInFlight(instDir, opId).catch(me => console.warn(`updateApp: ${inst.id}: could not remove the update-in-flight marker after verify: ${(me as Error).message}; the App will not start on its own until it is removed`))
+            }
+            const pending = !!(contract.work || contract.settle)
             storeHandle.change(doc => {
                 const i = doc.instanceDB[inst.id]
                 if (i) {
@@ -735,12 +859,22 @@ export const updateApp = async (
                         bootId: d.bootId(),
                         uptimeS: d.uptimeS(),
                     }
+                    if (staged) i.updatePending = true
                 }
+            })
+            if (pending) log(`updateApp: ${inst.id}: verify passed (point of no return); ${newAppId} runs; work and settle follow`)
+            // ── Work, Settle (no rollback); the temporary backup goes only after full success
+            const fin = await finishCommitted(storeHandle, d, {
+                inst, opId, engineId, contract, stepCtx: () => stepCtx(false), tempBackup, toAppId: newAppId,
+                resumeHint: `updateApp ${inst.id} ${newAppId}`, setStep, progress, done,
             })
             updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
             log(`updateApp: ${inst.id} ('${inst.name}') ${fromAppId} -> ${newAppId}; snapshot ${snap.path} (${snap.sizeBytes} bytes) kept`)
-            return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes, snapshotExcludes: snapExcludes, preUpdateBackup, tempBackup: tempBackupResult(tempBackup, tempDeleted) }
+            return { instanceId: inst.id, name: String(inst.name), fromAppId, toAppId: newAppId as AppID, snapshotPath: snap.path, snapshotBytes: snap.sizeBytes, steps: done, previousSnapshotQuarantinedAt: snap.previousQuarantinedAt, volumes: snap.volumes, snapshotExcludes: snapExcludes, preUpdateBackup, tempBackup: tempBackupResult(tempBackup, fin.tempDeleted) }
         } catch (e) {
+            // engine#456: after the point of no return there is no rollback; finishCommitted already
+            // ended the operation (MIGRATIONS_PENDING / SETTLE_FAILED) and the App keeps running.
+            if (committed) throw e
             const why = e instanceof UpdateAppError && e.code === 'NO_SPACE' ? null : String((e as Error).message)
             if (!why || !snap) {
                 // Before a complete snapshot nothing was swapped: the old version is intact.
@@ -802,7 +936,7 @@ export const updateApp = async (
             } catch (e) {
                 log(`updateApp: ${inst.id}: ${(e as Error).message}; restore-snapshot will use the live backup.exclude list only`)
             }
-            const err = await rollBack(storeHandle, d, inst, disk, instDir, step, why, snap, restoreExcludes, tempBackup)
+            const err = await rollBack(storeHandle, d, inst, disk, instDir, step, why, snap, restoreExcludes, tempBackup, String(inst.instanceOf), opId)
             keepTempBackup(storeHandle, opId, err, tempBackup)
             updateOperation(storeHandle, opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
             throw err
@@ -864,27 +998,29 @@ const keepTempBackup = (storeHandle: DocHandle<Store>, opId: string, err: Error,
 const tempBackupResult = (tb: TempBackupRef | null, deleted: boolean): UpdateResult['tempBackup'] =>
     tb ? { path: tb.path, sizeBytes: tb.sizeBytes, deleted } : null
 
-/** Restore the snapshot and start the old version. Returns the error to report. */
+/**
+ * Restore the snapshot and start the old version. Returns the error to report.
+ * engine#456 (Q6, mirrors #468): when the data was restored but the old version does not start,
+ * the result is ROLLBACK_START_FAILED (instance Stopped, statusCondition "ROLLBACK START FAILED: …"),
+ * not "the rollback failed". After a successful restore the update-in-flight marker of `opId` is
+ * cleared (restore-snapshot normally moved it aside already).
+ */
 const rollBack = async (
     storeHandle: DocHandle<Store>, d: UpdateDeps, inst: Instance, disk: Disk, instDir: string,
     failedAt: UpdateStep, why: string, snap: { path: string, sizeBytes: number }, excludes: string[],
     tempBackup: TempBackupRef | null = null,
     /** the version the rollback puts back (the op's fromAppId); at boot inst.instanceOf may already be the new one */
     restoredAppId: string = String(inst.instanceOf),
+    /** engine#456: the update operation (owner of the update-in-flight marker) */
+    opId: string | null = null,
 ): Promise<UpdateAppError> => {
     const plan = rollbackPlan(failedAt)
     log(`updateApp: ${failedAt} failed for ${inst.id} (${why}); rolling back from ${snap.path}`)
     writePreUpdateGate(storeHandle, inst.id, null)
     const wasUp = inst.status === 'Running' || inst.status === 'Starting'
-    const startOld = async () => {
-        await d.reread(disk, inst.id)
-        if (plan.startOld && wasUp) {
-            await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk)
-            const after = storeHandle.doc().instanceDB[inst.id]
-            if (!after || after.status === 'Error') throw new Error(`the old version did not start: ${after?.statusCondition ?? 'record missing'}`)
-        }
-    }
     let dataRestored = !plan.restoreData
+    let restoredFrom = `from ${snap.path}`
+    let snapWhy: string | null = null
     try {
         await d.composeDown(instDir, inst.id)
         await waitContainersGone(d, inst.id)
@@ -894,33 +1030,228 @@ const rollBack = async (
             dataRestored = true
             log(`updateApp: ${inst.id} restored in place from ${snap.path}; the replaced files are kept at ${aside}`)
         }
-        await startOld()
-        return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. ${restoredAppId} and its data were restored from ${snap.path}`)
     } catch (e) {
-        const snapWhy = (e as Error).message
+        snapWhy = (e as Error).message
+    }
+    let tempWhy: string | null = null
+    if (snapWhy !== null && !dataRestored && tempBackup) {
         // engine#469: the snapshot could not be put back: restore from the temporary backup instead.
-        let tempWhy: string | null = null
-        if (tempBackup && !dataRestored) {
-            try {
-                log(`updateApp: ${inst.id}: the snapshot rollback failed (${snapWhy}); restoring from the temporary pre-update backup ${tempBackup.path}`)
-                await d.composeDown(instDir, inst.id).catch(ce => log(`updateApp: ${inst.id}: compose down before the temporary-backup restore: ${(ce as Error).message}`))
-                await waitContainersGone(d, inst.id)
-                const aside = await d.tempBackupRestore(disk, inst.id, tempBackup.stamp)
-                await startOld()
-                return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}. The snapshot rollback failed (${snapWhy}), so ${restoredAppId} and its data were restored from the temporary pre-update backup ${tempBackup.path}${aside && aside !== 'none' ? ` (the replaced folder is at ${aside})` : ''}`)
-            } catch (te) {
-                tempWhy = (te as Error).message
-            }
+        try {
+            log(`updateApp: ${inst.id}: the snapshot rollback failed (${snapWhy}); restoring from the temporary pre-update backup ${tempBackup.path}`)
+            await d.composeDown(instDir, inst.id).catch(ce => log(`updateApp: ${inst.id}: compose down before the temporary-backup restore: ${(ce as Error).message}`))
+            await waitContainersGone(d, inst.id)
+            const aside = await d.tempBackupRestore(disk, inst.id, tempBackup.stamp)
+            dataRestored = true
+            restoredFrom = `from the temporary pre-update backup ${tempBackup.path}${aside && aside !== 'none' ? ` (the replaced folder is at ${aside})` : ''}`
+        } catch (te) {
+            tempWhy = (te as Error).message
         }
+    }
+    const markStopped = (err: UpdateAppError) => storeHandle.change(doc => {
+        const i = doc.instanceDB[inst.id]
+        if (!i) return
+        i.status = 'Stopped' as any
+        i.statusCondition = err.message
+    })
+    if (!dataRestored) {
         const tempClause = tempWhy ? `; restoring from the temporary pre-update backup ${tempBackup!.path} failed too: ${tempWhy}` : ''
         const err = new UpdateAppError('ROLLBACK_FAILED', `${failedAt} failed: ${why}; then the rollback failed: ${snapWhy}. The snapshot is kept at ${snap.path}${tempClause}`)
-        storeHandle.change(doc => {
-            const i = doc.instanceDB[inst.id]
-            if (!i) return
-            i.status = 'Stopped' as any
-            i.statusCondition = err.message
-        })
+        markStopped(err)
         return err
+    }
+    if (opId) await clearUpdateInFlight(instDir, opId).catch(me => log(`updateApp: ${inst.id}: clearing the update-in-flight marker after the restore: ${(me as Error).message}`))
+    const snapClause = snapWhy !== null ? `. The snapshot rollback failed (${snapWhy}), so` : '.'
+    try {
+        await d.reread(disk, inst.id)
+        if (plan.startOld && wasUp) {
+            await d.start(storeHandle.doc().instanceDB[inst.id] as Instance, disk, opId ? { updateOpId: opId } : undefined)
+            const after = storeHandle.doc().instanceDB[inst.id]
+            if (!after || after.status === 'Error') throw new Error(after?.statusCondition ?? 'record missing')
+        }
+    } catch (e) {
+        const cond = String((e as Error).message).replace(/^the old version did not start: /, '')
+        const err = new UpdateAppError('ROLLBACK_START_FAILED', `${failedAt} failed: ${why}${snapClause} ${restoredAppId} and its data were restored ${restoredFrom}; the old version did not start: ${cond}`)
+        markStopped(err)
+        log(`updateApp: ${inst.id}: ${err.message}`)
+        return err
+    }
+    return new UpdateAppError('ROLLED_BACK', `${failedAt} failed: ${why}${snapClause} ${restoredAppId} and its data were restored ${restoredFrom}`)
+}
+
+/** engine#456: a step run counts as passed only on exit 0 within its timeout. */
+const stepOk = (r: StepRun): boolean => r.exitCode === 0 && !r.timedOut && !r.spawnError
+
+/** engine#456: the step's ERROR: / not yet: line goes to the op (args.phaseNote) and idea/updateProgress. */
+const setPhaseNote = (storeHandle: DocHandle<Store>, d: Pick<UpdateDeps, 'broadcast'>, opId: string, engineId: string, instanceId: string, step: UpdateStep, note: string | null): void => {
+    if (!note) return
+    storeHandle.change(doc => { const o = doc.operationDB?.[opId]; if (o) o.args.phaseNote = note })
+    d.broadcast({ type: UPDATE_PROGRESS_TYPE, engineId, instanceId, step, bytesDone: 0, bytesTotal: 0, phaseNote: note })
+}
+
+interface CommitContext {
+    inst: Instance
+    opId: string
+    engineId: string
+    contract: UpdateContract
+    stepCtx: () => Promise<StepContext>
+    tempBackup: TempBackupRef | null
+    /** other operations that recorded the same temporary backup (the committed op, on a resume) */
+    tempBackupOps?: string[]
+    toAppId: string
+    resumeHint: string
+    setStep: (s: UpdateStep) => void
+    progress: (s: UpdateStep, bytesDone?: number, bytesTotal?: number) => void
+    done: UpdateStep[]
+}
+
+/**
+ * engine#456 §2: work and settle after the point of no return. Never rolls back. A failed or
+ * timed-out work, or a settle that still says "not yet" at its timeout, ends the operation Failed
+ * with MIGRATIONS_PENDING; any other settle exit ends it SETTLE_FAILED. In both cases the App stays
+ * Running with Instance.updatePending and the temporary backup is kept. Full success (settle exited
+ * 0, or nothing left to run) clears updatePending and deletes the temporary backup (Koen's exception).
+ */
+const finishCommitted = async (storeHandle: DocHandle<Store>, d: UpdateDeps, c: CommitContext): Promise<{ tempDeleted: boolean }> => {
+    const id = String(c.inst.id)
+    const fail = (code: 'MIGRATIONS_PENDING' | 'SETTLE_FAILED', text: string): UpdateAppError => {
+        const err = new UpdateAppError(code, `${text}; ${c.toAppId} keeps running; send ${c.resumeHint} to finish the update`)
+        keepTempBackup(storeHandle, c.opId, err, c.tempBackup)
+        updateOperation(storeHandle, c.opId, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
+        log(`updateApp: ${id}: ${err.message}`)
+        return err
+    }
+    let current: UpdateStep = 'Work'
+    try {
+        const work = c.contract.work
+        if (work) {
+            current = 'Work'; c.setStep('Work'); c.progress('Work')
+            const r = await d.runStep('work', work, await c.stepCtx())
+            setPhaseNote(storeHandle, d, c.opId, c.engineId, id, 'Work', r.note)
+            if (!stepOk(r)) throw fail('MIGRATIONS_PENDING', stepFailureText('work', work, r))
+            c.done.push('Work')
+        }
+        const settle = c.contract.settle
+        if (settle) {
+            current = 'Settle'; c.setStep('Settle'); c.progress('Settle', 0, settle.timeout * 1000)
+            const t0 = d.now(), deadline = t0 + settle.timeout * 1000
+            let runs = 0, lastNote: string | null = null
+            const ctx = await c.stepCtx()
+            for (;;) {
+                const leftS = Math.ceil((deadline - d.now()) / 1000)
+                if (leftS <= 0) throw fail('MIGRATIONS_PENDING', `settle ${settle.command} did not report settled within ${settle.timeout} s (${runs} run${runs === 1 ? '' : 's'})${lastNote ? `: ${lastNote}` : ''}`)
+                const budget = Math.min(settle.timeout, leftS)
+                const r = await d.runStep('settle', settle, ctx, { timeoutS: budget })
+                runs++
+                setPhaseNote(storeHandle, d, c.opId, c.engineId, id, 'Settle', r.note)
+                if (stepOk(r)) break
+                if (r.timedOut) throw fail('MIGRATIONS_PENDING', stepFailureText('settle', settle, r, budget))
+                if (r.exitCode !== 3) throw fail('SETTLE_FAILED', stepFailureText('settle', settle, r))
+                lastNote = r.note
+                c.progress('Settle', Math.min(d.now() - t0, settle.timeout * 1000), settle.timeout * 1000)
+                if (d.now() + settle.interval! * 1000 >= deadline) {
+                    throw fail('MIGRATIONS_PENDING', `settle ${settle.command} still reported not yet after ${settle.timeout} s (${runs} run${runs === 1 ? '' : 's'})${lastNote ? `: ${lastNote}` : ''}`)
+                }
+                await d.sleep(settle.interval! * 1000)
+            }
+            c.done.push('Settle')
+        }
+    } catch (e) {
+        if (e instanceof UpdateAppError && (e.code === 'MIGRATIONS_PENDING' || e.code === 'SETTLE_FAILED')) throw e
+        throw fail('MIGRATIONS_PENDING', `${current} could not run: ${(e as Error).message}`)
+    }
+    // ── full success
+    storeHandle.change(doc => {
+        const i = doc.instanceDB[c.inst.id] as any
+        if (i && i.updatePending !== undefined) delete i.updatePending
+    })
+    // engine#469 / engine#456 §4: only now is the temporary backup really deleted (Koen's exception).
+    let tempDeleted = false
+    if (c.tempBackup) {
+        const tbr: TempBackupRef = c.tempBackup
+        const ops = [c.opId, ...(c.tempBackupOps ?? [])]
+        try {
+            await d.tempBackupDelete(c.inst.id, tbr.stamp)
+            tempDeleted = true
+            for (const o of ops) setTempBackupOpArgs(storeHandle, o, tbr, 'deleted')
+            log(`updateApp: ${id}: temporary pre-update backup ${tbr.path} deleted after the update finished`)
+        } catch (e) {
+            for (const o of ops) setTempBackupOpArgs(storeHandle, o, tbr, 'delete-failed')
+            // Like backupApp's args.postStartWarning (engine#468): the update stays Done, the operation
+            // and the trace (console.warn lands in it) say the space was not given back.
+            const warning = tempBackupWarningMessage(tbr.path, (e as Error).message)
+            storeHandle.change(doc => { const o = doc.operationDB?.[c.opId]; if (o) o.args.tempBackupWarning = warning })
+            console.warn(`updateApp: ${id}: ${warning}`)
+        }
+        await d.refreshTempBackups().catch(re => log(`updateApp: ${id}: tempBackups refresh after delete: ${(re as Error).message}`))
+    }
+    return { tempDeleted }
+}
+
+/** engine#456: the newest updateApp operation of the instance that passed its point of no return. */
+export const committedUpdateOp = (store: Store, instanceId: string) =>
+    Object.values(store.operationDB ?? {})
+        .filter(o => o && o.kind === 'updateApp' && String(o.args?.instanceId) === instanceId && o.args?.committed === 'true')
+        .sort((a, b) => Number(b.startedAt ?? 0) - Number(a.startedAt ?? 0))[0] ?? null
+
+/**
+ * engine#456 Q1 / §10: Resume. A plain `updateApp <id> <current version>` while updatePending is
+ * set runs only work and settle again (the steps of the compose now in the folder), in a new
+ * updateApp operation (args.resume / args.resumeOf). Nothing is stopped, swapped or rolled back.
+ */
+const resumeUpdate = async (storeHandle: DocHandle<Store>, d: UpdateDeps, inst: Instance, disk: Disk, engineId: string): Promise<UpdateResult> => {
+    const key = instanceKey(inst.id)
+    if (!resourceLock.acquire(key, 'updateApp')) throw new UpdateAppError('BUSY', 'another operation is running on this instance')
+    beginUsageSkip('update')
+    let opened = false
+    try {
+        const root = await d.mountRoot(disk)
+        const instDir = joinMountRoot(root, 'instances', String(inst.id))
+        const composePath = path.join(instDir, 'compose.yaml')
+        const xapp = await readXApp(composePath)
+        const parsed = parseUpdateContract(xapp.update, await readComposeServices(composePath))
+        if (!parsed.ok) throw parsed.error
+        if (inst.status !== 'Running' && inst.status !== 'Starting') {
+            throw new UpdateAppError('UPDATE_PENDING', `${inst.instanceOf} is ${inst.status}; start it, then send ${resumeCommand(inst)} again to finish the update`)
+        }
+        const prev = committedUpdateOp(storeHandle.doc(), String(inst.id))
+        const toAppId = String(inst.instanceOf)
+        const fromAppId = prev?.args?.fromAppId ? String(prev.args.fromAppId) : String(inst.previousAppId ?? toAppId)
+        const tb = prev ? tempBackupFromOp(prev) : null
+        const opId = createOperation(storeHandle, 'updateApp', {
+            instanceId: String(inst.id), diskId: String(disk.id), fromAppId, toAppId,
+            resume: 'true', resumeOf: prev ? String(prev.id) : '', committed: 'true',
+            fromVersion: prev?.args?.fromVersion || appIdentity(fromAppId, undefined).version, toVersion: appIdentity(toAppId, xapp).version,
+        }, 'console-command', { type: 'instance', id: inst.id })
+        opened = true
+        updateOperation(storeHandle, opId, { status: 'Running' })
+        if (tb) setTempBackupOpArgs(storeHandle, opId, tb, 'kept')
+        const setStep = (step: UpdateStep) => updateOperation(storeHandle, opId, { currentStep: UPDATE_STEPS.indexOf(step), totalSteps: UPDATE_STEPS.length, stepLabel: step })
+        const progress = (step: UpdateStep, bytesDone = 0, bytesTotal = 0) =>
+            d.broadcast({ type: UPDATE_PROGRESS_TYPE, engineId, instanceId: String(inst.id), step, bytesDone, bytesTotal })
+        const fromVersion = prev?.args?.fromVersion || appIdentity(fromAppId, undefined).version
+        const toVersion = appIdentity(toAppId, xapp).version
+        const done: UpdateStep[] = []
+        log(`updateApp: ${inst.id}: resuming the committed update ${fromAppId} -> ${toAppId}${prev ? ` (operation ${prev.id})` : ''}: work and settle only`)
+        const fin = await finishCommitted(storeHandle, d, {
+            inst, opId, engineId, contract: parsed.contract, tempBackup: tb, tempBackupOps: prev ? [String(prev.id)] : [],
+            toAppId, resumeHint: resumeCommand(inst), setStep, progress, done,
+            stepCtx: async () => ({
+                instanceDir: instDir, project: composeProjectFor(String(inst.id)), fromVersion, toVersion,
+                extraComposeFiles: await d.stepComposeFiles((storeHandle.doc().instanceDB[inst.id] as Instance) ?? inst, disk, false),
+            }),
+        })
+        updateOperation(storeHandle, opId, { status: 'Done', completedAt: d.now() as Timestamp })
+        log(`updateApp: ${inst.id}: the update to ${toAppId} has finished (resumed)`)
+        return {
+            instanceId: inst.id, name: String(inst.name), fromAppId: fromAppId as AppID, toAppId: toAppId as AppID,
+            snapshotPath: joinMountRoot(root, PRE_UPDATE_DIR, String(inst.id)), snapshotBytes: 0, steps: done,
+            previousSnapshotQuarantinedAt: null, volumes: [], snapshotExcludes: [], preUpdateBackup: null,
+            tempBackup: tempBackupResult(tb, fin.tempDeleted), resumed: true,
+        }
+    } finally {
+        resourceLock.release(key)
+        endUsageSkip('update')
+        if (opened) await refreshOfferAfterUpdate(storeHandle, String(engineId), d)
     }
 }
 
@@ -942,7 +1273,26 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
         const inst = store.instanceDB[op.args.instanceId as InstanceID]
         const disk = inst && store.diskDB[inst.storedOn as DiskID] as Disk
         if (!inst || !disk || String(disk.dockedTo) !== engineId) { out.push(`${op.args.instanceId}: disk not docked; left as is`); continue }
-        const step = UPDATE_STEPS[op.currentStep ?? 0] ?? 'Snapshot'
+        // Operations written before #456 have six indices; interpret them with the old list.
+        const legacySteps: UpdateStep[] = ['Fetch', 'Check', 'Snapshot', 'Swap', 'Start', 'Health']
+        const step = (op.totalSteps === 6 || op.totalSteps == null ? legacySteps : UPDATE_STEPS)[op.currentStep ?? 0] ?? 'Snapshot'
+        const root0 = await d.mountRoot(disk)
+        const instDir0 = joinMountRoot(root0, 'instances', String(inst.id))
+        if (op.args?.committed === 'true') {
+            // engine#456 §5: past the point of no return (verify passed) there is no rollback. The
+            // op ends MIGRATIONS_PENDING, the App starts normally on the new version, and Resume is
+            // an explicit updateApp (the queued command is dropped, never replayed).
+            const tb = tempBackupFromOp(op)
+            if (tb) setTempBackupOpArgs(storeHandle, op.id, tb, 'kept')
+            await clearUpdateInFlight(instDir0, op.id).catch(me => log(`updateApp: ${inst.id}: ${(me as Error).message}`))
+            storeHandle.change(doc => { const i = doc.instanceDB[inst.id]; if (i) i.updatePending = true })
+            const err = new UpdateAppError('MIGRATIONS_PENDING', `the Engine restarted during ${step}, after verify passed (interrupted); ${inst.instanceOf} starts normally; send ${resumeCommand(inst)} to finish the update`)
+            keepTempBackup(storeHandle, op.id, err, tb)
+            updateOperation(storeHandle, op.id, { status: 'Failed', error: err.message, completedAt: d.now() as Timestamp })
+            dropInterruptedCommand(storeHandle, op)
+            out.push(`${inst.id}: ${err.message}`)
+            continue
+        }
         const snaps = (await d.listSnapshots(disk).catch(() => null))?.snapshots ?? []
         const complete = snaps.some(s => String(s.instanceId) === String(inst.id) && s.complete)
         const swapped = UPDATE_STEPS.indexOf(step) >= UPDATE_STEPS.indexOf('Swap')
@@ -950,6 +1300,8 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
             // engine#469: never deleted on boot; a temporary backup of this op stays for a manual restore.
             const tb = tempBackupFromOp(op)
             if (tb) setTempBackupOpArgs(storeHandle, op.id, tb, 'kept')
+            // engine#456: nothing was swapped, so a marker of this op (written at Swap) can go
+            if (!swapped) await clearUpdateInFlight(instDir0, op.id).catch(me => log(`updateApp: ${inst.id}: ${(me as Error).message}`))
             out.push(`${inst.id}: interrupted at ${step}; old version untouched${tb ? `; the temporary pre-update backup is kept at ${tb.path}` : ''}`)
             continue
         }
@@ -962,7 +1314,7 @@ export const recoverInterruptedUpdates = async (storeHandle: DocHandle<Store>, e
             log(`updateApp: ${inst.id}: ${(e as Error).message}; restoring with the snapshot's own EXCLUDE list only`)
         }
         const err = await rollBack(storeHandle, d, inst, disk, instDir, step, 'the Engine restarted during the update', { path: joinMountRoot(root, PRE_UPDATE_DIR, String(inst.id)), sizeBytes: 0 }, excludes, tempBackupFromOp(op),
-            op.args.fromAppId ? String(op.args.fromAppId) : String(inst.instanceOf))
+            op.args.fromAppId ? String(op.args.fromAppId) : String(inst.instanceOf), op.id)
         keepTempBackup(storeHandle, op.id, err, tempBackupFromOp(op))
         updateOperation(storeHandle, op.id, { status: 'Failed', error: `INTERRUPTED: ${err.message}`, completedAt: d.now() as Timestamp })
         // Pi proof step 8: the updateApp command is still queued (a command leaves the queue only
@@ -1116,6 +1468,13 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
         // engine#480: the instance's live compose x-app names its App (kiwix@release-1.0), not a split of instanceOf
         const ownDisk = docked.find(x => String(x.id) === String(inst.storedOn))!
         const liveXApp = await d.mountRoot(ownDisk).then(r => d.readXApp(joinMountRoot(r, 'instances', String(inst.id)))).catch(() => ({}))
+        if (inst.updatePending) {
+            // engine#456 §10: while a committed update has not settled, the only offer is Resume (a plain
+            // updateApp to the version it already runs), never the next major
+            const v = appIdentity(String(inst.instanceOf), liveXApp).version
+            updates[String(inst.id)] = { appId: inst.instanceOf as AppID, fromVersion: v, toVersion: v, major: false }
+            continue
+        }
         let best: (typeof bundles)[number] | null = null
         for (const b of bundles) {
             if (!offerable({ currentAppId: String(inst.instanceOf), newAppId: b.appId, sumsValid: true, updatesFrom: b.xapp.updatesFrom, xAppUpdate: b.xapp.update, currentXApp: liveXApp, newXApp: b.xapp })) continue
