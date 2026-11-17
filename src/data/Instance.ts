@@ -1,4 +1,5 @@
 import { isCommitSha } from './AppIdParse.js'
+import { assertContainerdImageStore } from '../utils/containerdImageStore.js'
 import { buildImageSteps, checkLoadedDigest, checkServiceTarPin, digestInspectRef, legacyServiceImageTarName, parseImageRef, planExistingTarOnInstall, planPinnedServiceImageLoad, saveFailedMessage, saveName, serviceImageTarName, serviceTarQuarantineName, type TarPinState } from './ImageRef.js'
 import { $, YAML, chalk, fs, os, sleep } from "zx";
 
@@ -626,6 +627,9 @@ export const ensureSaveTag = async (serviceImage: string): Promise<void> => {
 /** idea#322/#445: a pinned service image must be present as repo@digest; throws a clear error if not. */
 export const verifyServiceImageDigest = async (serviceImage: string, opts: { requirePresent: boolean } = { requirePresent: true }): Promise<void> => {
   if (!serviceImage.includes('@')) return
+  // Fail early on a classic/unreachable store: RepoDigests do not survive docker load
+  // there, so a later digest comparison would look like a pin mismatch (idea#322).
+  await assertContainerdImageStore()
   const digestRef = digestInspectRef(serviceImage)
   let repoDigests: string[] | null = null
   let id: string | null = null

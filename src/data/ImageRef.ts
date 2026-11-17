@@ -21,6 +21,12 @@
  * the index) cannot be resolved offline from a tag-saved tar. The verify step fails with an error that
  * names this case and asks for the top-level digest (`docker buildx imagetools inspect repo:tag`,
  * the top-level "Digest:").
+ *
+ * Verify also requires Docker's containerd image store (`docker info` DriverStatus
+ * `driver-type: io.containerd.snapshotter.v1`). On the classic overlay2 store RepoDigests do not
+ * survive `docker load`, so verify fails early with `CONTAINERD_IMAGE_STORE_REQUIRED` (or
+ * `DOCKER_UNAVAILABLE` if Docker does not answer) instead of a confusing digest mismatch. The
+ * Engine startup self-check reports the same problem (`src/monitors/containerdImageStoreCheck.ts`).
  */
 
 import { createHash } from 'node:crypto'
