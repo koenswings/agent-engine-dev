@@ -18,6 +18,7 @@ import { checkingProgressMessage, setPortReadyProgress, resetPortReadyProgressFo
 import { MoveError, MOVE_CODES, MOVE_FAILURE_CODES, MOVE_REFUSAL_CODES, MOVE_DONE_CODES, MOVE_CROSS_ENGINE_CAPABILITY, moveFailedText, sourceNotRemovedText, sourceKeptText, withTargetCleanupText, sizesMatch } from '../../src/data/MoveAppShapes.js'
 import { recoverInterruptedOperations } from '../../src/data/Operations.js'
 import { RemoveError } from '../../src/data/RemoveInstance.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const SRC = String(localEngineId)
 const TGT = 'ENGINE_idea04' as EngineID
@@ -502,8 +503,8 @@ describe('moveApp across Engines (idea#79)', () => {
         expect(t.status).toBe(failed ? 'error' : 'ok')
         if (failed) {
             expect(t.errorCode).toBe(code)
-            expect(t.errorMessage).toBe(result.text)
-            expect(t.errorMessage).toMatch(/^MOVE FAILED: .*source kept/)
+            expect(commandLogText(t.errorMessage)).toBe(result.text)
+            expect(commandLogText(t.errorMessage)).toMatch(/^MOVE FAILED: .*source kept/)
         } else {
             expect(t.errorCode ?? null).toBeNull()
         }

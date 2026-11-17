@@ -30,6 +30,7 @@ import { backupLinkIo } from '../../src/data/BackupLinks.js'
 import { applyBackupResult, successResultCode, failureResultCode, isManualBackupCause, pickResultCode, BACKUP_RESULT_PRECEDENCE } from '../../src/data/BackupResults.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import { config } from '../../src/data/Config.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 let prevSkipBorg: boolean | undefined
 beforeEach(() => { prevSkipBorg = config.settings.skipBorg; config.settings.skipBorg = true })
@@ -233,7 +234,7 @@ describe('backupInstance results (idea#400)', () => {
         await backupInstance(storeHandle, INST, backupDisk)
         const t = traces().find(x => x.command === 'backupApp')
         expect(t?.status).toBe('error')
-        expect(t?.errorMessage).toMatch(/^BUSY: .*locked by 'scheduledBackup'/)
+        expect(commandLogText(t?.errorMessage)).toMatch(/^BUSY: .*locked by 'scheduledBackup'/)
         expect(storeHandle.doc()!.instanceDB[INST].lastResult ?? null).toBeNull()
     })
 
@@ -242,14 +243,14 @@ describe('backupInstance results (idea#400)', () => {
         expect(resourceLock.acquire(diskKey(backupDisk.id), 'restoreApp')).toBe(true)
         await backupInstance(storeHandle, INST, backupDisk, undefined, 'backup-app-docked')
         expect(storeHandle.doc()!.instanceDB[INST].lastResult?.result).toBe('SKIPPED_LOCKED')
-        expect(traces().find(x => x.command === 'backupApp')?.errorMessage).toMatch(/^SKIPPED_LOCKED: /)
+        expect(commandLogText(traces().find(x => x.command === 'backupApp')?.errorMessage)).toMatch(/^SKIPPED_LOCKED: /)
     })
 
     it('a CLI backupApp while locked is refused with BUSY and records nothing', async () => {
         const { storeHandle, backupDisk } = await setup()
         expect(resourceLock.acquire(diskKey(backupDisk.id), 'restoreApp')).toBe(true)
         await backupInstance(storeHandle, INST, backupDisk, undefined, 'cli-command')
-        expect(traces().find(x => x.command === 'backupApp')?.errorMessage).toMatch(/^BUSY: /)
+        expect(commandLogText(traces().find(x => x.command === 'backupApp')?.errorMessage)).toMatch(/^BUSY: /)
         expect(storeHandle.doc()!.instanceDB[INST].lastResult ?? null).toBeNull()
     })
 
@@ -260,7 +261,7 @@ describe('backupInstance results (idea#400)', () => {
         expect(resourceLock.acquire(diskKey(backupDisk.id), 'restoreApp')).toBe(true)
         await processBackupDisk(storeHandle, backupDisk)
         expect(storeHandle.doc()!.instanceDB[INST].lastResult?.result).toBe('SKIPPED_LOCKED')
-        expect(traces().find(x => x.command === 'backupApp')?.errorMessage).toMatch(/^SKIPPED_LOCKED: /)
+        expect(commandLogText(traces().find(x => x.command === 'backupApp')?.errorMessage)).toMatch(/^SKIPPED_LOCKED: /)
     })
 
     it('an App Disk that is not docked records APP_DISK_NOT_DOCKED', async () => {

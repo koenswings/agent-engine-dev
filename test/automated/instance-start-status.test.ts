@@ -70,6 +70,7 @@ import {
     TEST_CONTAINER_LABEL_VALUE,
 } from '../harness/diskSim.js'
 import { removeTestDir } from '../harness/removeTestDir.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const IMAGE = 'traefik/whoami'
 
@@ -84,7 +85,7 @@ const tracesOf = (h: DocHandle<CommandLogStore>, instanceId: string): CommandTra
         if (t.command !== START_INSTANCE_COMMAND) return false
         // Start traces carry instanceId and instanceName (engine#399); match either.
         try {
-            const args = JSON.parse(t.args)
+            const args = JSON.parse(String(t.args))
             return args.instanceId === instanceId || args.instanceName === `${instanceId}-name`
         } catch { return false }
     })
@@ -99,7 +100,7 @@ describe('failed start → command log (idea#109, unit)', () => {
         closeTrace(h, 't1', 'error', 'compose up failed')
         closeTrace(h, 't1', 'ok')
         expect(h.doc()!.traces['t1'].status).to.equal('error')
-        expect(h.doc()!.traces['t1'].errorMessage).to.equal('compose up failed')
+        expect(commandLogText(h.doc()!.traces['t1'].errorMessage)).to.equal('compose up failed')
         addTrace(h, { traceId: 't2', command: 'startInstance', args: '{}', startedAt: 1, completedAt: null, status: 'running', errorMessage: null })
         closeTrace(h, 't2', 'ok')
         expect(h.doc()!.traces['t2'].status, 'a normal ok close still works').to.equal('ok')
@@ -112,9 +113,9 @@ describe('failed start → command log (idea#109, unit)', () => {
         expect(all).to.have.length(1)
         expect(all[0].command).to.equal('startInstance')
         expect(all[0].status).to.equal('error')
-        expect(all[0].errorMessage).to.equal('boom')
+        expect(commandLogText(all[0].errorMessage)).to.equal('boom')
         expect(all[0].completedAt).to.be.a('number')
-        expect(JSON.parse(all[0].args)).to.deep.equal({ instanceName: 'inst-a-name', instanceId: 'inst-a', diskId: 'disk-a', cause: 'post-copy' })
+        expect(JSON.parse(String(all[0].args))).to.deep.equal({ instanceName: 'inst-a-name', instanceId: 'inst-a', diskId: 'disk-a', cause: 'post-copy' })
     })
 
     it('closes the active startInstance trace as failed instead of adding a second one', async () => {
@@ -125,7 +126,7 @@ describe('failed start → command log (idea#109, unit)', () => {
         closeTrace(h, 'outer', 'ok')   // what the wrapper does after startInstance returns
         expect(traces(h)).to.have.length(1)
         expect(h.doc()!.traces['outer'].status).to.equal('error')
-        expect(h.doc()!.traces['outer'].errorMessage).to.equal('boom')
+        expect(commandLogText(h.doc()!.traces['outer'].errorMessage)).to.equal('boom')
     })
 
     it('inside another command trace (e.g. backupApp) it adds its own startInstance trace', async () => {
@@ -143,7 +144,7 @@ describe('failed start → command log (idea#109, unit)', () => {
         const appended = await runWithTrace({ traceId: 'outer', command: 'startInstance', args: '{}' }, () =>
             addInstanceStartWarning({ level: 'warn', message: 'tar missing', timestamp: 5 }, h))
         expect(appended).to.be.true
-        expect(h.doc()!.traces['outer'].logs.map(l => [l.level, l.message])).to.deep.equal([['warn', 'tar missing']])
+        expect(h.doc()!.traces['outer'].logs.map(l => [l.level, String(l.message)])).to.deep.equal([['warn', 'tar missing']])
         expect(h.doc()!.traces['outer'].status, 'a warning alone does not fail the trace').to.equal('running')
         expect(await addInstanceStartWarning({ level: 'warn', message: 'x', timestamp: 6 }, h), 'outside a startInstance trace it is not appended').to.be.false
     })
@@ -160,7 +161,7 @@ describe('failed start → command log (idea#109, unit)', () => {
         await recordInstanceStartFailure(fakeInstance('inst-g'), fakeDisk('disk-g'), 'post-move', 'create failed', w, h)
         const g = tracesOf(h, 'inst-g')
         expect(g.map(x => x.status), 'warnings + failure → one error entry').to.deep.equal(['error'])
-        expect(g[0].logs.map(l => l.message)).to.deep.equal(['tar missing'])
+        expect(g[0].logs.map(l => String(l.message))).to.deep.equal(['tar missing'])
     })
 
     it('does nothing (and does not throw) without a command log', async () => {
@@ -235,7 +236,7 @@ const buildFixtureDisk = async (c: StartCase): Promise<void> => {
     if (c.kind === 'badTar') await fs.writeFile(serviceImageTarPath(c.fixtureDir, IMAGE), 'not a docker image archive')
 }
 
-const warnLines = (t: CommandTrace): string[] => t.logs.filter(l => l.level === 'warn').map(l => l.message)
+const warnLines = (t: CommandTrace): string[] => t.logs.filter(l => l.level === 'warn').map(l => String(l.message))
 
 describe('Running only after compose up; failures end in Error (idea#109, real containers)', () => {
     let storeHandle: DocHandle<Store>
@@ -331,7 +332,7 @@ describe('Running only after compose up; failures end in Error (idea#109, real c
         expect(failed, 'a failed startInstance trace should be in the command log').to.be.true
         const t = tracesOf(logHandle, badCreate.instanceId)
         expect(t.map(x => x.status), 'exactly one trace, failed (not ok)').to.deep.equal(['error'])
-        expect(t[0].errorMessage ?? '').to.not.equal('')
+        expect(commandLogText(t[0].errorMessage) ?? '').to.not.equal('')
         expect(warnLines(t[0]), 'the missing tar is a warning in the same entry').to.have.length(1)
         const ps = await $`docker ps -aq --filter label=${TEST_CONTAINER_LABEL} --filter name=${badCreate.instanceId}`
         expect(ps.stdout.trim(), 'no container should exist').to.equal('')
@@ -346,7 +347,7 @@ describe('Running only after compose up; failures end in Error (idea#109, real c
         expect(failed, 'a failed startInstance trace should be in the command log').to.be.true
         const t = tracesOf(logHandle, badUp.instanceId)
         expect(t.map(x => x.status), 'exactly one trace, failed (not ok)').to.deep.equal(['error'])
-        expect(t[0].errorMessage ?? '').to.not.equal('')
+        expect(commandLogText(t[0].errorMessage) ?? '').to.not.equal('')
         const op = Object.values(storeHandle.doc()!.operationDB ?? {}).find((o: any) =>
             o.kind === 'startApp' && o.args?.instanceId === badUp.instanceId) as any
         expect(op?.status, 'the startApp operation is Failed').to.equal('Failed')

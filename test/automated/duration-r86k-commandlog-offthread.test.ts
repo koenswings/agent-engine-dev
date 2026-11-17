@@ -1,6 +1,6 @@
 import { fileURLToPath } from 'node:url'
 import { describe, it, expect } from 'vitest'
-import { Repo } from '@automerge/automerge-repo'
+import { Repo, ImmutableString } from '@automerge/automerge-repo'
 import { WebSocketServerAdapter } from '@automerge/automerge-repo-network-websocket'
 import { WebSocketServer } from 'ws'
 import { readFileSync } from 'node:fs'
@@ -28,10 +28,11 @@ describe('r86k CommandLog read off the main thread', () => {
             }
             expect(traces).toEqual([{ traceId: 't1', command: 'copyApp', args: 'kolibri-1 disk-x', status: 'error', startedAt: 1000, completedAt: 1010, errorMessage: 'nope' }])
             // later Engine changes reach the long-lived worker
-            h.change(d => { d.traces['t2'] = { traceId: 't2', command: 'moveApp', args: 'a b', status: 'ok', startedAt: 2000 } })
-            let seen = false
-            for (let i = 0; i < 50 && !seen; i++) { seen = (await reader.list(2_000)).some(t => t.traceId === 't2'); if (!seen) await sleep(100) }
-            expect(seen).toBe(true)
+            // engine#471 (b): a new Engine writes args/errorMessage as ImmutableString; the compact trace has plain text
+            h.change(d => { d.traces['t2'] = { traceId: 't2', command: 'moveApp', args: new ImmutableString('["a","b"]'), status: 'error', startedAt: 2000, errorMessage: new ImmutableString('busy') } })
+            let t2: Awaited<ReturnType<CommandLogReader['list']>>[number] | undefined
+            for (let i = 0; i < 50 && !t2; i++) { t2 = (await reader.list(2_000)).find(t => t.traceId === 't2'); if (!t2) await sleep(100) }
+            expect(t2).toMatchObject({ args: '["a","b"]', errorMessage: 'busy' })
             expect(JSON.stringify(h.heads())).not.toBe(headsBefore) // only the Engine wrote
         } finally {
             await reader.close()

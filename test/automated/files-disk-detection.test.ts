@@ -26,6 +26,7 @@ import { undockDisk } from '../../src/monitors/usbDeviceMonitor.js'
 import { CommandLogStore, setCommandLogHandle } from '../../src/data/CommandLogStore.js'
 import { DeviceName, DiskID, DiskName, EngineID, Timestamp } from '../../src/data/CommonTypes.js'
 import { DISKS_ROOT, FIXTURES_DIR, uniqueTestDevice } from '../harness/diskSim.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const LOCAL = localEngineId as EngineID
 const OTHER = 'ENGINE_other-engine-000000' as EngineID
@@ -148,10 +149,10 @@ describe('Files Disk detection (idea#131)', () => {
         expect(d.backupConfig?.mode).toBe('on-demand')
         expect(h.doc()!.appDB['sample-files-1.0' as any]).toBeDefined()
         const traces = Object.values(logHandle.doc()!.traces)
-        const t = traces.find(t => t.command === 'diskDetection' && JSON.parse(t.args).step === 'files')
+        const t = traces.find(t => t.command === 'diskDetection' && JSON.parse(String(t.args)).step === 'files')
         expect(t?.status).toBe('error')
-        expect(t?.errorMessage).toMatch(/Files Disk bad-1: FILES.yaml is not valid YAML/)
-        expect(JSON.parse(t!.args).diskId).toBe('bad-1')
+        expect(commandLogText(t?.errorMessage)).toMatch(/Files Disk bad-1: FILES.yaml is not valid YAML/)
+        expect(JSON.parse(String(t!.args)).diskId).toBe('bad-1')
     })
 
     it('FILES.yaml removed at runtime: the next processDisk drops the role and filesConfig', async () => {

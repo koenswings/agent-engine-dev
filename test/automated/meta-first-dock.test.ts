@@ -121,7 +121,7 @@ describe('first dock without META.yaml (idea#121, superseded by idea#201 §10 ru
         expect(disksOnDevice(storeHandle.doc()!, device)).toHaveLength(0)
         expect(Object.keys(storeHandle.doc()!.diskDB).length).toBe(before)
         const writeTrace = traces(logHandle).find(t => t.command === DISK_DETECTION_COMMAND
-            && JSON.parse(t.args).step === 'writeMeta' && JSON.parse(t.args).device === device)
+            && JSON.parse(String(t.args)).step === 'writeMeta' && JSON.parse(String(t.args)).device === device)
         expect(writeTrace).toBeUndefined()
     })
 

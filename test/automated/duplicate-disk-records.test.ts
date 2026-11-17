@@ -46,6 +46,7 @@ import {
     sentinelPath,
 } from '../harness/diskSim.js'
 import { removeTestDir } from '../harness/removeTestDir.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const LOCAL = localEngineId as EngineID
 const OTHER = 'ENGINE_other-engine-000000' as EngineID
@@ -114,8 +115,8 @@ describe('ejectDisk resolves by disk id; name fallback only for docked records (
         const trace = lastTrace(log)
         expect(trace.command).toBe('ejectDisk')
         expect(trace.status).toBe('error')
-        expect(trace.errorMessage).toContain('ambiguous')
-        expect(trace.errorMessage).toContain('a-one')
+        expect(commandLogText(trace.errorMessage)).toContain('ambiguous')
+        expect(commandLogText(trace.errorMessage)).toContain('a-one')
     })
 
     it('by name: records docked to another engine do not count', async () => {

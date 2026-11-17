@@ -12,6 +12,7 @@ import { enableStoreMonitor } from '../../src/monitors/storeMonitor.js'
 import { forgetDisk } from '../../src/data/ForgetDisk.js'
 import { commands } from '../../src/data/Commands.js'
 import { handleCommand } from '../../src/utils/commandUtils.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const DISK = '20070Q450002'
 const disk = (id: string) => ({ id, name: `stale ${id}`, dockedTo: null, device: null, created: 1, lastDocked: 1, diskType: 'app' })
@@ -63,8 +64,8 @@ describe('forgetDisk reports what it did (#262)', () => {
         const t = traces(log).find(x => x.command === 'forgetDisk')
         expect(t).toBeTruthy()
         expect(t!.status).toBe('error')
-        expect(t!.errorMessage).toMatch(/is docked/)
-        expect(t!.error).toBe(t!.errorMessage)
+        expect(commandLogText(t!.errorMessage)).toMatch(/is docked/)
+        expect(commandLogText(t!.error)).toBe(commandLogText(t!.errorMessage))
         expect(h.doc()!.diskDB['docked-1' as any]).toBeTruthy()
     })
 })

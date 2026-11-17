@@ -30,6 +30,7 @@ import {
     DiskDetectionPaths,
     DISK_DETECTION_COMMAND,
 } from '../../src/monitors/diskDetection.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const ROOT = process.cwd()
 const RULE_ASSET = path.join(ROOT, 'script/build_image_assets/90-docking.rules')
@@ -133,8 +134,8 @@ describe('runDiskDetectionSelfCheck (idea#82)', () => {
         expect(t[0].command).toBe(DISK_DETECTION_COMMAND)
         expect(t[0].status).toBe('error')
         expect(t[0].completedAt).not.toBeNull()
-        expect(t[0].errorMessage).toContain('is missing')
-        expect(JSON.parse(t[0].args).step).toBe('selfCheck')
+        expect(commandLogText(t[0].errorMessage)).toContain('is missing')
+        expect(JSON.parse(String(t[0].args)).step).toBe('selfCheck')
     })
 
     it('reports nothing when the problem is repaired before the re-check (boot.sh still running)', async () => {
@@ -162,8 +163,8 @@ describe('recordDiskDetectionFailure (idea#82)', () => {
         const [t] = traces(handle)
         expect(t.command).toBe('diskDetection')
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toBe('Could not mount /dev/sdb1')
-        expect(JSON.parse(t.args)).toEqual({ step: 'mount', device: 'sdb1' })
+        expect(commandLogText(t.errorMessage)).toBe('Could not mount /dev/sdb1')
+        expect(JSON.parse(String(t.args))).toEqual({ step: 'mount', device: 'sdb1' })
     })
 
     it('only logs when there is no command log', () => {

@@ -28,6 +28,7 @@ import { commands } from '../../src/data/Commands.js'
 import { handleCommand } from '../../src/utils/commandUtils.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import { config } from '../../src/data/Config.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 // These tests exercise the Engine side of a backup (store, BACKUP.yaml, lock file) with
 // borg skipped. Pin skipBorg rather than inherit it from the machine's config.yaml: in a
@@ -130,8 +131,8 @@ describe('backup locks via acquireAll (idea#126)', () => {
             expect(resourceLock.isLocked(instanceKey(INST))).toBe(false)   // rolled back
             const t = traces(logHandle).find(x => x.command === 'backupApp')
             expect(t?.status).toBe('error')
-            expect(t?.errorMessage).toContain('locked')
-            expect(t?.errorMessage).toContain("'restoreApp'")
+            expect(commandLogText(t?.errorMessage)).toContain('locked')
+            expect(commandLogText(t?.errorMessage)).toContain("'restoreApp'")
         } finally {
             resourceLock.release(diskKey(backupDisk.id))
         }
@@ -156,10 +157,10 @@ describe('backup locks via acquireAll (idea#126)', () => {
         await backupInstance(storeHandle, INST, backupDisk)
         const t = traces(logHandle).find(x => x.command === 'backupApp')
         expect(t?.status).toBe('error')
-        expect(t?.errorMessage).toMatch(/EACCES|permission denied/i)
+        expect(commandLogText(t?.errorMessage)).toMatch(/EACCES|permission denied/i)
         const op = Object.values(storeHandle.doc()!.operationDB).find(o => o.kind === 'backupApp')
         expect(op?.status).toBe('Failed')
-        expect(op?.error).toBe(t?.errorMessage)
+        expect(op?.error).toBe(commandLogText(t?.errorMessage))
         expect(resourceLock.isLocked(diskKey(backupDisk.id))).toBe(false)
     })
 
@@ -170,7 +171,7 @@ describe('backup locks via acquireAll (idea#126)', () => {
             await handleCommand(commands, storeHandle, 'engine', `backupApp ${INST} ${backupDisk.name}`, logHandle)
             const t = traces(logHandle).find(x => x.command === 'backupApp')
             expect(t?.status).toBe('error')
-            expect(t?.errorMessage).toContain('locked')
+            expect(commandLogText(t?.errorMessage)).toContain('locked')
         } finally {
             resourceLock.release(diskKey(backupDisk.id))
         }
@@ -204,7 +205,7 @@ describe('backup / restore refusals fail loud (idea#168 r29@97)', () => {
             await handleCommand(commands, storeHandle, 'engine', `restoreApp ${INST} ${appDisk.id}`, logHandle)
             const t = traces(logHandle).find(x => x.command === 'restoreApp')
             expect(t?.status).toBe('error')
-            expect(t?.errorMessage).toContain('restoreApp: resource locked')
+            expect(commandLogText(t?.errorMessage)).toContain('restoreApp: resource locked')
             expect(Object.values(storeHandle.doc()!.operationDB).find(o => o.kind === 'restoreApp')).toBeUndefined()
         } finally {
             resourceLock.release(diskKey(appDisk.id))
@@ -217,7 +218,7 @@ describe('backup / restore refusals fail loud (idea#168 r29@97)', () => {
         await handleCommand(commands, storeHandle, 'engine', `restoreApp ${INST} ${appDisk.id}`, logHandle)
         const t = traces(logHandle).find(x => x.command === 'restoreApp')
         expect(t?.status).toBe('error')
-        expect(t?.errorMessage).toContain(`No docked Backup Disk with archives for instance ${INST}`)
+        expect(commandLogText(t?.errorMessage)).toContain(`No docked Backup Disk with archives for instance ${INST}`)
         const op = Object.values(storeHandle.doc()!.operationDB).find(o => o.kind === 'restoreApp')
         expect(op?.status).toBe('Failed')
         expect(resourceLock.isLocked(diskKey(appDisk.id))).toBe(false)

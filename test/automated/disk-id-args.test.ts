@@ -28,6 +28,7 @@ import { CommandDefinition } from '../../src/data/CommandDefinition.js'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { DeviceName, DiskID, DiskName, DiskType, EngineID, InstanceID, Timestamp } from '../../src/data/CommonTypes.js'
 import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const LOCAL = localEngineId as EngineID
 const OTHER = 'ENGINE_other-engine-000000' as EngineID
@@ -103,7 +104,7 @@ describe('resolveDiskArg: one resolver for disk arguments (idea#128)', () => {
         await handleCommand(commands, h, 'engine', 'ejectDisk d-sys', log)
         err.mockRestore()
         expect(lastTrace(log).status).toBe('error')
-        expect(lastTrace(log).errorMessage).toContain('system disk')
+        expect(commandLogText(lastTrace(log).errorMessage)).toContain('system disk')
         expect(h.doc()!.diskDB['d-sys' as DiskID].dockedTo).toBe(LOCAL)
     })
     it('ejectDisk by a unique name still works and warns', async () => {
@@ -147,7 +148,7 @@ describe('installApp <appId> <targetDiskId> [--source <sourceDiskId>] (idea#128)
         try {
             const t = await run('installApp kolibri-1.0 tgt-id --source src-id --name my-kolibri')
             // Must not be the old Route-1 hard-fail; falls through to GitHub / alt disk
-            expect(t.errorMessage ?? '').not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
+            expect(String(t.errorMessage ?? '')).not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
             expect(warn).not.toHaveBeenCalled()
         } finally {
             if (prev === undefined) delete process.env.IDEA_INSTALL_FORCE_OFFLINE
@@ -182,7 +183,7 @@ describe('installApp <appId> <targetDiskId> [--source <sourceDiskId>] (idea#128)
         process.env.IDEA_INSTALL_FORCE_OFFLINE = 'true'
         try {
             const t = await run('installApp kolibri-1.0 tgt-id --source Catalog')
-            expect(t.errorMessage ?? '').not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
+            expect(String(t.errorMessage ?? '')).not.toMatch(/not found on disk 'Catalog' at .*\/apps\/kolibri-1\.0/)
             expect(warn).toHaveBeenCalledWith(expect.stringContaining("installApp --source: disk 'Catalog' was given by name"))
         } finally {
             if (prev === undefined) delete process.env.IDEA_INSTALL_FORCE_OFFLINE
@@ -192,19 +193,19 @@ describe('installApp <appId> <targetDiskId> [--source <sourceDiskId>] (idea#128)
     it('ambiguous target name: refused, trace error, nothing written', async () => {
         const t = await run('installApp kolibri-1.0 IDEA_Disk --source src-id')
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toContain("Disk name 'IDEA_Disk' is ambiguous")
+        expect(commandLogText(t.errorMessage)).toContain("Disk name 'IDEA_Disk' is ambiguous")
         expect(await fs.pathExists(`${DISKS_ROOT}/${tgt}/apps`)).toBe(false)
         expect(await fs.pathExists(`${DISKS_ROOT}/${twin}/apps`)).toBe(false)
     })
     it('undocked or other-engine target / source: refused (no fallback to those records)', async () => {
-        expect((await run('installApp kolibri-1.0 gone-id --source src-id')).errorMessage).toContain('not currently docked')
-        expect((await run('installApp kolibri-1.0 Gone --source src-id')).errorMessage).toContain('not currently docked')
-        expect((await run('installApp kolibri-1.0 remote-id --source src-id')).errorMessage).toContain('not docked to this engine')
-        expect((await run('installApp kolibri-1.0 tgt-id --source remote-id')).errorMessage).toContain('not docked to this engine')
+        expect(commandLogText((await run('installApp kolibri-1.0 gone-id --source src-id')).errorMessage)).toContain('not currently docked')
+        expect(commandLogText((await run('installApp kolibri-1.0 Gone --source src-id')).errorMessage)).toContain('not currently docked')
+        expect(commandLogText((await run('installApp kolibri-1.0 remote-id --source src-id')).errorMessage)).toContain('not docked to this engine')
+        expect(commandLogText((await run('installApp kolibri-1.0 tgt-id --source remote-id')).errorMessage)).toContain('not docked to this engine')
     })
     it('usage errors end the trace as error', async () => {
         expect((await run('installApp kolibri-1.0')).status).toBe('error')
-        expect((await run('installApp kolibri-1.0 tgt-id --source')).errorMessage).toContain('--source needs a value')
+        expect(commandLogText((await run('installApp kolibri-1.0 tgt-id --source')).errorMessage)).toContain('--source needs a value')
     })
 })
 
@@ -259,7 +260,7 @@ describe('optional variadic last arg (idea#128)', () => {
         const log = newLog()
         await handleCommand(testCommands, null, 'engine', 'testOptional disk-1', log)
         expect(seen).toEqual([['disk-1']])
-        expect(JSON.parse(lastTrace(log).args)).toEqual({ diskId: 'disk-1', shareName: [] })
+        expect(JSON.parse(String(lastTrace(log).args))).toEqual({ diskId: 'disk-1', shareName: [] })
     })
     it('takes the rest of the line as tokens', async () => {
         await handleCommand(testCommands, null, 'engine', 'testOptional disk-1 My Share (2)')

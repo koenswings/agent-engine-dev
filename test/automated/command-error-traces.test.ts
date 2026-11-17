@@ -11,6 +11,7 @@ import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { CommandDefinition } from '../../src/data/CommandDefinition.js'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { handleCommand } from '../../src/utils/commandUtils.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const newLog = (): DocHandle<CommandLogStore> =>
     new Repo({ network: [], storage: undefined }).create<CommandLogStore>({ traces: {}, recentTraceIds: [] })
@@ -50,8 +51,8 @@ describe('handleCommand error traces (idea#122)', () => {
         expect(t).toBeTruthy()
         expect(t!.command).toBe('createFilesDisk')
         expect(t!.status).toBe('error')
-        expect(t!.errorMessage).toBe('Unknown command: createFilesDisk')
-        expect(t!.error).toBe(t!.errorMessage)
+        expect(commandLogText(t!.errorMessage)).toBe('Unknown command: createFilesDisk')
+        expect(commandLogText(t!.error)).toBe(commandLogText(t!.errorMessage))
         expect(t!.completedAt).not.toBeNull()
     })
 
@@ -60,7 +61,7 @@ describe('handleCommand error traces (idea#122)', () => {
         await handleCommand(consoleOnly, null, 'engine', 'consoleOnlyCmd', log)
         const t = lastTrace(log)!
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toMatch(/can only be executed on a console/)
+        expect(commandLogText(t.errorMessage)).toMatch(/can only be executed on a console/)
     })
 
     it('records an error trace for an engine-only command run on the console', async () => {
@@ -68,7 +69,7 @@ describe('handleCommand error traces (idea#122)', () => {
         await handleCommand(engineOnly, null, 'console', 'engineOnlyCmd disk-1', log)
         const t = lastTrace(log)!
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toMatch(/can only be executed on an engine/)
+        expect(commandLogText(t.errorMessage)).toMatch(/can only be executed on an engine/)
     })
 
     it('records an error trace for insufficient arguments', async () => {
@@ -76,7 +77,7 @@ describe('handleCommand error traces (idea#122)', () => {
         await handleCommand(needsArgs, null, 'engine', 'needsTwo only-one', log)
         const t = lastTrace(log)!
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toMatch(/Insufficient arguments/)
+        expect(commandLogText(t.errorMessage)).toMatch(/Insufficient arguments/)
     })
 
     it('records an error trace when a wrapper throws', async () => {
@@ -90,6 +91,6 @@ describe('handleCommand error traces (idea#122)', () => {
         await handleCommand(cmds, null, 'engine', 'failing', log)
         const t = lastTrace(log)!
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toBe('boom from wrapper')
+        expect(commandLogText(t.errorMessage)).toBe('boom from wrapper')
     })
 })

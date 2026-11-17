@@ -65,7 +65,7 @@ const startTracesOf = (h: DocHandle<CommandLogStore>, instanceId: string): Comma
     traces(h).filter(t => {
         if (t.command !== START_INSTANCE_COMMAND) return false
         try {
-            const args = JSON.parse(t.args)
+            const args = JSON.parse(String(t.args))
             return args.instanceId === instanceId || args.instanceName === `${instanceId}-name`
         } catch { return false }
     })
@@ -97,7 +97,7 @@ describe('no .env values in logs (idea#111, unit)', () => {
             const value = await runWithTrace({ traceId, command: 'unit-readEnv', args: '{}' }, () => readEnvVariable(envFile, 'pass'))
             expect(value, 'the value is still returned').to.equal(secret)
             await flushTrace(traceId)
-            const messages = logHandle.doc()!.traces[traceId].logs.map(l => l.message)
+            const messages = logHandle.doc()!.traces[traceId].logs.map(l => String(l.message))
             expect(messages.some(m => m.includes('pass')), `the name is logged: ${messages}`).to.be.true
             expect(JSON.stringify(logHandle.doc()!.traces[traceId])).to.not.include(secret)
         } finally {
@@ -243,7 +243,7 @@ describe('startInstance History entry holds no .env values (idea#111, real conta
             expect(values.length).to.be.greaterThan(0)
 
             const entry = logHandle.doc()!.traces[t.traceId]
-            const messages = entry.logs.map(l => l.message)
+            const messages = entry.logs.map(l => String(l.message))
             expect(messages.length, 'verbose logging reached the History entry').to.be.greaterThan(5)
             expect(messages.some(m => /\bpass\b/.test(m)), 'the variable name is in the entry').to.be.true
             const entryText = JSON.stringify(entry)

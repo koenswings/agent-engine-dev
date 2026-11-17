@@ -21,6 +21,7 @@ import { copyApp, moveApp, recoverInterruptedOperations } from '../../src/data/C
 import {
     InstanceID, DiskID, DiskName, EngineID, Timestamp, AppID
 } from '../../src/data/CommonTypes.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 // ── Mocks ─────────────────────────────────────────────────────────────────────
 
@@ -361,7 +362,7 @@ describe('copyApp', () => {
         const t = log.doc().traces[ids[ids.length - 1]]
         expect(t.command).toBe('copyApp')
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toContain("copyApp: Instance 'nonexistent' not found")
+        expect(commandLogText(t.errorMessage)).toContain("copyApp: Instance 'nonexistent' not found")
         expect(consoleSpy).toHaveBeenCalledWith(expect.stringContaining("copyApp: Instance 'nonexistent' not found"))
     })
 })
@@ -630,9 +631,9 @@ describe('moveApp', () => {
             const ids = log.doc().recentTraceIds
             const t = log.doc().traces[ids[ids.length - 1]]
             expect(t.status).toBe('error')
-            expect(t.errorMessage).toMatch(/^MOVE FAILED: .*source kept$/)
+            expect(commandLogText(t.errorMessage)).toMatch(/^MOVE FAILED: .*source kept$/)
             expect(t.errorCode).toBe('PEER_ACCESS')
-            expect(JSON.parse(t.result!)).toMatchObject({ code: 'PEER_ACCESS', text: t.errorMessage })
+            expect(JSON.parse(String(t.result!))).toMatchObject({ code: 'PEER_ACCESS', text: commandLogText(t.errorMessage) })
             expect(Object.keys(handle.doc().operationDB)).toHaveLength(0)
             consoleSpy.mockRestore()
         } finally {
@@ -695,7 +696,7 @@ describe('moveApp', () => {
         const t = log.doc().traces[ids[ids.length - 1]]
         expect(t.command).toBe('moveApp')
         expect(t.status).toBe('error')
-        expect(t.errorMessage).toMatch(/^MOVE FAILED: .*code 23.*source kept$/)
+        expect(commandLogText(t.errorMessage)).toMatch(/^MOVE FAILED: .*code 23.*source kept$/)
         expect(t.errorCode).toBe('COPY_FAILED')
         expect(Object.values(handle.doc().operationDB)[0].status).toBe('Failed')
         consoleSpy.mockRestore()

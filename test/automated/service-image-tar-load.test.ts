@@ -184,7 +184,7 @@ describe('Service images load from services/*.tar on the App Disk (idea#81, real
     const startTracesOf = (instanceName: string): CommandTrace[] =>
         logHandle.doc()!.recentTraceIds.map(id => logHandle.doc()!.traces[id]).filter(t => {
             if (t.command !== START_INSTANCE_COMMAND) return false
-            try { return JSON.parse(t.args).instanceName === instanceName } catch { return false }
+            try { return JSON.parse(String(t.args)).instanceName === instanceName } catch { return false }
         })
 
     beforeAll(async () => {
@@ -259,7 +259,7 @@ describe('Service images load from services/*.tar on the App Disk (idea#81, real
         expect(await waitFor(storeHandle, () => startTracesOf(`tarload-${missing.nonce}`).some(x => x.status === 'error'), 10_000)).to.be.true
         const t = startTracesOf(`tarload-${missing.nonce}`)
         expect(t.map(x => x.status), 'one failed startInstance entry').to.deep.equal(['error'])
-        const warnings = t[0].logs.filter(l => l.level === 'warn').map(l => l.message)
+        const warnings = t[0].logs.filter(l => l.level === 'warn').map(l => String(l.message))
         expect(warnings, 'the missing tar is a warning in that entry').to.have.length(1)
         expect(warnings[0]).to.include(`idea-test_tarload:${missing.nonce}.tar`)
         expect(warnings[0]).to.include('not found')

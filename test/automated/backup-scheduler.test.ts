@@ -28,6 +28,7 @@ import { DISKS_ROOT, uniqueTestDevice } from '../harness/diskSim.js'
 import { fakeScheduleClock, FakeScheduleClock } from '../harness/fakeScheduleClock.js'
 import { config } from '../../src/data/Config.js'
 import { clearPeerPings, notePing, HB_TYPE } from '../../src/data/Liveness.js'
+import { commandLogText } from '../../src/data/CommandLogStore.js'
 
 const A = 'sched-a' as InstanceID
 const B = 'sched-b' as InstanceID
@@ -475,7 +476,7 @@ describe('locks, retry and catch-up (Steve, Q2 / Q3)', () => {
         expect(resourceLock.acquireAll([instanceKey(B), diskKey(BD)], 'backupApp')).toBe(true)
         await backupInstance(h, A, h.doc()!.diskDB[BD] as Disk, undefined, 'console-command')
         const t = logHandle.doc()!.recentTraceIds.map(id => logHandle.doc()!.traces[id]).find((x: CommandTrace) => x.command === 'backupApp')
-        expect(t?.errorMessage).toMatch(/^BUSY: .*a scheduled backup is running on this Backup Disk$/)
+        expect(commandLogText(t?.errorMessage)).toMatch(/^BUSY: .*a scheduled backup is running on this Backup Disk$/)
         expect(h.doc()!.instanceDB[A].lastResult ?? null).toBeNull()
     })
 })
