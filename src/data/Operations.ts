@@ -608,6 +608,7 @@ export const resetResumeStateForTests = (): void => {
     resumeHandlers = null
     peerSeen.clear()
     peerTriedAt.clear()
+    peerProbeRetry.clear()
 }
 
 /**
@@ -713,11 +714,23 @@ export const peerInterruption = (store: Store | undefined, targetDiskId: string,
 //   - it is RESUME_WAITING (an interruption, never counted): at most once per PEER_RESUME_RETRY_MS;
 //   - it is RESUME_PENDING (a counted failure): only when the peer rebooted or the disk re-docked
 //     there since this Engine last looked (lastBooted / lastDocked / address changed), like a dock.
+// engine#511e: a failed liveness probe does not consume that peer change. It re-arms a bounded
+// retry (15 s, 30 s, 60 s, capped at the liveness window). After the last backoff the op waits
+// for the next peer change. Either kind therefore resumes on its own once the target Engine is
+// really back, without a further dock or boot.
 
 /** How often a RESUME_WAITING cross-Engine op is tried again while its peer target is ready. */
 export const PEER_RESUME_RETRY_MS = 60_000
+/** Cap on a failed-probe retry delay; matches the resume liveness window (PEER_CLOCK_STALE_MS). */
+export const PEER_PROBE_RETRY_CAP_MS = 60_000
+/** Backoff after a failed liveness probe, before waiting for the next peer change (engine#511e). */
+export const PEER_PROBE_BACKOFF_MS: readonly number[] = [15_000, 30_000, 60_000].map(ms => Math.min(ms, PEER_PROBE_RETRY_CAP_MS))
 const peerSeen = new Map<string, string>()
 const peerTriedAt = new Map<string, number>()
+/** Failed-probe backoff: not written to peerSeen, so a later live probe can still use `changed`. */
+const peerProbeRetry = new Map<string, { key: string, fails: number, triedAt: number }>()
+const peerProbeBackoffMs = (fails: number): number | undefined =>
+    fails > 0 && fails <= PEER_PROBE_BACKOFF_MS.length ? PEER_PROBE_BACKOFF_MS[fails - 1] : undefined
 
 const peerKeyOf = (store: Store | undefined, op: Operation): string => {
     const d = store?.diskDB?.[String(op.args?.targetDiskId ?? '') as any] as any
@@ -735,24 +748,45 @@ export const resumePeerParkedOps = async (storeHandle: DocHandle<Store>, now: nu
         if (String(op.engineId) !== String(engineId) || activeResumes.has(op.id)) continue
         const key = peerKeyOf(store, op)
         const prev = peerSeen.get(op.id)
-        peerSeen.set(op.id, key)
-        if (!resumeGate(store, op, engineId).ready) continue
-        const waiting = String(op.error ?? '').startsWith(RESUME_WAITING)
         const changed = prev !== undefined && prev !== key
+        const rec = peerProbeRetry.get(op.id)
+        // A new peer key resets the failed-probe backoff so a later boot or dock gets a fresh schedule
+        if (rec && rec.key !== key) peerProbeRetry.delete(op.id)
+        const backoff = peerProbeRetry.get(op.id)
+        if (!resumeGate(store, op, engineId).ready) {
+            peerSeen.set(op.id, key)
+            continue
+        }
+        const waiting = String(op.error ?? '').startsWith(RESUME_WAITING)
         const due = now - (peerTriedAt.get(op.id) ?? 0) >= PEER_RESUME_RETRY_MS
-        if (!changed && !(waiting && due)) continue
+        const retryAfter = backoff ? peerProbeBackoffMs(backoff.fails) : undefined
+        const probeRetryDue = retryAfter !== undefined && now - backoff!.triedAt >= retryAfter
+        // First look at a new peer key, or a WAITING interval while not in probe backoff,
+        // or a scheduled retry after a failed probe (PENDING or WAITING).
+        const firstShot = changed && !backoff
+        const waitingDue = waiting && due && !backoff
+        if (!firstShot && !waitingDue && !probeRetryDue) {
+            peerSeen.set(op.id, key)
+            continue
+        }
         const handler = resumeHandlers[op.kind]
         if (!handler) continue
-        // Mark tried before the probe so a dead peer is not hammered every watch tick
-        peerTriedAt.set(op.id, now)
         // engine#511 B2: do not log "its target is ready" or start the retry until a
         // liveness probe succeeds. A stale connections[] address / store dockedTo is not enough.
         if (peerResumeProbe.reachable) {
             const targetEngineId = String((store?.diskDB as any)?.[String(op.args?.targetDiskId)]?.dockedTo ?? op.args?.targetEngineId ?? '')
             let live = false
             try { live = !!(await peerResumeProbe.reachable(targetEngineId)) } catch { live = false }
-            if (!live) continue
+            if (!live) {
+                // engine#511e: do not consume peerSeen/changed; re-arm 15 s, 30 s, 60 s, then wait for the next peer change
+                const fails = (backoff?.fails ?? 0) + 1
+                peerProbeRetry.set(op.id, { key, fails, triedAt: now })
+                continue
+            }
         }
+        peerSeen.set(op.id, key)
+        peerProbeRetry.delete(op.id)
+        peerTriedAt.set(op.id, now)
         log(chalk.blue(`resume: ${op.id.slice(0, 8)} ${op.kind}: its target is ready on Engine ${String((store?.diskDB as any)?.[String(op.args?.targetDiskId)]?.dockedTo)}; resuming it in the same operation (was: ${op.error})`))
         updateOperation(storeHandle, op.id, { status: 'Pending', error: RETRY_MARKER })
         void runRecoveryRetry(storeHandle, op, handler)

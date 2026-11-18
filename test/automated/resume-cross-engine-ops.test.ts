@@ -31,7 +31,7 @@ import { setPortReadyProgress, resetPortReadyProgressForTests } from '../../src/
 import {
     recoverInterruptedOperations, noteDiskDocked, resetResumeStateForTests, resumePeerParkedOps, peerResumeProbe,
     peerInterruption, peerTargetReady, setOperationArgs, markEngineStopping, resetEngineStoppingForTests,
-    isResumableOp, isParkedOp, RETRY_MARKER, PEER_RESUME_RETRY_MS, RetryHandler, resumeGate, skippedSystemDiskHere,
+    isResumableOp, isParkedOp, RETRY_MARKER, PEER_RESUME_RETRY_MS, PEER_PROBE_BACKOFF_MS, RetryHandler, resumeGate, skippedSystemDiskHere,
 } from '../../src/data/Operations.js'
 import { CROSS_ENGINE_RESUME_CAPABILITY, peerInFlight, isPeerLinkFailure, engineCanResume } from '../../src/data/InFlight.js'
 import { engineCapabilities } from '../../src/data/Engine.js'
@@ -475,6 +475,75 @@ describe('engine#497 stage 3 (a): cross-Engine resume (the source owns the resum
         expect(peer.markers.size).toBe(0)
         expect(peer.folders.get(INST)).toBe('complete')
         expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
+    })
+
+    it('engine#511e: a failed liveness probe does not consume the peer change; a RESUME_PENDING op retries on its own once the target is really back, with no further store change', async () => {
+        const h = makeStore({ status: 'Running' })
+        const w = wire(h)
+        await recoverInterruptedOperations(h, w.handlers)
+        noteDiskDocked(h, SRC_DISK)
+        peer.verifyScript.push('bad')
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
+        expect(r.code).toBe('RESUME_PARKED')
+        const op = theOp(h)
+        expect(op.error).toMatch(/^RESUME_PENDING \(1\/3\): VERIFY_SIZE: /)
+        expect(op.args.resumeFailures).toBe('1')
+        expect(peer.markers.get(INST)).toBe(op.id)
+        // stale address (the store change below would have started a resume before the probe existed)
+        peer.up = false
+        peerResumeProbe.address = (id: string) => (id === String(TGT)) ? TGT_ADDR : undefined
+        peerResumeProbe.reachable = async (id: string) => id === String(TGT) && peer.up
+        expect(await resumePeerParkedOps(h)).toEqual([])                   // PENDING does not loop on the same peer key
+        // the peer "boots" in the store (lastBooted changes) but TCP is not up yet
+        h.change(d => { (d.engineDB as any)[TGT].lastBooted = 3; (d.engineDB as any)[TGT].capabilitiesBootedAt = 3 })
+        const frozen = JSON.stringify({ lastBooted: (h.doc().engineDB as any)[TGT].lastBooted, lastDocked: (h.doc().diskDB as any)[TGT_DISK].lastDocked })
+        const t0 = Date.now()
+        expect(await resumePeerParkedOps(h, t0)).toEqual([])               // probe fails; must not consume changed
+        expect(theOp(h).error).toMatch(/^RESUME_PENDING \(1\/3\): /)
+        expect(theOp(h).args.resumeFailures).toBe('1')
+        expect(await resumePeerParkedOps(h, t0 + PEER_PROBE_BACKOFF_MS[0] - 1)).toEqual([])
+        // the target is really reachable; the store is untouched
+        peer.up = true
+        expect(JSON.stringify({ lastBooted: (h.doc().engineDB as any)[TGT].lastBooted, lastDocked: (h.doc().diskDB as any)[TGT_DISK].lastDocked })).toBe(frozen)
+        expect(await resumePeerParkedOps(h, t0 + PEER_PROBE_BACKOFF_MS[0])).toEqual([op.id])
+        await until(() => theOp(h).status === 'Done', 'the PENDING op to finish after a probe retry, with no further store change')
+        expect(Object.keys(h.doc().operationDB)).toEqual([op.id])
+        expect(theOp(h).error).toBeNull()
+        expect(theOp(h).move).toMatchObject({ phase: 'done', code: 'MOVED', verified: true, sourceRemoved: true })
+        expect(theOp(h).args.resumeFailures).toBe('1')                     // the counted failure is kept; this resume succeeded
+        expect(peer.markers.size).toBe(0)
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
+    })
+
+    it('engine#511e: after the probe backoff is exhausted, a parked op waits for the next peer change (it does not retry on a timer)', async () => {
+        const h = makeStore({ status: 'Running' })
+        const w = wire(h)
+        await recoverInterruptedOperations(h, w.handlers)
+        noteDiskDocked(h, SRC_DISK)
+        peer.copyScript.push('link')
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
+        expect(r.code).toBe('RESUME_PARKED')
+        const op = theOp(h)
+        expect(op.error).toMatch(/^RESUME_WAITING/)
+        peer.up = false
+        peerResumeProbe.address = (id: string) => (id === String(TGT)) ? TGT_ADDR : undefined
+        peerResumeProbe.reachable = async () => false
+        const t0 = Date.now()
+        expect(await resumePeerParkedOps(h, t0)).toEqual([])               // first WAITING try; probe fails
+        let t = t0
+        for (const delay of PEER_PROBE_BACKOFF_MS) {
+            t += delay
+            expect(await resumePeerParkedOps(h, t)).toEqual([])           // each backoff fires and fails
+        }
+        expect(await resumePeerParkedOps(h, t + PEER_RESUME_RETRY_MS + 1)).toEqual([])  // exhausted: no timer retry
+        expect(theOp(h).error).toMatch(/^RESUME_WAITING/)
+        // a later peer change gets a fresh schedule and starts once the probe passes
+        peer.up = true
+        peerResumeProbe.reachable = async (id: string) => id === String(TGT)
+        h.change(d => { (d.engineDB as any)[TGT].lastBooted = 3; (d.engineDB as any)[TGT].capabilitiesBootedAt = 3 })
+        expect(await resumePeerParkedOps(h, t + PEER_RESUME_RETRY_MS + 2)).toEqual([op.id])
+        await until(() => theOp(h).status === 'Done', 'the op to finish after a new peer change following exhausted backoff')
+        expect(theOp(h).move).toMatchObject({ phase: 'done', code: 'MOVED' })
     })
 
     it('a legacy cross move (no crossResume) is not resumable and keeps the old recovery (INTERRUPTED)', async () => {
