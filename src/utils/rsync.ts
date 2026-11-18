@@ -193,13 +193,13 @@ export const rsyncToPeer = async (
 /** One instance-data transfer through the root helper. Roots are helper root tokens. */
 export type InstanceDataTransfer =
     | { kind: 'copy', srcRoot: string, srcId: string, dstRoot: string, dstId: string, opId?: string }
-    | { kind: 'send', srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string }
+    | { kind: 'send', srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string, opId?: string }
 
 /** The helper arguments for a transfer (subcommand first). */
 export const instanceDataTransferArgs = (t: InstanceDataTransfer): string[] =>
     t.kind === 'copy'
         ? copyArgs(t.srcRoot, t.srcId, t.dstRoot, t.dstId, t.opId)
-        : sendArgs(t.srcRoot, t.srcId, t.host, t.peerEngineId, t.dstRoot, t.dstId)
+        : sendArgs(t.srcRoot, t.srcId, t.host, t.peerEngineId, t.dstRoot, t.dstId, t.opId)
 
 /**
  * Copy (same Engine) or send (to `pi@host` with this Engine's key, received there

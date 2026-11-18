@@ -172,7 +172,7 @@ describe('engine#469 refusals before anything stops', () => {
             .toMatch(/^TEMP_BACKUP_FAILED: \/usr\/bin\/borg is not installed\./)
         expect(calls).toEqual([])
         expect(TEMP_BACKUP_HELPER_MIN).toBe(18)
-        expect(APP_DATA_HELPER_VERSION).toBe('24')
+        expect(APP_DATA_HELPER_VERSION).toBe('25')
     })
 })
 

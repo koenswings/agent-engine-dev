@@ -578,7 +578,7 @@ declare -A WANT_STAT=(
 for i in "${!NAMES[@]}"; do
     out=$(rsh "$i" bash -s <<<"$INSTALL_PROBE" 2>&1); echo "$out" > "$EVID/1-install-${NAMES[$i]}.txt"
     bad=()
-    [[ "$(sed -n 's/^VERSION=//p' <<<"$out")" == "idea-app-data 24" ]] || bad+=("helper version: $(sed -n 's/^VERSION=//p' <<<"$out")")
+    [[ "$(sed -n 's/^VERSION=//p' <<<"$out")" == "idea-app-data 25" ]] || bad+=("helper version: $(sed -n 's/^VERSION=//p' <<<"$out")")
     [[ "$(sed -n 's/^SSHD_T=//p' <<<"$out")" == ok ]] || bad+=("sshd -t: $(sed -n 's/^SSHD_T=//p' <<<"$out")")
     grep -q '/etc/ssh/idea_authorized_keys/%u' <<<"$(sed -n 's/^AKF=//p' <<<"$out")" || bad+=("AuthorizedKeysFile is '$(sed -n 's/^AKF=//p' <<<"$out")'")
     for p in "${!WANT_STAT[@]}"; do
@@ -818,7 +818,7 @@ refusals() {  # refusals <fromIdx> <toIdx>
         out=$(peer_ssh_to "$a" "$b" "$check_host" "sudo -n $HELPER version" 2>&1); rc=$?
         echo "== LAN $check_host version rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
     fi
-    [[ $rc == 0 && "$out" == *"idea-app-data 24"* ]] || bad+=("control 'version' through the gate on $check_host failed (rc $rc: ${out:0:120})")
+    [[ $rc == 0 && "$out" == *"idea-app-data 25"* ]] || bad+=("control 'version' through the gate on $check_host failed (rc $rc: ${out:0:120})")
     # a) plain command → gate refusal, exit 2, journal
     out=$(peer_ssh_to "$a" "$b" "$check_host" "id" 2>&1); rc=$?
     echo "== id rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"

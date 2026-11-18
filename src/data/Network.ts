@@ -225,6 +225,26 @@ export const getEngineAddress = (engineId: EngineID): IPAddress | undefined => {
     return undefined
 }
 
+/**
+ * Like getEngineAddress, but only when the WebSocket adapter to that Engine is
+ * ready. A stale connections[] entry after the peer was SIGKILL'd must not look
+ * live (engine#511 B2). An adapter without isReady (tests) is treated as live.
+ */
+export const getLiveEngineEndpoint = (engineId: EngineID): { address: IPAddress, port: number } | undefined => {
+    for (const [key, conn] of Object.entries(network.connections)) {
+        if (String(conn.engineId) !== String(engineId)) continue
+        if (typeof (conn.adapter as any)?.isReady === 'function' && !(conn.adapter as any).isReady()) continue
+        const [address, portStr] = key.split(':')
+        const port = Number(portStr) || Number(settings.port) || 4321
+        return { address: address as IPAddress, port }
+    }
+    return undefined
+}
+
+export const getLiveEngineAddress = (engineId: EngineID): IPAddress | undefined => {
+    return getLiveEngineEndpoint(engineId)?.address
+}
+
 export const isEngineConnected = (network: Network, ip: IPAddress):boolean => {
   return network.connections.hasOwnProperty(ip) && network.connections[ip] !== undefined && network.connections[ip].adapter.isReady()
 }

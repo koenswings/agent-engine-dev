@@ -1530,6 +1530,8 @@ export type StartInstanceOpts = {
   deferStoreStatus?: boolean
   /** engine#497: the op that owns this folder's in-flight marker; any other start is refused */
   inFlightOpId?: string
+  /** engine#511: port-ready stable window for the already-running re-check (default 10 s; tests shorten it) */
+  portStableMs?: number
   /** engine#456: the updateApp op that owns instances/<id>/.idea-update-in-flight; any other start is refused */
   updateOpId?: string
   /** engine#456: LoadImages already ran before Prepare; do not repeat it inside Start */
@@ -1586,6 +1588,16 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
           if (port > 0) inst.port = port as PortNumber
           inst.lastStarted = Date.now() as Timestamp
         })
+        // engine#511 Finding 3: a cross-Engine move's `--op` start (deferred, Checking) of a copy that
+        // is already running — a resume at checking while the target Engine stayed up — must publish a
+        // fresh port-ready result for verifyMoveTarget. The previous verify cleared it, and without a
+        // probe here the new verify waits out its timeout and answers VERIFY_NOT_RUNNING.
+        if (deferStore && opts.inFlightOpId) {
+          const instanceDir = `${await diskMountRoot(disk)}/instances/${instance.id}`
+          log(`Instance '${instance.id}' already running for move ${opts.inFlightOpId} — re-checking port-ready for its verify (engine#511)`)
+          const readyTimeoutMs = await readPortReadyTimeoutMs(`${instanceDir}/compose.yaml`, parseAppId(String(instance.instanceOf ?? "")).name, String(instance.instanceOf ?? ""))
+          await assertInstancePortReady(instance.id, port, instanceDir, { readyTimeoutMs, forceRecreate: false, ...(opts.portStableMs != null ? { stableMs: opts.portStableMs } : {}) })
+        }
         // idea#139 step 9: running containers may predate a Files role on this
         // disk (Add Files) or carry a stale override; recreate once if needed.
         const { resolveInstanceApp } = await import('./InstanceApp.js')
@@ -1597,7 +1609,11 @@ const startInstanceTracked = async (storeHandle: DocHandle<Store>, instance: Ins
       } else {
         log(`Instance '${instance.id}' containers are not running — proceeding with full start`)
       }
-    } catch { /* docker not available or no containers — continue with normal start */ }
+    } catch (e) {
+      // engine#511: the move's port-ready re-check of a running copy failed — that is the verdict
+      if (isPortNotReadyError(e)) throw e
+      /* docker not available or no containers — continue with normal start */
+    }
   }
 
   const totalStartSteps = START_STEPS.length
