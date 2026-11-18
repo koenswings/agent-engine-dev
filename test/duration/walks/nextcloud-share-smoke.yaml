@@ -16,10 +16,10 @@ name: nextcloud-share-smoke
 graph: unified
 steps:
   - { from: start, to: console_teacher, action: open_console_as_teacher }
-  - { from: console_teacher, to: nc_browse, action: open_nextcloud_as_teacher }
-  - { from: nc_browse, to: nc_browse, action: browse_folders }
-  - { from: nc_browse, to: nc_share, action: share_to_class }
-  - { from: nc_share, to: nc_browse, action: done_sharing }
-  - { from: nc_browse, to: nc_share, action: share_to_class }
+  - { from: console_teacher, to: nc_browse_teacher, action: open_nextcloud_as_teacher }
+  - { from: nc_browse_teacher, to: nc_browse_teacher, action: browse_folders }
+  - { from: nc_browse_teacher, to: nc_share, action: share_to_class }
+  - { from: nc_share, to: nc_browse_teacher, action: done_sharing }
+  - { from: nc_browse_teacher, to: nc_share, action: share_to_class }
   - { from: nc_share, to: console_teacher, action: back_to_console_from_share }
   - { from: console_teacher, to: start, action: return_to_start }

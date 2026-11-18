@@ -54,10 +54,10 @@ states:
       - to: kolibri_manage
         weight: 20
         action: open_kolibri_as_teacher
-      - to: nc_browse
+      - to: nc_browse_teacher
         weight: 20
         action: open_nextcloud_as_teacher
-      - to: wiki_browse
+      - to: wiki_browse_teacher
         weight: 10
         action: open_wikipedia_as_teacher
       - to: console_teacher
@@ -73,10 +73,10 @@ states:
       - to: kolibri_home
         weight: 40
         action: open_kolibri_as_learner
-      - to: nc_browse
+      - to: nc_browse_learner
         weight: 25
         action: open_nextcloud_as_learner
-      - to: wiki_browse
+      - to: wiki_browse_learner
         weight: 20
         action: open_wikipedia_as_learner
       - to: console_learner
@@ -162,24 +162,22 @@ states:
         weight: 5
         action: return_to_start
 
-  nc_browse:
+  # Role-split states (idea#166, run random-c1cc4bb-markov-20261118 step 109): the Console and
+  # Nextcloud Intents are role-gated, so every state below is reachable from exactly one sign-in.
+  # Teacher: share_to_class. Learner: open_file_drop / after_upload / leave_file_drop.
+  # test/automated/duration-markov-role-states.test.ts fails if a role-gated Intent leaks.
+  nc_browse_teacher:
     layer: usage
     transitions:
       - to: nc_share
         weight: 18
         action: share_to_class
-      - to: nc_drop
-        weight: 22
-        action: open_file_drop
-      - to: nc_collab
+      - to: nc_collab_teacher
         weight: 22
         action: open_collab_doc
-      - to: nc_browse
+      - to: nc_browse_teacher
         weight: 15
         action: browse_folders
-      - to: console_learner
-        weight: 13
-        action: leave_nextcloud_as_learner
       - to: console_teacher
         weight: 10
         action: leave_nextcloud_as_teacher
@@ -187,10 +185,29 @@ states:
         weight: 5
         action: return_to_start
 
+  nc_browse_learner:
+    layer: usage
+    transitions:
+      - to: nc_drop
+        weight: 22
+        action: open_file_drop
+      - to: nc_collab_learner
+        weight: 22
+        action: open_collab_doc
+      - to: nc_browse_learner
+        weight: 15
+        action: browse_folders
+      - to: console_learner
+        weight: 13
+        action: leave_nextcloud_as_learner
+      - to: start
+        weight: 5
+        action: return_to_start
+
   nc_share:
     layer: usage
     transitions:
-      - to: nc_browse
+      - to: nc_browse_teacher
         weight: 80
         action: done_sharing
       - to: console_teacher
@@ -203,7 +220,7 @@ states:
   nc_drop:
     layer: usage
     transitions:
-      - to: nc_browse
+      - to: nc_browse_learner
         weight: 85
         action: after_upload
       - to: console_learner
@@ -213,31 +230,54 @@ states:
         weight: 5
         action: return_to_start
 
-  nc_collab:
+  nc_collab_teacher:
     layer: usage
     transitions:
-      - to: nc_browse
+      - to: nc_browse_teacher
         weight: 70
         action: close_doc
-      - to: nc_collab
+      - to: nc_collab_teacher
         weight: 30
         action: keep_editing
       - to: start
         weight: 5
         action: return_to_start
 
-  wiki_browse:
+  nc_collab_learner:
     layer: usage
     transitions:
-      - to: wiki_browse
+      - to: nc_browse_learner
+        weight: 70
+        action: close_doc
+      - to: nc_collab_learner
+        weight: 30
+        action: keep_editing
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  wiki_browse_teacher:
+    layer: usage
+    transitions:
+      - to: wiki_browse_teacher
+        weight: 65
+        action: search_browse_wikipedia
+      - to: console_teacher
+        weight: 15
+        action: leave_wikipedia_as_teacher
+      - to: start
+        weight: 5
+        action: return_to_start
+
+  wiki_browse_learner:
+    layer: usage
+    transitions:
+      - to: wiki_browse_learner
         weight: 65
         action: search_browse_wikipedia
       - to: console_learner
         weight: 20
         action: leave_wikipedia_as_learner
-      - to: console_teacher
-        weight: 15
-        action: leave_wikipedia_as_teacher
       - to: start
         weight: 5
         action: return_to_start
