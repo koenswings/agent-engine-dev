@@ -250,7 +250,27 @@ const startInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instan
     if (!disk) throw new Error(`Disk '${diskName}' not found or has no device on engine ${localEngineId}`)
     // #239 (Steve): await the start too, so a stopInstance queued behind it cannot run mid-start
     // and the start trace closes only once the start is done.
-    await startInstance(storeHandle, instance, disk, cause, deferStoreStatus ? { deferStoreStatus: true } : {})
+    // engine#497 stage 3 (a): `--op <opId>` — the cross-Engine move that marked this folder starts
+    // it while it is still under its in-flight marker (any other start of a marked folder is refused)
+    const opFlag = rest.indexOf('--op')
+    const inFlightOpId = opFlag >= 0 ? rest[opFlag + 1] : undefined
+    if (inFlightOpId) {
+        // engine#511 Finding 4: a stale `--op` start of a move that has ended does nothing (a Done
+        // move's target is started by its own post-move start; a failed one must not start)
+        const { moveOpFinished } = await import('./MoveAppRemote.js')
+        const ended = moveOpFinished(store, inFlightOpId)
+        if (ended) {
+            const text = `startInstance: operation ${inFlightOpId} is already ${ended}; the move's start of ${instance.id} is skipped (a stale queued command, engine#511)`
+            log(text)
+            attachTraceResult({ skipped: true, reason: 'OP_FINISHED', opStatus: ended })
+            print(chalk.yellow(text))
+            return
+        }
+    }
+    await startInstance(storeHandle, instance, disk, cause, {
+        ...(deferStoreStatus ? { deferStoreStatus: true } : {}),
+        ...(inFlightOpId ? { inFlightOpId } : {}),
+    })
 }
 
 const runInstanceWrapper = async (storeHandle: DocHandle<Store> | null, instanceName: InstanceName, diskName: DiskName) => {
@@ -573,7 +593,16 @@ const moveAppWrapper = async (storeHandle: DocHandle<Store> | null, instanceArg:
 /** verifyMoveTarget <opId> <instanceId> <expectedBytes> <expectRunning> (idea#79): sent Engine → Engine by a cross-Engine moveApp. */
 const verifyMoveTargetWrapper = async (storeHandle: DocHandle<Store> | null, opId: string, instanceId: string, expectedBytes: string, expectRunning: string) => {
     if (!storeHandle) throw new Error('Store is not available.')
-    const { verifyMoveTarget } = await import('./MoveAppRemote.js')
+    const { verifyMoveTarget, moveOpFinished } = await import('./MoveAppRemote.js')
+    // engine#511 Finding 4: a stale (e.g. boot-replayed) verify for a finished move does nothing
+    const ended = moveOpFinished(storeHandle.doc(), opId)
+    if (ended) {
+        const text = `verifyMoveTarget: operation ${opId} is already ${ended}; skipped (a stale queued check, engine#511)`
+        log(text)
+        attachTraceResult({ skipped: true, reason: 'OP_FINISHED', opStatus: ended })
+        print(chalk.yellow(text))
+        return
+    }
     const v = await verifyMoveTarget(storeHandle, opId, instanceId, expectedBytes, expectRunning)
     attachTraceResult(v)
     print(v.ok ? chalk.green(`Move copy ${instanceId} checks out`) : chalk.yellow(`Move copy ${instanceId} does not check out: ${v.detail}`))

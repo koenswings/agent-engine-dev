@@ -30,7 +30,7 @@ import path from 'path'
 const order = vi.hoisted(() => [] as string[])
 const remoteOverlays = vi.hoisted(() => [] as { src: string | string[], peer: { host: string, engineId: string }, helperArgs: string[], files: Record<string, string> }[])
 // r36: make the instance rsync fail after writing part of the copy
-const failure = vi.hoisted(() => ({ rsync: null as string | null, process: null as string | null }))
+const failure = vi.hoisted(() => ({ rsync: null as string | null, process: null as string | null, ssh: null as string | null }))
 const sshCalls = vi.hoisted(() => [] as string[])
 // idea#168: instance data goes through the app-data helper (copy / send / delete)
 const instanceTransfers = vi.hoisted(() => [] as any[])
@@ -152,6 +152,7 @@ vi.mock('zx', async (importOriginal) => {
                 ? strings.reduce((acc: string, str: string, i: number) => acc + str + (i < vals.length ? [vals[i]].flat().map(String).join(' ') : ''), '')
                 : flat
             sshCalls.push(cmd.replace(/\s+/g, ' ').trim())
+            if (failure.ssh) return Promise.reject(new Error(failure.ssh))
             return Promise.resolve({ stdout: '', stderr: '' })
         }
         return actual.$(strings, ...vals)
@@ -257,12 +258,20 @@ const linkDataOffDisk = async () => {
 
 // engine#497 (helper v20): marker, verify-copy and the version check go through
 // InFlight.inFlightHelper; recorded here (no sudo, no marker file on the pretend disks)
-import { inFlightHelper } from '../../src/data/InFlight.js'
+import { inFlightHelper, peerInFlight, CROSS_ENGINE_RESUME_CAPABILITY } from '../../src/data/InFlight.js'
 const inFlightCalls: string[][] = []
+// engine#497 stage 3 (a, helper v23): the peer marker and the source-side verify-send go through
+// InFlight.peerInFlight; recorded here
+const peerInFlightCalls: string[][] = []
 beforeEach(() => {
     inFlightCalls.length = 0
     inFlightHelper.atLeast = async () => null
     inFlightHelper.run = async (args: string[]) => { inFlightCalls.push(args); return args[0] === 'verify-copy' ? 'differences=0\n' : '' }
+    peerInFlightCalls.length = 0
+    peerInFlight.helperProblem = async () => null
+    peerInFlight.mark = async (host, peer, root, id, opId) => { peerInFlightCalls.push(['mark', host, peer, root, id, opId]) }
+    peerInFlight.clear = async (host, peer, root, id, opId) => { peerInFlightCalls.push(['clear', host, peer, root, id, opId]) }
+    peerInFlight.verify = async (_sr, _si, host, peer, root, id, opId) => { peerInFlightCalls.push(['verify', host, peer, root, id, opId]); return { differences: 0, diffs: [] } }
 })
 
 const copyDirs = async (): Promise<string[]> =>
@@ -279,6 +288,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         helperDeletes.length = 0
         failure.rsync = null
         failure.process = null
+        failure.ssh = null
         setRootDeviceForTests('mmcblk-not-a-test-disk')
         outside = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-outside-'))
         await fs.remove(srcRoot()); await fs.remove(tgtRoot())
@@ -421,7 +431,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         const REMOTE = 'ENGINE_remote-r35' as EngineID
         h.change(doc => {
             doc.diskDB[TGT].dockedTo = REMOTE
-            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now() }
+            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now(), capabilities: [CROSS_ENGINE_RESUME_CAPABILITY] }
             peersExchanged(doc, REMOTE)
         })
         network.connections['10.0.0.35:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea35' as any, engineId: REMOTE }
@@ -430,7 +440,16 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
             const newRow = Object.values(h.doc().instanceDB).find(i => String(i.id) !== ORIG)!
             expect(newRow.name).toBe('kolibri-2')
             // The helper sends the original files as root (idea#168); the overlay (from a local temp dir) then replaces them
-            expect(instanceTransfers).toEqual([{ kind: 'send', srcRoot: SRC_DEV, srcId: ORIG, host: '10.0.0.35', peerEngineId: REMOTE, dstRoot: TGT_DEV, dstId: newRow.id }])
+            const opId = (Object.values(h.doc().operationDB)[0] as any).id
+            // engine#497 (a): the push carries the op id (a resumed run continues into the same folder)
+            expect(instanceTransfers).toEqual([{ kind: 'send', srcRoot: SRC_DEV, srcId: ORIG, host: '10.0.0.35', peerEngineId: REMOTE, dstRoot: TGT_DEV, dstId: newRow.id, opId }])
+            // marked on the peer before the first byte, verified against the source, cleared after registration
+            expect(peerInFlightCalls).toEqual([
+                ['mark', '10.0.0.35', REMOTE, TGT_DEV, newRow.id, opId],
+                ['verify', '10.0.0.35', REMOTE, TGT_DEV, newRow.id, opId],
+                ['clear', '10.0.0.35', REMOTE, TGT_DEV, newRow.id, opId],
+            ])
+            expect((Object.values(h.doc().operationDB)[0] as any)).toMatchObject({ status: 'Done', args: { crossResume: '1', crossEngine: 'true', phase: 'done' } })
             // every remote step goes to the peer's helper with this Engine's key, pinned by the peer's Engine id
             expect(sshCalls).toEqual([`ssh ${peerSshOptions(REMOTE).join(' ')} pi@10.0.0.35 -- sudo -n /usr/local/sbin/idea-app-data ensure-dirs ${TGT_DEV}`])
             expect(remoteOverlays.map(o => [o.peer, o.helperArgs])).toEqual([
@@ -475,12 +494,12 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         expect(inFlightCalls).toEqual([['mark-in-flight', TGT_DEV, newId, op.id, String(localEngineId)]])
     })
 
-    it('a failed cross-engine copy removes the partial folder on the remote with that Engine\'s helper (ssh … sudo -n idea-app-data delete <root> <id>)', async () => {
+    it('engine#497 (a): a failed cross-engine copy keeps the partial folder on the peer under its marker (no remote delete) and parks the op', async () => {
         h = await makeHandle('Stopped')
         const REMOTE = 'ENGINE_remote-r36' as EngineID
         h.change(doc => {
             doc.diskDB[TGT].dockedTo = REMOTE
-            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now() }
+            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now(), capabilities: [CROSS_ENGINE_RESUME_CAPABILITY] }
             peersExchanged(doc, REMOTE)
         })
         network.connections['10.0.0.36:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea36' as any, engineId: REMOTE }
@@ -490,18 +509,85 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
             expect(instanceTransfers.map(t => t.kind)).toEqual(['send'])
             const newId = instanceTransfers[0].dstId
             expect(newId).not.toBe(ORIG)
+            const op = Object.values(h.doc().operationDB)[0] as any
+            expect(instanceTransfers[0].opId).toBe(op.id)
             expect(sshCalls.filter(c => / rm -rf /.test(c)), JSON.stringify(sshCalls)).toEqual([])
+            // no remote delete any more: only ensure-dirs went over ssh; the partial stays marked
             expect(sshCalls.filter(c => /idea-app-data/.test(c))).toEqual([
                 `ssh ${peerSshOptions(REMOTE).join(' ')} pi@10.0.0.36 -- sudo -n /usr/local/sbin/idea-app-data ensure-dirs ${TGT_DEV}`,
-                `ssh ${peerSshOptions(REMOTE).join(' ')} pi@10.0.0.36 -- sudo -n /usr/local/sbin/idea-app-data delete ${TGT_DEV} ${newId}`,
             ])
+            expect(peerInFlightCalls).toEqual([['mark', '10.0.0.36', REMOTE, TGT_DEV, newId, op.id]])
             expect(sshCalls.some(c => /StrictHostKeyChecking=no/.test(c))).toBe(false)
-            // the instance folder itself is no longer pre-created over ssh (the receiving helper creates it as root)
-            expect(sshCalls.some(c => new RegExp(`mkdir -p \\S+/instances/${newId}`).test(c))).toBe(false)
-            expect(helperDeletes).toEqual([])                               // nothing deleted locally
+            expect(helperDeletes).toEqual([])
             expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
             expect(h.doc().engineDB[REMOTE].commands).toEqual([])          // no remote startInstance
-            expect((Object.values(h.doc().operationDB)[0] as any).status).toBe('Failed')
+            expect(op.status).toBe('Pending')
+            expect(op.error).toBe(`RESUME_PENDING (1/3): ${R36_RSYNC}`)
+            expect(op.args).toMatchObject({ targetInstanceId: newId, phase: 'copying', crossEngine: 'true', crossResume: '1', targetMarked: '1', targetEngineId: REMOTE })
+            // the SOURCE resumes it (Koen Q1 option A): the same op pushes again into the same id
+            failure.rsync = null
+            instanceTransfers.length = 0
+            peerInFlightCalls.length = 0
+            await copyApp(h, ORIG as any, SRC, TGT, 'console-command', { recoveredOpId: op.id })
+            expect(instanceTransfers).toEqual([{ kind: 'send', srcRoot: SRC_DEV, srcId: ORIG, host: '10.0.0.36', peerEngineId: REMOTE, dstRoot: TGT_DEV, dstId: newId, opId: op.id }])
+            expect(peerInFlightCalls).toEqual([
+                ['mark', '10.0.0.36', REMOTE, TGT_DEV, newId, op.id],
+                ['verify', '10.0.0.36', REMOTE, TGT_DEV, newId, op.id],
+                ['clear', '10.0.0.36', REMOTE, TGT_DEV, newId, op.id],
+            ])
+            expect(Object.keys(h.doc().operationDB)).toEqual([op.id])
+            expect(h.doc().operationDB[op.id]).toMatchObject({ status: 'Done', args: { phase: 'done' } })
+            expect(Object.keys(h.doc().instanceDB).sort()).toEqual([ORIG, newId].sort())
+        } finally {
+            delete network.connections['10.0.0.36:4321' as any]
+        }
+    })
+
+    it('engine#511 B2: a resume whose ensure-dirs exits 255 stays parked (RESUME_WAITING), keeps the partial under the marker, and finishes when the target is back', async () => {
+        h = await makeHandle('Stopped')
+        const REMOTE = 'ENGINE_remote-r36' as EngineID
+        h.change(doc => {
+            doc.diskDB[TGT].dockedTo = REMOTE
+            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now(), capabilities: [CROSS_ENGINE_RESUME_CAPABILITY] }
+            peersExchanged(doc, REMOTE)
+        })
+        network.connections['10.0.0.36:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea36' as any, engineId: REMOTE }
+        try {
+            // Mid-receive cut (B2): a link failure after the marker is written, not a real rsync-23
+            failure.rsync = 'exit code: 255'
+            await copyApp(h, ORIG as any, SRC, TGT)
+            const newId = instanceTransfers[0].dstId
+            const op = Object.values(h.doc().operationDB)[0] as any
+            expect(op.status).toBe('Pending')
+            expect(op.error).toMatch(/^RESUME_WAITING/)
+            expect(op.args.resumeFailures).toBeUndefined()
+            expect(op.args).toMatchObject({ targetInstanceId: newId, targetMarked: '1', crossResume: '1' })
+            // resume while the target is cut: ensure-dirs fails the way zx reports ssh exit 255
+            failure.rsync = null
+            failure.ssh = 'exit code: 255'
+            instanceTransfers.length = 0
+            peerInFlightCalls.length = 0
+            sshCalls.length = 0
+            await copyApp(h, ORIG as any, SRC, TGT, 'console-command', { recoveredOpId: op.id })
+            const parked = h.doc().operationDB[op.id] as any
+            expect(parked.status).toBe('Pending')
+            expect(parked.error).toMatch(/^RESUME_WAITING/)
+            expect(parked.error).toMatch(/exit code: 255/)
+            expect(parked.args.resumeFailures).toBeUndefined()
+            expect(parked.args).toMatchObject({ targetInstanceId: newId, targetMarked: '1', phase: 'copying' })
+            expect(sshCalls.filter(c => /idea-app-data ensure-dirs/.test(c)).length).toBeGreaterThan(0)
+            expect(sshCalls.filter(c => / rm -rf /.test(c)), JSON.stringify(sshCalls)).toEqual([])
+            expect(helperDeletes).toEqual([])
+            expect(instanceTransfers).toEqual([])                         // send never started
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
+            // the target is really back: the same op resumes to Done
+            failure.ssh = null
+            instanceTransfers.length = 0
+            peerInFlightCalls.length = 0
+            await copyApp(h, ORIG as any, SRC, TGT, 'console-command', { recoveredOpId: op.id })
+            expect(instanceTransfers).toEqual([{ kind: 'send', srcRoot: SRC_DEV, srcId: ORIG, host: '10.0.0.36', peerEngineId: REMOTE, dstRoot: TGT_DEV, dstId: newId, opId: op.id }])
+            expect(h.doc().operationDB[op.id]).toMatchObject({ status: 'Done', args: { phase: 'done' } })
+            expect(Object.keys(h.doc().instanceDB).sort()).toEqual([ORIG, newId].sort())
         } finally {
             delete network.connections['10.0.0.36:4321' as any]
         }
@@ -512,7 +598,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         const REMOTE = 'ENGINE_remote-r37' as EngineID
         h.change(doc => {
             doc.diskDB[TGT].dockedTo = REMOTE
-            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, hostname: 'idea37', commands: [], lastRun: Date.now() }
+            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, hostname: 'idea37', commands: [], lastRun: Date.now(), capabilities: [CROSS_ENGINE_RESUME_CAPABILITY] }
             peersExchanged(doc, REMOTE, { remoteAccepts: false })
         })
         network.connections['10.0.0.37:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea37' as any, engineId: REMOTE }

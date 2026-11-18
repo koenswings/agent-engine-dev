@@ -54,6 +54,8 @@ export const MOVE_FAILURE_CODES = [
     'VERIFY_FAILED',      // fallback only: the target could not check (e.g. sizing error) or sent no code
     'INTERRUPTED',        // the Engine restarted before verify was recorded
     'SOURCE_KEPT',        // pre-flip failure that is not SOURCE_CHANGED (engine#388), including a failed size measurement after a finished copy: source kept, not moved
+    'RESUME_PARKED',      // engine#497 (a): trace only — a run failed after the target was marked; the op is Pending RESUME_WAITING / RESUME_PENDING and resumes
+    'RESUME_GAVE_UP',     // engine#497 (a): three real failures after the target was marked; op Failed, move.code RESUME_GAVE_UP, source started again if it ran
 ] as const
 export const MOVE_DONE_CODES = [
     'MOVED',              // copied, verified, source quarantined
@@ -86,6 +88,8 @@ export interface MoveVerify {
 export interface MoveProgress {
     phase: MovePhase
     targetEngineId: string
+    /** engine#497 (a): the Engine that owns and resumes the move (= Operation.engineId); absent on older ops */
+    sourceEngineId?: string
     sourceInstanceId: string
     /** equal to the source id, set once the target folder is in place (engine#381) */
     targetInstanceId: string | null
@@ -121,6 +125,8 @@ export interface MoveResult {
 // ── Failure texts (idea#79 approach comment) ───────────────────────────────────
 export const movedText = (engineName: string): string => `MOVED to ${engineName}`
 export const moveFailedText = (reason: string): string => `MOVE FAILED: ${reason.replace(/[.;\s]+$/, '')}; source kept`
+/** engine#497 (a): a run failed after the target was marked; the op is parked and resumes (Koen Q2: source stays stopped). */
+export const movePausedText = (reason: string): string => `MOVE PAUSED: ${reason.replace(/[.;\s]+$/, '')}; the move resumes, the source stays stopped until it resumes or gives up`
 export const sourceNotRemovedText = (reason: string): string => `MOVED, source not removed: ${reason.replace(/[.;\s]+$/, '')}`
 /** SOURCE_CHANGED (pre-flip; source kept, not moved). */
 export const sourceKeptText = (reason: string): string => `MOVE STOPPED: ${reason.replace(/[.;\s]+$/, '')}; source kept`

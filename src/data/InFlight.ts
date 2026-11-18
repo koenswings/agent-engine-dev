@@ -8,12 +8,14 @@
  * op removes it only after success. While it exists, no Engine registers or starts that
  * instance folder; only the owning op (same opId) continues into it.
  */
-import { fs } from 'zx'
+import { fs, $ } from 'zx'
 import { log } from '../utils/utils.js'
 import {
-    AppDataRunner, runAppData, helperAtLeast, RESUME_HELPER_MIN,
+    AppDataRunner, runAppData, helperAtLeast, RESUME_HELPER_MIN, CROSS_RESUME_HELPER_MIN,
     markInFlightArgs, clearInFlightArgs, verifyCopyArgs, parseVerifyCopy,
+    verifySendArgs, remoteMarkInFlightSshArgs, remoteClearInFlightSshArgs,
 } from '../utils/appDataHelper.js'
+import type { Store } from './Store.js'
 
 export const IN_FLIGHT_SUFFIX = '.idea-op-in-flight'
 
@@ -88,3 +90,66 @@ export const clearInFlight = async (root: string, instanceId: string, opId: stri
 /** Compare the copy with its source (helper verify-copy, a read-only rsync dry run). */
 export const verifyInstanceCopy = async (srcRoot: string, srcId: string, dstRoot: string, dstId: string): Promise<{ differences: number, diffs: string[] }> =>
     parseVerifyCopy(await inFlightHelper.run(verifyCopyArgs(srcRoot, srcId, dstRoot, dstId)))
+
+// ── engine#497 stage 3 (a): cross-Engine resume (helper v23) ─────────────────
+//
+// Koen 2026-11-17, Q1 option A: the SOURCE Engine owns the op and the resume. It marks the
+// target id on the peer through the peer's gate (the marker's engineId is the gate's peer id,
+// so it names the source Engine), pushes into that folder with its op id, checks the result
+// against the source (verify-send, a dry run on both sides) and clears the marker only after
+// success. An interruption keeps the partial folder under its marker on the peer; the source
+// pushes again into the same folder and id. Nothing is deleted on the peer.
+
+/** Advertised by an Engine whose app-data helper and gate are v23+ (a peer that can be resumed into). */
+export const CROSS_ENGINE_RESUME_CAPABILITY = 'crossEngineResume'
+
+/** True when the Engine record counts `crossEngineResume` (same rule as the Console: this boot's list). */
+export const engineCanResume = (store: Store | undefined, engineId: string): boolean => {
+    const e = (store?.engineDB as any)?.[engineId]
+    if (!e || !Array.isArray(e.capabilities) || !e.capabilities.includes(CROSS_ENGINE_RESUME_CAPABILITY)) return false
+    return e.capabilitiesBootedAt === undefined || e.capabilitiesBootedAt === e.lastBooted
+}
+
+/** The peer side of a resumable cross-Engine copy; tests replace these. */
+export const peerInFlight: {
+    mark: (host: string, peerEngineId: string, root: string, id: string, opId: string) => Promise<void>
+    clear: (host: string, peerEngineId: string, root: string, id: string, opId: string) => Promise<void>
+    verify: (srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string, opId: string) => Promise<{ differences: number, diffs: string[] }>
+    helperProblem: (what: string) => Promise<string | null>
+} = {
+    mark: async (host, peer, root, id, opId) => { await $`${remoteMarkInFlightSshArgs(host, peer, root, id, opId)}` },
+    clear: async (host, peer, root, id, opId) => { await $`${remoteClearInFlightSshArgs(host, peer, root, id, opId)}` },
+    verify: async (srcRoot, srcId, host, peer, dstRoot, dstId, opId) =>
+        parseVerifyCopy(await runAppData(verifySendArgs(srcRoot, srcId, host, peer, dstRoot, dstId, opId))),
+    helperProblem: (what) => helperAtLeast(CROSS_RESUME_HELPER_MIN, what),
+}
+
+/** Mark instances/<id> on the peer for this op, before its first byte (the peer writes engineId = this Engine). */
+export const markPeerInFlight = async (host: string, peerEngineId: string, root: string, id: string, opId: string): Promise<void> => {
+    await peerInFlight.mark(host, peerEngineId, root, id, opId)
+    log(`in-flight: marked instances/${id} on ${root} of Engine ${peerEngineId} for operation ${opId}`)
+}
+
+/** Clear this op's marker on the peer (absent is ok). */
+export const clearPeerInFlight = async (host: string, peerEngineId: string, root: string, id: string, opId: string): Promise<void> => {
+    await peerInFlight.clear(host, peerEngineId, root, id, opId)
+    log(`in-flight: cleared the marker of instances/${id} on ${root} of Engine ${peerEngineId} (operation ${opId})`)
+}
+
+/** VERIFY_FAILED unless the folder on the peer matches its source (verify-send). */
+export const verifyPeerCopyOrThrow = async (srcRoot: string, srcId: string, host: string, peerEngineId: string, dstRoot: string, dstId: string, opId: string, who: string): Promise<void> => {
+    const v = await peerInFlight.verify(srcRoot, srcId, host, peerEngineId, dstRoot, dstId, opId)
+    if (v.differences > 0) {
+        throw new Error(`VERIFY_FAILED: the copy instances/${dstId} on ${dstRoot} of Engine ${peerEngineId} differs from its source in ${v.differences} item(s)` +
+            `${v.diffs.length ? `: ${v.diffs.join('; ')}` : ''}`)
+    }
+    log(`${who}: the copy instances/${dstId} on ${dstRoot} of Engine ${peerEngineId} matches its source (idea-app-data verify-send)`)
+}
+
+/**
+ * A failure of a cross-Engine transfer that is an interruption (the peer or the link went away),
+ * not a real failure: ssh exit 255 (zx reports `exit code: 255`, rsync `exited with code 255`), rsync's connection codes (10 socket, 12 stream, 30/35 timeouts),
+ * a signal, or a connection error text. Such a failure is never counted (RESUME_WAITING).
+ */
+export const PEER_LINK_FAILURE = /exited with code (10|12|30|35|255)\b|exit code[: ]*(10|12|30|35|255)\b|stopped by SIG|Connection (refused|reset|closed|timed out)|closed by remote host|Broken pipe|No route to host|Network is unreachable|connection unexpectedly closed|not currently reachable|Host is down/i
+export const isPeerLinkFailure = (text: string): boolean => PEER_LINK_FAILURE.test(String(text ?? ''))

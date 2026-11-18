@@ -165,6 +165,19 @@ const RUNNING_STATES = new Set(['Running', 'Starting'])
 const BACKUP_KINDS = new Set(['backupApp', 'restoreApp'])
 const MOVE_KINDS = new Set(['moveApp', 'copyApp'])
 
+/** engine#511: the Running or Pending moveApp / copyApp whose source is `instanceId`, if any. */
+export const unfinishedMoveOf = (store: Store, instanceId: string): { id: string, kind: string, status: string, error: string | null } | null => {
+    for (const [key, op] of Object.entries(store.operationDB ?? {})) {
+        const o = op as any
+        if (!o || !MOVE_KINDS.has(String(o.kind))) continue
+        if (o.status !== 'Running' && o.status !== 'Pending') continue
+        const src = String(o.move?.sourceInstanceId ?? o.args?.instanceId ?? '')
+        if (src !== String(instanceId)) continue
+        return { id: String(o.id ?? key), kind: String(o.kind), status: String(o.status), error: o.error ? String(o.error) : null }
+    }
+    return null
+}
+
 export const removeInstance = async (
     storeHandle: DocHandle<Store>, instanceArg: string, engineId: string, deps: Partial<RemoveDeps> = {},
 ): Promise<RemoveResult> => {
@@ -195,6 +208,10 @@ export const removeInstance = async (
         })
         if (clash) throw new RemoveError('PROJECT_CLASH', `instance '${inst.id}' has compose project '${idCheck.project}', which instance '${clash.id}' also has; nothing changed`)
     }
+    // engine#511: a move/copy of this instance that has not finished (Running, or Pending — parked
+    // with RESUME_WAITING / RESUME_PENDING) holds no lock while parked, but still owns the source
+    const unfinished = unfinishedMoveOf(store, String(inst.id))
+    if (unfinished) throw new RemoveError('BUSY_MOVE', `instance '${inst.name}' is the source of unfinished ${unfinished.kind} ${unfinished.id} (${unfinished.status}${unfinished.error ? `: ${unfinished.error}` : ''}); it resumes or gives up first (or cancel it); nothing changed`)
     if (RUNNING_STATES.has(String(inst.status))) throw new RemoveError('RUNNING', `instance '${inst.name}' is ${inst.status}; stop it first`)
 
     const helper = await d.helperProblem(idCheck.legacy ? REMOVE_LEGACY_ID_HELPER_MIN : REMOVE_HELPER_MIN)

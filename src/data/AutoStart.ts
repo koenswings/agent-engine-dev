@@ -82,8 +82,12 @@ export interface AutoStartDecision {
     userStop?: Operation
 }
 
-/** Phases of a resumable local move while the target holds its in-flight marker and the source is still the App (engine#497). */
-const MOVE_IN_FLIGHT_PHASES: ReadonlySet<string> = new Set(['copying', 'verified'])
+/**
+ * Phases of a resumable move while the target holds its in-flight marker and the source is still the App
+ * (engine#497): local copying / verified; cross-Engine (stage 3 (a), args.crossResume '1') copying /
+ * checking / removing (until storedOn flips to the target).
+ */
+const MOVE_IN_FLIGHT_PHASES: ReadonlySet<string> = new Set(['copying', 'verified', 'checking', 'removing'])
 
 /**
  * engine#497 stage 3 (c): the unfinished resumable moveApp that is moving `instance` away from
@@ -97,7 +101,7 @@ const MOVE_IN_FLIGHT_PHASES: ReadonlySet<string> = new Set(['copying', 'verified
 export const moveInFlightFromSource = (store: Store, instance: Instance): Operation | undefined => {
     if (!instance?.storedOn) return undefined
     return Object.values(store.operationDB ?? {}).find((op): op is Operation =>
-        !!op && op.kind === 'moveApp' && !op.move &&
+        !!op && op.kind === 'moveApp' && (!op.move || op.args?.crossResume === '1') &&
         (op.status === 'Running' || op.status === 'Pending') &&
         MOVE_IN_FLIGHT_PHASES.has(String(op.args?.phase ?? '')) &&
         String(op.args?.instanceId ?? '') === String(instance.id) &&

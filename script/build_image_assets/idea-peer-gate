@@ -21,6 +21,16 @@
 #   receive-service <root> --server …      → idea-app-data receive-service <root> --server …
 #   delete <root> <id>                     → idea-app-data peer-delete <peer> <root> <id>
 #                                            (only a folder that peer's receive created)
+# engine#497 stage 3 (a), helper v23 (Koen 2026-11-17, Q1 option A: the source Engine resumes and
+# pushes again into the SAME folder and id):
+#   mark-in-flight <root> <id> <opId>      → idea-app-data peer-mark-in-flight <peer> <root> <id> <opId>
+#                                            (the marker's engineId is the gate's peer; a new id only)
+#   clear-in-flight <root> <id> <opId>     → idea-app-data peer-clear-in-flight <peer> <root> <id> <opId>
+#   receive <root> <id> <opId> --server …  → idea-app-data peer-resume-receive <peer> <root> <id> <opId> --server …
+#                                            (only into a folder under that peer's marker of that op)
+#   verify-receive <root> <id> <opId> --server … → idea-app-data peer-verify-receive <peer> …
+#                                            (dry run only; the one place the exact token
+#                                            --log-format=%i is accepted, for rsync's itemized list)
 # Everything else — a shell, scp/sftp, any other program or subcommand, --sender,
 # a character outside [A-Za-z0-9._=,:+@/-] and space — is refused (exit 2,
 # "refused: …"). The helper checks every token again. Every call is logged with
@@ -64,13 +74,18 @@ allow() {   # allow <helper args…>
 (( $# == 1 )) || refuse "the gate takes exactly one argument (the peer's Engine id), got $#"
 [[ "$PEER" =~ $RE_ENGINE ]] || refuse "peer Engine id does not match $RE_ENGINE"
 [[ -n "$CMD" ]] || refuse "no command: a peer key gets no shell"
-[[ "$CMD" =~ $RE_COMMAND ]] || refuse "the command holds a character outside [A-Za-z0-9._=,:+@/ -] (or is longer than 4096)"
+# v23: rsync's itemized dry run sends the server '--log-format=%i'; that exact token is the only
+# '%' a command may hold, and only verify-receive may carry it (checked below)
+CHECK_CMD="$CMD"
+[[ "$CHECK_CMD" == *" --log-format=%i "* ]] && CHECK_CMD="${CHECK_CMD// --log-format=%i / --log-format=i }"
+[[ "$CHECK_CMD" =~ $RE_COMMAND ]] || refuse "the command holds a character outside [A-Za-z0-9._=,:+@/ -] (or is longer than 4096)"
 
 read -r -a W <<<"$CMD"
 (( ${#W[@]} >= 4 )) || refuse "not a call of $HELPER_PATH"
 [[ "${W[0]}" == sudo || "${W[0]}" == "$SUDO_WORD" ]] || refuse "only $HELPER_PATH may run (through sudo -n), not '${W[0]}'"
 [[ "${W[1]}" == -n && "${W[2]}" == "$HELPER_PATH" ]] || refuse "only '$SUDO_WORD -n $HELPER_PATH …' may run"
 SUBCMD="${W[3]}"
+[[ "$CHECK_CMD" == "$CMD" || "$SUBCMD" == verify-receive ]] || refuse "only verify-receive may carry --log-format=%i"
 ARGS=("${W[@]:4}")
 N=${#ARGS[@]}
 
@@ -88,9 +103,24 @@ case "$SUBCMD" in
         (( N == 1 )) || refuse "ensure-dirs takes exactly <root>"
         allow ensure-dirs "${ARGS[0]}" ;;
     receive)
-        (( N >= 3 )) || refuse "receive takes <root> <id> and the rsync server arguments"
-        server_args 2
-        allow peer-receive "$PEER" "${ARGS[@]}" ;;
+        (( N >= 3 )) || refuse "receive takes <root> <id> [<opId>] and the rsync server arguments"
+        if [[ "${ARGS[2]}" == --server ]]; then
+            server_args 2
+            allow peer-receive "$PEER" "${ARGS[@]}"
+        fi
+        (( N >= 4 )) || refuse "receive takes <root> <id> [<opId>] and the rsync server arguments"
+        server_args 3
+        allow peer-resume-receive "$PEER" "${ARGS[@]}" ;;
+    verify-receive)
+        (( N >= 4 )) || refuse "verify-receive takes <root> <id> <opId> and the rsync server arguments"
+        server_args 3
+        allow peer-verify-receive "$PEER" "${ARGS[@]}" ;;
+    mark-in-flight)
+        (( N == 3 )) || refuse "mark-in-flight takes exactly <root> <id> <opId>"
+        allow peer-mark-in-flight "$PEER" "${ARGS[@]}" ;;
+    clear-in-flight)
+        (( N == 3 )) || refuse "clear-in-flight takes exactly <root> <id> <opId>"
+        allow peer-clear-in-flight "$PEER" "${ARGS[@]}" ;;
     receive-files)
         (( N >= 3 )) || refuse "receive-files takes <root> <id> and the rsync server arguments"
         server_args 2

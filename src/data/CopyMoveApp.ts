@@ -12,7 +12,7 @@
  */
 
 import { chalk, fs, $ } from 'zx'
-import { log } from '../utils/utils.js'
+import { log, isEngineOnline } from '../utils/utils.js'
 import { rsyncDirectory, rsyncInstanceData, rsyncToPeer, PeerEngine } from '../utils/rsync.js'
 import {
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData, ensureRemoteDirs,
@@ -29,11 +29,15 @@ import { stopInstance, startInstance, applyBackupMethod } from './Instance.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { uuid } from '../utils/utils.js'
 import { beginUsageSkip, endUsageSkip } from '../usage/opFlags.js'
-import { createOperation, updateOperation, setOperationArgs, parkResumableOp, resumeGaveUpHooks } from './Operations.js'
-import { markInFlight, clearInFlight, verifyInstanceCopy, resumeHelperProblem } from './InFlight.js'
+import { createOperation, updateOperation, setOperationArgs, parkResumableOp, resumeGaveUpHooks, peerResumeProbe, peerInterruption } from './Operations.js'
+import {
+    markInFlight, clearInFlight, verifyInstanceCopy, resumeHelperProblem,
+    engineCanResume, peerInFlight, markPeerInFlight, clearPeerInFlight, verifyPeerCopyOrThrow,
+} from './InFlight.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { sendCommand } from '../utils/commandUtils.js'
-import { getEngineAddress } from './Network.js'
+import { getEngineAddress, getLiveEngineAddress, getLiveEngineEndpoint } from './Network.js'
+import { peerLiveSeen, PEER_CLOCK_STALE_MS } from './Liveness.js'
 import { serviceImageTarName } from './ImageRef.js'
 import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
@@ -267,6 +271,46 @@ const parkCopyMove = async (storeHandle: DocHandle<Store>, opId: string, diskIds
     parkResumableOp(storeHandle, opId, gone ? `${gone}: ${reason}` : reason, { interrupted: !!gone })
 }
 
+// engine#497 / #511 B2: a parked-op resume needs a live WS address, a fresh
+// heartbeat (when one has been seen), and a successful TCP probe of the Engine port.
+// copyApp itself still uses getEngineAddress so a forced retry can reach ssh and
+// re-park on a transport failure rather than treating a stale entry as "no peer".
+export const PEER_RESUME_LIVE_MS = PEER_CLOCK_STALE_MS
+
+export const probePeerEngineReachable = async (engineId: string, now: number = Date.now()): Promise<boolean> => {
+    const ep = getLiveEngineEndpoint(engineId as any)
+    if (!ep) return false
+    const seen = peerLiveSeen(engineId)
+    if (seen != null && now - seen > PEER_RESUME_LIVE_MS) return false
+    return isEngineOnline(ep.address, ep.port)
+}
+
+peerResumeProbe.address = (engineId: string) => getLiveEngineAddress(engineId as any) as string | undefined
+peerResumeProbe.reachable = (engineId: string) => probePeerEngineReachable(engineId)
+
+/**
+ * engine#497 stage 3 (a): park a cross-Engine copy/move after a failed run. An interruption (the
+ * source disk left this Engine, the target disk or its Engine is gone, or the link to it failed)
+ * is never counted; anything else is a real failure (RESUME_PENDING n/3, then RESUME_GAVE_UP).
+ */
+export const parkCrossCopyMove = async (
+    storeHandle: DocHandle<Store>, opId: string, sourceDiskId: string, targetDiskId: string, targetEngineId: string, e: unknown,
+): Promise<void> => {
+    const reason = (e as any)?.message ?? String(e)
+    const gone = await copyInterruption(storeHandle, [sourceDiskId]) ?? peerInterruption(storeHandle.doc(), targetDiskId, targetEngineId, reason)
+    parkResumableOp(storeHandle, opId, gone ? `${gone}: ${reason}` : reason, { interrupted: !!gone })
+}
+
+/** TARGET_OUTDATED / HELPER_OUTDATED text when a cross-Engine copy to `targetEngineId` cannot be resumed, else null. */
+export const crossResumeRefusal = async (store: Store, targetEngineId: string, what: string): Promise<string | null> => {
+    if (!engineCanResume(store, targetEngineId)) {
+        const name = String((store?.engineDB as any)?.[targetEngineId]?.hostname ?? targetEngineId)
+        return `TARGET_OUTDATED: Engine ${name} cannot resume an interrupted ${what} (no crossEngineResume capability); update it first (engine#497)`
+    }
+    const helperIssue = await peerInFlight.helperProblem(`${what} to another Engine (resumable cross-Engine ${what}, engine#497)`)
+    return helperIssue ? `HELPER_OUTDATED: ${helperIssue}` : null
+}
+
 /** VERIFY_FAILED unless the copy matches its source (helper verify-copy). */
 const verifyCopyOrThrow = async (sourceRoot: string, srcId: string, targetRoot: string, dstId: string, who: string): Promise<void> => {
     const v = await verifyInstanceCopy(sourceRoot, srcId, targetRoot, dstId)
@@ -305,6 +349,13 @@ export const copyApp = async (
     // crash-recovery retry ends as error instead of silently succeeding.
     if (typeof v === 'string') throw new Error(`copyApp: ${v}`)
     const { instance, sourceDisk, targetDisk, appId, sourceDevice, targetDevice, appMasterSrc, instanceSrc, sourceRoot, targetRoot } = v
+
+    // engine#497 stage 3 (a): every cross-Engine copy is resumable, so both Engines need helper v23
+    // (a clear refusal before anything is stopped or written; no partial on an older peer)
+    if (String(targetDisk.dockedTo) !== String((await import('./Engine.js')).localEngineId)) {
+        const refusal = await crossResumeRefusal(store, String(targetDisk.dockedTo), 'copy')
+        if (refusal) throw new Error(`copyApp: ${refusal}`)
+    }
 
     // Acquire per-resource locks: source instance + target disk
     const lockKeys = [instanceKey(instance.id), diskKey(targetDisk.id)]
@@ -367,6 +418,12 @@ export const copyApp = async (
     // same folder and id, verify). Cross-Engine copies keep the idea#79 rules (stage 3).
     // (dstId is the copy step of a cross-Engine move, which keeps its own rules)
     const resumable = !journal && !isCrossEngine && !opts.dstId
+    // engine#497 stage 3 (a), Koen Q1 option A: a cross-Engine copy (a plain copy, or the copy step of
+    // a cross-Engine move under its moveApp op) resumes too. This Engine marks the target id on the
+    // peer before the first byte, pushes into it with the op id, verifies against the source and
+    // clears the marker only after success. A failure keeps the partial folder marked on the peer.
+    const crossResumable = isCrossEngine
+    const anyResumable = resumable || crossResumable
 
     // ── step definitions ──────────────────────────────────────────────────────
     const COPY_STEPS = [
@@ -396,6 +453,17 @@ export const copyApp = async (
                 log(chalk.green(`copyApp: done — instance ${newInstanceId} was already registered on '${targetDisk.name}'; cleared its in-flight marker`))
                 return newInstanceId
             }
+        }
+
+        // engine#497 (a): a resumed cross-Engine copy that registered the copy before it stopped
+        if (crossResumable && !journal && peer && resumedArgs?.targetInstanceId &&
+            (resumedArgs.phase === 'registered' || String(storeHandle.doc()?.instanceDB?.[newInstanceId]?.storedOn ?? '') === String(targetDisk.id))) {
+            await clearPeerInFlight(peer.host, peer.engineId, targetRoot, newInstanceId, opId)
+            setOperationArgs(storeHandle, opId, { phase: 'done' })
+            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd` as any)
+            updateOperation(storeHandle, opId, { status: 'Done', progressPercent: 100, error: null, completedAt: Date.now() as Timestamp })
+            log(chalk.green(`copyApp: done — instance ${newInstanceId} was already registered on '${targetDisk.name}' (Engine ${peer.engineId}); cleared its in-flight marker there`))
+            return newInstanceId
         }
 
         // 1. Stop source instance if running
@@ -428,6 +496,15 @@ export const copyApp = async (
             }
         }
 
+        // engine#511 B2: a resume of a marked cross-Engine copy already has the
+        // marker (and often a partial folder) on the peer. Treat the marker as
+        // written before ensureRemoteDirs so an ssh/transport failure (exit 255)
+        // parks as RESUME_WAITING instead of marking the op Failed, and so the
+        // partial is not treated as an unmarked leftover.
+        if (crossResumable && resumedArgs?.targetMarked === '1') {
+            markerWritten = true
+        }
+
         // 3. Ensure target directory structure
         // For cross-engine: the peer's helper (ensure-dirs <root>, through its gate)
         const targetMountRoot = await diskMountRoot(targetDisk) // '' for system disk (both local and remote)
@@ -445,6 +522,18 @@ export const copyApp = async (
             setOperationArgs(storeHandle, opId, { targetInstanceId: String(newInstanceId), phase: 'copying', wasRunning: wasRunning ? '1' : '0' })
             await markInFlight(targetRoot, newInstanceId, opId, String(localEngineId))
             markerWritten = true
+        }
+        // engine#497 (a): the marker on the peer, written by its gate with this Engine's id
+        if (crossResumable && peer) {
+            if (!journal) {
+                setOperationArgs(storeHandle, opId, {
+                    targetInstanceId: String(newInstanceId), phase: 'copying', wasRunning: wasRunning ? '1' : '0',
+                    crossEngine: 'true', crossResume: '1', targetEngineId: peer.engineId,
+                })
+            }
+            await markPeerInFlight(peer.host, peer.engineId, targetRoot, String(newInstanceId), opId)
+            markerWritten = true
+            setOperationArgs(storeHandle, opId, { targetMarked: '1' })
         }
 
         // 4. rsync app master (idempotent — skips if already present and identical)
@@ -474,12 +563,12 @@ export const copyApp = async (
         setCopyStep(3)
         const instanceDest = `${targetMountRoot}/instances/${newInstanceId}`
         // a resumable copy is kept (marked) on failure; only a cross-Engine one is removed
-        if (!resumable) createdInstanceDest = instanceDest
+        if (!anyResumable) createdInstanceDest = instanceDest
         log(`copyApp: syncing instance data ${instanceSrc} → ${isCrossEngine ? remoteAddress + ':' : ''}${instanceDest} (idea-app-data ${isCrossEngine ? 'send' : 'copy'})`)
         const instanceByteProgress = copyBytes.stage(instanceBytes)
         await rsyncInstanceData(
             peer
-                ? { kind: 'send', srcRoot: sourceRoot, srcId: instance.id, host: peer.host, peerEngineId: peer.engineId, dstRoot: targetRoot, dstId: newInstanceId }
+                ? { kind: 'send', srcRoot: sourceRoot, srcId: instance.id, host: peer.host, peerEngineId: peer.engineId, dstRoot: targetRoot, dstId: newInstanceId, ...(crossResumable ? { opId } : {}) }
                 : { kind: 'copy', srcRoot: sourceRoot, srcId: instance.id, dstRoot: targetRoot, dstId: newInstanceId, ...(resumable ? { opId } : {}) },
             (p) => {
                 updateOperation(storeHandle, opId, { progressPercent: 25 + Math.round(p.progressPercent * 0.30) })
@@ -491,6 +580,11 @@ export const copyApp = async (
             await verifyCopyOrThrow(sourceRoot, String(instance.id), targetRoot, String(newInstanceId), 'copyApp')
             setOperationArgs(storeHandle, opId, { phase: 'verified' })
         }
+        // engine#497 (a): verified against the source on the peer (dry run both sides)
+        if (crossResumable && peer) {
+            await verifyPeerCopyOrThrow(sourceRoot, String(instance.id), peer.host, peer.engineId, targetRoot, String(newInstanceId), opId, 'copyApp')
+            if (!journal) setOperationArgs(storeHandle, opId, { phase: 'verified' })
+        }
 
         // 5a. Give the copy its own name and port (idea#168 r35). The rsync
         //     copied the original's compose.yaml (x-app.instanceName) and .env
@@ -499,7 +593,7 @@ export const copyApp = async (
         //     neither listening nor owned by another instance in the store.
         const copyName = opts.keepName ? instance.name
             : ((resumedArgs?.copyName as InstanceName | undefined) || uniqueCopyName(storeHandle.doc(), String(instance.name)))
-        if (resumable) setOperationArgs(storeHandle, opId, { copyName: String(copyName) })
+        if (anyResumable && !journal) setOperationArgs(storeHandle, opId, { copyName: String(copyName) })
         const prepared = await preparedCopyFiles(instanceSrc, copyName)
         const preparedNames = Object.keys(prepared) as (keyof typeof prepared)[]
         if (preparedNames.length > 0) {
@@ -624,6 +718,13 @@ export const copyApp = async (
                 applyBackupMethod(newInst, compose)   // idea#403
                 doc.instanceDB[newInstanceId] = newInst
             })
+            // engine#497 (a): registered; then the marker on the peer goes, before the start
+            if (crossResumable && peer) {
+                setOperationArgs(storeHandle, opId, { phase: 'registered' })
+                await clearPeerInFlight(peer.host, peer.engineId, targetRoot, String(newInstanceId), opId)
+                markerWritten = false
+                setOperationArgs(storeHandle, opId, { phase: 'done', targetMarked: null })
+            }
             // Tell the remote engine to start this instance, by id (idea#168)
             log(`copyApp: sending startInstance command to remote engine '${targetDisk.dockedTo}'`)
             sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd` as any)
@@ -645,7 +746,7 @@ export const copyApp = async (
         if (!journal) updateOperation(storeHandle, opId, {
             status: 'Done',
             progressPercent: 100,
-            ...(resumable ? { error: null } : {}),
+            ...(anyResumable ? { error: null } : {}),
             completedAt: Date.now() as Timestamp,
         })
         log(chalk.green(`copyApp: done — new instance ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id})`))
@@ -654,7 +755,13 @@ export const copyApp = async (
         // Don't overwrite Cancelled status (set by cancelOperation before SIGTERM completes)
         copyError = e instanceof Error ? e : new Error(String(e))
         const currentStatus = storeHandle.doc()?.operationDB?.[opId]?.status
-        if (markerWritten) {
+        if (markerWritten && journal) {
+            // engine#497 (a): the copy step of a cross-Engine move; the move parks its own op
+        } else if (markerWritten && crossResumable) {
+            // engine#497 (a): the partial copy stays on the peer under its marker; this Engine
+            // resumes the op and pushes again into the same folder (nothing is deleted there)
+            if (currentStatus !== 'Cancelled') await parkCrossCopyMove(storeHandle, opId, String(sourceDisk.id), String(targetDisk.id), String(targetDisk.dockedTo), e)
+        } else if (markerWritten) {
             // engine#497 (Koen's rule; r36 delete-on-failure withdrawn for local copies): the
             // partial copy stays, under its marker, and the op resumes at the next boot or dock
             if (currentStatus !== 'Cancelled') await parkCopyMove(storeHandle, opId, [String(sourceDisk.id), String(targetDisk.id)], e)
@@ -684,7 +791,8 @@ export const copyApp = async (
         resourceLock.releaseAll(lockKeys)
         endUsageSkip('move')
         // Always restart the source if we stopped it and the success path did not
-        if (wasRunning && !sourceRestarted && (copyError || !opts.keepSourceStopped)) await restartSource('after a failed copy')
+        // engine#497 stage 3 (c), Koen Q2: a cross-Engine move's source stays stopped once its target is marked
+        if (wasRunning && !sourceRestarted && ((copyError && !(journal && markerWritten)) || !opts.keepSourceStopped)) await restartSource('after a failed copy')
     }
     if (copyError && opts.rethrow) throw copyError
     return copyError ? null : newInstanceId
@@ -787,10 +895,15 @@ export const moveApp = async (
     const { localEngineId: localId } = await import('./Engine.js')
     const tgt = getDisk(store, targetDiskId) as Disk | undefined
     if (tgt?.dockedTo && String(tgt.dockedTo) !== String(localId)) {
+        const { moveAppCrossEngine } = await import('./MoveAppRemote.js')
+        // engine#497 stage 3 (a): a resumable cross-Engine move resumes in its own op
+        const recovered = opts.recoveredOpId ? store?.operationDB?.[opts.recoveredOpId] : undefined
+        if (recovered?.move && recovered.args?.crossResume === '1') {
+            return moveAppCrossEngine(storeHandle, instanceName, sourceDiskId, targetDiskId, cause, {}, { recoveredOpId: opts.recoveredOpId })
+        }
         // engine#497: an interrupted local move whose target is now on another Engine is
         // not turned into a cross-Engine move by recovery; the operator re-issues it.
         if (opts.recoveredOpId) throw new Error(`moveApp: the target disk ${targetDiskId} is now docked to another Engine; the interrupted local move is not retried, re-issue the move`)
-        const { moveAppCrossEngine } = await import('./MoveAppRemote.js')
         return moveAppCrossEngine(storeHandle, instanceName, sourceDiskId, targetDiskId, cause)
     }
 
@@ -1065,8 +1178,13 @@ export const moveApp = async (
  * here, start it there again. If the source disk is not docked here, nothing is started now:
  * the op is terminal, so the next dock of the source disk auto-starts it as usual.
  */
-export const restartMoveSourceAfterGiveUp = async (storeHandle: DocHandle<Store>, op: { id: string, args?: Record<string, string> }): Promise<void> => {
+export const restartMoveSourceAfterGiveUp = async (storeHandle: DocHandle<Store>, op: { id: string, args?: Record<string, string>, move?: any, error?: string | null }): Promise<void> => {
     const args = (op.args ?? {}) as Record<string, string>
+    // engine#497 stage 3 (a): a cross-Engine move records its end on op.move first
+    if (op.move) {
+        const { crossMoveGaveUp } = await import('./MoveAppRemote.js')
+        await crossMoveGaveUp(storeHandle, op)
+    }
     if (args.wasRunning !== '1') return
     const store = storeHandle.doc()
     const instance = getInstance(store, String(args.instanceId ?? '') as InstanceID)
