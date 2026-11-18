@@ -78,7 +78,12 @@ export let verbosityLevel = parseInt(verbosity) || 0
 // Verbosity-gated debug logger. Uses console.info so CommandLogger captures
 // always-on/gated messages without matching the hygiene.console_log scan
 // (which flags the console "log" method call pattern only).
+/** engine#512: the most recent log() message (printed or not), for the loop-stall monitor. */
+let lastLogMessage = ''
+export const lastLogLine = (): string => lastLogMessage
+
 export const log = (msg:string, level?:number):void => {
+  lastLogMessage = typeof msg === 'string' ? msg : String(msg)
   if (!level) {
     // Set the default log level to 2
     level = 2
