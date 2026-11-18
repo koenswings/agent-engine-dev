@@ -187,6 +187,7 @@ describe('engine#497 stage 3 (a): cross-Engine resume (the source owns the resum
         // the source disk is mounted here (copyInterruption looks for <mount>/instances)
         await fs.ensureDir(`${disksRoot()}/${SRC_DEV}/instances`)
         peerResumeProbe.address = (id: string) => (id === String(TGT) && peer.up) ? TGT_ADDR : undefined
+        peerResumeProbe.reachable = undefined
         // the give-up path clears the target marker through peerInFlight (MoveAppRemote defaultDeps)
         peerInFlight.clear = async (_host, _e, _root, id, opId) => { if (peer.markers.get(id) === opId) peer.markers.delete(id) }
         vi.spyOn(console, 'error').mockImplementation(() => {})
@@ -236,10 +237,10 @@ describe('engine#497 stage 3 (a): cross-Engine resume (the source owns the resum
         expect(peer.folders.get(INST)).toBe('partial')
         expectSourceHeldStopped(h, w.startSource)
         // peer still away: nothing resumes
-        expect(resumePeerParkedOps(h)).toEqual([])
+        expect(await resumePeerParkedOps(h)).toEqual([])
         // the peer is back: the source Engine resumes the op itself
         peer.up = true
-        expect(resumePeerParkedOps(h)).toEqual([op.id])
+        expect(await resumePeerParkedOps(h)).toEqual([op.id])
         await until(() => theOp(h).status === 'Done', 'the resumed move to end Done')
         const done = theOp(h)
         expect(Object.keys(h.doc().operationDB)).toEqual([op.id])          // the same op, no second one
@@ -321,16 +322,16 @@ describe('engine#497 stage 3 (a): cross-Engine resume (the source owns the resum
         expect(op.args.resumeFailures).toBe('1')
         expectSourceHeldStopped(h, w.startSource)
         // a counted failure does not loop: nothing changed on the peer, nothing resumes
-        expect(resumePeerParkedOps(h)).toEqual([])
-        expect(resumePeerParkedOps(h, Date.now() + PEER_RESUME_RETRY_MS + 1)).toEqual([])
+        expect(await resumePeerParkedOps(h)).toEqual([])
+        expect(await resumePeerParkedOps(h, Date.now() + PEER_RESUME_RETRY_MS + 1)).toEqual([])
         // the target disk re-docks on its Engine: like a dock, that is a new chance
         h.change(d => { (d.diskDB as any)[TGT_DISK].lastDocked = 10 })
-        expect(resumePeerParkedOps(h)).toEqual([op.id])
+        expect(await resumePeerParkedOps(h)).toEqual([op.id])
         await until(() => /^RESUME_PENDING \(2\/3\)/.test(String(theOp(h).error)), 'the second park')
         expectSourceHeldStopped(h, w.startSource)
         // the target Engine reboots
         h.change(d => { (d.engineDB as any)[TGT].lastBooted = 3; (d.engineDB as any)[TGT].capabilitiesBootedAt = 3 })
-        expect(resumePeerParkedOps(h)).toEqual([op.id])
+        expect(await resumePeerParkedOps(h)).toEqual([op.id])
         await until(() => theOp(h).status === 'Failed', 'the give-up')
         const failed = theOp(h)
         expect(failed.error).toMatch(/^RESUME_GAVE_UP: VERIFY_SIZE: /)
@@ -357,11 +358,11 @@ describe('engine#497 stage 3 (a): cross-Engine resume (the source owns the resum
         await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
         const op = theOp(h)
         expect(op.error).toMatch(/^RESUME_PENDING \(1\/3\): rsync \(idea-app-data send exited with code 23/)
-        expect(resumePeerParkedOps(h)).toEqual([])                         // first look: nothing changed yet
+        expect(await resumePeerParkedOps(h)).toEqual([])                         // first look: nothing changed yet
         for (const n of [2, 3]) {
             h.change(d => { (d.diskDB as any)[TGT_DISK].lastDocked = n })
-            expect(resumePeerParkedOps(h)).toEqual([op.id])
-            expect(resumePeerParkedOps(h)).toEqual([])                     // never twice at once
+            expect(await resumePeerParkedOps(h)).toEqual([op.id])
+            expect(await resumePeerParkedOps(h)).toEqual([])                     // never twice at once
             await until(() => n === 3 ? theOp(h).status === 'Failed' : /\(2\/3\)/.test(String(theOp(h).error)), `run ${n}`)
         }
         expect(w.copy).toHaveBeenCalledTimes(3)
@@ -419,7 +420,7 @@ describe('engine#497 stage 3 (a): cross-Engine resume (the source owns the resum
         const s = () => h.doc()
         expect(peerInterruption(s(), TGT_DISK, String(TGT), REAL_ERR)).toBeNull()
         expect(peerInterruption(s(), TGT_DISK, String(TGT), LINK_ERR)).toMatch(/link to Engine .* failed/)
-        for (const e of ['ssh exited with code 255', 'rsync stopped by SIGPIPE', 'Connection reset by peer', 'Broken pipe', 'exited with code 30 (timeout)', 'exited with code 35']) {
+        for (const e of ['ssh exited with code 255', 'rsync stopped by SIGPIPE', 'Connection reset by peer', 'Broken pipe', 'exited with code 30 (timeout)', 'exited with code 35', 'exit code: 255', 'Error: exit code: 255']) {
             expect(isPeerLinkFailure(e), e).toBe(true)
         }
         expect(isPeerLinkFailure('exited with code 23: some files vanished')).toBe(false)
@@ -436,6 +437,44 @@ describe('engine#497 stage 3 (a): cross-Engine resume (the source owns the resum
         expect(peerTargetReady(s(), { ...op, args: { targetDiskId: TGT_DISK } }, TGT_DISK)).toBe(false) // not a cross op
         h.change(d => { (d.diskDB as any)[TGT_DISK].dockedTo = null })
         expect(peerInterruption(s(), TGT_DISK, String(TGT), REAL_ERR)).toMatch(/no longer docked$/)
+    })
+
+    it('engine#511 B2: a stale store address does not start a resume; ensure-dirs exit 255 re-parks RESUME_WAITING; it finishes when the target is really reachable', async () => {
+        const h = makeStore({ status: 'Running' })
+        const w = wire(h)
+        await recoverInterruptedOperations(h, w.handlers)
+        noteDiskDocked(h, SRC_DISK)
+        peer.copyScript.push('link')
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
+        expect(r.code).toBe('RESUME_PARKED')
+        const op = theOp(h)
+        expect(op.status).toBe('Pending')
+        expect(op.error).toMatch(/^RESUME_WAITING/)
+        expect(op.args.resumeFailures).toBeUndefined()
+        expect(peer.markers.get(INST)).toBe(op.id)
+        expect(peer.folders.get(INST)).toBe('partial')
+        // the target is cut, but the store still reports an address (getEngineAddress after SIGKILL)
+        peer.up = false
+        peerResumeProbe.address = (id: string) => (id === String(TGT)) ? TGT_ADDR : undefined
+        peerResumeProbe.reachable = async (id: string) => id === String(TGT) && peer.up
+        expect(peerTargetReady(h.doc(), op, TGT_DISK)).toBe(true)          // the stale gate would have said ready
+        const t0 = Date.now()
+        expect(await resumePeerParkedOps(h, t0)).toEqual([])               // due, but reachable is false
+        expect(theOp(h).status).toBe('Pending')
+        expect(theOp(h).error).toMatch(/^RESUME_WAITING/)
+        expect(theOp(h).args.resumeFailures).toBeUndefined()
+        expect(peer.markers.get(INST)).toBe(op.id)
+        expect(peer.folders.get(INST)).toBe('partial')
+        // the target is really back: a fresh reachable probe lets the same op finish
+        peer.up = true
+        expect(await resumePeerParkedOps(h, t0 + PEER_RESUME_RETRY_MS + 1)).toEqual([op.id])
+        await until(() => theOp(h).status === 'Done', 'the resumed move to end Done after a real liveness probe')
+        expect(Object.keys(h.doc().operationDB)).toEqual([op.id])
+        expect(theOp(h).error).toBeNull()
+        expect(theOp(h).move).toMatchObject({ phase: 'done', code: 'MOVED', verified: true, sourceRemoved: true })
+        expect(peer.markers.size).toBe(0)
+        expect(peer.folders.get(INST)).toBe('complete')
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(TGT_DISK)
     })
 
     it('a legacy cross move (no crossResume) is not resumable and keeps the old recovery (INTERRUPTED)', async () => {
@@ -470,6 +509,7 @@ describe('engine#511 Finding 2: a cross-Engine move whose SOURCE is the system d
         setRootDeviceForTests('mmcblk-not-a-test-disk')
         await fs.ensureDir(`${disksRoot()}/${SRC_DEV}/instances`)
         peerResumeProbe.address = (id: string) => (id === String(TGT) && peer.up) ? TGT_ADDR : undefined
+        peerResumeProbe.reachable = undefined
         peerInFlight.clear = async (_host, _e, _root, id, opId) => { if (peer.markers.get(id) === opId) peer.markers.delete(id) }
         vi.spyOn(console, 'error').mockImplementation(() => {})
     })
@@ -513,7 +553,7 @@ describe('engine#511 Finding 2: a cross-Engine move whose SOURCE is the system d
         expect(resumeGate(h.doc(), theOp(h)).waitingFor).toEqual([TGT_DISK])
         // the peer reconnects: the peer watch resumes it, with no dock pass of the system disk
         peer.up = true
-        expect(resumePeerParkedOps(h)).toEqual([op.id])
+        expect(await resumePeerParkedOps(h)).toEqual([op.id])
         await until(() => theOp(h).status === 'Done', 'the resumed move to end Done')
         expect(Object.keys(h.doc().operationDB)).toEqual([op.id])
         expect(theOp(h).move).toMatchObject({ code: 'MOVED', verified: true })
@@ -552,7 +592,7 @@ describe('engine#511 Finding 2: a cross-Engine move whose SOURCE is the system d
         resetResumeStateForTests()
         await recoverInterruptedOperations(h, w.handlers)
         expect(theOp(h).error).toMatch(/^RESUME_WAITING: resumes when 'src' \(disk-src\) has docked/)
-        expect(resumePeerParkedOps(h)).toEqual([])                         // the peer alone is not enough
+        expect(await resumePeerParkedOps(h)).toEqual([])                         // the peer alone is not enough
         expect(noteDiskDocked(h, SRC_DISK)).toEqual([op.id])              // the system disk's dock pass
         await until(() => theOp(h).status === 'Done', 'the resumed move to end Done')
         expect(theOp(h).move.code).toBe('MOVED')

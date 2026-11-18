@@ -12,7 +12,7 @@
  */
 
 import { chalk, fs, $ } from 'zx'
-import { log } from '../utils/utils.js'
+import { log, isEngineOnline } from '../utils/utils.js'
 import { rsyncDirectory, rsyncInstanceData, rsyncToPeer, PeerEngine } from '../utils/rsync.js'
 import {
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData, ensureRemoteDirs,
@@ -36,7 +36,8 @@ import {
 } from './InFlight.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { sendCommand } from '../utils/commandUtils.js'
-import { getEngineAddress } from './Network.js'
+import { getEngineAddress, getLiveEngineAddress, getLiveEngineEndpoint } from './Network.js'
+import { peerLiveSeen, PEER_CLOCK_STALE_MS } from './Liveness.js'
 import { serviceImageTarName } from './ImageRef.js'
 import { Instance, Status } from './Instance.js'
 import { IPAddress } from './CommonTypes.js'
@@ -270,8 +271,22 @@ const parkCopyMove = async (storeHandle: DocHandle<Store>, opId: string, diskIds
     parkResumableOp(storeHandle, opId, gone ? `${gone}: ${reason}` : reason, { interrupted: !!gone })
 }
 
-// engine#497 stage 3 (a): this Engine reaches a peer target through its network connection
-peerResumeProbe.address = (engineId: string) => getEngineAddress(engineId as any) as string | undefined
+// engine#497 / #511 B2: a parked-op resume needs a live WS address, a fresh
+// heartbeat (when one has been seen), and a successful TCP probe of the Engine port.
+// copyApp itself still uses getEngineAddress so a forced retry can reach ssh and
+// re-park on a transport failure rather than treating a stale entry as "no peer".
+export const PEER_RESUME_LIVE_MS = PEER_CLOCK_STALE_MS
+
+export const probePeerEngineReachable = async (engineId: string, now: number = Date.now()): Promise<boolean> => {
+    const ep = getLiveEngineEndpoint(engineId as any)
+    if (!ep) return false
+    const seen = peerLiveSeen(engineId)
+    if (seen != null && now - seen > PEER_RESUME_LIVE_MS) return false
+    return isEngineOnline(ep.address, ep.port)
+}
+
+peerResumeProbe.address = (engineId: string) => getLiveEngineAddress(engineId as any) as string | undefined
+peerResumeProbe.reachable = (engineId: string) => probePeerEngineReachable(engineId)
 
 /**
  * engine#497 stage 3 (a): park a cross-Engine copy/move after a failed run. An interruption (the
@@ -479,6 +494,15 @@ export const copyApp = async (
                     `have ${Math.ceil(available / 1024 / 1024)}MB`
                 )
             }
+        }
+
+        // engine#511 B2: a resume of a marked cross-Engine copy already has the
+        // marker (and often a partial folder) on the peer. Treat the marker as
+        // written before ensureRemoteDirs so an ssh/transport failure (exit 255)
+        // parks as RESUME_WAITING instead of marking the op Failed, and so the
+        // partial is not treated as an unmarked leftover.
+        if (crossResumable && resumedArgs?.targetMarked === '1') {
+            markerWritten = true
         }
 
         // 3. Ensure target directory structure

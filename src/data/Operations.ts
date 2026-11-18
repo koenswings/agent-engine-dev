@@ -535,7 +535,17 @@ const dockedThisBoot = new Set<string>()
  * engine#497 stage 3 (a): how this Engine reaches a peer now (its address in the network
  * connections, or undefined). CopyMoveApp.ts wires it to Network.getEngineAddress; tests replace it.
  */
-export const peerResumeProbe: { address: (engineId: string) => string | undefined } = { address: () => undefined }
+/**
+ * How this Engine reaches a peer for a parked-op resume (engine#497 / #511 B2).
+ * `address` is the sync gate (a live WS address). `reachable` is the liveness
+ * probe: production requires a fresh heartbeat (when one has been seen) plus a
+ * successful TCP connect to the Engine port. When `reachable` is omitted, a
+ * truthy `address` is enough (tests).
+ */
+export const peerResumeProbe: {
+    address: (engineId: string) => string | undefined
+    reachable?: (engineId: string) => boolean | Promise<boolean>
+} = { address: () => undefined }
 
 /**
  * The target disk of a cross-Engine copy/move is ready on a peer: docked there, the peer is
@@ -641,7 +651,7 @@ const runRecoveryRetry = (
         } else if (isResumableOp(current())) {
             if (!parkedByRun() && statusNow() !== 'Cancelled') {
                 const gate = resumeGate(storeHandle.doc(), current()!)
-                parkResumableOp(storeHandle, op.id, msg, { interrupted: !gate.ready })
+                parkResumableOp(storeHandle, op.id, msg, { interrupted: !gate.ready || isPeerLinkFailure(msg) })
             }
         } else if (statusNow() !== 'Cancelled') {
             updateOperation(storeHandle, op.id, {
@@ -716,7 +726,7 @@ const peerKeyOf = (store: Store | undefined, op: Operation): string => {
 }
 
 /** Resume this Engine's parked cross-Engine ops whose peer target is ready (see above). Returns the ids it started. */
-export const resumePeerParkedOps = (storeHandle: DocHandle<Store>, now: number = Date.now(), engineId: EngineID = localEngineId): string[] => {
+export const resumePeerParkedOps = async (storeHandle: DocHandle<Store>, now: number = Date.now(), engineId: EngineID = localEngineId): Promise<string[]> => {
     if (!resumeHandlers) return []
     const store = storeHandle.doc()
     const started: string[] = []
@@ -733,7 +743,16 @@ export const resumePeerParkedOps = (storeHandle: DocHandle<Store>, now: number =
         if (!changed && !(waiting && due)) continue
         const handler = resumeHandlers[op.kind]
         if (!handler) continue
+        // Mark tried before the probe so a dead peer is not hammered every watch tick
         peerTriedAt.set(op.id, now)
+        // engine#511 B2: do not log "its target is ready" or start the retry until a
+        // liveness probe succeeds. A stale connections[] address / store dockedTo is not enough.
+        if (peerResumeProbe.reachable) {
+            const targetEngineId = String((store?.diskDB as any)?.[String(op.args?.targetDiskId)]?.dockedTo ?? op.args?.targetEngineId ?? '')
+            let live = false
+            try { live = !!(await peerResumeProbe.reachable(targetEngineId)) } catch { live = false }
+            if (!live) continue
+        }
         log(chalk.blue(`resume: ${op.id.slice(0, 8)} ${op.kind}: its target is ready on Engine ${String((store?.diskDB as any)?.[String(op.args?.targetDiskId)]?.dockedTo)}; resuming it in the same operation (was: ${op.error})`))
         updateOperation(storeHandle, op.id, { status: 'Pending', error: RETRY_MARKER })
         void runRecoveryRetry(storeHandle, op, handler)
@@ -752,7 +771,7 @@ export const watchPeerResumes = (storeHandle: DocHandle<Store>, intervalMs: numb
         const now = Date.now()
         if (now - last < 1000) return
         last = now
-        try { resumePeerParkedOps(storeHandle, now) } catch (e: any) { log(chalk.red(`resume: peer watch: ${e?.message ?? e}`)) }
+        try { void resumePeerParkedOps(storeHandle, now).catch((e: any) => log(chalk.red(`resume: peer watch: ${e?.message ?? e}`))) } catch (e: any) { log(chalk.red(`resume: peer watch: ${e?.message ?? e}`)) }
     }
     storeHandle.on('change', run)
     const timer = setInterval(run, Math.max(1000, intervalMs))

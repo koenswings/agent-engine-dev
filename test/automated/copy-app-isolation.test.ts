@@ -30,7 +30,7 @@ import path from 'path'
 const order = vi.hoisted(() => [] as string[])
 const remoteOverlays = vi.hoisted(() => [] as { src: string | string[], peer: { host: string, engineId: string }, helperArgs: string[], files: Record<string, string> }[])
 // r36: make the instance rsync fail after writing part of the copy
-const failure = vi.hoisted(() => ({ rsync: null as string | null, process: null as string | null }))
+const failure = vi.hoisted(() => ({ rsync: null as string | null, process: null as string | null, ssh: null as string | null }))
 const sshCalls = vi.hoisted(() => [] as string[])
 // idea#168: instance data goes through the app-data helper (copy / send / delete)
 const instanceTransfers = vi.hoisted(() => [] as any[])
@@ -152,6 +152,7 @@ vi.mock('zx', async (importOriginal) => {
                 ? strings.reduce((acc: string, str: string, i: number) => acc + str + (i < vals.length ? [vals[i]].flat().map(String).join(' ') : ''), '')
                 : flat
             sshCalls.push(cmd.replace(/\s+/g, ' ').trim())
+            if (failure.ssh) return Promise.reject(new Error(failure.ssh))
             return Promise.resolve({ stdout: '', stderr: '' })
         }
         return actual.$(strings, ...vals)
@@ -287,6 +288,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         helperDeletes.length = 0
         failure.rsync = null
         failure.process = null
+        failure.ssh = null
         setRootDeviceForTests('mmcblk-not-a-test-disk')
         outside = await fs.mkdtemp(path.join(os.tmpdir(), 'idea-outside-'))
         await fs.remove(srcRoot()); await fs.remove(tgtRoot())
@@ -534,6 +536,56 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
                 ['clear', '10.0.0.36', REMOTE, TGT_DEV, newId, op.id],
             ])
             expect(Object.keys(h.doc().operationDB)).toEqual([op.id])
+            expect(h.doc().operationDB[op.id]).toMatchObject({ status: 'Done', args: { phase: 'done' } })
+            expect(Object.keys(h.doc().instanceDB).sort()).toEqual([ORIG, newId].sort())
+        } finally {
+            delete network.connections['10.0.0.36:4321' as any]
+        }
+    })
+
+    it('engine#511 B2: a resume whose ensure-dirs exits 255 stays parked (RESUME_WAITING), keeps the partial under the marker, and finishes when the target is back', async () => {
+        h = await makeHandle('Stopped')
+        const REMOTE = 'ENGINE_remote-r36' as EngineID
+        h.change(doc => {
+            doc.diskDB[TGT].dockedTo = REMOTE
+            ;(doc.engineDB as any)[REMOTE] = { id: REMOTE, commands: [], lastRun: Date.now(), capabilities: [CROSS_ENGINE_RESUME_CAPABILITY] }
+            peersExchanged(doc, REMOTE)
+        })
+        network.connections['10.0.0.36:4321' as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea36' as any, engineId: REMOTE }
+        try {
+            // Mid-receive cut (B2): a link failure after the marker is written, not a real rsync-23
+            failure.rsync = 'exit code: 255'
+            await copyApp(h, ORIG as any, SRC, TGT)
+            const newId = instanceTransfers[0].dstId
+            const op = Object.values(h.doc().operationDB)[0] as any
+            expect(op.status).toBe('Pending')
+            expect(op.error).toMatch(/^RESUME_WAITING/)
+            expect(op.args.resumeFailures).toBeUndefined()
+            expect(op.args).toMatchObject({ targetInstanceId: newId, targetMarked: '1', crossResume: '1' })
+            // resume while the target is cut: ensure-dirs fails the way zx reports ssh exit 255
+            failure.rsync = null
+            failure.ssh = 'exit code: 255'
+            instanceTransfers.length = 0
+            peerInFlightCalls.length = 0
+            sshCalls.length = 0
+            await copyApp(h, ORIG as any, SRC, TGT, 'console-command', { recoveredOpId: op.id })
+            const parked = h.doc().operationDB[op.id] as any
+            expect(parked.status).toBe('Pending')
+            expect(parked.error).toMatch(/^RESUME_WAITING/)
+            expect(parked.error).toMatch(/exit code: 255/)
+            expect(parked.args.resumeFailures).toBeUndefined()
+            expect(parked.args).toMatchObject({ targetInstanceId: newId, targetMarked: '1', phase: 'copying' })
+            expect(sshCalls.filter(c => /idea-app-data ensure-dirs/.test(c)).length).toBeGreaterThan(0)
+            expect(sshCalls.filter(c => / rm -rf /.test(c)), JSON.stringify(sshCalls)).toEqual([])
+            expect(helperDeletes).toEqual([])
+            expect(instanceTransfers).toEqual([])                         // send never started
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
+            // the target is really back: the same op resumes to Done
+            failure.ssh = null
+            instanceTransfers.length = 0
+            peerInFlightCalls.length = 0
+            await copyApp(h, ORIG as any, SRC, TGT, 'console-command', { recoveredOpId: op.id })
+            expect(instanceTransfers).toEqual([{ kind: 'send', srcRoot: SRC_DEV, srcId: ORIG, host: '10.0.0.36', peerEngineId: REMOTE, dstRoot: TGT_DEV, dstId: newId, opId: op.id }])
             expect(h.doc().operationDB[op.id]).toMatchObject({ status: 'Done', args: { phase: 'done' } })
             expect(Object.keys(h.doc().instanceDB).sort()).toEqual([ORIG, newId].sort())
         } finally {

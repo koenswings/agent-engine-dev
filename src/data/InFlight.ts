@@ -148,8 +148,8 @@ export const verifyPeerCopyOrThrow = async (srcRoot: string, srcId: string, host
 
 /**
  * A failure of a cross-Engine transfer that is an interruption (the peer or the link went away),
- * not a real failure: ssh exit 255, rsync's connection codes (10 socket, 12 stream, 30/35 timeouts),
+ * not a real failure: ssh exit 255 (zx reports `exit code: 255`, rsync `exited with code 255`), rsync's connection codes (10 socket, 12 stream, 30/35 timeouts),
  * a signal, or a connection error text. Such a failure is never counted (RESUME_WAITING).
  */
-export const PEER_LINK_FAILURE = /exited with code (10|12|30|35|255)\b|stopped by SIG|Connection (refused|reset|closed|timed out)|closed by remote host|Broken pipe|No route to host|Network is unreachable|connection unexpectedly closed|not currently reachable|Host is down/i
+export const PEER_LINK_FAILURE = /exited with code (10|12|30|35|255)\b|exit code[: ]*(10|12|30|35|255)\b|stopped by SIG|Connection (refused|reset|closed|timed out)|closed by remote host|Broken pipe|No route to host|Network is unreachable|connection unexpectedly closed|not currently reachable|Host is down/i
 export const isPeerLinkFailure = (text: string): boolean => PEER_LINK_FAILURE.test(String(text ?? ''))
