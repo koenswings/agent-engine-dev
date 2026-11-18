@@ -223,15 +223,43 @@ const BACKUP_CLEANUP_HELPER_CHECK_MS = 5_000
 /** Cached result of the one startup version check; null = not yet checked (omit the capability). */
 let backupCleanupHelperOk: boolean | null = null
 
-const withTimeout = async <T>(promise: Promise<T>, ms: number): Promise<T> => {
-  let timer: ReturnType<typeof setTimeout> | undefined
+/** Longest wall-clock wait, as a multiple of the healthy-time budget, however long the loop stalls. */
+const STALL_TIMEOUT_WALL_FACTOR = 6
+
+/**
+ * engine#521: a timeout that does not count a blocked event loop as the helper's silence.
+ * A plain setTimeout race fires first when the loop was blocked longer than the budget (the
+ * timers phase runs before the child's exit is read), so a helper that answered at once was
+ * recorded as "timeout" and the capability stayed out for the whole boot (idea03, 11-18 05:32:
+ * stalls of 20 s and 7 s at start; the 5 s check expired, crossEngineResume was left out, and
+ * every cross-Engine copy to idea03 was refused TARGET_OUTDATED). Only healthy ticks count
+ * toward `ms`; a tick later than twice its step counts as one step. `wallFactor` x `ms` of
+ * real time is still the hard limit, so a hung helper cannot hold the boot.
+ */
+export const withTimeout = async <T>(
+  promise: Promise<T>,
+  ms: number,
+  wallFactor: number = STALL_TIMEOUT_WALL_FACTOR,
+): Promise<T> => {
+  const step = Math.max(5, Math.min(250, Math.floor(ms / 5)))
+  let timer: ReturnType<typeof setInterval> | undefined
   try {
     return await Promise.race([
       promise,
-      new Promise<T>((_, reject) => { timer = setTimeout(() => reject(new Error('timeout')), ms) }),
+      new Promise<T>((_, reject) => {
+        const startedAt = Date.now()
+        let last = startedAt
+        let healthyMs = 0
+        timer = setInterval(() => {
+          const t = Date.now()
+          healthyMs += Math.min(t - last, step * 2)
+          last = t
+          if (healthyMs >= ms || t - startedAt >= ms * wallFactor) reject(new Error('timeout'))
+        }, step)
+      }),
     ])
   } finally {
-    if (timer !== undefined) clearTimeout(timer)
+    if (timer !== undefined) clearInterval(timer)
   }
 }
 
