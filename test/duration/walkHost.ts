@@ -25,7 +25,7 @@ export const idea02InHostMap = (map: Record<string, string>, env: NodeJS.Process
 export interface StoreCheckEngine { id?: string; hostname?: string; commands?: unknown[] }
 export interface StoreCheckDoc {
     engineDB?: Record<string, StoreCheckEngine>
-    instanceDB?: Record<string, { id?: string; name?: string; status?: string; storedOn?: string }>
+    instanceDB?: Record<string, { id?: string; name?: string; status?: string; storedOn?: string | null }>
     diskDB?: Record<string, { dockedTo?: string }>
 }
 export const STORE_CHECK_EXPECTED = [
@@ -36,13 +36,30 @@ export const STORE_CHECK_EXPECTED = [
 export const STORE_CHECK_POOL = ['idea01', 'idea03', 'idea04'] as const
 
 /**
+ * Known residue (Steve 2026-11-18 10:52, engine#525): an instance row the Engine keeps on purpose after
+ * its folder was dropped from a disk (#179 dock pass: status Missing, storedOn null). No command can
+ * remove it yet (removeInstance refuses NOT_LOCAL everywhere). Only that exact shape is tolerated: status
+ * 'Missing' AND storedOn null/absent (so no disk, docked or not, holds it). A Missing row that still has
+ * storedOn set, or any other status, is not residue and still fails the count. An expected walk id is
+ * never residue.
+ */
+export const isKnownResidue = (i: { id?: string; name?: string; status?: string; storedOn?: string | null }): boolean =>
+    i.status === 'Missing' && (i.storedOn === null || i.storedOn === undefined) &&
+    !STORE_CHECK_EXPECTED.some(([id]) => id === String(i.id ?? i.name))
+
+/** The tolerated residue rows, one evidence line each (store-check prints them into store-check.txt). */
+export const storeCheckResidue = (via: string, d: StoreCheckDoc): string[] =>
+    Object.values(d.instanceDB ?? {}).filter(isKnownResidue)
+        .map(i => `${via}: KNOWN_RESIDUE ${String(i.id ?? i.name)} status=Missing storedOn=null (engine#525)`)
+
+/**
  * READY gate (Atlas 11:0x): store=3 instances (the three expected, on their homes), every pool
  * Engine present with an empty command queue, idea02 absent from the engine list. Read-only.
  */
 export const storeCheckVerdict = (via: string, d: StoreCheckDoc, env: NodeJS.ProcessEnv = process.env): string[] => {
     const fails: string[] = []
     const engines = Object.entries(d.engineDB ?? {}).map(([id, e]) => ({ ...e, id: e.id ?? id }))
-    const insts = Object.values(d.instanceDB ?? {})
+    const insts = Object.values(d.instanceDB ?? {}).filter(i => !isKnownResidue(i))
     const host = (engId?: string) => engines.find(e => e.id === engId)?.hostname ?? engId ?? '?'
     const rows = insts.map(i => ({ id: String(i.id ?? i.name), on: host(d.diskDB?.[i.storedOn ?? '']?.dockedTo) }))
     if (insts.length !== STORE_CHECK_EXPECTED.length) fails.push(`${via}: instance count ${insts.length} (want ${STORE_CHECK_EXPECTED.length}: ${rows.map(r => `${r.id}@${r.on}`).join(', ')})`)

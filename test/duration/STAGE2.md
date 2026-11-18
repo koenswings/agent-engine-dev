@@ -169,6 +169,12 @@ The Path A READY store (r86t) has `kiwix-ideaa-001` storedOn `duration-nextcloud
 instance from the store; they fail loud only if it is missing or the NC disk is not docked
 on idea03.
 
+The count ignores known residue (engine#525, Steve 2026-11-18): rows with status `Missing` AND
+`storedOn` null, which the Engine keeps after a dock drops an instance folder and which no command can
+remove yet. `store-check` prints each one as a `KNOWN_RESIDUE` line into the run's `store-check.txt`.
+A `Missing` row that still has `storedOn` set, any other status, or one of the three expected ids is not
+residue and still fails the gate.
+
 ## infra_dock_fixture docks only what needs docking (r54 step 58)
 
 The per-Pi path used to dock every fixture disk, and an Empty dock is always fresh (Engine eject → reset

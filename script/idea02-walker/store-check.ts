@@ -2,7 +2,7 @@
 // Usage: STORE_DOC=<docId> npx tsx script/idea02-walker/store-check.ts   (exit 0 PASS / 1 FAIL)
 import { Repo } from '@automerge/automerge-repo'
 import { BrowserWebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
-import { storeCheckVerdict, type StoreCheckDoc } from '../../test/duration/walkHost.js'
+import { storeCheckResidue, storeCheckVerdict, type StoreCheckDoc } from '../../test/duration/walkHost.js'
 const HOSTS: Record<string, string> = { idea01: '192.168.0.138', idea03: '192.168.0.228', idea04: '192.168.0.113' }
 const DOC = process.env.STORE_DOC, PORT = process.env.WS_PORT || '4321'
 const WAIT = Number(process.env.DURATION_DOC_WAIT_MS || 45000)
@@ -16,6 +16,7 @@ for (const [eng, ip] of Object.entries(HOSTS)) {
         const d = (h as { doc: () => StoreCheckDoc }).doc()
         const n = Object.keys(d.instanceDB ?? {}).length
         console.log(`[via ${eng}] engines=${Object.values(d.engineDB ?? {}).map(e => `${e.hostname}(cmds=${(e.commands ?? []).length})`).join(',')} instances=${n}`)
+        for (const line of storeCheckResidue(eng, d)) console.log(line)
         fails.push(...storeCheckVerdict(eng, d))
     } catch (e) { fails.push(`${eng}: ${e instanceof Error ? e.message : String(e)}`) } finally { (repo as { shutdown?: () => void }).shutdown?.() }
 }
