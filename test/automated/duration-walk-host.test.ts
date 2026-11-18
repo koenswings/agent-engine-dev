@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { readFileSync } from 'node:fs'
-import { assertNotIdea02Target, idea02InHostMap, isIdea02Target, storeCheckVerdict, type StoreCheckDoc } from '../duration/walkHost.js'
+import { assertNotIdea02Target, idea02InHostMap, isIdea02Target, isKnownResidue, storeCheckResidue, storeCheckVerdict, type StoreCheckDoc } from '../duration/walkHost.js'
 
 describe('idea02 target guard', () => {
     it('refuses idea02 by hostname, LAN IP, Tailscale IP and listed store engine id', () => {
@@ -30,6 +30,39 @@ describe('store=3 / queues=0 / idea02 absent preflight', () => {
         const m = ok(); delete m.engineDB!.e4; expect(storeCheckVerdict('v', m, {})).toEqual(['v: no engine idea04'])
         const w = ok(); w.diskDB!.k!.dockedTo = 'e4'; expect(storeCheckVerdict('v', w, {})).toEqual(['v: missing kolibri-grade5a-001@idea01'])
         const i = ok(); i.engineDB!.e2 = { hostname: 'idea02', commands: [] }; expect(storeCheckVerdict('v', i, {})).toEqual(['v: idea02 IN engine list (e2)'])
+    })
+})
+
+describe('known residue: Missing + storedOn null (engine#525, Steve 2026-11-18)', () => {
+    const zmo = 'kolibri-zmofftr8wga47xwfbdf'
+    it('the live 2VroE shape after walk step 91 passes and is logged as residue', () => {
+        const d = ok(); d.instanceDB!.z = { id: zmo, status: 'Missing', storedOn: null }
+        expect(storeCheckVerdict('idea01', d, {})).toEqual([])
+        expect(storeCheckResidue('idea01', d)).toEqual([`idea01: KNOWN_RESIDUE ${zmo} status=Missing storedOn=null (engine#525)`])
+        const u = ok(); u.instanceDB!.z = { id: zmo, status: 'Missing' }
+        expect(storeCheckVerdict('v', u, {})).toEqual([])
+    })
+    it('a Missing row that still has storedOn set fails (docked, undocked or unknown disk)', () => {
+        for (const on of ['k', 'gone']) {
+            const d = ok(); d.instanceDB!.z = { id: zmo, status: 'Missing', storedOn: on }
+            expect(storeCheckVerdict('v', d, {}).join('\n')).toMatch(/instance count 4/)
+            expect(storeCheckResidue('v', d)).toEqual([])
+        }
+    })
+    it('any other status with storedOn null fails', () => {
+        for (const status of ['Undocked', 'Stopped', 'Running', 'Error', undefined]) {
+            const d = ok(); d.instanceDB!.z = { id: zmo, status, storedOn: null }
+            expect(storeCheckVerdict('v', d, {}).join('\n'), String(status)).toMatch(/instance count 4/)
+        }
+    })
+    it('an expected walk instance that went Missing is never residue', () => {
+        const d = ok(); d.instanceDB!.a = { id: 'kolibri-grade5a-001', status: 'Missing', storedOn: null }
+        expect(isKnownResidue(d.instanceDB!.a!)).toBe(false)
+        expect(storeCheckVerdict('v', d, {})).toEqual(['v: missing kolibri-grade5a-001@idea01'])
+    })
+    it('residue does not hide other failures', () => {
+        const d = ok(); d.instanceDB!.z = { id: zmo, status: 'Missing', storedOn: null }; d.engineDB!.e4!.commands = [{}]
+        expect(storeCheckVerdict('v', d, {})).toEqual(['v: idea04 queue=1'])
     })
 })
 
