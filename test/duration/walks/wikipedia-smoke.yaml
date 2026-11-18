@@ -13,11 +13,11 @@ name: wikipedia-smoke
 graph: unified
 steps:
   - { from: start, to: console_learner, action: open_console_as_learner }
-  - { from: console_learner, to: wiki_browse, action: open_wikipedia_as_learner }
-  - { from: wiki_browse, to: wiki_browse, action: search_browse_wikipedia }
-  - { from: wiki_browse, to: console_learner, action: leave_wikipedia_as_learner }
+  - { from: console_learner, to: wiki_browse_learner, action: open_wikipedia_as_learner }
+  - { from: wiki_browse_learner, to: wiki_browse_learner, action: search_browse_wikipedia }
+  - { from: wiki_browse_learner, to: console_learner, action: leave_wikipedia_as_learner }
   - { from: console_learner, to: start, action: return_to_start }
   - { from: start, to: console_teacher, action: open_console_as_teacher }
-  - { from: console_teacher, to: wiki_browse, action: open_wikipedia_as_teacher }
-  - { from: wiki_browse, to: console_teacher, action: leave_wikipedia_as_teacher }
+  - { from: console_teacher, to: wiki_browse_teacher, action: open_wikipedia_as_teacher }
+  - { from: wiki_browse_teacher, to: console_teacher, action: leave_wikipedia_as_teacher }
   - { from: console_teacher, to: start, action: return_to_start }

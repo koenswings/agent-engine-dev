@@ -48,9 +48,9 @@ steps:
     to: console_teacher
     action: back_to_console
   - from: console_teacher
-    to: nc_browse
+    to: nc_browse_teacher
     action: open_nextcloud_as_teacher
-  - from: nc_browse
+  - from: nc_browse_teacher
     to: console_teacher
     action: leave_nextcloud_as_teacher
   - from: console_teacher
@@ -93,9 +93,9 @@ steps:
     to: console_learner
     action: leave_kolibri
   - from: console_learner
-    to: nc_browse
+    to: nc_browse_learner
     action: open_nextcloud_as_learner
-  - from: nc_browse
+  - from: nc_browse_learner
     to: console_learner
     action: leave_nextcloud_as_learner
   - from: console_learner

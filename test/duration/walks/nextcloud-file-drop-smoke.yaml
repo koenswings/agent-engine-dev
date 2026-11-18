@@ -13,10 +13,10 @@ name: nextcloud-file-drop-smoke
 graph: unified
 steps:
   - { from: start, to: console_learner, action: open_console_as_learner }
-  - { from: console_learner, to: nc_browse, action: open_nextcloud_as_learner }
-  - { from: nc_browse, to: nc_browse, action: browse_folders }
-  - { from: nc_browse, to: nc_drop, action: open_file_drop }
-  - { from: nc_drop, to: nc_browse, action: after_upload }
-  - { from: nc_browse, to: nc_drop, action: open_file_drop }
+  - { from: console_learner, to: nc_browse_learner, action: open_nextcloud_as_learner }
+  - { from: nc_browse_learner, to: nc_browse_learner, action: browse_folders }
+  - { from: nc_browse_learner, to: nc_drop, action: open_file_drop }
+  - { from: nc_drop, to: nc_browse_learner, action: after_upload }
+  - { from: nc_browse_learner, to: nc_drop, action: open_file_drop }
   - { from: nc_drop, to: console_learner, action: leave_file_drop }
   - { from: console_learner, to: start, action: return_to_start }

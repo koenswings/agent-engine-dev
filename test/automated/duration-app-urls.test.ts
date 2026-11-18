@@ -305,7 +305,7 @@ describe('r55: no fallback for any App (Kolibri, Nextcloud, Kiwix, copies)', () 
         const { ops } = mkOps()
         process.env.DURATION_NC_FILE_REQUEST_URL = 'http://idea01:18280/s/grade5adropzone'
         const { driver } = mkDriver(() => null)
-        const r = await dispatchAction(ctxFor(ops, driver, { from: 'nc_browse', to: 'nc_drop', action: 'open_file_drop' }, 28))
+        const r = await dispatchAction(ctxFor(ops, driver, { from: 'nc_browse_learner', to: 'nc_drop', action: 'open_file_drop' }, 28))
         expect(r.ok).toBe(false)
         expect(r.message).toMatch(/DURATION_NC_FILE_REQUEST_URL=http:\/\/idea01:18280\/s\/grade5adropzone is not on nextcloud-grade5a-001's store host idea03:61820/)
     })

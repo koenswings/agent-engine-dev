@@ -118,13 +118,13 @@ describe('duration scenario YAML loader', () => {
         expect(s.fixtures?.find(f => f.name === 'nextcloud')?.instanceId).toBe('nextcloud-grade5a-001')
     })
 
-    it('loads unified with all 28 proposal states; deprecated aliases resolve to unified', () => {
+    it('loads unified with all 31 states (28 proposal states; nc_browse / nc_collab / wiki_browse split by role); deprecated aliases resolve to unified', () => {
         const s = loadScenario('unified')
         const expected = [
             'start',
             'console_teacher', 'console_learner', 'kolibri_home', 'kolibri_watching',
-            'kolibri_exercise', 'kolibri_manage', 'nc_browse', 'nc_share', 'nc_drop',
-            'nc_collab', 'wiki_browse',
+            'kolibri_exercise', 'kolibri_manage', 'nc_browse_teacher', 'nc_browse_learner', 'nc_share', 'nc_drop',
+            'nc_collab_teacher', 'nc_collab_learner', 'wiki_browse_teacher', 'wiki_browse_learner',
             'op_entry', 'op_overview', 'op_disk', 'op_eject', 'op_instance', 'op_install',
             'op_copy_move', 'op_files', 'op_backup', 'op_erase', 'op_account', 'op_settings',
             'infra_idle', 'infra_docked', 'infra_disk_moved', 'infra_reboot',
@@ -147,7 +147,7 @@ describe('duration scenario YAML loader', () => {
         // Deprecated aliases still load the same graph
         for (const alias of ['minimal', 'stress', 'school-day', 'minimal-live', 'minimal-dock', 'random']) {
             expect(loadScenario(alias).name).toBe(s.name)
-            expect(Object.keys(loadScenario(alias).states).length).toBe(28)
+            expect(Object.keys(loadScenario(alias).states).length).toBe(31)
         }
     })
 

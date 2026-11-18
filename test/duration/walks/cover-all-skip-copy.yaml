@@ -113,18 +113,18 @@ steps:
     action: open_console_as_teacher
   # @21 = cover-all @21
   - from: console_teacher
-    to: nc_browse
+    to: nc_browse_teacher
     action: open_nextcloud_as_teacher
   # @22 = cover-all @22
-  - from: nc_browse
+  - from: nc_browse_teacher
     to: nc_share
     action: share_to_class
   # @23 = cover-all @23
   - from: nc_share
-    to: nc_browse
+    to: nc_browse_teacher
     action: done_sharing
   # @24 = cover-all @24
-  - from: nc_browse
+  - from: nc_browse_teacher
     to: console_teacher
     action: leave_nextcloud_as_teacher
   # @25 = cover-all @25
@@ -137,42 +137,42 @@ steps:
     action: open_console_as_learner
   # @27 = cover-all @27
   - from: console_learner
-    to: nc_browse
+    to: nc_browse_learner
     action: open_nextcloud_as_learner
   # @28 = cover-all @28
-  - from: nc_browse
+  - from: nc_browse_learner
     to: nc_drop
     action: open_file_drop
   # @29 = cover-all @29
   - from: nc_drop
-    to: nc_browse
+    to: nc_browse_learner
     action: after_upload
   # @30 = cover-all @30
-  - from: nc_browse
-    to: nc_collab
+  - from: nc_browse_learner
+    to: nc_collab_learner
     action: open_collab_doc
   # @31 = cover-all @31
-  - from: nc_collab
-    to: nc_browse
+  - from: nc_collab_learner
+    to: nc_browse_learner
     action: close_doc
   # @32 = cover-all @32
-  - from: nc_browse
-    to: nc_browse
+  - from: nc_browse_learner
+    to: nc_browse_learner
     action: browse_folders
   # @33 = cover-all @33
-  - from: nc_browse
+  - from: nc_browse_learner
     to: console_learner
     action: leave_nextcloud_as_learner
   # @34 = cover-all @34
   - from: console_learner
-    to: wiki_browse
+    to: wiki_browse_learner
     action: open_wikipedia_as_learner
   # @35 = cover-all @35
-  - from: wiki_browse
-    to: wiki_browse
+  - from: wiki_browse_learner
+    to: wiki_browse_learner
     action: search_browse_wikipedia
   # @36 = cover-all @36
-  - from: wiki_browse
+  - from: wiki_browse_learner
     to: console_learner
     action: leave_wikipedia_as_learner
   # @37 = cover-all @37
@@ -285,18 +285,18 @@ steps:
     action: open_console_as_teacher
   # @64 = cover-all @65
   - from: console_teacher
-    to: nc_browse
+    to: nc_browse_teacher
     action: open_nextcloud_as_teacher
   # @65 = cover-all @66
-  - from: nc_browse
+  - from: nc_browse_teacher
     to: console_teacher
     action: leave_nextcloud_as_teacher
   # @66 = cover-all @67
   - from: console_teacher
-    to: wiki_browse
+    to: wiki_browse_teacher
     action: open_wikipedia_as_teacher
   # @67 = cover-all @68
-  - from: wiki_browse
+  - from: wiki_browse_teacher
     to: console_teacher
     action: leave_wikipedia_as_teacher
   # @68 = cover-all @69
@@ -313,10 +313,10 @@ steps:
     action: back_to_console
   # @71 = cover-all @72
   - from: console_teacher
-    to: nc_browse
+    to: nc_browse_teacher
     action: open_nextcloud_as_teacher
   # @72 = cover-all @73
-  - from: nc_browse
+  - from: nc_browse_teacher
     to: nc_share
     action: share_to_class
   # @73 = cover-all @74
@@ -333,10 +333,10 @@ steps:
     action: open_console_as_learner
   # @76 = cover-all @77
   - from: console_learner
-    to: nc_browse
+    to: nc_browse_learner
     action: open_nextcloud_as_learner
   # @77 = cover-all @78
-  - from: nc_browse
+  - from: nc_browse_learner
     to: nc_drop
     action: open_file_drop
   # @78 = cover-all @79
@@ -345,18 +345,18 @@ steps:
     action: leave_file_drop
   # @79 = cover-all @80
   - from: console_learner
-    to: nc_browse
+    to: nc_browse_learner
     action: open_nextcloud_as_learner
   # @80 = cover-all @81
-  - from: nc_browse
-    to: nc_collab
+  - from: nc_browse_learner
+    to: nc_collab_learner
     action: open_collab_doc
   # @81 = cover-all @82
-  - from: nc_collab
-    to: nc_collab
+  - from: nc_collab_learner
+    to: nc_collab_learner
     action: keep_editing
   # @82 = cover-all @83
-  - from: nc_collab
+  - from: nc_collab_learner
     to: start
     action: return_to_start
   # @83 = cover-all @84
