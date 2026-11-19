@@ -244,7 +244,7 @@ const runWalkWithSteps = async (
             }
             let picked: Awaited<ReturnType<typeof pickDrawableTransition>>
             try {
-                picked = await pickDrawableTransition(walker.current, stateDef.transitions, rng, (a, t) => randomStepPrecondition(guardCtx, a, process.env, t))
+                picked = await pickDrawableTransition(walker.current, stateDef.transitions.filter(t => !t.walkOnly), rng, (a, t) => randomStepPrecondition(guardCtx, a, process.env, t))
             } catch (err) {
                 aborted = true
                 abortReason = err instanceof Error ? err.message : String(err)

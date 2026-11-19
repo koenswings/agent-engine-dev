@@ -148,6 +148,7 @@ states:
       - to: start
         weight: 5
         action: return_to_start
+        walk_only: true
 
   kolibri_exercise:
     layer: usage
@@ -161,6 +162,7 @@ states:
       - to: start
         weight: 5
         action: return_to_start
+        walk_only: true
 
   # Role-split states (idea#166, run random-c1cc4bb-markov-20261118 step 109): the Console and
   # Nextcloud Intents are role-gated, so every state below is reachable from exactly one sign-in.
@@ -230,6 +232,11 @@ states:
         weight: 5
         action: return_to_start
 
+  # Doc-open states (nc_collab_*, kolibri_watching, kolibri_exercise): the Markov sampler must close the doc / viewer / player
+  # (close_doc / exit_lesson / finish_exercise) before leaving (run random-c1cc4bb-875a10e-markov-20261119 FAIL@105: return_to_start
+  # from nc_collab_learner left the Nextcloud Text viewer open over the next sign-in). Their return_to_start edge is walk_only:
+  # deterministic walks keep their step numbers, the sampler never draws it.
+  # test/automated/duration-markov-role-states.test.ts fails if a drawable exit leaves a doc open.
   nc_collab_teacher:
     layer: usage
     transitions:
@@ -242,6 +249,7 @@ states:
       - to: start
         weight: 5
         action: return_to_start
+        walk_only: true
 
   nc_collab_learner:
     layer: usage
@@ -255,6 +263,7 @@ states:
       - to: start
         weight: 5
         action: return_to_start
+        walk_only: true
 
   wiki_browse_teacher:
     layer: usage
