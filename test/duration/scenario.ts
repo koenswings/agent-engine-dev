@@ -102,7 +102,7 @@ const parseTransition = (raw: unknown, stateName: string, index: number): Transi
             `(YAML schema requires to + weight + action for ALL layers)`,
         )
     }
-    return { to: t.to, weight: t.weight, action: t.action }
+    return { to: t.to, weight: t.weight, action: t.action, ...(t.walk_only === true ? { walkOnly: true } : {}) }
 }
 
 const parseState = (name: string, raw: unknown): StateDef => {

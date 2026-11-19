@@ -74,6 +74,30 @@ export const roleAudit = (scenario: Pick<Scenario, 'states' | 'initial_state'>):
     return { roles, leaks: [...leaks].sort() }
 }
 
+/**
+ * Doc-open audit (random-c1cc4bb-875a10e-markov-20261119 FAIL@105): return_to_start from nc_collab_learner left the
+ * Nextcloud Text viewer open, and the next open_nextcloud_as_teacher clicked into the modal.
+ * A state entered by an opener Intent holds an open doc / viewer / player. Every edge out of such a state to a state
+ * that does NOT hold one must be a closer Intent (close_doc, exit_lesson, finish_exercise); anything else leaves the doc open.
+ */
+const DOC_OPENERS = new Set(['open_collab_doc', 'open_video', 'open_exercise'])
+const DOC_CLOSERS = new Set(['close_doc', 'exit_lesson', 'finish_exercise'])
+
+export const docAudit = (scenario: Pick<Scenario, 'states'>): { docStates: string[]; leaks: string[] } => {
+    const docStates = new Set<string>()
+    for (const st of Object.values(scenario.states)) {
+        for (const t of st.transitions) if (DOC_OPENERS.has(t.action)) docStates.add(t.to)
+    }
+    const leaks: string[] = []
+    for (const from of docStates) {
+        for (const t of scenario.states[from]!.transitions) {
+            if (t.walkOnly) continue // never drawn by the Markov sampler; the harness closes the leftover tab
+            if (!docStates.has(t.to) && !DOC_CLOSERS.has(t.action)) leaks.push(`${from} --${t.action}--> ${t.to} leaves the doc open`)
+        }
+    }
+    return { docStates: [...docStates].sort(), leaks: leaks.sort() }
+}
+
 describe('Markov graph: role-gated Intents are reachable only from the matching role', () => {
     const scenario = loadScenario('unified')
 
@@ -98,8 +122,13 @@ describe('Markov graph: role-gated Intents are reachable only from the matching 
         expect(actions('nc_browse_teacher')).not.toContain('open_file_drop')
         expect(actions('nc_browse_learner')).toContain('open_file_drop')
         expect(actions('nc_browse_learner')).not.toContain('share_to_class')
-        for (const s of ['nc_browse_teacher', 'nc_browse_learner', 'nc_collab_teacher', 'nc_collab_learner', 'wiki_browse_teacher', 'wiki_browse_learner']) {
+        for (const s of ['nc_browse_teacher', 'nc_browse_learner', 'wiki_browse_teacher', 'wiki_browse_learner']) {
             expect(actions(s)).toContain('return_to_start')
+        }
+        // doc-open states: the sampler closes the doc first; return_to_start stays for deterministic walks only
+        for (const s of ['nc_collab_teacher', 'nc_collab_learner']) {
+            expect(actions(s)).toContain('close_doc')
+            expect(scenario.states[s]!.transitions.find(t => t.action === 'return_to_start')?.walkOnly).toBe(true)
         }
     })
 
@@ -135,7 +164,7 @@ describe('Markov graph: role-gated Intents are reachable only from the matching 
         const bad: string[] = []
         const seen = new Set<string>()
         for (let i = 0; i < 2000; i++) {
-            const ts = scenario.states[state]!.transitions
+            const ts = scenario.states[state]!.transitions.filter(t => !t.walkOnly)
             const total = ts.reduce((a, t) => a + t.weight, 0)
             let x = rng() * total
             let pick = ts[ts.length - 1]!
@@ -166,5 +195,32 @@ describe('Markov graph: role-gated Intents are reachable only from the matching 
             }
             expect(bad).toEqual([])
         }
+    })
+    it('no exit from a doc-open state leaves the doc / viewer open (every exit closes it)', () => {
+        const { docStates, leaks } = docAudit(scenario)
+        expect(docStates).toEqual(['kolibri_exercise', 'kolibri_watching', 'nc_collab_learner', 'nc_collab_teacher'])
+        expect(leaks).toEqual([])
+    })
+
+    it('walk_only edges out of a doc-open state are only return_to_start (the harness closes the tab), never drawn', () => {
+        const { docStates } = docAudit(scenario)
+        for (const from of docStates) {
+            for (const t of scenario.states[from]!.transitions.filter(x => x.walkOnly)) expect(t.action).toBe('return_to_start')
+        }
+    })
+
+    it('the doc-open checker catches the old shape: return_to_start straight out of nc_collab (FAIL@105)', () => {
+        const old = {
+            states: {
+                nc_browse_learner: { transitions: [{ to: 'nc_collab_learner', weight: 1, action: 'open_collab_doc' }] },
+                nc_collab_learner: { transitions: [
+                    { to: 'nc_browse_learner', weight: 1, action: 'close_doc' },
+                    { to: 'nc_collab_learner', weight: 1, action: 'keep_editing' },
+                    { to: 'start', weight: 1, action: 'return_to_start' },
+                ] },
+                start: { transitions: [] },
+            },
+        } as never as Scenario
+        expect(docAudit(old).leaks).toEqual(['nc_collab_learner --return_to_start--> start leaves the doc open'])
     })
 })

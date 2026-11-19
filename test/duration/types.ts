@@ -14,6 +14,12 @@ export interface Transition {
     to: string
     weight: number
     action: string
+    /**
+     * YAML `walk_only: true`: a deterministic walk may take this edge (its step numbers stay stable) but the
+     * Markov sampler never draws it. Used for return_to_start out of a doc-open state: the harness closes the
+     * leftover App tab (ui/consoleSurface.ts), but a random walk must close the doc first.
+     */
+    walkOnly?: boolean
 }
 
 export interface InvariantSpec {

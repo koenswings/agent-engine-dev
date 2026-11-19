@@ -34,6 +34,13 @@ import {
 } from './fixtures.js'
 import type { UiDriver, UiIntentContext, UiIntentResult } from './types.js'
 import { loadPlaywright, type PlaywrightModule } from './playwrightLoader.js'
+import {
+    assertOnConsole,
+    prepareConsoleSurface,
+    prepareNextcloudSignIn,
+    CONSOLE_SURFACE_INTENTS,
+    type SurfacePage,
+} from './consoleSurface.js'
 import { ActiveTabTracker, captureFrameFrom, followContextTabs, type TrackablePage } from './activeTab.js'
 
 export interface PlaywrightUiOptions {
@@ -342,6 +349,12 @@ export class PlaywrightUiDriver implements UiDriver {
         return out
     }
 
+    /** Every open tab of the browser context (Console page included); empty before the browser starts. */
+    private contextPages(): SurfacePage[] {
+        const c = this.context as unknown as { pages?: () => SurfacePage[] } | null
+        try { return c?.pages?.() ?? [] } catch { return [] }
+    }
+
     /** The tab the walker is on now: the newest / brought-to-front App tab, else the Console page. */
     activePage(): unknown {
         if (!this.page) return null
@@ -391,6 +404,12 @@ export class PlaywrightUiDriver implements UiDriver {
             }
             // --record-walk: do NOT hand screenshotPath to Pixel — it would capture the
             // Console page it was given, not the App tab an in-app Intent switched to.
+            // FAIL@105 (random-c1cc4bb-875a10e-markov): Console Intents never touch an App tab, so a leftover
+            // Nextcloud tab (viewer open) stayed active and blocked the next sign-in. Clean up first.
+            const tabs = this.contextPages()
+            const consolePage = this.page as SurfacePage
+            const leftover = await prepareConsoleSurface(ctx.action, consolePage, tabs)
+            await prepareNextcloudSignIn(ctx.action, consolePage, tabs)
             const result = await bridge.runDurationIntent(runOpts)
 
             // Post-Intent capture of the active tab (success or fail — useful for debugging).
@@ -412,10 +431,18 @@ export class PlaywrightUiDriver implements UiDriver {
                     message: `runDurationIntent('${ctx.action}'): ${result.message ?? 'failed'}`,
                 }
             }
+            if (CONSOLE_SURFACE_INTENTS.has(ctx.action)) {
+                await assertOnConsole(
+                    ctx.action,
+                    this.page as SurfacePage,
+                    this.activePage() as SurfacePage | null,
+                    this.opts.baseUrl,
+                )
+            }
             return {
                 ok: true,
                 mode: 'playwright',
-                message: `runDurationIntent ok: ${ctx.action}`,
+                message: `runDurationIntent ok: ${ctx.action}${leftover ? ` (${leftover})` : ''}`,
             }
         } catch (err) {
             const raw = err instanceof Error ? err.message : String(err)
