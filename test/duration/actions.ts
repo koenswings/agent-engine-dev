@@ -2569,6 +2569,36 @@ export const stage2MoveAppPins = (
 }
 
 /**
+ * Markov seed 42 FAIL@747 (random-mixed-f171032-5805bb0-markov-20261119): add_files_role@666 gave the pinned
+ * app-only fixture duration-add-files-001 its files role; add_files_role@747 was drawn again and the Path A
+ * pre-check (correctly) aborted: DiskView offers Add Files only on a disk without a files role.
+ * make_files_disk can be redrawn because its Empty (empty-001) is reset fresh before every run of it; the
+ * app-only fixture has no such reset (stage2-dock.sh `reset` is Empty fixtures only, and an app-only pack
+ * with its content cannot be rebuilt without a Pi-side change), so add_files_role is a ONE-SHOT role:
+ * not drawable once the fixture holds a files role — shown by the store (docked or not, the disk row keeps its
+ * diskTypes) or, when the store has no row, by this run's own earlier ok add_files_role (walker.addFilesRoleDone).
+ * Stage 2 only (Stage 1 / Fake draw as before); the dispatcher's loud pre-check stays as the backstop.
+ */
+export const stage2AddFilesRoleTaken = async (
+    ctx: Pick<ActionContext, 'opts' | 'walker' | 'poolEngines' | 'excludeEngines'> &
+        { snapshot?: () => Promise<PoolSnapshot> },
+    action: string,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> => {
+    if (action !== 'add_files_role' || !isStage2(ctx as ActionContext)) return null
+    const id = env.DURATION_ADD_FILES_DISK_ID?.trim() || STAGE2_ADD_FILES_DISK_ID // addFilesAppDiskId's Stage 2 pin
+    if (ctx.walker.addFilesRoleDone) {
+        return `${id} already got its files role earlier in this walk (add_files_role is one-shot: the app-only fixture has no fresh re-dock like empty-001)`
+    }
+    const snap = await (ctx.snapshot ? ctx.snapshot() : readPoolSnapshot(ctx))
+    const types = snap.readable ? snap.diskTypes?.get(id) : undefined
+    if (types?.includes('files')) {
+        return `${id} already has a files role in the store (diskTypes=[${types.join(', ')}]) — DiskView will not offer Add Files; add_files_role is one-shot`
+    }
+    return null
+}
+
+/**
  * Markov (--scenario random) draw guard, idea#168 Markov 9040e73@8: a random walk drew move_app
  * before any copy_app had recorded a disposable instance and aborted before the Intent. A step whose
  * harness precondition is an earlier step's result is not drawable until that result exists; the
@@ -2580,6 +2610,7 @@ export const stage2MoveAppPins = (
  *   backup_instance     (live) needs a docked Backup Disk linking the instance (make_backup_disk first).
  *   backup_schedule     (live) needs a docked Backup Disk (make_backup_disk first).
  *   restore_from_backup (live) needs a docked Backup Disk and an archive from a backup_instance of this run.
+ *   add_files_role      (Stage 2) one-shot: not drawable once the pinned app-only fixture (duration-add-files-001) has its files role.
  * Markov 2 (random-9040e73-markov-20261116b@16): eject_disk + confirm_eject@10-11 ejected the Kolibri fixture
  * disk, then copy_app@16 hit its preflight "source disk … is not docked on any pool engine". Only
  * infra_dock_fixture re-docks it, so in a random walk the fixture can legitimately be absent. Stage 2 live
@@ -2604,6 +2635,9 @@ export const randomStepPrecondition = async (
             return 'no copy_app instance recorded yet (Stage 2 move_app moves that copy; never the Kolibri fixture)'
         }
     }
+    // Markov seed 42 @747 (random-mixed-f171032-5805bb0-markov-20261119): add_files_role is a one-shot role.
+    const filesTaken = await stage2AddFilesRoleTaken(ctx, action, env)
+    if (filesTaken) return filesTaken
     // Markov 2 (random-9040e73-markov-20261116b@16): fixture disk / instance legitimately absent (eject, stop, …).
     const absent = await stage2FixtureAbsent(ctx, action, to, env)
     if (absent) return absent
@@ -2624,12 +2658,14 @@ export interface PoolSnapshot {
     readable: boolean
     docked: Map<string, string>
     instances: Map<string, { diskId: string | null; status: string; port?: number }>
+    /** diskId → diskTypes from the store (live row wins over an Undocked copy). Optional for hand-built snapshots. */
+    diskTypes?: Map<string, string[]>
 }
 
 export const readPoolSnapshot = async (
     ctx: Pick<ActionContext, 'opts' | 'poolEngines' | 'excludeEngines'>,
 ): Promise<PoolSnapshot> => {
-    const snap: PoolSnapshot = { readable: false, docked: new Map(), instances: new Map() }
+    const snap: PoolSnapshot = { readable: false, docked: new Map(), instances: new Map(), diskTypes: new Map() }
     for (const eng of ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e) && !isNeverEngine(e))) {
         let view: SemanticStoreView
         try {
@@ -2640,6 +2676,7 @@ export const readPoolSnapshot = async (
         snap.readable = true
         for (const d of Object.values(view.diskDB ?? {})) {
             if (d.dockedTo && !snap.docked.has(d.id)) snap.docked.set(d.id, d.dockedTo)
+            if (d.diskTypes && (d.dockedTo || !snap.diskTypes!.has(d.id))) snap.diskTypes!.set(d.id, [...d.diskTypes])
         }
         for (const [id, i] of Object.entries(view.instanceDB ?? {})) {
             const prev = snap.instances.get(id)
@@ -2881,6 +2918,7 @@ export const markovRedockAfter = async (
 /** Markov draw guard bookkeeping: remember results later steps depend on (after an ok step). */
 export const noteStepPreconditionProgress = (walker: WalkerState, action: string): void => {
     if (action === 'backup_instance') walker.backupTaken = true
+    if (action === 'add_files_role') walker.addFilesRoleDone = true
 }
 
 /** Sets harness-owned env vars; returns the restore function. */
