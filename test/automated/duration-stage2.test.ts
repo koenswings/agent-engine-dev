@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 import { RealFleetOps } from '../duration/realFleetOps.js'
 import { allowedSequentialShare, backupDiskTargetId, eraseDiskTargetId, filesDiskTargetId, fixtureDiskPreflight } from '../duration/fixtureDisks.js'
-import { dispatchAction, stage2RedockSharedEraseDisk, stage2SidecarOwnerNote, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine } from '../duration/actions.js'
+import { dispatchAction, readPoolSnapshot, stage2MarkovRedock, stage2RedockSharedEraseDisk, stage2SidecarOwnerNote, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine } from '../duration/actions.js'
 import {
     EXIT_STAGE2_PREFLIGHT, PRODUCTION_EFFECTIVE, STAGE2_DOCK_SPLIT, STAGE2_FIXTURES, STAGE2_GAPS, STAGE2_MOVE_TARGET_ID, STAGE2_PINS,
     STAGE2_ROLE_MAP, buildEngineConfigProbe, buildStage2DockCmd, describeStage2Conflicts, describeStage2Windows, parseEngineConfigProbe,
@@ -680,6 +680,62 @@ describe('r53: Stage 2 already-docked shortcuts', () => {
         expect(r.ok).toBe(true)
         expect(o.calls).toEqual([`idea03 undock ${NC}`, `idea03 dock ${NC}`])
         expect(r.message).toMatch(/duration-kolibri-grade5a-001 stays on idea04 \(moved copy\)/)
+    })
+    // #step641 (random-mixed-bdd7800-markov-20261119, seed 42): infra_move_disk@618 network-copied Kolibri to
+    // idea04/empty-003; eject_disk@640 + confirm_eject@641 ejected it; the Markov re-dock then tried the HOME
+    // partition on idea01, the Stage 2 guard refused ("two partitions one diskId") and the walk aborted.
+    it('#step641: move → eject → confirm_eject → Markov re-dock re-docks the COPY on idea04, never the home partition', async () => {
+        const o = liveCanned()
+        await o.moveDisk('idea01', 'idea04', K)
+        expect(o.movedCopyHolder(K)).toBe('idea04')
+        expect(o.movedCopyHolder(NC)).toBeNull()
+        const walker = { dockedEngine: 'idea04', step: 641 }
+        const ctx = { ...(infraCtx(o, 'confirm_eject', 'idea04') as object), walker, from: 'op_eject', to: 'op_overview' } as never
+        const before = await readPoolSnapshot(ctx)
+        expect(before.docked.get(K)).toBe('idea04')
+        o.docked[K] = null // eject_disk@640 + confirm_eject@641: store shows the disk gone, copy partition present + unmounted
+        o.calls = []
+        const r = await stage2MarkovRedock(ctx, before, { afterEject: true, leavingInfra: false }, { waitMs: 50, ejectWaitMs: 40, pollMs: 5, log: () => {} })
+        expect(r.ok).toBe(true)
+        expect(r.note).toMatch(/Markov re-dock \[duration-kolibri-grade5a-001\] docked again in the store/)
+        // The copy partition is re-added on idea04 (present + unmounted → undock, gap, dock) — nothing touches idea01.
+        expect(o.calls).toEqual([`idea04 undock ${E3}`, `idea04 dock ${E3}`])
+        expect(o.docked[K]).toBe('idea04')
+        // Walker bookkeeping: the fixture still lives on the move target; home partition stays held, copy no longer held.
+        expect(walker.dockedEngine).toBe('idea04')
+        expect(o.moveCopies.get(E3)).toBe(K)
+        expect(o.heldUndocked.has(K)).toBe(true)
+        expect(o.heldUndocked.has(E3)).toBe(false)
+        expect(o.docked[E2]).toBe('idea04') // sibling Backup partition untouched
+        // Later steps still work: infra_dock_fixture is a no-op, undock → dock again re-docks the copy, move target stays occupied.
+        o.calls = []
+        const again = await dispatchAction(infraCtx(o, 'infra_dock_fixture', 'idea04'))
+        expect(again.ok).toBe(true)
+        expect(o.calls).toEqual([])
+        await o.undockFixtures(['idea01', 'idea03', 'idea04'], K)
+        expect(o.heldUndocked.has(E3)).toBe(true)
+        o.calls = []
+        const back = await dispatchAction(infraCtx(o, 'infra_dock_fixture', null))
+        expect(back.ok).toBe(true)
+        expect(o.calls).toEqual([`idea04 dock ${E3}`]) // absent after `undock` → a real add, no home dock
+        expect(o.docked[K]).toBe('idea04')
+        expect(back.dockedEngine).toBe('idea04')
+        await expect(o.moveDisk('idea04', 'idea04', K)).rejects.toThrow(/not a move/)
+    })
+    it('#step641: Stage2FleetOps.dockFixture(moved fixture) targets the copy on the holder; the home-partition guard stays', async () => {
+        const o = liveCanned()
+        await o.moveDisk('idea01', 'idea04', K)
+        o.docked[K] = null
+        o.calls = []
+        await o.dockFixture('idea04', K)
+        expect(o.calls).toEqual([`idea04 undock ${E3}`, `idea04 dock ${E3}`])
+        expect(o.docked[K]).toBe('idea04')
+        o.calls = []
+        await o.dockFixture('idea04', K) // docked + mounted → no-op
+        expect(o.calls).toEqual([])
+        await expect(o.dockFixture('idea01', K)).rejects.toThrow(/two partitions one diskId/)
+        await expect(o.dockFixture('idea04', E3)).rejects.toThrow(/holds the moved/)
+        expect(o.calls).toEqual([])
     })
     it('Stage2FleetOps.dockFixture: store says docked but the partition is not mounted → real dock, not a no-op', async () => {
         const o = liveCanned()

@@ -356,6 +356,9 @@ export class Stage2FleetOps extends RealFleetOps {
         if (f.expectDocked === false) throw new Error(`Stage 2: ${diskId} is kept out of the Engine — never docked by the walk`)
         if (this.moveCopies.has(diskId)) throw new Error(`Stage 2: ${diskId} holds the moved ${this.moveCopies.get(diskId)} — the move target is never re-docked as itself mid-run`)
         const copyOn = [...this.moveCopies.entries()].find(([, a]) => a === diskId)?.[0]
+        // #step641: a network-copied fixture lives on the move target (META diskId = the fixture's). Re-docking it
+        // after an eject / undock means re-adding THAT partition on its holder, never the home partition.
+        if (copyOn && engineId === stage2Fixture(copyOn).host) return this.dockMovedCopy(engineId, copyOn, diskId)
         if (copyOn && engineId === f.host) {
             throw new Error(`Stage 2: ${diskId} was network-copied to ${copyOn} (${stage2Fixture(copyOn).host}); docking the home partition too would give two partitions one diskId — refused`)
         }
@@ -378,6 +381,25 @@ export class Stage2FleetOps extends RealFleetOps {
         }
         this.heldUndocked.delete(diskId)
         await this.dockPartition(engineId, diskId)
+    }
+
+    /** Engine that holds `diskId`'s network copy (the move target's Pi), or null when it was never moved. */
+    movedCopyHolder(diskId: string): string | null {
+        const target = [...this.moveCopies.entries()].find(([, a]) => a === diskId)?.[0]
+        return target ? stage2Fixture(target).host : null
+    }
+
+    /**
+     * #step641 (Markov FAIL@641 confirm_eject, harness bdd7800): re-dock a network-copied fixture where it lives.
+     * `part` = the move-target partition (duration-empty-003) whose META diskId is `diskId`. Store has it Docked
+     * on the holder AND the partition mounted → nothing to do. Otherwise dockPartition (present + unmounted →
+     * undock, gap, dock; absent → dock) and verify. The home partition stays held undocked (one diskId, one
+     * partition); the move target is not reset (that would destroy the copy).
+     */
+    private async dockMovedCopy(engineId: string, part: string, diskId: string): Promise<void> {
+        if (await this.stage2DockedAndMounted(engineId, diskId)) return
+        this.heldUndocked.delete(part)
+        await this.dockPartition(engineId, part, diskId)
     }
 
     /**

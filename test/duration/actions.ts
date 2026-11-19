@@ -1227,13 +1227,18 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
     const kept: string[] = []
     const alreadyUp: string[] = []
     const docked: string[] = []
-    const opsS2 = ctx.opts.ops as FleetOps & { stage2DockedAndMounted?: (e: string, d: string) => Promise<boolean> }
-    const dockOne = async (target: string, diskId: string) => {
+    const opsS2 = ctx.opts.ops as FleetOps & { stage2DockedAndMounted?: (e: string, d: string) => Promise<boolean>; movedCopyHolder?: (d: string) => string | null }
+    // #step641: a fixture network-copied to the move target is re-docked THERE (its copy partition), never on its
+    // home Pi (Stage2FleetOps refuses a second partition for one diskId).
+    const copyHolder = (diskId: string): string | null =>
+        isStage2(ctx) && typeof opsS2.movedCopyHolder === 'function' ? opsS2.movedCopyHolder(diskId) : null
+    const dockOne = async (homeTarget: string, diskId: string) => {
         const on = await movedCopyOn(diskId)
         if (on) {
             kept.push(`${diskId} stays on ${on} (moved copy)`)
             return
         }
+        const target = copyHolder(diskId) ?? homeTarget
         // r54 step 58: only the ejected Nextcloud needed docking, but the per-Pi path re-docked the
         // Empties fresh too (Engine eject → reset → dock). Stage 2: a disk the store has Docked on its
         // target AND whose partition is mounted there is left alone.
@@ -1266,7 +1271,8 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
                 `${alreadyUp.length ? ` [already Docked+mounted, not re-docked: ${alreadyUp.join(', ')}]` : ''}` +
                 `${notDocked.length ? ` [was not docked: ${notDocked.join(', ')}]` : ''}` +
                 `${kept.length ? ` [${kept.join('; ')}]` : ''}; ${urls}${ncReady ? `; ${ncReady}` : ''}`,
-            dockedEngine: engine,
+            // walker.dockedEngine follows the fixture (after infra_move_disk: the move target's Pi).
+            dockedEngine: copyHolder(ctx.fixtureDisk) ?? engine,
             layer: 'infra',
         }
     }
