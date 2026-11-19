@@ -19,6 +19,7 @@ import { recordDiskDetectionFailure } from '../monitors/diskDetection.js';
 import { shouldAutoStart } from './AutoStart.js';
 import { isLegacyDottedInstanceId, LEGACY_DOTTED_INSTANCE_MESSAGE } from '../utils/instanceIds.js';
 import { inFlightRefusal, isInFlightMarkerName } from './InFlight.js';
+import { isUndockPending } from './InstanceInFlight.js';
 
 // Disks are multi-purpose  - they can be used for engines, apps, backups, etc.
 
@@ -896,6 +897,15 @@ const tracedStartInstance = async (storeHandle: DocHandle<Store>, instance: Inst
     if (isLegacyDottedInstanceId(String(current.id))) {
         log(`tracedStartInstance: leaving '${current.id}' listed as Error — ${LEGACY_DOTTED_INSTANCE_MESSAGE} (idea#494)`)
         markLegacyDottedInstance(storeHandle, current.id)
+        return
+    }
+    // engine#535: an undock of this disk has begun (eject, erase). A dock pass still walking the
+    // disk's instances (a spurious udev re-add right after an eject) must not begin the next start:
+    // the undock's in-flight wait only covers starts already registered, so a start begun after it
+    // loads images / writes .env on the disk while the unmount runs and makes it "target is busy".
+    // The undock stops and marks every instance of the disk Undocked; a later dock starts them.
+    if (isUndockPending(String(disk.id))) {
+        log(`tracedStartInstance: not auto-starting '${current.name}' (${current.id}) on disk ${disk.id}: an undock of the disk is pending`)
         return
     }
     const gate = shouldAutoStart(storeHandle.doc(), current)
