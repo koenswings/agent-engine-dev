@@ -248,12 +248,33 @@ export class Stage2FleetOps extends RealFleetOps {
     }
 
     /**
+     * Send the Engine eject and know that it was sent. Markov 5 step 93: the walker's view of idea03's store
+     * still showed empty-001 undocked (it had just re-docked), so the inherited undockFixtures skipped
+     * silently and engineEject waited 120 s for a command that was never written. When the view says there
+     * is nothing to eject but the Pi itself has the partition mounted, the Pi wins: the eject is forced
+     * (an Engine that is not docked refuses it harmlessly).
+     */
+    private async sendEjectOrForce(engineId: string, diskId: string): Promise<void> {
+        const idReason = protectedDiskReason(diskId)
+        if (idReason) throw new Error(protectedDiskRefusal('eject', null, diskId, idReason))
+        const first = await this.sendEject(engineId, diskId, false)
+        if (first.sent) return
+        const p = this.partitionWith(await this.stage2Status(engineId), diskId)
+        if (!p?.mounted) return // the Pi agrees: nothing mounted, the wait below settles on the store
+        console.log(`[duration] stage2: eject of ${diskId} on ${engineId}: the walker's view said ${first.why} but ${p.partLabel} is mounted at ${p.mounted} → forcing ejectDisk`)
+        const forced = await this.sendEject(engineId, diskId, true)
+        if (!forced.sent) {
+            throw new Error(`Stage 2: Engine eject of ${diskId} on ${engineId} could not be sent (${forced.why}); ${p.partLabel} is mounted at ${p.mounted}. Fail loud.`)
+        }
+    }
+
+    /**
      * Engine eject (WS `ejectDisk`, inherited) and wait until the store shows it undocked AND the
      * partition is no longer mounted — only then may a partition verb (undock/reset/export) run.
      * Partition = the one carrying diskId's META (a moved copy lives on the move target).
      */
     async engineEject(engineId: string, diskId: string): Promise<void> {
-        await super.undockFixtures([engineId], diskId)
+        await this.sendEjectOrForce(engineId, diskId)
         const deadline = Date.now() + this.dockWaitMs
         let last = 'unread'
         for (;;) {

@@ -318,6 +318,9 @@ export interface RealFleetOptions {
 /** r86h FAIL@104: a store write (Engine command / purge) that could not be made, even after one reconnect. */
 export class StoreWriteError extends Error {}
 
+/** Outcome of sendEject: pushed, or why nothing was pushed (the caller decides whether that is fine). */
+export type EjectSend = { sent: true } | { sent: false; why: 'no-doc' | 'no-disk' | 'view-undocked' | 'no-live-id' }
+
 export class EngineUnreachableError extends Error {
     constructor(readonly engine: string, readonly url: string, readonly detail: string) {
         super(`engine ${engine} unreachable (WS ${url}): ${detail}`)
@@ -2744,56 +2747,63 @@ export class RealFleetOps implements FleetOps {
         for (const logicalId of engineIds) {
             if (this.exclude.includes(logicalId)) continue
             try {
-                const conn = await this.connect(logicalId)
-                const doc = conn.storeHandle.doc()
-                if (!doc) continue
-
-                // Only the disk asked for: by id, else by store name (a caller passing a name).
-                const disk = (doc.diskDB[diskId as keyof typeof doc.diskDB]
-                    ?? Object.values(doc.diskDB ?? {}).find(d => d && String(d.name) === diskId)) as
-                    | { id?: string; name?: string; dockedTo?: string | null; device?: string | null }
-                    | undefined
-                if (!disk) {
-                    // Fixture not present — already undocked
-                    continue
-                }
-                const name = disk.name != null ? String(disk.name) : null
-                const storeDevice = disk.device != null ? String(disk.device) : null
-                const reason = protectedDiskReason(String(disk.id ?? diskId), { name, device: storeDevice })
-                if (reason) {
-                    throw new Error(protectedDiskRefusal('eject', logicalId, String(disk.id ?? diskId), reason, name, storeDevice))
-                }
-                if (!disk.dockedTo) continue // already undocked
-
-                const liveTarget = this.liveIds.get(logicalId)
-                    ?? this.discoverLiveEngineId(doc, logicalId)
-                if (!liveTarget) {
-                    console.warn(`[RealFleetOps] undock: no live engine id for ${logicalId}; skip`)
-                    continue
-                }
-                // Prefer eject by id
-                console.log(`[RealFleetOps] ejectDisk ${diskId} on ${logicalId} (live=${liveTarget})`)
-                await this.changeStore(logicalId, conn, `ejectDisk ${diskId}`, s => {
-                    const eng = s.engineDB[liveTarget as keyof typeof s.engineDB] as
-                        | { commands: string[] }
-                        | undefined
-                    if (eng) eng.commands.push(`ejectDisk ${diskId}` as never)
-                })
-                // Drop Kid sentinel so chokidar does not re-add; keep fixture tree.
-                const device = this.deviceMap(logicalId).get(diskId)
-                    ?? (disk.device && /^idea-test-[0-9]+$/.test(String(disk.device))
-                        ? String(disk.device)
-                        : null)
-                if (device) {
-                    await this.sshRemoveSentinel(logicalId, device)
-                    this.releaseTestDevice(logicalId, diskId)
-                }
+                const r = await this.sendEject(logicalId, diskId, false)
+                if (!r.sent && r.why === 'no-live-id') console.warn(`[RealFleetOps] undock: no live engine id for ${logicalId}; skip`)
             } catch (e) {
                 if (e instanceof Error && /refuse to eject/.test(e.message)) throw e
                 if (e instanceof StoreWriteError) throw e
                 console.warn(`[RealFleetOps] undockFixtures ${logicalId}/${diskId}: ${e}`)
             }
         }
+    }
+
+    /**
+     * Push `ejectDisk <diskId>` onto logicalId's Engine command queue and say whether it was pushed.
+     * Markov 5 (random-c1cc4bb-markov-20261119, step 93): this used to skip silently when the walker's
+     * OWN view of that Engine's store still showed the disk undocked (`dockedTo` null), so the command was
+     * never written (idea03's store history has no walker write after step 92) and the caller waited 120 s
+     * for an eject nobody asked for. `force` skips the view check: the caller knows from the Pi itself
+     * (partition mounted) that the disk is up, and an Engine that is not docked just refuses the command.
+     */
+    async sendEject(logicalId: string, diskId: string, force: boolean): Promise<EjectSend> {
+        const conn = await this.connect(logicalId)
+        const doc = conn.storeHandle.doc()
+        if (!doc && !force) return { sent: false, why: 'no-doc' }
+        // Only the disk asked for: by id, else by store name (a caller passing a name).
+        const disk = (doc?.diskDB?.[diskId as keyof typeof doc.diskDB]
+            ?? Object.values(doc?.diskDB ?? {}).find(d => d && String(d.name) === diskId)) as
+            | { id?: string; name?: string; dockedTo?: string | null; device?: string | null }
+            | undefined
+        if (!disk && !force) return { sent: false, why: 'no-disk' } // Fixture not present — already undocked
+        const name = disk?.name != null ? String(disk.name) : null
+        const storeDevice = disk?.device != null ? String(disk.device) : null
+        const reason = protectedDiskReason(String(disk?.id ?? diskId), { name, device: storeDevice })
+        if (reason) {
+            throw new Error(protectedDiskRefusal('eject', logicalId, String(disk?.id ?? diskId), reason, name, storeDevice))
+        }
+        if (!disk?.dockedTo && !force) return { sent: false, why: 'view-undocked' } // already undocked
+
+        const liveTarget = this.liveIds.get(logicalId)
+            ?? (doc ? this.discoverLiveEngineId(doc, logicalId) : undefined)
+        if (!liveTarget) return { sent: false, why: 'no-live-id' }
+        // Prefer eject by id
+        console.log(`[RealFleetOps] ejectDisk ${diskId} on ${logicalId} (live=${liveTarget})${force ? ' [forced: the Pi has it mounted]' : ''}`)
+        await this.changeStore(logicalId, conn, `ejectDisk ${diskId}`, s => {
+            const eng = s.engineDB[liveTarget as keyof typeof s.engineDB] as
+                | { commands: string[] }
+                | undefined
+            if (eng) eng.commands.push(`ejectDisk ${diskId}` as never)
+        })
+        // Drop Kid sentinel so chokidar does not re-add; keep fixture tree.
+        const device = this.deviceMap(logicalId).get(diskId)
+            ?? (disk?.device && /^idea-test-[0-9]+$/.test(String(disk.device))
+                ? String(disk.device)
+                : null)
+        if (device) {
+            await this.sshRemoveSentinel(logicalId, device)
+            this.releaseTestDevice(logicalId, diskId)
+        }
+        return { sent: true }
     }
 
     private deviceMap(engineId: string): Map<string, string> {
