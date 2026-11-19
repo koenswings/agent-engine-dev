@@ -417,6 +417,12 @@ const quiet = () => {
         engineEjects.push(`${engines.join(',')} ${diskId}`)
         if (this.docked[diskId] && engines.includes(this.docked[diskId]!)) { this.lagLeft[diskId] = this.unmountLag; this.docked[diskId] = null }
     })
+    // engineEject now sends through sendEject (it must know the command was written): same canned effect.
+    vi.spyOn(RealFleetOps.prototype, 'sendEject').mockImplementation(async function (this: CannedStage2, engine: string, diskId: string) {
+        engineEjects.push(`${engine} ${diskId}`)
+        if (this.docked[diskId] && this.docked[diskId] === engine) { this.lagLeft[diskId] = this.unmountLag; this.docked[diskId] = null }
+        return { sent: true }
+    })
     vi.spyOn(console, 'log').mockImplementation(() => {})
 }
 
