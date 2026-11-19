@@ -334,6 +334,19 @@ export const diskOpSettleMs = (env: NodeJS.ProcessEnv = process.env): number => 
 }
 
 /**
+ * idea#533: walker bookkeeping for a disk the fixture dock just reset to a fresh Empty pack
+ * (dockFixture rm+cp of the Kid pack). Whatever the walk had put on it, including an install_app
+ * the walker was still waiting to land (pendingInstallDisk), is gone with it. A stale pending mark
+ * made the next settleDiskOpsBeforeReset wait the whole DURATION_DISK_OP_SETTLE_MS for an install
+ * that no longer exists (Markov seed 42 FAIL@274). Also clears the late-install hold the next
+ * install_app would re-dock for.
+ */
+export const noteDiskResetToEmpty = (ctx: Pick<ActionContext, 'walker'>, diskId: string): void => {
+    if (ctx.walker.pendingInstallDisk === diskId) ctx.walker.pendingInstallDisk = null
+    if (diskId === eraseDiskTargetId() || diskId === 'duration-empty-002') ctx.walker.empty002HoldsApp = false
+}
+
+/**
  * r75 FAIL@91 fix 1: never reset a disk under a live operation. install_app@88 soft-returned, the
  * Engine wrote the new instance 14 s later (after the purge), then stage2-dock reset reformatted the
  * partition under it: stale Pauzed record (currentStep 5) + orphan Created container. Before a fresh
@@ -1230,6 +1243,7 @@ const infraDockFixture = async (ctx: ActionContext): Promise<ActionResult> => {
         }
         await ctx.opts.ops.dockFixture(target, diskId)
         docked.push(diskId)
+        if (/^duration-empty-/.test(diskId)) noteDiskResetToEmpty(ctx, diskId)
     }
     await dockOne(engine, ctx.fixtureDisk)
     // Sibling fixtures (nextcloud) on the same engine so inventory sees both packs.
@@ -2807,7 +2821,7 @@ export const stage2MarkovRedock = async (
             if (f.diskTypes?.[0] === 'empty') {
                 // dockFixture resets an Empty: what the walk had put on it is gone.
                 if (d === STAGE2_ROLE_MAP.backup) ctx.walker.backupTaken = false
-                if (d === 'duration-empty-002') ctx.walker.empty002HoldsApp = false
+                noteDiskResetToEmpty(ctx, d)
                 const copy = ctx.walker.stage2CopyInstanceId?.trim()
                 if (copy && before?.instances.get(copy)?.diskId === d) ctx.walker.stage2CopyInstanceId = null
                 notes.push(`${d} re-docked on ${f.host} (reset to Empty)`)
@@ -4266,7 +4280,9 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     // pre-Intent hook above) — works with or without copy_app/open_copied_instance.
     if (result.ok && ctx.action === 'start_after_install') {
         ctx.walker.empty002HoldsApp = true
-        message = `${message}; empty-002 now holds the late-installed app (next install_app re-docks it Empty)`
+        // The settle above saw the instance Running on its disk: the install has landed.
+        ctx.walker.pendingInstallDisk = null
+        message = `${message}; ${eraseDiskTargetId()} now holds the late-installed app (next install_app re-docks it Empty)`
     }
     // Prefer A r37: after stay_on_disk (precedes late erase), re-dock empty-002 Empty
     // before erase_disk (second late install_app left empty-002 as app disk again).
