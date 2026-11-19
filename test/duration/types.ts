@@ -249,6 +249,8 @@ export interface WalkerState {
     eraseStarted?: boolean
     /** Markov draw guard: true after an ok backup_instance (restore_from_backup becomes drawable). */
     backupTaken?: boolean
+    /** Markov draw guard: true after an ok add_files_role (the app-only fixture keeps its files role; no fresh re-dock exists). */
+    addFilesRoleDone?: boolean
 }
 
 /** One step in a deterministic walk file (kind: walk). */

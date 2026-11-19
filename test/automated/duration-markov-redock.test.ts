@@ -21,6 +21,7 @@ const NC = 'duration-nextcloud-grade5a-001'
 const KI = 'kolibri-grade5a-001'
 const NCI = 'nextcloud-grade5a-001'
 const KXI = 'kiwix-ideaa-001'
+const AF = 'duration-add-files-001'
 const FIXTURE_DISKS = [KOL, NC]
 const FIXTURES = { [KOL]: KI, [NC]: NCI }
 
@@ -256,6 +257,8 @@ const intentNeeds = (m: Stage2Model, walker: WalkerState, action: string, to: st
         case 'copy_app': return live(KI) ? null : `copy source ${KI} absent`
         case 'move_app': return walker.stage2CopyInstanceId && live(walker.stage2CopyInstanceId) ? null : 'no live copy to move'
         case 'infra_move_disk': return docked(KOL) ? null : `${KOL} not docked`
+        // Path A pre-check: DiskView offers Add Files only on an app-only disk (seed 42 @747).
+        case 'add_files_role': return m.disks[AF]?.diskTypes?.includes('files') ? `${AF} already has a files role` : null
     }
     if (/^leave_/.test(action) || action === 'return_to_start') return null
     if (/kolibri/.test(action) || /^kolibri_/.test(to)) return running(KI) ? null : `${KI} not Running`
@@ -271,6 +274,7 @@ const applyEffect = (m: Stage2Model, walker: WalkerState, action: string): void 
         case 'stop_instance': if (m.insts[KI]!.status !== 'Undocked') m.insts[KI]!.status = 'Stopped'; break
         case 'start_instance': if (m.insts[KI]!.status !== 'Undocked') m.insts[KI]!.status = 'Running'; break
         case 'make_backup_disk': m.disks[STAGE2_ROLE_MAP.backup]!.diskTypes = ['backup']; break
+        case 'add_files_role': m.disks[AF]!.diskTypes = ['app', 'files']; break
         case 'copy_app':
             m.insts['kolibri-copy'] = { id: 'kolibri-copy', status: 'Running', diskId: NC, port: 18081 }
             walker.stage2CopyInstanceId = 'kolibri-copy'
@@ -337,9 +341,70 @@ describe('dry run: seed 42, 2000 draws, unified graph, Stage 2 model', () => {
         const { problems, counts } = await dryRun(true)
         expect(problems).toEqual([])
         expect(counts.confirm_eject ?? 0).toBeGreaterThan(0)
+        // add_files_role is one-shot (no fresh app-only re-dock exists): drawn at most once, and at least once.
+        expect(counts.add_files_role ?? 0).toBe(1)
     })
     it('control without the re-dock: the checker catches the Markov 3 failure class', async () => {
         const { problems } = await dryRun(false)
         expect(problems.some(p => /undocked outside infra|disk card duration-kolibri-grade5a-001 missing/.test(p))).toBe(true)
+    })
+})
+
+// ── Markov seed 42 FAIL@747: add_files_role redrawn after the pinned fixture already has its files role ──────
+
+describe('add_files_role is one-shot (stage2AddFilesRoleTaken / randomStepPrecondition)', () => {
+    const pre = (m: Stage2Model, walker: WalkerState) =>
+        randomStepPrecondition({ opts: { ops: m, fast: true, settleTimeoutMs: 50 }, walker, poolEngines: POOL, excludeEngines: ['idea02'], fixtureInstance: KI, fixtureDisk: KOL } as never, 'add_files_role', {}, 'op_files')
+    it('fresh app-only fixture: drawable', async () => {
+        const m = new Stage2Model()
+        expect(await pre(m, walkerOf())).toBeNull()
+    })
+    it('the store shows a files role on duration-add-files-001 (step 666 state): not drawable, reason names the disk', async () => {
+        const m = new Stage2Model()
+        m.disks[AF]!.diskTypes = ['app', 'files']
+        expect(await pre(m, walkerOf())).toMatch(/duration-add-files-001 already has a files role in the store \(diskTypes=\[app, files\]\).*one-shot/)
+    })
+    it('still not drawable when the fixture is undocked (the disk row keeps its types)', async () => {
+        const m = new Stage2Model()
+        m.disks[AF]!.diskTypes = ['app', 'files']
+        m.undock(AF)
+        expect(await pre(m, walkerOf())).toMatch(/already has a files role/)
+    })
+    it('this run\'s own ok add_files_role (walker bookkeeping) closes it even if the store has no row', async () => {
+        const m = new Stage2Model()
+        delete m.disks[AF]
+        const w = walkerOf()
+        expect(await pre(m, w)).toBeNull()
+        noteStepPreconditionProgress(w, 'add_files_role')
+        expect(w.addFilesRoleDone).toBe(true)
+        expect(await pre(m, w)).toMatch(/already got its files role earlier in this walk/)
+    })
+    it('other roles and other steps are untouched; make_files_disk stays redrawable', async () => {
+        const m = new Stage2Model()
+        m.disks[AF]!.diskTypes = ['app', 'files']
+        const w = walkerOf({ addFilesRoleDone: true })
+        for (const a of ['make_files_disk', 'make_backup_disk', 'install_app', 'eject_disk']) {
+            expect(await randomStepPrecondition({ opts: { ops: m, fast: true, settleTimeoutMs: 50 }, walker: w, poolEngines: POOL, excludeEngines: ['idea02'], fixtureInstance: KI, fixtureDisk: KOL } as never, a, {}, 'op_files')).toBeNull()
+        }
+    })
+    it('the draw resamples: with the role taken, op_disk never draws add_files_role', async () => {
+        const scenario = loadScenario('unified')
+        const m = new Stage2Model()
+        m.disks[AF]!.diskTypes = ['app', 'files']
+        const rng = makeRng(7)
+        const base = { opts: { ops: m, fast: true, settleTimeoutMs: 50 }, walker: walkerOf({ current: 'op_disk' }), poolEngines: POOL, excludeEngines: ['idea02'], fixtureInstance: KI, fixtureDisk: KOL }
+        let blocked = 0
+        for (let i = 0; i < 300; i++) {
+            const picked = await pickDrawableTransition('op_disk', scenario.states.op_disk!.transitions, rng, (a, t) => randomStepPrecondition(base as never, a, {}, t))
+            expect(picked.transition.action).not.toBe('add_files_role')
+            if (picked.blocked.some(b => /add_files_role/.test(JSON.stringify(b)))) blocked++
+        }
+        expect(blocked).toBeGreaterThan(0)
+    })
+    it('Stage 1 / Fake: unchanged (not Stage 2 → always drawable)', async () => {
+        const m = new Stage2Model()
+        m.stage = 1
+        m.disks[AF]!.diskTypes = ['app', 'files']
+        expect(await pre(m, walkerOf({ addFilesRoleDone: true }))).toBeNull()
     })
 })
