@@ -22,6 +22,14 @@ import type { MutateSpec } from './sshMutate.js'
 
 const DOCK_WAIT_MS = Number(process.env.DURATION_STAGE2_DOCK_WAIT_MS ?? 120_000)
 /**
+ * Step 92 (random-mixed c6ed5f4-7cbaf60): idea01's Engine ejected kolibri at 10:25:09 (dockedTo=null in its own
+ * store, partition unmounted) yet a walker store replica still said dockedTo=idea01 for 120 s. Once the Pi says
+ * "unmounted" this long and a replica still says docked, that replica is re-synced (stale-view guard, counted).
+ */
+export const EJECT_VIEW_REFRESH_MS = 10_000
+/** At most this many re-syncs per engineEject; each also gets its own read window (min(30 s, dockWaitMs)). */
+export const EJECT_VIEW_MAX_REFRESHES = 2
+/**
  * Gap between `undock` and `dock` when re-docking a partition that is present but not mounted
  * (Engine-ejected, or after reset/import). Atlas reset-r53: the script's own partx -d/-a cycle is
  * milliseconds apart, chokidar merges unlink+add of /dev/engine/<kname> into a 'change', and the Engine
@@ -41,6 +49,8 @@ export class Stage2FleetOps extends RealFleetOps {
     private readonly sleepMs: (ms: number) => Promise<void>
     private readonly dockWaitMs: number
     private readonly redockGapMs: number
+    /** Step 92: how long the Pi may say "unmounted" while a walker replica still says docked before that replica is re-synced. */
+    private readonly ejectViewRefreshMs: number
     /** Partition diskId → diskId of the app network-copied onto it (move target occupancy). */
     readonly moveCopies = new Map<string, string>()
     /** Fixtures the harness deliberately left undocked (a reboot re-adds partitions → undock again). */
@@ -54,7 +64,7 @@ export class Stage2FleetOps extends RealFleetOps {
     /** Log of partition docks (undock → gap → dock decisions), for evidence / tests. */
     readonly dockLog: string[] = []
 
-    constructor(opts: RealFleetOptions & { dockScript?: string; sleep?: (ms: number) => Promise<void>; dockWaitMs?: number; redockGapMs?: number }) {
+    constructor(opts: RealFleetOptions & { dockScript?: string; sleep?: (ms: number) => Promise<void>; dockWaitMs?: number; redockGapMs?: number; ejectViewRefreshMs?: number }) {
         for (const n of STAGE2_NEVER_HOSTS) {
             if (opts.poolEngines.includes(n)) throw new Error(`Stage2FleetOps: refuse ${n} in pool`)
         }
@@ -64,6 +74,8 @@ export class Stage2FleetOps extends RealFleetOps {
         this.sleepMs = opts.sleep ?? (ms => new Promise(r => setTimeout(r, ms)))
         this.dockWaitMs = opts.dockWaitMs ?? DOCK_WAIT_MS
         this.redockGapMs = opts.redockGapMs ?? stage2RedockGapMs()
+        this.ejectViewRefreshMs = opts.ejectViewRefreshMs
+            ?? (Number(process.env.DURATION_STAGE2_EJECT_REFRESH_MS) > 0 ? Number(process.env.DURATION_STAGE2_EJECT_REFRESH_MS) : EJECT_VIEW_REFRESH_MS)
     }
 
     private s2host(engineId: string): string {
@@ -275,8 +287,12 @@ export class Stage2FleetOps extends RealFleetOps {
      */
     async engineEject(engineId: string, diskId: string): Promise<void> {
         await this.sendEjectOrForce(engineId, diskId)
-        const deadline = Date.now() + this.dockWaitMs
+        let deadline = Date.now() + this.dockWaitMs
         let last = 'unread'
+        let unmountedSince: number | null = null
+        let refreshes = 0
+        const stale = new Set<string>()
+        let replicasNote = ''
         for (;;) {
             try {
                 const on = await this.findDockedEngine(diskId)
@@ -284,8 +300,35 @@ export class Stage2FleetOps extends RealFleetOps {
                 const p = this.partitionWith(st, diskId)
                 last = `dockedTo=${on ?? 'none'} ${p?.partLabel ?? '?'} mounted=${p?.mounted ?? 'no'}`
                 if (on !== engineId && !p?.mounted) return
+                if (on === engineId && !p?.mounted) {
+                    // The Pi has unmounted the partition (the Engine did its part) but a walker replica still says
+                    // docked. A frozen sync view is a known failure mode (r65, staleView.ts): re-sync the replicas
+                    // that disagree, count it, and read again — never wave it through.
+                    const now = Date.now()
+                    unmountedSince ??= now
+                    if (refreshes < EJECT_VIEW_MAX_REFRESHES && now - unmountedSince >= this.ejectViewRefreshMs) {
+                        const by = await this.dockedToByReplica(diskId)
+                        const lagging = Object.entries(by).filter(([, v]) => v === engineId).map(([e]) => e)
+                        replicasNote = ` replicas: ${Object.entries(by).map(([e, v]) => `${e}=${v ?? 'none'}`).join(' ')}`
+                        if (lagging.length) {
+                            refreshes++
+                            for (const e of lagging) stale.add(e)
+                            console.log(`[duration] stage2: eject of ${diskId} on ${engineId}: the Pi has ${p?.partLabel ?? 'the partition'} unmounted for ${Math.round((now - unmountedSince) / 1000)}s but the walker's view of [${lagging.join(', ')}] still says docked → re-syncing it (refresh ${refreshes}/${EJECT_VIEW_MAX_REFRESHES})`)
+                            for (const e of lagging) {
+                                await this.refreshView(e, `engineEject ${diskId}: ${p?.partLabel ?? 'partition'} unmounted on ${engineId} but ${e}'s view still says dockedTo=${engineId}`)
+                            }
+                            unmountedSince = Date.now()
+                            deadline = Math.max(deadline, Date.now() + Math.min(30_000, this.dockWaitMs))
+                        }
+                    }
+                } else unmountedSince = null
             } catch (e) { last = e instanceof Error ? e.message : String(e) }
-            if (Date.now() >= deadline) throw new Error(`Stage 2: Engine eject of ${diskId} on ${engineId} not done within ${this.dockWaitMs}ms (${last})`)
+            if (Date.now() >= deadline) {
+                const note = stale.size
+                    ? `; the Pi has it unmounted — the walker's view of [${[...stale].join(', ')}] stayed stale through ${refreshes} re-sync(s)`
+                    : ''
+                throw new Error(`Stage 2: Engine eject of ${diskId} on ${engineId} not done within ${this.dockWaitMs}ms (${last}${replicasNote}${note})`)
+            }
             await this.sleepMs(1000)
         }
     }

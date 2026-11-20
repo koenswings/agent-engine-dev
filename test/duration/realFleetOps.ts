@@ -3237,23 +3237,49 @@ export class RealFleetOps implements FleetOps {
                 const view = await this.readStore(id)
                 const disk = view.diskDB[diskId]
                 if (!disk?.dockedTo) continue
-                const docked = disk.dockedTo
-                // toSemanticView usually already mapped live→logical
-                if (this.pool.includes(docked) || this.exclude.includes(docked)) return docked
-                const live = this.liveIds.get(id)
-                if (docked === id || (live && docked === live)) return id
-                const mapped = this.logicalIds.get(docked)
-                if (mapped) return mapped
-                for (const pid of this.pool) {
-                    if (this.exclude.includes(pid)) continue
-                    const plive = this.liveIds.get(pid)
-                    if (plive && docked === plive) return pid
-                }
+                const resolved = this.resolveDockedTo(id, disk.dockedTo)
+                if (resolved) return resolved
             } catch {
                 /* try next */
             }
         }
         return null
+    }
+
+    /** Logical engine a store `dockedTo` value names, as read through `viewOf`'s replica (null = unknown id). */
+    private resolveDockedTo(viewOf: string, docked: string): string | null {
+        // toSemanticView usually already mapped live→logical
+        if (this.pool.includes(docked) || this.exclude.includes(docked)) return docked
+        const live = this.liveIds.get(viewOf)
+        if (docked === viewOf || (live && docked === live)) return viewOf
+        const mapped = this.logicalIds.get(docked)
+        if (mapped) return mapped
+        for (const pid of this.pool) {
+            if (this.exclude.includes(pid)) continue
+            const plive = this.liveIds.get(pid)
+            if (plive && docked === plive) return pid
+        }
+        return null
+    }
+
+    /**
+     * Step 92: what EACH pool engine's walker replica says diskId is docked to (logical id; null = undocked in
+     * that replica; 'unreadable' = the replica could not be read). findDockedEngine returns the first replica
+     * that says docked, so one lagging replica makes the whole pool look docked — this names which one.
+     */
+    async dockedToByReplica(diskId: string): Promise<Record<string, string | null>> {
+        const out: Record<string, string | null> = {}
+        for (const id of this.pool) {
+            if (this.exclude.includes(id)) continue
+            try {
+                const view = await this.readStore(id)
+                const docked = view.diskDB[diskId]?.dockedTo
+                out[id] = docked ? (this.resolveDockedTo(id, docked) ?? `unknown:${docked}`) : null
+            } catch {
+                out[id] = 'unreadable'
+            }
+        }
+        return out
     }
 
     async dockFixture(engineId: string, diskId: string): Promise<void> {
