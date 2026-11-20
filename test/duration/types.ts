@@ -267,6 +267,8 @@ export interface WalkerState {
     backupTaken?: boolean
     /** Markov draw guard: true after an ok add_files_role (the app-only fixture keeps its files role; no fresh re-dock exists). */
     addFilesRoleDone?: boolean
+    /** Markov draw guard: true after an ok make_backup_disk until the Backup Disk is reset to Empty (one-shot role). */
+    backupDiskMade?: boolean
 }
 
 /** One step in a deterministic walk file (kind: walk). */

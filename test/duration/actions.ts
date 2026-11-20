@@ -343,6 +343,8 @@ export const diskOpSettleMs = (env: NodeJS.ProcessEnv = process.env): number => 
  */
 export const noteDiskResetToEmpty = (ctx: Pick<ActionContext, 'walker'>, diskId: string): void => {
     if (ctx.walker.pendingInstallDisk === diskId) ctx.walker.pendingInstallDisk = null
+    // Step 747b: a reset Backup Disk is Empty again (its archives are gone): make_backup_disk is drawable again.
+    if (diskId === backupDiskTargetId() || diskId === STAGE2_ROLE_MAP.backup) { ctx.walker.backupDiskMade = false; ctx.walker.backupTaken = false }
     if (diskId === eraseDiskTargetId() || diskId === 'duration-empty-002') ctx.walker.empty002HoldsApp = false
 }
 
@@ -2599,6 +2601,39 @@ export const stage2AddFilesRoleTaken = async (
 }
 
 /**
+ * Markov seed 42 FAIL@747 (random-mixed-d2b8f57-7cbaf60-markov-20261120): make_backup_disk@661 turned duration-empty-002
+ * into the Backup Disk (BACKUP.yaml, diskTypes=[backup]); nothing resets it afterwards, so make_backup_disk@747 hit the
+ * dispatcher's pre-Intent check (the target must be docked EMPTY) and aborted. Unlike make_files_disk / erase_disk
+ * (STAGE2_RESET_BEFORE: a settled fresh re-dock precedes every run), the Backup Disk is a role that PERSISTS: backup_instance /
+ * backup_schedule / restore_from_backup consume its BACKUP.yaml link and archives (walker.backupTaken), and a reset
+ * would destroy exactly that, so make_backup_disk is ONE-SHOT until the disk is Empty again. Not drawable while the
+ * pinned Backup Disk already holds the backup role: shown by the store (docked or not, the row keeps its diskTypes) or,
+ * when the store has no row, by this run's own earlier ok make_backup_disk (walker.backupDiskMade). A row that is
+ * readable and not [backup] wins over the flag (the disk was reset: noteDiskResetToEmpty also clears the flag).
+ * Stage 2 only; the dispatcher's loud pre-check stays as the backstop.
+ */
+export const stage2BackupDiskTaken = async (
+    ctx: Pick<ActionContext, 'opts' | 'walker' | 'poolEngines' | 'excludeEngines'> &
+        { snapshot?: () => Promise<PoolSnapshot> },
+    action: string,
+    env: NodeJS.ProcessEnv = process.env,
+): Promise<string | null> => {
+    if (action !== 'make_backup_disk' || !isStage2(ctx as ActionContext)) return null
+    // Stage 2 is already established from the ops (isStage2 above), whatever `env` says: the pinned disk is the Stage 2 role disk.
+    const id = env.DURATION_BACKUP_DISK_ID?.trim() || STAGE2_ROLE_MAP.backup
+    const snap = await (ctx.snapshot ? ctx.snapshot() : readPoolSnapshot(ctx))
+    const types = snap.readable ? snap.diskTypes?.get(id) : undefined
+    if (types?.includes('backup')) {
+        return `${id} already is the Backup Disk in the store (diskTypes=[${types.join(', ')}]) — make_backup_disk needs an Empty disk; the Backup Disk persists for backup_instance/restore_from_backup, so make_backup_disk is one-shot`
+    }
+    if (types) return null // the row is readable and not a Backup Disk (reset to Empty): drawable
+    if (ctx.walker.backupDiskMade) {
+        return `${id} already became the Backup Disk earlier in this walk (make_backup_disk is one-shot: nothing resets it, backup_instance/restore_from_backup depend on it)`
+    }
+    return null
+}
+
+/**
  * Markov (--scenario random) draw guard, idea#168 Markov 9040e73@8: a random walk drew move_app
  * before any copy_app had recorded a disposable instance and aborted before the Intent. A step whose
  * harness precondition is an earlier step's result is not drawable until that result exists; the
@@ -2611,6 +2646,7 @@ export const stage2AddFilesRoleTaken = async (
  *   backup_schedule     (live) needs a docked Backup Disk (make_backup_disk first).
  *   restore_from_backup (live) needs a docked Backup Disk and an archive from a backup_instance of this run.
  *   add_files_role      (Stage 2) one-shot: not drawable once the pinned app-only fixture (duration-add-files-001) has its files role.
+ *   make_backup_disk    (Stage 2) one-shot: not drawable while the pinned Backup Disk (duration-empty-002) already holds the backup role.
  * Markov 2 (random-9040e73-markov-20261116b@16): eject_disk + confirm_eject@10-11 ejected the Kolibri fixture
  * disk, then copy_app@16 hit its preflight "source disk … is not docked on any pool engine". Only
  * infra_dock_fixture re-docks it, so in a random walk the fixture can legitimately be absent. Stage 2 live
@@ -2638,6 +2674,9 @@ export const randomStepPrecondition = async (
     // Markov seed 42 @747 (random-mixed-f171032-5805bb0-markov-20261119): add_files_role is a one-shot role.
     const filesTaken = await stage2AddFilesRoleTaken(ctx, action, env)
     if (filesTaken) return filesTaken
+    // Markov seed 42 @747 (random-mixed-d2b8f57-7cbaf60-markov-20261120): make_backup_disk is one-shot too.
+    const backupTaken = await stage2BackupDiskTaken(ctx, action, env)
+    if (backupTaken) return backupTaken
     // Markov 2 (random-9040e73-markov-20261116b@16): fixture disk / instance legitimately absent (eject, stop, …).
     const absent = await stage2FixtureAbsent(ctx, action, to, env)
     if (absent) return absent
@@ -2919,6 +2958,7 @@ export const markovRedockAfter = async (
 export const noteStepPreconditionProgress = (walker: WalkerState, action: string): void => {
     if (action === 'backup_instance') walker.backupTaken = true
     if (action === 'add_files_role') walker.addFilesRoleDone = true
+    if (action === 'make_backup_disk') walker.backupDiskMade = true
 }
 
 /** Sets harness-owned env vars; returns the restore function. */

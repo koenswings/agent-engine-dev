@@ -9,7 +9,7 @@
  * drawn step checked against what its Console intent needs (disk card / instance row / running App).
  */
 import { describe, expect, it } from 'vitest'
-import { FakeFleetOps, markovRedockAfter, markovRedockBefore, randomStepPrecondition, readPoolSnapshot, stage2MarkovRedock, noteStepPreconditionProgress } from '../duration/actions.js'
+import { FakeFleetOps, markovRedockAfter, markovRedockBefore, randomStepPrecondition, readPoolSnapshot, stage2MarkovRedock, noteStepPreconditionProgress, noteDiskResetToEmpty } from '../duration/actions.js'
 import { pickDrawableTransition, runDeterministicWalk, runWalk } from '../duration/runner.js'
 import { loadScenario, makeRng } from '../duration/scenario.js'
 import { STAGE2_FIXTURES, STAGE2_ROLE_MAP } from '../duration/stage2.js'
@@ -259,6 +259,8 @@ const intentNeeds = (m: Stage2Model, walker: WalkerState, action: string, to: st
         case 'infra_move_disk': return docked(KOL) ? null : `${KOL} not docked`
         // Path A pre-check: DiskView offers Add Files only on an app-only disk (seed 42 @747).
         case 'add_files_role': return m.disks[AF]?.diskTypes?.includes('files') ? `${AF} already has a files role` : null
+        // Pre-Intent check (seed 42 @747 of random-mixed-d2b8f57): the Backup Disk target must be docked EMPTY.
+        case 'make_backup_disk': return m.disks[STAGE2_ROLE_MAP.backup]?.diskTypes?.includes('backup') ? `${STAGE2_ROLE_MAP.backup} is not Empty (diskTypes=[backup])` : null
     }
     if (/^leave_/.test(action) || action === 'return_to_start') return null
     if (/kolibri/.test(action) || /^kolibri_/.test(to)) return running(KI) ? null : `${KI} not Running`
@@ -343,6 +345,8 @@ describe('dry run: seed 42, 2000 draws, unified graph, Stage 2 model', () => {
         expect(counts.confirm_eject ?? 0).toBeGreaterThan(0)
         // add_files_role is one-shot (no fresh app-only re-dock exists): drawn at most once, and at least once.
         expect(counts.add_files_role ?? 0).toBe(1)
+        // make_backup_disk is one-shot too (nothing resets the Backup Disk in this model): drawn exactly once, never redrawn (@747b).
+        expect(counts.make_backup_disk ?? 0).toBe(1)
     })
     it('control without the re-dock: the checker catches the Markov 3 failure class', async () => {
         const { problems } = await dryRun(false)
@@ -406,5 +410,90 @@ describe('add_files_role is one-shot (stage2AddFilesRoleTaken / randomStepPrecon
         m.stage = 1
         m.disks[AF]!.diskTypes = ['app', 'files']
         expect(await pre(m, walkerOf({ addFilesRoleDone: true }))).toBeNull()
+    })
+})
+
+// ── Markov seed 42 FAIL@747 (random-mixed-d2b8f57): make_backup_disk redrawn after empty-002 became the Backup Disk ─────
+
+describe('make_backup_disk is one-shot (stage2BackupDiskTaken / randomStepPrecondition)', () => {
+    const BK = STAGE2_ROLE_MAP.backup
+    const pre = (m: Stage2Model, walker: WalkerState, action = 'make_backup_disk', env: NodeJS.ProcessEnv = {}) =>
+        randomStepPrecondition({ opts: { ops: m, fast: true, settleTimeoutMs: 50 }, walker, poolEngines: POOL, excludeEngines: ['idea02'], fixtureInstance: KI, fixtureDisk: KOL } as never, action, env, 'op_backup')
+    it('the Backup Disk is Empty in the store: drawable', async () => {
+        expect(BK).toBe('duration-empty-002')
+        expect(await pre(new Stage2Model(), walkerOf())).toBeNull()
+    })
+    it('step 661 state: the store shows diskTypes=[backup] on duration-empty-002 → not drawable, reason names the disk', async () => {
+        const m = new Stage2Model()
+        m.disks[BK]!.diskTypes = ['backup']
+        expect(await pre(m, walkerOf())).toMatch(/duration-empty-002 already is the Backup Disk in the store \(diskTypes=\[backup\]\).*one-shot/)
+    })
+    it('still not drawable when the Backup Disk is undocked (the disk row keeps its types)', async () => {
+        const m = new Stage2Model()
+        m.disks[BK]!.diskTypes = ['backup']
+        m.undock(BK)
+        expect(await pre(m, walkerOf())).toMatch(/already is the Backup Disk/)
+    })
+    it('this run\'s own ok make_backup_disk (walker bookkeeping) closes it even if the store has no row', async () => {
+        const m = new Stage2Model()
+        delete m.disks[BK]
+        const w = walkerOf()
+        expect(await pre(m, w)).toBeNull()
+        noteStepPreconditionProgress(w, 'make_backup_disk')
+        expect(w.backupDiskMade).toBe(true)
+        expect(await pre(m, w)).toMatch(/already became the Backup Disk earlier in this walk/)
+    })
+    it('the disk was reset to Empty again (readable [empty] row): drawable again although the flag is set', async () => {
+        const m = new Stage2Model()
+        const w = walkerOf({ backupDiskMade: true })
+        expect(await pre(m, w)).toBeNull()
+    })
+    it('a reset Backup Disk clears the bookkeeping (noteDiskResetToEmpty): flag and archive flag', () => {
+        const w = walkerOf({ backupDiskMade: true, backupTaken: true })
+        noteDiskResetToEmpty({ walker: w }, BK)
+        expect(w.backupDiskMade).toBe(false)
+        expect(w.backupTaken).toBe(false)
+        const w2 = walkerOf({ backupDiskMade: true, backupTaken: true })
+        noteDiskResetToEmpty({ walker: w2 }, 'duration-empty-001')
+        expect(w2.backupDiskMade).toBe(true)
+    })
+    it('DURATION_BACKUP_DISK_ID pins the checked disk', async () => {
+        const m = new Stage2Model()
+        m.disks['duration-empty-003']!.diskTypes = ['backup']
+        expect(await pre(m, walkerOf())).toBeNull() // default target empty-002 is still Empty
+        expect(await pre(m, walkerOf(), 'make_backup_disk', { DURATION_BACKUP_DISK_ID: 'duration-empty-003' })).toMatch(/duration-empty-003 already is the Backup Disk/)
+    })
+    it('the other steps are untouched: backup_instance/backup_schedule/make_files_disk/erase_disk stay as before', async () => {
+        const m = new Stage2Model()
+        m.disks[BK]!.diskTypes = ['backup']
+        const w = walkerOf({ backupDiskMade: true, backupTaken: true })
+        for (const a of ['backup_instance', 'backup_schedule', 'restore_from_backup', 'make_files_disk', 'erase_disk', 'install_app']) {
+            expect(await pre(m, w, a)).toBeNull()
+        }
+    })
+    it('the draw resamples: with the Backup Disk taken, no state ever draws make_backup_disk', async () => {
+        const scenario = loadScenario('unified')
+        const m = new Stage2Model()
+        m.disks[BK]!.diskTypes = ['backup']
+        const rng = makeRng(11)
+        let blocked = 0, from = 0
+        for (const [name, st] of Object.entries(scenario.states)) {
+            if (!st.transitions.some(t => t.action === 'make_backup_disk')) continue
+            from++
+            const base = { opts: { ops: m, fast: true, settleTimeoutMs: 50 }, walker: walkerOf({ current: name }), poolEngines: POOL, excludeEngines: ['idea02'], fixtureInstance: KI, fixtureDisk: KOL }
+            for (let i = 0; i < 200; i++) {
+                const picked = await pickDrawableTransition(name, st.transitions, rng, (a, t) => randomStepPrecondition(base as never, a, {}, t))
+                expect(picked.transition.action).not.toBe('make_backup_disk')
+                if (picked.blocked.some(b => /make_backup_disk/.test(JSON.stringify(b)))) blocked++
+            }
+        }
+        expect(from).toBeGreaterThan(0)
+        expect(blocked).toBeGreaterThan(0)
+    })
+    it('Stage 1 / Fake: unchanged (not Stage 2 → always drawable)', async () => {
+        const m = new Stage2Model()
+        m.stage = 1
+        m.disks[BK]!.diskTypes = ['backup']
+        expect(await pre(m, walkerOf({ backupDiskMade: true }))).toBeNull()
     })
 })
