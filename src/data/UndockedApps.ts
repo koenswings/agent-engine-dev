@@ -146,23 +146,36 @@ export const checkAndSetUndockedApps = async (
                 log(`checkAndSetUndockedApps: leaving ${instanceId} ${instance.status}: it is on the system disk and no dock pass follows (systemDiskSkip)`)
                 return
             }
+            // engine#543: the operation-log scans (isUserStopped / userStopInForce / moveInFlightFromSource) read the
+            // read-only snapshot, not the change proxy: the same scan costs ~35x more inside storeHandle.change on a
+            // big store (measured: 7 x shouldAutoStart 28 ms on the snapshot, 970 ms in a change; ~21 s on idea03).
+            // The snapshot is taken in the same tick as the change, so it is the state the change sees.
+            const snap = storeHandle.doc()
+            const snapInst = snap.instanceDB[instanceId]
+            type Decision = { kind: 'skip' } | { kind: 'stopped'; stopOp: NonNullable<ReturnType<typeof userStopInForce>> } | { kind: 'move-stopped' } | { kind: 'undocked' }
+            let decision: Decision = { kind: 'skip' }
+            if (snapInst && snapInst.status !== 'Undocked' && isInstanceDockedOn(snap, snapInst, engineId) && !isUserStopped(snap, snapInst)) {
+                const stopOp = userStopInForce(snap, snapInst)
+                decision = stopOp ? { kind: 'stopped', stopOp }
+                    : (noDockPass && moveInFlightFromSource(snap, snapInst)) ? { kind: 'move-stopped' }
+                    : { kind: 'undocked' }
+            }
             storeHandle.change(doc => {
                 const inst = doc.instanceDB[instanceId]
                 // Re-check inside the change: the disk may have been undocked or moved
                 // to another Engine (a sync) while docker ps ran.
                 if (!inst || inst.status === 'Undocked' || !isInstanceDockedOn(doc, inst, engineId)) return
-                if (isUserStopped(doc, inst)) return
+                if (decision.kind === 'skip') return
                 // An operator stop is still in force (e.g. it was interrupted by the
                 // restart after its containers stopped): the instance is Stopped.
-                const stopOp = userStopInForce(doc, inst)
-                if (stopOp) {
-                    log(`Setting status of instance ${instanceId} to Stopped (operator stop ${String(stopOp.id).slice(0, 8)} by ${stopOp.cause} is in force; no container on this Engine)`)
+                if (decision.kind === 'stopped') {
+                    log(`Setting status of instance ${instanceId} to Stopped (operator stop ${String(decision.stopOp.id).slice(0, 8)} by ${decision.stopOp.cause} is in force; no container on this Engine)`)
                     inst.status = 'Stopped' as Status
                     return
                 }
                 // engine#511 Finding 2: the held-stopped source of a parked move on a skipped system
                 // disk is docked (no dock pass follows to say so): it is Stopped, not Undocked (Q2)
-                if (noDockPass && moveInFlightFromSource(doc, inst)) {
+                if (decision.kind === 'move-stopped') {
                     log(`checkAndSetUndockedApps: ${instanceId} is the stopped source of an unfinished move on the system disk (systemDiskSkip); setting it Stopped, not Undocked`)
                     if (inst.status !== 'Stopped') inst.status = 'Stopped' as Status
                     return
@@ -178,12 +191,19 @@ export const checkAndSetUndockedApps = async (
     }))
     if (toStarting.length > 0) {
         await yieldToEventLoop()   // let queued sync answers run before the one big write
+        // engine#543: shouldAutoStart scans the operation log; do it on the snapshot, not inside the change (see above)
+        const snap = storeHandle.doc()
+        const startable = new Set<string>()
+        for (const { instanceId } of toStarting) {
+            const inst = snap.instanceDB[instanceId]
+            if (inst && inst.status === 'Running' && isInstanceDockedOn(snap, inst, engineId) && shouldAutoStart(snap, inst).start) startable.add(String(instanceId))
+        }
         storeHandle.change(doc => {
             for (const { instanceId, why } of toStarting) {
                 const inst = doc.instanceDB[instanceId]
                 if (!inst || inst.status !== 'Running' || !isInstanceDockedOn(doc, inst, engineId)) continue
                 // Only when the dock pass will start (and so re-check) it; else it would stay Starting.
-                if (!shouldAutoStart(doc, inst).start) continue
+                if (!startable.has(String(instanceId))) continue
                 log(`Setting status of instance ${instanceId} to Starting until the dock pass checks it (${why})`)
                 inst.status = 'Starting' as Status
                 inst.statusCondition = null

@@ -243,4 +243,22 @@ describe('checkAndSetUndockedApps: one write for all Starting marks (engine#543)
         expect(st('i0')).toBe('Stopped')
         expect(st('i1')).toBe('Starting')
     })
+
+    it('the operation-log decisions (shouldAutoStart / userStopInForce) are taken on the snapshot and give the same results: an operator stop in force keeps an instance out of Starting, and a stop with no container → Stopped', async () => {
+        const h = await make(3)
+        h.change(d => {
+            d.operationDB['op-stop-i0' as any] = { id: 'op-stop-i0', kind: 'stopApp', status: 'Done', cause: 'console-command', startedAt: 100, subject: { type: 'instance', id: 'i0' }, args: {} } as any
+            d.operationDB['op-stop-i1' as any] = { id: 'op-stop-i1', kind: 'stopApp', status: 'Done', cause: 'console-command', startedAt: 100, subject: { type: 'instance', id: 'i1' }, args: {} } as any
+            d.instanceDB['i0' as InstanceID].lastStarted = 50 as any   // stop after the last start: in force
+            d.instanceDB['i1' as InstanceID].lastStarted = 50 as any
+        })
+        // i0: Running, container found, operator stop in force → shouldAutoStart says no → stays Running (not Starting)
+        // i1: Running, no container, operator stop in force → Stopped (not Undocked)
+        // i2: Running, container found, nothing in force → Starting
+        await checkAndSetUndockedApps(h, E, async (id) => id !== 'i1', { systemDiskSkip: false })
+        const st = (id: string) => String(h.doc().instanceDB[id as InstanceID].status)
+        expect(st('i0')).toBe('Running')
+        expect(st('i1')).toBe('Stopped')
+        expect(st('i2')).toBe('Starting')
+    })
 })
