@@ -135,27 +135,29 @@ describe('FirstSyncGate (engine#543)', () => {
         expect(order).toEqual(['queued', 'after-yield'])
     })
 
-    it('real Automerge: the sharedHeads of a finished sync equal A.getHeads of the Engine doc (the criterion works with the real library)', () => {
-        const repo = new Repo({ network: [], storage: undefined })
-        const h = repo.create<{ n: number; items: Record<string, number> }>({ n: 1, items: {} })
-        for (let i = 0; i < 5; i++) h.change(d => { d.items['k' + i] = i })
-        let peer = A.init<{ n: number; items: Record<string, number> }>()
+    it('real Automerge: the sharedHeads of a finished sync equal A.getHeads of the Engine doc, and A.getHeads reads a Repo handle doc (what start.ts uses)', () => {
+        type D = { n: number; items: Record<string, number> }
+        let engine = A.from<D>({ n: 1, items: {} })
+        for (let i = 0; i < 5; i++) engine = A.change(engine, d => { d.items['k' + i] = i })
+        let peer = A.init<D>()
         let sEngine = A.initSyncState(), sPeer = A.initSyncState()
         let seen: readonly string[] = []
         for (let i = 0; i < 20; i++) {
-            const [s1, m1] = A.generateSyncMessage(h.doc() as any, sEngine); sEngine = s1
-            if (m1) [peer, sPeer] = A.receiveSyncMessage(peer, sPeer, m1) as any
+            const [s1, m1] = A.generateSyncMessage(engine, sEngine); sEngine = s1
+            if (m1) { const r = A.receiveSyncMessage(peer, sPeer, m1); peer = r[0]; sPeer = r[1] }
             const [s2, m2] = A.generateSyncMessage(peer, sPeer); sPeer = s2
-            if (m2) {
-                // the Engine side would receive it; its sync state's sharedHeads is what the gate records
-                const res = A.receiveSyncMessage(h.doc() as any, sEngine, m2) as any
-                sEngine = res[1]; seen = sEngine.sharedHeads
-            }
+            if (m2) { const r = A.receiveSyncMessage(engine, sEngine, m2); engine = r[0]; sEngine = r[1]; seen = sEngine.sharedHeads }
             if (!m1 && !m2) break
         }
-        const heads = A.getHeads(h.doc() as any)
+        const heads = A.getHeads(engine)
         expect(heads.length).toBeGreaterThan(0)
         expect([...seen].sort()).toEqual([...heads].sort())
+        // the Repo's own handle doc is read with the same call in start.ts
+        const h = new Repo({ network: [], storage: undefined }).create<D>({ n: 1, items: {} })
+        h.change(d => { d.items.a = 1 })
+        const rh = A.getHeads(h.doc() as any)
+        expect(rh.length).toBe(1)
+        expect(rh[0]).toMatch(/^[0-9a-f]{64}$/)
     })
 })
 

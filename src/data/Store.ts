@@ -96,7 +96,7 @@ export const createServerStore = async (repo: Repo, storeDocId: DocumentId, stor
     await handle.whenReady();
     log("Store document is ready.")
     log(`   Doc in state ${handle.state}`);
-    // engine#543: counts only. The old `deepPrint(handle.doc(), 2)` printed the whole store (~29.5k console
+    // engine#543: counts only. The old deepPrint of the doc printed the whole store (~29.5k console
     // lines on a big store) and blocked the loop for seconds while the peers waited for the first sync.
     log(`   Doc contains: ${describeStoreCounts(handle.doc())}`);
     return handle;
