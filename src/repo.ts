@@ -3,7 +3,10 @@ import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
 import { ThreadedWebSocketServerAdapter } from "./wsServerThread.js";
 import { PortNumber } from "./data/CommonTypes.js";
 import { deepPrint, log, error } from './utils/utils.js'
-import { enginePeerId, isCommandLogContent, isForeignStoreDoc, isOwnCommandLog, peerVerdict, shareCommandLogWith, storeTag } from './data/StoreScope.js'
+import { archivedCommandLogIds, enginePeerId, isCommandLogContent, isForeignStoreDoc, isOwnCommandLog, isRefusedDoc, markOwnArchivedCommandLog, peerVerdict, shareCommandLogWith, storeTag } from './data/StoreScope.js'
+import fs from 'fs'
+import path from 'path'
+import { config } from './data/Config.js'
 export { isForeignStoreDoc }
 
 
@@ -121,6 +124,21 @@ export interface EngineIdentity {
     /** This Engine's store doc id (store-url.txt). */
     storeDocId: string
     engineId: string
+    /** engine#549: folder of this Engine's archived command logs. Default: <storeIdentityFolder>/command-log-archive (as CommandLogStore). */
+    commandLogArchiveDir?: string
+}
+
+/**
+ * engine#549 (2'): mark this Engine's archived command logs (file names in
+ * command-log-archive/) so peer-started sync for them is refused from the first
+ * message on. Read only; a missing or unreadable folder marks nothing.
+ */
+export const markOwnArchivedCommandLogs = (repo: object, archiveDir: string): number => {
+    let names: string[] = []
+    try { names = fs.readdirSync(archiveDir) } catch { return 0 }
+    const ids = archivedCommandLogIds(names)
+    for (const id of ids) markOwnArchivedCommandLog(repo, id)
+    return ids.length
 }
 
 export const startAutomergeServer = async (dataDir:string, port:PortNumber, identity: EngineIdentity):Promise<Repo> => {
@@ -150,8 +168,12 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber, iden
         sharePolicy: (p, d) => sharePolicy(p, d)
     });
     sharePolicy = storeScopedSharePolicy(repo, identity.storeDocId, identity.engineId)
-    network.setDocGuard((documentId) => isForeignStoreDoc(repo, identity.storeDocId, documentId))
+    // engine#549 (2'): marked before any message can be processed (no await since new Repo)
+    const archiveDir = identity.commandLogArchiveDir ?? path.join('./' + config.settings.storeIdentityFolder, 'command-log-archive')
+    const archived = markOwnArchivedCommandLogs(repo, archiveDir)
+    network.setDocGuard((documentId) => isRefusedDoc(repo, identity.storeDocId, documentId))
     log(`[store-scope] Engine peerId ${peerId}: syncing only with Engines of store ${storeTag(identity.storeDocId)}`)
+    log(`[store-scope] Refusing peer sync of ${archived} own archived command log(s) in ${archiveDir} (engine#549)`)
 
     startPeriodicFlush(repo);
 
