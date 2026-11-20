@@ -12,7 +12,7 @@ import { describe, expect, it } from 'vitest'
 import { FakeFleetOps, markovRedockAfter, markovRedockBefore, randomStepPrecondition, readPoolSnapshot, stage2MarkovRedock, noteStepPreconditionProgress, noteDiskResetToEmpty } from '../duration/actions.js'
 import { pickDrawableTransition, runDeterministicWalk, runWalk } from '../duration/runner.js'
 import { loadScenario, makeRng } from '../duration/scenario.js'
-import { STAGE2_FIXTURES, STAGE2_MOVE_TARGET_ID, STAGE2_ROLE_MAP } from '../duration/stage2.js'
+import { STAGE2_FIXTURES, STAGE2_MOVE_TARGET_HOST, STAGE2_MOVE_TARGET_ID, STAGE2_ROLE_MAP } from '../duration/stage2.js'
 import type { Scenario, WalkerState } from '../duration/types.js'
 
 const POOL = ['idea01', 'idea03', 'idea04']
@@ -24,6 +24,10 @@ const KXI = 'kiwix-ideaa-001'
 const AF = 'duration-add-files-001'
 const FIXTURE_DISKS = [KOL, NC]
 const FIXTURES = { [KOL]: KI, [NC]: NCI }
+/** After infra_move_disk, a re-dock of the Kolibri fixture targets the copy on idea04 (Stage2FleetOps.movedCopyHolder), not home. */
+const dockHostOf = (m: Stage2Model, diskId: string): string =>
+    diskId === KOL && m.moveTargetConsumed ? STAGE2_MOVE_TARGET_HOST : STAGE2_FIXTURES.find(f => f.diskId === diskId)!.host
+
 
 type Disk = { id: string; dockedTo: string | null; diskTypes?: string[] }
 type Inst = { id: string; status: string; diskId: string | null; port?: number }
@@ -84,7 +88,7 @@ const ctxOf = (model: Stage2Model, walker = walkerOf()) => ({
 /** infra_dock_fixture stand-in (its own Stage 2 path is covered by the infra tests): docks every undocked fixture home. */
 const dockFixtures = (model: Stage2Model) => async () => {
     const docked: string[] = []
-    for (const d of FIXTURE_DISKS) if (!model.disks[d]!.dockedTo) { await model.dockFixture(STAGE2_FIXTURES.find(f => f.diskId === d)!.host, d); docked.push(d) }
+    for (const d of FIXTURE_DISKS) if (!model.disks[d]!.dockedTo) { await model.dockFixture(dockHostOf(model, d), d); docked.push(d) }
     return { ok: true, message: `Stage 2 homes: docked ${docked.join(', ') || 'none'}`, layer: 'infra' as const }
 }
 const FAST = { waitMs: 50, ejectWaitMs: 40, pollMs: 5, log: () => {} }
@@ -282,7 +286,13 @@ const intentNeeds = (m: Stage2Model, walker: WalkerState, action: string, to: st
         case 'open_app': return running(KI) ? null : `${KI} not Running`
         case 'copy_app': return live(KI) ? null : `copy source ${KI} absent`
         case 'move_app': return walker.stage2CopyInstanceId && live(walker.stage2CopyInstanceId) ? null : 'no live copy to move'
-        case 'infra_move_disk': return docked(KOL) ? null : `${KOL} not docked`
+        case 'infra_move_disk':
+            if (!docked(KOL)) return `${KOL} not docked`
+            // Execution-time refusal (actions.ts infraMoveDisk): already on idea04 is not a move.
+            if (m.disks[KOL]!.dockedTo === STAGE2_MOVE_TARGET_HOST) {
+                return `${KOL} already docked on the move target ${STAGE2_MOVE_TARGET_HOST} — refusing a no-op move`
+            }
+            return null
         // Path A pre-check: DiskView offers Add Files only on an app-only disk (seed 42 @747).
         case 'add_files_role': return m.disks[AF]?.diskTypes?.includes('files') ? `${AF} already has a files role` : null
         // Pre-Intent check (seed 42 @747 of random-mixed-d2b8f57): the Backup Disk target must be docked EMPTY.
@@ -325,12 +335,12 @@ const applyEffect = (m: Stage2Model, walker: WalkerState, action: string): void 
         case 'move_app': m.insts['kolibri-copy']!.diskId = STAGE2_ROLE_MAP.moveApp; break
         case 'infra_undock_fixtures': for (const d of FIXTURE_DISKS) m.undock(d); break
         case 'infra_dock_fixture':
-            for (const d of FIXTURE_DISKS) if (!m.disks[d]!.dockedTo) void m.dockFixture(STAGE2_FIXTURES.find(f => f.diskId === d)!.host, d)
+            for (const d of FIXTURE_DISKS) if (!m.disks[d]!.dockedTo) void m.dockFixture(dockHostOf(m, d), d)
             break
     }
 }
 
-const dryRun = async (redock: boolean, resetBefore: boolean = redock) => {
+const dryRun = async (redock: boolean, resetBefore: boolean = redock, gateMove: boolean = true) => {
         const scenario = loadScenario('unified')
         const m = new Stage2Model()
         const walker: WalkerState = { current: scenario.initial_state, layer: null, dockedEngine: null, step: 0 }
@@ -345,7 +355,12 @@ const dryRun = async (redock: boolean, resetBefore: boolean = redock) => {
             const base = { opts: { ops: m, fast: true, settleTimeoutMs: 50 }, walker, poolEngines: POOL, excludeEngines: ['idea02'], fixtureInstance: KI, fixtureInstances: FIXTURES, fixtureDisk: KOL }
             let picked
             try {
-                picked = await pickDrawableTransition(from, state.transitions, rng, (a, t) => randomStepPrecondition(base as never, a, {}, t))
+                picked = await pickDrawableTransition(from, state.transitions, rng, async (a, t) => {
+                    const reason = await randomStepPrecondition(base as never, a, {}, t)
+                    // Control: ignore the FAIL@788 gate so the checker can still catch a no-op redraw.
+                    if (!gateMove && a === 'infra_move_disk' && reason && /already docked on the move target/.test(reason)) return null
+                    return reason
+                })
             } catch (e) {
                 problems.push(`draw ${i + 1} @${from}: ${(e as Error).message}`)
                 break
@@ -382,10 +397,11 @@ const dryRun = async (redock: boolean, resetBefore: boolean = redock) => {
             }
         }
         const tag = !redock ? 'control (no re-dock)' : !resetBefore ? 'control (no install reset)' : 'dry-run seed 42'
-        console.log(`[${tag}] draws=2000 confirm_eject=${counts.confirm_eject ?? 0} redocks=${redocks} drawsWithBlockedEdges=${blockedDraws} ` +
+        const tagMove = !gateMove ? 'control (no move gate)' : tag
+        console.log(`[${tagMove}] draws=2000 confirm_eject=${counts.confirm_eject ?? 0} redocks=${redocks} drawsWithBlockedEdges=${blockedDraws} ` +
             `copy_app=${counts.copy_app ?? 0} back_to_disk=${counts.back_to_disk ?? 0} infra_undock=${counts.infra_undock_fixtures ?? 0} ` +
-            `install_app=${counts.install_app ?? 0} installResets=${installResets} problems=${problems.length}`)
-        for (const p of problems.slice(0, redock ? 40 : 5)) console.log(`[${tag}] ${p}`)
+            `infra_move_disk=${counts.infra_move_disk ?? 0} install_app=${counts.install_app ?? 0} installResets=${installResets} problems=${problems.length}`)
+        for (const p of problems.slice(0, redock ? 40 : 5)) console.log(`[${tagMove}] ${p}`)
         return { problems, counts, installResets, installDraws }
 }
 
@@ -401,6 +417,8 @@ describe('dry run: seed 42, 2000 draws, unified graph, Stage 2 model', () => {
         // install_app stays drawable because empty-001 is reset when it is not already Empty (FAIL@778).
         expect(counts.install_app ?? 0).toBeGreaterThan(0)
         expect(installResets).toBeGreaterThan(0)
+        // infra_move_disk is one-shot after landing on idea04 (READY §4.4 move-only; FAIL@788).
+        expect(counts.infra_move_disk ?? 0).toBe(1)
     })
     it('control without the re-dock: the checker catches the Markov 3 failure class', async () => {
         const { problems } = await dryRun(false)
@@ -409,6 +427,11 @@ describe('dry run: seed 42, 2000 draws, unified graph, Stage 2 model', () => {
     it('control without the install_app reset: the checker catches the FAIL@778 class (no docked Empty)', async () => {
         const { problems } = await dryRun(true, false)
         expect(problems.some(p => /install_app.*no docked empty disk showing EmptyDiskPanel/.test(p))).toBe(true)
+    })
+    it('control without the infra_move_disk gate: the checker catches the FAIL@788 class (no-op idea04→idea04)', async () => {
+        const { problems, counts } = await dryRun(true, true, false)
+        expect(problems.some(p => /infra_move_disk.*already docked on the move target idea04/.test(p))).toBe(true)
+        expect(counts.infra_move_disk ?? 0).toBeGreaterThan(1)
     })
 })
 
@@ -434,6 +457,32 @@ describe('install_app needs a docked Empty (Markov seed 42 FAIL@778)', () => {
         expect(dockedEmpty(m)).toBeTruthy()
         expect(resetEmpty001IfNeeded(m)).toBe(false)
         expect(intentNeeds(m, walkerOf(), 'install_app', 'op_install')).toBeNull()
+    })
+})
+
+// ── Markov seed 42 FAIL@788: infra_move_disk redrawn after the fixture already sits on idea04 ──────
+
+describe('infra_move_disk is not drawable once the fixture is on the move target (Markov seed 42 FAIL@788)', () => {
+    const pre = (m: Stage2Model) =>
+        randomStepPrecondition({ opts: { ops: m, fast: true, settleTimeoutMs: 50 }, walker: walkerOf(), poolEngines: POOL, excludeEngines: ['idea02'], fixtureInstance: KI, fixtureDisk: KOL } as never, 'infra_move_disk', {}, 'infra_disk_moved')
+    it('fresh home on idea01: drawable; intent would accept the move', async () => {
+        const m = new Stage2Model()
+        expect(await pre(m)).toBeNull()
+        expect(intentNeeds(m, walkerOf(), 'infra_move_disk', 'infra_disk_moved')).toBeNull()
+    })
+    it('after idea01→idea04 (step 788 state): precondition blocks; intent would refuse the no-op', async () => {
+        const m = new Stage2Model()
+        applyEffect(m, walkerOf(), 'infra_move_disk')
+        expect(m.disks[KOL]!.dockedTo).toBe(STAGE2_MOVE_TARGET_HOST)
+        expect(await pre(m)).toMatch(/already docked on the move target idea04/)
+        expect(intentNeeds(m, walkerOf(), 'infra_move_disk', 'infra_disk_moved')).toMatch(/already docked on the move target idea04 — refusing a no-op move/)
+    })
+    it('undocked after the move: still needs a dock first (the landing gate is not a substitute)', async () => {
+        const m = new Stage2Model()
+        applyEffect(m, walkerOf(), 'infra_move_disk')
+        m.undock(KOL)
+        expect(await pre(m)).toMatch(/not docked on a pool engine/)
+        expect(intentNeeds(m, walkerOf(), 'infra_move_disk', 'infra_disk_moved')).toMatch(/not docked/)
     })
 })
 
