@@ -106,6 +106,16 @@ describe('audit: every step that needs the fixture disk / instance', () => {
         expect(await stage2FixtureAbsent(ejected(), 'infra_move_disk', 'infra_disk_moved', {})).toMatch(/infra_dock_fixture first/)
         expect(await stage2FixtureAbsent(ctxOf(liveOps(storeOf(true))), 'infra_move_disk', 'infra_disk_moved', {})).toBeNull()
     })
+    it('infra_move_disk is not drawable once the fixture already sits on the Stage 2 move target (FAIL@788)', async () => {
+        const s = storeOf(true)
+        s.diskDB[KOL].dockedTo = 'idea04'
+        expect(await stage2FixtureAbsent(ctxOf(liveOps(s)), 'infra_move_disk', 'infra_disk_moved', {})).toMatch(/already docked on the move target idea04/)
+        expect(await randomStepPrecondition(ctxOf(liveOps(s)), 'infra_move_disk', {}, 'infra_disk_moved')).toMatch(/already docked on the move target idea04/)
+        s.diskDB[KOL].dockedTo = 'idea01'
+        expect(await stage2FixtureAbsent(ctxOf(liveOps(s)), 'infra_move_disk', 'infra_disk_moved', {})).toBeNull()
+        s.diskDB[KOL].dockedTo = 'idea03'
+        expect(await stage2FixtureAbsent(ctxOf(liveOps(s)), 'infra_move_disk', 'infra_disk_moved', {})).toBeNull()
+    })
     it('steps that do not need the fixture (navigation, re-dock, eject, other disks) stay drawable', async () => {
         for (const a of ['return_to_start', 'back_to_overview', 'eject_disk', 'confirm_eject', 'infra_dock_fixture', 'install_app', 'make_backup_disk', 'erase_disk', 'open_instance_controls', 'notice_usb_dock']) {
             expect(await stage2FixtureAbsent(ejected(), a, 'op_overview', {}), a).toBeNull()
