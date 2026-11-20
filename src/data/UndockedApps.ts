@@ -39,6 +39,7 @@ import { Instance, Status } from './Instance.js'
 import { Store } from './Store.js'
 import { localEngineId } from './Engine.js'
 import { config } from './Config.js'
+import { yieldToEventLoop } from './FirstSyncGate.js'
 import type { Disk } from './Disk.js'
 import type { Timestamp } from './CommonTypes.js'
 
@@ -100,6 +101,7 @@ export const checkAndSetUndockedApps = async (
     const mine = all.filter(inst => isInstanceDockedOn(store, inst, engineId))
     const others = all.length - mine.length
     if (others > 0) log(`checkAndSetUndockedApps: leaving ${others} instance(s) alone (disk docked on another Engine, not docked, or unknown)`)
+    const toStarting: Array<{ instanceId: InstanceID; why: string }> = []
     await Promise.all(mine.map(async (instance) => {
         if (instance.status === 'Undocked') return
         const instanceId = instance.id
@@ -111,15 +113,9 @@ export const checkAndSetUndockedApps = async (
         // #167: after a restart, never keep claiming Running for a container nobody has checked yet.
         // Containers present (or docker not answering yet, e.g. right after a reboot): mark the
         // instance Starting; the dock pass (startInstance) then sets Running, or does a full start.
-        const markStarting = (why: string) => storeHandle.change(doc => {
-            const inst = doc.instanceDB[instanceId]
-            if (!inst || inst.status !== 'Running' || !isInstanceDockedOn(doc, inst, engineId)) return
-            // Only when the dock pass will start (and so re-check) it; else it would stay Starting.
-            if (!shouldAutoStart(doc, inst).start) return
-            log(`Setting status of instance ${instanceId} to Starting until the dock pass checks it (${why})`)
-            inst.status = 'Starting' as Status
-            inst.statusCondition = null
-        })
+        // engine#543: collected here and written in ONE storeHandle.change after the loop (one doc write on a
+        // big store instead of one per instance); the guards and the log line per instance are unchanged.
+        const markStarting = (why: string) => { toStarting.push({ instanceId, why }) }
         // idea#449: no dock pass will follow (systemDiskSkip and a system-disk instance), so
         // never mark it Starting; heal one left Starting by an earlier boot when its
         // containers are up and healthy (no start, no recreate).
@@ -180,6 +176,20 @@ export const checkAndSetUndockedApps = async (
             markStarting('docker not answering')
         }
     }))
+    if (toStarting.length > 0) {
+        await yieldToEventLoop()   // let queued sync answers run before the one big write
+        storeHandle.change(doc => {
+            for (const { instanceId, why } of toStarting) {
+                const inst = doc.instanceDB[instanceId]
+                if (!inst || inst.status !== 'Running' || !isInstanceDockedOn(doc, inst, engineId)) continue
+                // Only when the dock pass will start (and so re-check) it; else it would stay Starting.
+                if (!shouldAutoStart(doc, inst).start) continue
+                log(`Setting status of instance ${instanceId} to Starting until the dock pass checks it (${why})`)
+                inst.status = 'Starting' as Status
+                inst.statusCondition = null
+            }
+        })
+    }
 }
 
 /**
