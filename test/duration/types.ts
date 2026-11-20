@@ -106,6 +106,22 @@ export interface SemanticEngine {
 export interface SettleReady {
     wsUp: boolean
     storeSynced: boolean
+    /**
+     * Step-91 diagnostics (RealFleetOps.waitReady fills these; test fakes may omit them). `failure` says
+     * WHICH stage failed when wsUp is false: 'ws-unreachable' (no usable WS handshake) vs
+     * 'store-not-ready' (the WS was open but the store doc never synced within the doc wait).
+     */
+    failure?: 'ws-unreachable' | 'store-not-ready'
+    /** Last connect error text (stall / unreachable detail), when a connect attempt failed. */
+    detail?: string
+    /** Real wall-clock the wait took (it can exceed the nominal budget: every attempt finishes its own bound). */
+    waitedMs?: number
+    /** Connect attempts made inside the wait. */
+    attempts?: number
+    /** ms from the wait start to the first WS handshake seen (null = none) — WS-up, measured apart from store-ready. */
+    wsUpAfterMs?: number | null
+    /** ms from the wait start to store-ready (null = never). */
+    storeReadyAfterMs?: number | null
 }
 
 /** Phase 4 dwell probe sample (FleetOps.probeStability). */

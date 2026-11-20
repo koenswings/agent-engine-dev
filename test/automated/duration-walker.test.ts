@@ -881,7 +881,7 @@ describe('RealFleetOps guard clauses (no network)', () => {
         })
         expect(ops.getDisksRoot()).toBe(DEFAULT_DURATION_DISKS_ROOT)
         expect(ops.getWatchDir()).toBe(DEFAULT_DURATION_WATCH_DIR)
-        expect(PM2_RECONNECT_TIMEOUT_MS).toBe(150_000)
+        expect(PM2_RECONNECT_TIMEOUT_MS).toBe(300_000)
         expect(resolveDurationFixturePack('duration-kolibri-grade5a-001')).toBe('kolibri')
         expect(resolveDurationFixturePack('duration-nextcloud-grade5a-001')).toBe('nextcloud')
         expect(resolveDurationFixturePack('duration-empty-001')).toBe('empty')

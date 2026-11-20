@@ -97,7 +97,17 @@ export const DEFAULT_DURATION_FIXTURE_SOURCE_ROOT =
  * smoke (~step 22): Automerge withTimeout while idea03 was still reconnecting after
  * rapid pm2 restarts. Duration-test-only bump (RealFleetOps), not production Engine.
  */
-export const PM2_RECONNECT_TIMEOUT_MS = 150_000
+export const PM2_RECONNECT_TIMEOUT_MS = 300_000
+/**
+ * Step 91 (random-mixed bf8ef1a, seed 42): idea03 (31 instances, large store) after `pm2 restart engine`:
+ * its Engine event loop was blocked ~63 s of the first ~75 s ([loop-stall] 28.4 + 3.1 + 2.5 + 7.7 + 21.1 s),
+ * and the walker's fresh first sync of the big store doc then needs 25–37 s of its own host thread
+ * (initial syncs idea01 36.7 s / idea03 25.5 s / idea04 27.9 s). A 45 s doc wait ended every attempt
+ * mid-sync (3 × 63 s, each restarting the sync from scratch). Post-restart store-ready therefore gets the
+ * same 120 s as idea04's first sync (still fail-loud after it). Applies only inside the reboot window and
+ * overrides DURATION_DOC_WAIT_MS (a global 45 s); DURATION_REBOOT_DOC_WAIT_MS / opts.rebootDocWaitMs change it.
+ */
+export const REBOOT_DOC_WAIT_MS = 120_000
 /**
  * r32: wait for the automerge-repo WS handshake before repo.find(). Without it,
  * WebSocketClientAdapter force-marks itself ready after 1 s (dist/WebSocketClientAdapter.js
@@ -296,6 +306,8 @@ export interface RealFleetOptions {
     startInstances?: boolean
     /** waitReady timeout after pm2 restart (default PM2_RECONNECT_TIMEOUT_MS). */
     pm2ReconnectTimeoutMs?: number
+    /** Store-ready wait for a connect made inside a reboot / pm2-restart window (default REBOOT_DOC_WAIT_MS). */
+    rebootDocWaitMs?: number
     /** Max wait for the WS handshake before find() (default DURATION_WS_HANDSHAKE_MS or 10 s). */
     wsHandshakeTimeoutMs?: number
     /** Per-host doc wait after the handshake (tests may go below MIN_DOC_WAIT_MS; env may not). */
@@ -1300,6 +1312,7 @@ export class RealFleetOps implements FleetOps {
     private readonly startInstances: boolean
     private readonly sudoMode: SudoMode
     private readonly pm2ReconnectTimeoutMs: number
+    private readonly rebootDocWaitOpt?: number
     private readonly conns = new Map<string, Conn>()
     /** In-flight connects per logical engine, so concurrent callers share one Repo. */
     private readonly connecting = new Map<string, Promise<Conn>>()
@@ -1355,6 +1368,7 @@ export class RealFleetOps implements FleetOps {
         this.startInstances = opts.startInstances === true
         this.sudoMode = opts.sudoMode ?? 'auto'
         this.pm2ReconnectTimeoutMs = opts.pm2ReconnectTimeoutMs ?? PM2_RECONNECT_TIMEOUT_MS
+        this.rebootDocWaitOpt = opts.rebootDocWaitMs
         this.wsHandshakeTimeoutMs = opts.wsHandshakeTimeoutMs
             ?? Math.min(15_000, Number(process.env.DURATION_WS_HANDSHAKE_MS ?? DEFAULT_WS_HANDSHAKE_TIMEOUT_MS) || DEFAULT_WS_HANDSHAKE_TIMEOUT_MS)
         this.docWaitOpt = opts.docWaitMs
@@ -1696,6 +1710,22 @@ export class RealFleetOps implements FleetOps {
      * DEFAULT_DOC_WAIT_MS_BY_HOST > DURATION_DOC_WAIT_MS > opts.docWaitMs > DEFAULT_DOC_WAIT_MS.
      */
     docWaitMsFor(logicalId: string): number {
+        const base = this.baseDocWaitMsFor(logicalId)
+        // Inside a reboot / pm2-restart window the Engine is still bringing itself up (see REBOOT_DOC_WAIT_MS).
+        return this.rebootWindow.has(logicalId) ? Math.max(base, this.rebootDocWaitMsFor(logicalId)) : base
+    }
+
+    /** Doc wait for a connect made inside a reboot window: DURATION_REBOOT_DOC_WAIT_MS > opts.rebootDocWaitMs > default (0 when the caller pinned docWaitMs, as tests do). */
+    rebootDocWaitMsFor(logicalId: string): number {
+        const raw = process.env.DURATION_REBOOT_DOC_WAIT_MS?.trim()
+        const n = raw && /^\d+$/.test(raw) ? Number(raw) : NaN
+        if (Number.isFinite(n) && n > 0) return n
+        if (this.rebootDocWaitOpt !== undefined) return this.rebootDocWaitOpt
+        if (this.docWaitOpt !== undefined || this.docWaitByHostOpt[logicalId] !== undefined) return 0
+        return REBOOT_DOC_WAIT_MS
+    }
+
+    private baseDocWaitMsFor(logicalId: string): number {
         const env = (v: string | undefined): number | null => {
             const n = v === undefined || v === '' ? NaN : Number(v)
             return Number.isFinite(n) && n > 0 ? Math.min(MAX_DOC_WAIT_MS_BY_HOST[logicalId] ?? MAX_DOC_WAIT_MS, Math.max(MIN_DOC_WAIT_MS, n)) : null
@@ -2152,6 +2182,52 @@ export class RealFleetOps implements FleetOps {
      */
     async waitReady(engineId: string, timeoutMs: number): Promise<SettleReady> {
         const start = Date.now()
+        const trace: { attempts: number; lastKind: 'stall' | 'unreachable' | null; lastError: string | null } =
+            { attempts: 0, lastKind: null, lastError: null }
+        const r = await this.waitReadyTraced(engineId, timeoutMs, start, trace)
+        // Step 91: say WHICH stage failed (WS up vs store ready), when each happened, and the real wait.
+        const link = getEngineLink(engineId)
+        const since = (at: number | null | undefined): number | null => (at != null && at >= start ? at - start : null)
+        const out: SettleReady = {
+            ...r,
+            waitedMs: Date.now() - start,
+            attempts: trace.attempts,
+            wsUpAfterMs: since(link?.lastOpenAt),
+            storeReadyAfterMs: r.wsUp ? (since(link?.lastStoreReadyAt) ?? Date.now() - start) : null,
+        }
+        if (!r.wsUp) {
+            out.failure = trace.lastKind === 'stall' ? 'store-not-ready' : 'ws-unreachable'
+            if (trace.lastError) out.detail = trace.lastError
+        }
+        return out
+    }
+
+    /**
+     * One-line abort text for a failed post-restart / post-reboot wait. A store that never synced over an
+     * OPEN WS must not read "WS not up" (step 91: the WS was open, the store-ready wait ended mid-sync).
+     */
+    reconnectFailureMessage(engineId: string, ready: SettleReady, what: string, budgetMs: number): string {
+        const counters = `waited ${ready.waitedMs ?? budgetMs}ms of the ${budgetMs}ms budget, ${ready.attempts ?? '?'} attempt(s), ` +
+            `WS first open ${ready.wsUpAfterMs != null ? `${ready.wsUpAfterMs}ms` : 'never'} after the wait began`
+        const last = ready.detail ? `; last: ${ready.detail}` : ''
+        return ready.failure === 'store-not-ready'
+            ? `RealFleetOps: ${engineId} store not ready after ${what} (WS was open but the store doc never synced; ${counters}${last})`
+            : `RealFleetOps: ${engineId} WS not up after ${what} (${counters}${last})`
+    }
+
+    private emitReconnectMeasured(engineId: string, kind: 'pm2-restart' | 'reboot', budgetMs: number, ready: SettleReady): void {
+        console.log(JSON.stringify({
+            event: 'reboot_reconnect_measured', engine: engineId, kind, ok: ready.wsUp, budgetMs,
+            docWaitMs: this.docWaitMsFor(engineId), failure: ready.failure ?? null,
+            waitedMs: ready.waitedMs ?? null, attempts: ready.attempts ?? null,
+            wsUpAfterMs: ready.wsUpAfterMs ?? null, storeReadyAfterMs: ready.storeReadyAfterMs ?? null,
+        }))
+    }
+
+    private async waitReadyTraced(
+        engineId: string, timeoutMs: number, start: number,
+        trace: { attempts: number; lastKind: 'stall' | 'unreachable' | null; lastError: string | null },
+    ): Promise<SettleReady> {
         let first = true
         let freshAfterDrop = false
         while (first || Date.now() - start < timeoutMs) {
@@ -2188,10 +2264,13 @@ export class RealFleetOps implements FleetOps {
                 continue
             }
             try {
+                trace.attempts++
                 await this.connect(engineId)
                 first = true // always validate the fresh connection, even past timeoutMs
                 continue
             } catch (e) {
+                trace.lastKind = e instanceof StoreSyncStallError ? 'stall' : 'unreachable'
+                trace.lastError = e instanceof Error ? e.message : String(e)
                 if (e instanceof StoreSyncStallError && !this.rebootWindow.has(engineId)) break
                 if (Date.now() - start + 1_000 < timeoutMs) await sleep(1_000)
             }
@@ -2672,11 +2751,9 @@ export class RealFleetOps implements FleetOps {
             // (PM2_RECONNECT_TIMEOUT_MS) for duration-test RealFleetOps only.
             await sleep(2000)
             const ready = await this.waitReady(engineId, this.pm2ReconnectTimeoutMs)
+            this.emitReconnectMeasured(engineId, 'pm2-restart', this.pm2ReconnectTimeoutMs, ready)
             if (!ready.wsUp) {
-                throw new Error(
-                    `RealFleetOps: ${engineId} WS not up after pm2 restart ` +
-                    `(waited ${this.pm2ReconnectTimeoutMs}ms)`,
-                )
+                throw new Error(this.reconnectFailureMessage(engineId, ready, 'pm2 restart', this.pm2ReconnectTimeoutMs))
             }
         } else {
             console.log(`[RealFleetOps] sudo reboot on ${engineId} (${host})`)
@@ -2706,8 +2783,9 @@ export class RealFleetOps implements FleetOps {
             }
             if (!sshUp) throw new Error(`RealFleetOps: SSH to ${engineId} did not return after reboot`)
             const ready = await this.waitReady(engineId, FULL_REBOOT_RECONNECT_TIMEOUT_MS)
+            this.emitReconnectMeasured(engineId, 'reboot', FULL_REBOOT_RECONNECT_TIMEOUT_MS, ready)
             if (!ready.wsUp) {
-                throw new Error(`RealFleetOps: ${engineId} WS not up after reboot`)
+                throw new Error(this.reconnectFailureMessage(engineId, ready, 'reboot', FULL_REBOOT_RECONNECT_TIMEOUT_MS))
             }
         }
     }
