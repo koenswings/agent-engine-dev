@@ -469,9 +469,13 @@ export const STAGE2_DISK_CONSUMERS: Readonly<Record<string, { role: (i: { eraseS
 /**
  * Steps that the harness precedes with a SETTLED fresh re-dock (wait for in-flight ops, remove
  * instances, reset, re-check; actions.ts settleDiskOpsBeforeReset): they may consume a dirtied
- * partition. install_app only after a start_after_install (redockEmpty002BeforeSecondInstall hook).
+ * partition. install_app is in the set after Markov seed 42 FAIL@778 (random-mixed-0f111bb):
+ * the previous one-shot redockEmpty002BeforeSecondInstall hook only ran after start_after_install,
+ * so a later install_app was drawn with empty-001 already [files], empty-002 the Backup Disk, and
+ * empty-003 consumed as the move-only target (READY §4.4, by design). The dispatcher no-ops the
+ * reset when empty-001 is already a docked Empty (stage2RedockEmptyBeforeInstall).
  */
-export const STAGE2_RESET_BEFORE = new Set(['make_files_disk', 'erase_disk'])
+export const STAGE2_RESET_BEFORE = new Set(['make_files_disk', 'erase_disk', 'install_app'])
 
 /**
  * r75 fix 3: per-partition state machine over the whole walk. A step that needs an Empty partition
@@ -506,6 +510,8 @@ export const stage2DiskStateConflicts = (
         if (disk === target) {
             out.push({ kind: 'consumer-on-move-target', diskId: disk, detail: `${s.action}@${n} uses the move-only target ${disk}` })
         }
+        // install_app is in STAGE2_RESET_BEFORE (FAIL@778); the holdsStartedApp clause kept for
+        // start_after_install → install_app walks that predate the set membership.
         const reset = STAGE2_RESET_BEFORE.has(s.action) || (s.action === 'install_app' && holdsStartedApp.has(disk))
         if (reset) { dirtyBy.delete(disk); holdsStartedApp.delete(disk) }
         if (c.needsEmpty && dirtyBy.has(disk)) {

@@ -12,7 +12,7 @@ import { describe, expect, it } from 'vitest'
 import { FakeFleetOps, markovRedockAfter, markovRedockBefore, randomStepPrecondition, readPoolSnapshot, stage2MarkovRedock, noteStepPreconditionProgress, noteDiskResetToEmpty } from '../duration/actions.js'
 import { pickDrawableTransition, runDeterministicWalk, runWalk } from '../duration/runner.js'
 import { loadScenario, makeRng } from '../duration/scenario.js'
-import { STAGE2_FIXTURES, STAGE2_ROLE_MAP } from '../duration/stage2.js'
+import { STAGE2_FIXTURES, STAGE2_MOVE_TARGET_ID, STAGE2_ROLE_MAP } from '../duration/stage2.js'
 import type { Scenario, WalkerState } from '../duration/types.js'
 
 const POOL = ['idea01', 'idea03', 'idea04']
@@ -34,6 +34,8 @@ class Stage2Model {
     disks: Record<string, Disk> = {}
     insts: Record<string, Inst> = {}
     docks: string[] = []
+    /** After infra_move_disk the empty-003 row is undocked (partition carries the moved fixture). */
+    moveTargetConsumed = false
     /** Live store lag (Markov 4): a Console eject reaches the shared store only after N more store reads. */
     pending: { disk: string; reads: number } | null = null
     reads = 0
@@ -61,7 +63,7 @@ class Stage2Model {
         this.docks.push(id)
         const d = this.disks[id]!
         d.dockedTo = engineId
-        if (d.diskTypes?.[0] === 'empty' || d.diskTypes?.[0] === 'backup') d.diskTypes = ['empty']
+        if (/^duration-empty-/.test(id) || d.diskTypes?.[0] === 'empty' || d.diskTypes?.[0] === 'backup') d.diskTypes = ['empty']
         for (const i of Object.values(this.insts)) if (i.diskId === id) i.status = 'Running'
     }
     async undockFixtures(_e: string[], id: string) { this.undock(id) }
@@ -242,6 +244,30 @@ describe('runner wiring: Markov re-docks after confirm_eject; deterministic walk
 
 // ── 2000-draw seed-42 dry run over the real graph ───────────────────────────────────────────────
 
+/** Console EmptyDiskPanel: a docked disk whose types are exactly ['empty'] and that holds no instance. */
+const dockedEmpty = (m: Stage2Model): string | undefined =>
+    Object.values(m.disks).find(d =>
+        !!d.dockedTo && d.diskTypes?.length === 1 && d.diskTypes[0] === 'empty' &&
+        !Object.values(m.insts).some(i => i.diskId === d.id && i.status !== 'Undocked'),
+    )?.id
+
+/**
+ * STAGE2_RESET_BEFORE settled re-dock of empty-001 (home idea03). Returns true when a reset ran.
+ * Mirrors stage2RedockEmptyBeforeInstall / redockEmpty001BeforeMakeFiles / stage2RedockSharedEraseDisk.
+ */
+const resetEmpty001IfNeeded = (m: Stage2Model): boolean => {
+    const d = m.disks[STAGE2_ROLE_MAP.files]!
+    const already = dockedEmpty(m) === d.id || (
+        !!d.dockedTo && d.diskTypes?.length === 1 && d.diskTypes[0] === 'empty' &&
+        !Object.values(m.insts).some(i => i.diskId === d.id && i.status !== 'Undocked')
+    )
+    if (already && d.dockedTo === 'idea03') return false
+    d.dockedTo = 'idea03'
+    d.diskTypes = ['empty']
+    for (const id of Object.keys(m.insts)) if (m.insts[id]!.diskId === d.id) delete m.insts[id]
+    return true
+}
+
 /** What each drawn step's Console intent (3d81cfd e2e/intents) needs on screen / in the store. null = ok. */
 const intentNeeds = (m: Stage2Model, walker: WalkerState, action: string, to: string): string | null => {
     const docked = (d: string) => !!m.disks[d]?.dockedTo
@@ -261,6 +287,8 @@ const intentNeeds = (m: Stage2Model, walker: WalkerState, action: string, to: st
         case 'add_files_role': return m.disks[AF]?.diskTypes?.includes('files') ? `${AF} already has a files role` : null
         // Pre-Intent check (seed 42 @747 of random-mixed-d2b8f57): the Backup Disk target must be docked EMPTY.
         case 'make_backup_disk': return m.disks[STAGE2_ROLE_MAP.backup]?.diskTypes?.includes('backup') ? `${STAGE2_ROLE_MAP.backup} is not Empty (diskTypes=[backup])` : null
+        // Pre-Intent check (seed 42 @778 of random-mixed-0f111bb): EmptyDiskPanel needs a docked Empty.
+        case 'install_app': return dockedEmpty(m) ? null : 'no docked empty disk showing EmptyDiskPanel'
     }
     if (/^leave_/.test(action) || action === 'return_to_start') return null
     if (/kolibri/.test(action) || /^kolibri_/.test(to)) return running(KI) ? null : `${KI} not Running`
@@ -276,6 +304,19 @@ const applyEffect = (m: Stage2Model, walker: WalkerState, action: string): void 
         case 'stop_instance': if (m.insts[KI]!.status !== 'Undocked') m.insts[KI]!.status = 'Stopped'; break
         case 'start_instance': if (m.insts[KI]!.status !== 'Undocked') m.insts[KI]!.status = 'Running'; break
         case 'make_backup_disk': m.disks[STAGE2_ROLE_MAP.backup]!.diskTypes = ['backup']; break
+        case 'make_files_disk': m.disks[STAGE2_ROLE_MAP.files]!.diskTypes = ['files']; break
+        case 'erase_disk': m.disks[STAGE2_ROLE_MAP.erase]!.diskTypes = ['empty']; break
+        case 'install_app':
+            m.disks[STAGE2_ROLE_MAP.files]!.diskTypes = ['app']
+            m.insts['walk-install'] = { id: 'walk-install', status: 'Running', diskId: STAGE2_ROLE_MAP.files, port: 18090 }
+            break
+        case 'infra_move_disk':
+            // READY §4.4: network copy lands on empty-003; the empty-003 store row becomes undocked types=[].
+            m.disks[STAGE2_MOVE_TARGET_ID]!.dockedTo = null
+            m.disks[STAGE2_MOVE_TARGET_ID]!.diskTypes = []
+            m.disks[KOL]!.dockedTo = 'idea04'
+            m.moveTargetConsumed = true
+            break
         case 'add_files_role': m.disks[AF]!.diskTypes = ['app', 'files']; break
         case 'copy_app':
             m.insts['kolibri-copy'] = { id: 'kolibri-copy', status: 'Running', diskId: NC, port: 18081 }
@@ -289,14 +330,15 @@ const applyEffect = (m: Stage2Model, walker: WalkerState, action: string): void 
     }
 }
 
-const dryRun = async (redock: boolean) => {
+const dryRun = async (redock: boolean, resetBefore: boolean = redock) => {
         const scenario = loadScenario('unified')
         const m = new Stage2Model()
         const walker: WalkerState = { current: scenario.initial_state, layer: null, dockedEngine: null, step: 0 }
         const rng = makeRng(42)
         const problems: string[] = []
         const counts: Record<string, number> = {}
-        let redocks = 0, blockedDraws = 0
+        let redocks = 0, blockedDraws = 0, installResets = 0
+        const installDraws: number[] = []
         for (let i = 0; i < 2000; i++) {
             const from = walker.current
             const state = scenario.states[from]!
@@ -311,6 +353,11 @@ const dryRun = async (redock: boolean) => {
             if (picked.blocked.length) blockedDraws++
             const { action, to } = picked.transition
             counts[action] = (counts[action] ?? 0) + 1
+            // Dispatcher STAGE2_RESET_BEFORE: settled re-dock of empty-001 before the Intent when needed.
+            if (resetBefore && (action === 'install_app' || action === 'make_files_disk' || action === 'erase_disk')) {
+                if (resetEmpty001IfNeeded(m) && action === 'install_app') installResets++
+            }
+            if (action === 'install_app') installDraws.push(i + 1)
             const need = intentNeeds(m, walker, action, to)
             if (need) problems.push(`draw ${i + 1} ${from} --${action}--> ${to}: ${need}`)
             const ctx = { ...base, from, to, action, fixtureDisks: FIXTURE_DISKS } as never
@@ -326,31 +373,67 @@ const dryRun = async (redock: boolean) => {
             if (r.note && /docked again/.test(r.note)) redocks++
             if (!redock) for (let k = 0; k < 8; k++) m.tick() // control: let the eject land anyway
             // outside the infra layer every partition is docked again before the next draw
+            // (the move-target row is undocked by design after infra_move_disk — the partition carries the copy).
             if (walker.layer !== 'infra') {
-                const missing = Object.values(m.disks).filter(d => !d.dockedTo).map(d => d.id)
+                const missing = Object.values(m.disks)
+                    .filter(d => !d.dockedTo && !(m.moveTargetConsumed && d.id === STAGE2_MOVE_TARGET_ID))
+                    .map(d => d.id)
                 if (missing.length) problems.push(`draw ${i + 1} after ${action}: undocked outside infra: ${missing.join(', ')}`)
             }
         }
-        const tag = redock ? 'dry-run seed 42' : 'control (no re-dock)'
+        const tag = !redock ? 'control (no re-dock)' : !resetBefore ? 'control (no install reset)' : 'dry-run seed 42'
         console.log(`[${tag}] draws=2000 confirm_eject=${counts.confirm_eject ?? 0} redocks=${redocks} drawsWithBlockedEdges=${blockedDraws} ` +
-            `copy_app=${counts.copy_app ?? 0} back_to_disk=${counts.back_to_disk ?? 0} infra_undock=${counts.infra_undock_fixtures ?? 0} problems=${problems.length}`)
+            `copy_app=${counts.copy_app ?? 0} back_to_disk=${counts.back_to_disk ?? 0} infra_undock=${counts.infra_undock_fixtures ?? 0} ` +
+            `install_app=${counts.install_app ?? 0} installResets=${installResets} problems=${problems.length}`)
         for (const p of problems.slice(0, redock ? 40 : 5)) console.log(`[${tag}] ${p}`)
-        return { problems, counts }
+        return { problems, counts, installResets, installDraws }
 }
 
 describe('dry run: seed 42, 2000 draws, unified graph, Stage 2 model', () => {
     it('with the re-dock: no abort, no "no drawable transition", every drawn step finds what its intent needs', async () => {
-        const { problems, counts } = await dryRun(true)
+        const { problems, counts, installResets } = await dryRun(true)
         expect(problems).toEqual([])
         expect(counts.confirm_eject ?? 0).toBeGreaterThan(0)
         // add_files_role is one-shot (no fresh app-only re-dock exists): drawn at most once, and at least once.
         expect(counts.add_files_role ?? 0).toBe(1)
         // make_backup_disk is one-shot too (nothing resets the Backup Disk in this model): drawn exactly once, never redrawn (@747b).
         expect(counts.make_backup_disk ?? 0).toBe(1)
+        // install_app stays drawable because empty-001 is reset when it is not already Empty (FAIL@778).
+        expect(counts.install_app ?? 0).toBeGreaterThan(0)
+        expect(installResets).toBeGreaterThan(0)
     })
     it('control without the re-dock: the checker catches the Markov 3 failure class', async () => {
         const { problems } = await dryRun(false)
         expect(problems.some(p => /undocked outside infra|disk card duration-kolibri-grade5a-001 missing/.test(p))).toBe(true)
+    })
+    it('control without the install_app reset: the checker catches the FAIL@778 class (no docked Empty)', async () => {
+        const { problems } = await dryRun(true, false)
+        expect(problems.some(p => /install_app.*no docked empty disk showing EmptyDiskPanel/.test(p))).toBe(true)
+    })
+})
+
+describe('install_app needs a docked Empty (Markov seed 42 FAIL@778)', () => {
+    it('step 778 store: empty-001 is [files], empty-002 is [backup], empty-003 consumed by the move — no Empty badge', () => {
+        const m = new Stage2Model()
+        m.disks[STAGE2_ROLE_MAP.files]!.diskTypes = ['files']
+        m.disks[STAGE2_ROLE_MAP.backup]!.diskTypes = ['backup']
+        m.disks[STAGE2_MOVE_TARGET_ID]!.dockedTo = null
+        m.disks[STAGE2_MOVE_TARGET_ID]!.diskTypes = []
+        m.disks[KOL]!.dockedTo = 'idea04'
+        m.moveTargetConsumed = true
+        expect(dockedEmpty(m)).toBeUndefined()
+        expect(intentNeeds(m, walkerOf(), 'install_app', 'op_install')).toMatch(/no docked empty disk showing EmptyDiskPanel/)
+        expect(resetEmpty001IfNeeded(m)).toBe(true)
+        expect(m.disks[STAGE2_ROLE_MAP.files]!.diskTypes).toEqual(['empty'])
+        expect(m.disks[STAGE2_ROLE_MAP.files]!.dockedTo).toBe('idea03')
+        expect(dockedEmpty(m)).toBe(STAGE2_ROLE_MAP.files)
+        expect(intentNeeds(m, walkerOf(), 'install_app', 'op_install')).toBeNull()
+    })
+    it('no reset when empty-001 is already a docked Empty', () => {
+        const m = new Stage2Model()
+        expect(dockedEmpty(m)).toBeTruthy()
+        expect(resetEmpty001IfNeeded(m)).toBe(false)
+        expect(intentNeeds(m, walkerOf(), 'install_app', 'op_install')).toBeNull()
     })
 })
 

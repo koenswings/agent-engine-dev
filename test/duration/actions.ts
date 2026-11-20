@@ -675,6 +675,42 @@ export const stage2RedockSharedEraseDisk = async (ctx: ActionContext): Promise<s
     return note
 }
 
+/**
+ * Markov seed 42 FAIL@778 (random-mixed-0f111bb-7cbaf60-markov-20261120): install_app was drawn after
+ * make_files_disk@749 typed duration-empty-001 [files], make_backup_disk@661 had consumed empty-002,
+ * and infra_move_disk@618 had consumed empty-003. empty-003 is the Stage 2 move-only target (READY
+ * §4.4) — that leftover is by design, not a targeting bug; infra_move_disk is not changed.
+ * randomStepPrecondition did not require a still-Empty disk, STAGE2_RESET_BEFORE was only
+ * {make_files_disk, erase_disk}, and redockEmpty002BeforeSecondInstall is one-shot
+ * (walker.empty002HoldsApp, used at @670 then cleared; no later start_after_install). The Console
+ * EmptyDiskPanel check failed loud and correctly.
+ *
+ * Stage 2: before install_app, if the files/erase partition (empty-001) is not a docked Empty,
+ * do a settled fresh re-dock (same path as stage2RedockSharedEraseDisk). No-op when it already is
+ * Empty on its home Pi. That makes install_app redrawable, like make_files_disk, and subsumes the
+ * empty002HoldsApp hook in Stage 2. Stage 1 still uses that one-shot hook.
+ */
+export const stage2RedockEmptyBeforeInstall = async (ctx: ActionContext): Promise<string | null> => {
+    if (!isStage2(ctx)) return null
+    // Files and Erase share empty-001; do not use eraseDiskTargetId() here (it keys off DURATION_STAGE
+    // and would pick Stage 1's empty-002 if the env were unset while ops.stage is already 2).
+    const diskId = STAGE2_ROLE_MAP.erase
+    const home = stage2HomeOf(diskId)
+    const st = diskEmptiness(await ctx.opts.ops.readStore(home), diskId)
+    if (st.empty && st.dockedTo === home) return null
+    // Call redockEmptyFresh with the Stage 2 role disk directly — redockEmpty002Fresh uses
+    // eraseDiskTargetId() (DURATION_STAGE env) and would reset empty-002 if the env were unset.
+    const note = await redockEmptyFresh(
+        ctx,
+        diskId,
+        'stage2RedockEmptyBeforeInstall',
+        `before install_app (Stage 2; was ${describeDisk(st)}; fresh reset + store purge so EmptyDiskPanel is offered)`,
+        { purgeStoreInstances: true },
+    )
+    if (ctx.walker) ctx.walker.empty002HoldsApp = false
+    return note
+}
+
 /** kc9 FAIL@105: what the Stage 2 confirm_erase pre-check found on the Erase partition's home Pi. */
 export interface Stage2ConfirmErasePre { diskId: string; home: string; parent: string; siblings: Stage2StatusFixture[] }
 type Stage2StatusReader = { stage2Status?: (engineId: string) => Promise<Stage2Status> }
@@ -2647,6 +2683,7 @@ export const stage2BackupDiskTaken = async (
  *   restore_from_backup (live) needs a docked Backup Disk and an archive from a backup_instance of this run.
  *   add_files_role      (Stage 2) one-shot: not drawable once the pinned app-only fixture (duration-add-files-001) has its files role.
  *   make_backup_disk    (Stage 2) one-shot: not drawable while the pinned Backup Disk (duration-empty-002) already holds the backup role.
+ *   install_app         (Stage 2) stays drawable: a settled re-dock of empty-001 precedes the Intent when it is not already a docked Empty (STAGE2_RESET_BEFORE; FAIL@778). Not a draw-guard.
  * Markov 2 (random-9040e73-markov-20261116b@16): eject_disk + confirm_eject@10-11 ejected the Kolibri fixture
  * disk, then copy_app@16 hit its preflight "source disk … is not docked on any pool engine". Only
  * infra_dock_fixture re-docks it, so in a random walk the fixture can legitimately be absent. Stage 2 live
@@ -3893,14 +3930,23 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     // Backup Disk by then — r38). Used to hang
     // off open_copied_instance (cover-all @117); now keyed on the real precondition so
     // cover-all (@119) and cover-all-skip-copy (@116) both get it before the second install.
-    if (ctx.action === 'install_app' && ctx.walker.empty002HoldsApp) {
+    // Stage 2 (Markov seed 42 FAIL@778): settled re-dock of empty-001 whenever it is not already
+    // a docked Empty — not only after start_after_install. Subsumes the empty002HoldsApp hook.
+    // Stage 1 keeps the one-shot hook unchanged.
+    if (ctx.action === 'install_app') {
         try {
-            preStartSettleNote = await redockEmpty002BeforeSecondInstall(ctx)
+            if (isStage2(ctx)) {
+                const fresh = await stage2RedockEmptyBeforeInstall(ctx)
+                if (fresh) preStartSettleNote = fresh
+            } else if (ctx.walker.empty002HoldsApp) {
+                preStartSettleNote = await redockEmpty002BeforeSecondInstall(ctx)
+            }
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e)
+            const which = isStage2(ctx) ? 'empty-001' : 'empty-002'
             return {
                 ok: false,
-                message: `install_app aborted before Intent: empty-002 re-dock failed: ${err}`,
+                message: `install_app aborted before Intent: ${which} re-dock failed: ${err}`,
                 layer,
             }
         }

@@ -83,14 +83,15 @@ describe('fix 3: all-pairs role windows + dirtied-then-needs-Empty', () => {
     it('install then a needs-Empty step without a settled reset is a pre-walk conflict', () => {
         const steps = [{ action: 'install_app' }, { action: 'back_to_overview' }, { action: 'make_backup_disk' }]
         expect(stage2DiskStateConflicts(steps, E3, { files: E1, backup: E1, erase: E2, moveApp: 'x-move-unused' }).map(c => c.kind)).toEqual(['dirty-needs-empty'])
-        expect(stage2DiskStateConflicts([{ action: 'install_app' }, { action: 'install_app' }]).map(c => c.kind)).toEqual(['dirty-needs-empty'])
+        // FAIL@778: install_app is now in STAGE2_RESET_BEFORE, so a second install is a settled reset, not a conflict.
+        expect(stage2DiskStateConflicts([{ action: 'install_app' }, { action: 'install_app' }])).toEqual([])
         expect(stage2DiskStateConflicts([{ action: 'install_app' }, { action: 'make_files_disk' }])).toEqual([])
     })
-    it('late installs: second install after start_after_install is re-docked; erase resets', () => {
+    it('late installs: every install_app is preceded by a settled reset of empty-001; erase resets', () => {
         const late = ['erase_disk', 'confirm_erase', 'install_app', 'start_after_install', 'install_app', 'stay_on_disk', 'erase_disk'].map(action => ({ action }))
         expect(stage2DiskStateConflicts(late)).toEqual([])
         const noStart = ['erase_disk', 'confirm_erase', 'install_app', 'install_app'].map(action => ({ action }))
-        expect(stage2DiskStateConflicts(noStart).map(c => c.kind)).toEqual(['dirty-needs-empty'])
+        expect(stage2DiskStateConflicts(noStart)).toEqual([])
     })
     it('every role pair and every consumer is checked against the move target', () => {
         for (const role of ['files', 'backup', 'erase'] as const) {

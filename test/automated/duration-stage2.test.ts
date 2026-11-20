@@ -8,7 +8,7 @@ import fs from 'node:fs'
 import { parse as parseYaml } from 'yaml'
 import { RealFleetOps } from '../duration/realFleetOps.js'
 import { allowedSequentialShare, backupDiskTargetId, eraseDiskTargetId, filesDiskTargetId, fixtureDiskPreflight } from '../duration/fixtureDisks.js'
-import { dispatchAction, readPoolSnapshot, stage2MarkovRedock, stage2RedockSharedEraseDisk, stage2SidecarOwnerNote, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine } from '../duration/actions.js'
+import { dispatchAction, readPoolSnapshot, stage2MarkovRedock, stage2RedockSharedEraseDisk, stage2RedockEmptyBeforeInstall, stage2SidecarOwnerNote, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine } from '../duration/actions.js'
 import {
     EXIT_STAGE2_PREFLIGHT, PRODUCTION_EFFECTIVE, STAGE2_DOCK_SPLIT, STAGE2_FIXTURES, STAGE2_GAPS, STAGE2_MOVE_TARGET_ID, STAGE2_PINS,
     STAGE2_ROLE_MAP, buildEngineConfigProbe, buildStage2DockCmd, describeStage2Conflicts, describeStage2Windows, parseEngineConfigProbe,
@@ -589,6 +589,21 @@ describe('Stage 2 erase share + sidecar owner (actions)', () => {
         delete process.env.DURATION_STAGE
         const b = ctxWith(['files'], 1)
         expect(await stage2RedockSharedEraseDisk(b.ctx)).toBeNull()
+    })
+    it('before install_app (FAIL@778): Files disk is re-docked fresh when it is not Empty', async () => {
+        const { ctx, calls } = ctxWith(['files'])
+        const note = await stage2RedockEmptyBeforeInstall(ctx)
+        expect(note).toMatch(/re-docked duration-empty-001 on idea03/)
+        expect(note).toMatch(/before install_app/)
+        expect(calls).toEqual([`undock idea01,idea03,idea04 ${E1}`, `purge idea03 ${E1}`, `dock idea03 ${E1}`])
+    })
+    it('before install_app: no-op when empty-001 is already Empty on idea03, or in Stage 1', async () => {
+        const a = ctxWith(['empty'])
+        expect(await stage2RedockEmptyBeforeInstall(a.ctx)).toBeNull()
+        expect(a.calls).toEqual([])
+        const b = ctxWith(['files'], 1)
+        expect(await stage2RedockEmptyBeforeInstall(b.ctx)).toBeNull()
+        expect(b.calls).toEqual([])
     })
     it('sidecar owner note: Running needs a store port + owner; non-Running skips', async () => {
         const owner = vi.fn(async () => ['kolibri-grade5a-001-kolibri-1'])
