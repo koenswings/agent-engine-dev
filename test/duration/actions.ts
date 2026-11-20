@@ -2694,7 +2694,10 @@ export const stage2BackupDiskTaken = async (
  *   App steps (open_kolibri_as_*, open_nextcloud_as_*, open_wikipedia_as_*, kolibri_* / nc_* / wiki_* states),
  *   open_app                that App's instance Running with a store port (pinAppsForStep; a stopped App cannot be opened).
  *   copy_app / move_app / restore_from_backup  the instance the Console settles on: live + port (pinAppsForStep).
- *   infra_move_disk         the fixture disk docked on a pool engine (stage2MoveSource).
+ *   infra_move_disk         the fixture disk docked on a pool engine that is not already
+ *                           the Stage 2 move target (stage2MoveSource; READY §4.4 move-only).
+ *                           Once the fixture sits on STAGE2_MOVE_TARGET_HOST the action is not
+ *                           drawable (a redraw would be the no-op that actions.ts refuses).
  */
 export const randomStepPrecondition = async (
     ctx: Pick<ActionContext, 'opts' | 'walker' | 'poolEngines' | 'excludeEngines' | 'fixtureInstance'> &
@@ -2807,7 +2810,17 @@ export const stage2FixtureAbsent = async (
     }
     if (action === 'infra_move_disk') {
         const disk = ctx.fixtureDisk
-        return disk && !dockedOn(disk) ? `fixture disk ${disk} not docked on a pool engine (infra_dock_fixture first)` : null
+        if (!disk) return null
+        const holder = dockedOn(disk)
+        if (!holder) return `fixture disk ${disk} not docked on a pool engine (infra_dock_fixture first)`
+        // Markov seed 42 @788 (random-mixed-0823c73-7cbaf60-markov-20261120): after the first
+        // network copy the fixture already sits on STAGE2_MOVE_TARGET_HOST; a redraw is the
+        // idea04→idea04 no-op that infraMoveDisk refuses. READY §4.4: empty-003 is move-only
+        // (never moved back onto idea01), so the action stays undrawable once it has landed.
+        if (holder === STAGE2_MOVE_TARGET_HOST) {
+            return `fixture disk ${disk} already docked on the move target ${STAGE2_MOVE_TARGET_HOST} (READY §4.4 move-only; a redraw would be a no-op)`
+        }
+        return null
     }
     // App opened in a tab: Running with a store port (pinAppsForStep throws on no live row / no port).
     for (const u of appUses) {
