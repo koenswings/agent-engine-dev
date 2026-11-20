@@ -6,7 +6,7 @@ import { DocHandle, DocumentId, Repo } from "@automerge/automerge-repo";
 import { config } from './Config.js';
 import { Store, findRunningEngineByHostname } from "./Store.js";
 import { readStoreDocId } from "./StoreIdentity.js";
-import { describeRefusal, isForeignStoreDoc, PeerVerdict, RefusalLog, storeTag } from "./StoreScope.js";
+import { describeRefusal, isRefusedDoc, PeerVerdict, RefusalLog, storeTag } from "./StoreScope.js";
 import { ClientRefusal, StoreScopedWebSocketClientAdapter } from "./StoreScopedClientAdapter.js";
 
 const settings = config.settings
@@ -160,7 +160,7 @@ export const connectEngine = async (repo:Repo, address: IPAddress, hostname: Hos
     // link is dropped before any document is exchanged (StoreScopedClientAdapter.ts).
     const clientConnection: StoreScopedWebSocketClientAdapter = new StoreScopedWebSocketClientAdapter(`ws://${key}`, {
       ownTag,
-      docGuard: (documentId) => isForeignStoreDoc(repo as any, storeDocId, documentId),
+      docGuard: (documentId) => isRefusedDoc(repo as any, storeDocId, documentId),
       onRefused: (r) => refuseEngine(repo, key, hostname, ownTag, clientConnection, r),
     })
     refusedPeers.delete(key)

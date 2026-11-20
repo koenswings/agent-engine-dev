@@ -173,20 +173,56 @@ export const peerIdEngineId = (engineId: string): string => String(engineId).rep
  *     is connected to, which requests it from its peers (see below) and answers.
  *   - another Engine's log (fetched here on demand): only with its owner, the
  *     Engine named in its engineId, so the copy stays live (also after a
- *     reconnect) without being passed on to every other Engine.
- *   - a log without engineId (written before engine#471, owner unknown): yes, as
- *     before, so an on-demand copy still catches up with its owner. These are
- *     only loaded when asked for, and every Engine's log gets an engineId at its
- *     next start (backfill) or rotation.
+ *     reconnect) without being passed on to every other Engine. The Console's
+ *     relayed view of another Engine's current log (idea#168 r86i) depends on it.
+ *   - a log without engineId (owner unknown): no (engine#549). Every current log
+ *     carries an engineId (backfill at start, stamped at rotation), so these are
+ *     archived logs from before engine#471, which no feature reads through sync.
+ *     Pushing them made every Engine load dozens of them (80 of 90 logs on
+ *     idea03, 22.7 s on the box) on the main thread when its peers reconnected.
+ *     Asked for explicitly they are still served (a request is answered whatever
+ *     the share policy says).
  * A doc that is not loaded yet (a request in flight) is not judged here: the
  * caller lets the request go out, which is how the on-demand fetch works.
  */
 export const shareCommandLogWith = (doc: unknown, ownEngineId: string | undefined, peerEngineId: string | undefined): boolean => {
     const owner = (doc as any)?.engineId
-    if (typeof owner !== 'string' || !owner) return true
+    if (typeof owner !== 'string' || !owner) return false
     if (ownEngineId && peerIdEngineId(owner) === peerIdEngineId(ownEngineId)) return false
     return !!peerEngineId && peerIdEngineId(owner) === peerEngineId
 }
+
+/**
+ * engine#549 (2'): this Engine's own archived command logs. Rotation exports the old
+ * log to store-identity/command-log-archive/command-log-<day>-<documentId>.automerge
+ * and deletes it from the Repo ("no more sync"), but peers holding a copy pushed it
+ * back at every reconnect, so the owner re-created it in store-data and loaded it on
+ * its main thread at every boot (idea03: 29 archives, up to 11.7 MB each). The owner
+ * now refuses any peer-started sync for these ids, permanently: the adapters'
+ * docGuard answers doc-unavailable (server) or drops it (client) before the Repo
+ * sees the message, so the doc is never loaded. The archive files and store-data are
+ * left as they are. Kept per Repo, like markOwnCommandLog.
+ */
+const _ownArchivedCommandLogs = new WeakMap<object, Set<string>>()
+const ARCHIVE_NAME = /^command-log-.+-([1-9A-HJ-NP-Za-km-z]{20,})\.automerge$/
+/** Document ids in archive file names (command-log-<day>-<documentId>.automerge); other names are ignored. */
+export const archivedCommandLogIds = (fileNames: string[]): string[] =>
+    fileNames.map(n => ARCHIVE_NAME.exec(n)?.[1]).filter((id): id is string => !!id)
+export const markOwnArchivedCommandLog = (repo: object, documentId: string): void => {
+    let ids = _ownArchivedCommandLogs.get(repo)
+    if (!ids) _ownArchivedCommandLogs.set(repo, ids = new Set())
+    ids.add(bareId(documentId))
+}
+export const isOwnArchivedCommandLog = (repo: object, documentId: string): boolean =>
+    _ownArchivedCommandLogs.get(repo)?.has(bareId(documentId)) ?? false
+export const ownArchivedCommandLogCount = (repo: object): number => _ownArchivedCommandLogs.get(repo)?.size ?? 0
+
+/**
+ * The adapters' docGuard: a doc that is never processed nor sent, whoever asks.
+ * Another fleet's store doc (loaded here), or one of our own archived command logs.
+ */
+export const isRefusedDoc = (repo: { handles: Record<string, any> }, ownStoreDocId: string, documentId: string): boolean =>
+    isOwnArchivedCommandLog(repo, documentId) || isForeignStoreDoc(repo, ownStoreDocId, documentId)
 
 /**
  * Is `documentId` another fleet's store doc that is loaded in `repo`? A doc that is

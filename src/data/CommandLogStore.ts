@@ -15,7 +15,7 @@ import path from 'path'
 import { redactString } from '../utils/redact.js'
 import { config, commandLogArchiveMaxBytes } from './Config.js'
 import { stopPeriodicFlush } from '../repo.js'
-import { markOwnCommandLog } from './StoreScope.js'
+import { markOwnArchivedCommandLog, markOwnCommandLog } from './StoreScope.js'
 
 // ── Types (also exported for use in CommonTypes consumers) ───────────────────
 
@@ -390,6 +390,8 @@ const _rotate = async (repo: Repo, options: CommandLogStoreOptions): Promise<Doc
         log(`[commandLog] Archived previous CommandLog to ${file} (${bin.byteLength} bytes)`)
       }
       repo.delete(old.documentId)
+      // engine#549 (2'): a peer's copy is never synced back into this Repo (StoreScope.isRefusedDoc)
+      if (bin) markOwnArchivedCommandLog(repo, old.documentId)
     } catch (e) {
       log(`[commandLog] Could not archive previous CommandLog ${old.url}: ${e instanceof Error ? e.message : e}`)
     }

@@ -16,7 +16,7 @@ import {
     COMMAND_LOG_CARRY_GRACE_MS,
 } from '../../src/data/CommandLogStore.js'
 import { commandLogText } from '../../src/data/CommandLogStore.js'
-import { isOwnCommandLog } from '../../src/data/StoreScope.js'
+import { isOwnCommandLog, isOwnArchivedCommandLog, archivedCommandLogIds } from '../../src/data/StoreScope.js'
 
 let dir = ''
 const urlFile = () => path.join(dir, 'store-identity', 'command-log-url.txt')
@@ -66,6 +66,10 @@ describe('CommandLog daily rotation (idea#183)', () => {
         expect(files).toEqual([`command-log-2026-10-12-${old.documentId}.automerge`])
         const archived = A.load<CommandLogStore>(await fs.readFile(path.join(archiveDir(), files[0])))
         expect(archived.recentTraceIds).toEqual(['done-long-ago'])
+        // engine#549 (2'): the archived id is refused for peer sync from now on, and its file name names it
+        expect(isOwnArchivedCommandLog(repo2, old.documentId)).toBe(true)
+        expect(isOwnArchivedCommandLog(repo2, h.documentId)).toBe(false)
+        expect(archivedCommandLogIds(files)).toEqual([old.documentId])
         await shutdownRepo(repo2)
         // Old doc no longer in storage
         const docDir = path.join(storageDir, old.documentId.slice(0, 2), old.documentId.slice(2))

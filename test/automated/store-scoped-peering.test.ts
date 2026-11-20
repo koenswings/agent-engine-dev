@@ -48,6 +48,7 @@ import {
     storeTag, enginePeerId, parseEnginePeerId, peerVerdict, describeRefusal, refusalMessage, parseRefusalMessage,
     isForeignStoreDocContent, RefusalLog,
     markOwnCommandLog, isOwnCommandLog, shareCommandLogWith, isCommandLogContent,
+    archivedCommandLogIds, isOwnArchivedCommandLog, isRefusedDoc,
 } from '../../src/data/StoreScope.js'
 import { guardOutgoing, StoreScopedWebSocketClientAdapter } from '../../src/data/StoreScopedClientAdapter.js'
 import { config } from '../../src/data/Config.js'
@@ -98,13 +99,13 @@ const clients: Array<() => Promise<void> | void> = []
  * Start a real Engine repo of store `storeId` seeded with `seed` (docId -> binary)
  * in its storage, and load its own store doc, as start.ts does.
  */
-const startEngine = async (name: string, storeId: DocumentId, seed: Record<string, Uint8Array>, load: string[] = [storeId]): Promise<TestEngine> => {
+const startEngine = async (name: string, storeId: DocumentId, seed: Record<string, Uint8Array>, load: string[] = [storeId], commandLogArchiveDir?: string): Promise<TestEngine> => {
     const dir = tmp(name)
     const s = new Repo({ network: [], storage: new NodeFSStorageAdapter(dir) })
     for (const [docId, bin] of Object.entries(seed)) s.import(bin, { docId: docId as DocumentId })
     await s.flush()
     const port = await freePort()
-    const repo = await startAutomergeServer(dir, port as PortNumber, { storeDocId: storeId, engineId: `ENGINE_${name}` })
+    const repo = await startAutomergeServer(dir, port as PortNumber, { storeDocId: storeId, engineId: `ENGINE_${name}`, commandLogArchiveDir })
     const server = repo.networkSubsystem.adapters[0] as unknown as ThreadedWebSocketServerAdapter
     await server.listening
     let store: DocHandle<any> | undefined
@@ -406,7 +407,7 @@ describe('store-scoped peering between real Engine repos', () => {
     }, 60_000)
 
     it('a foreign store doc already here (loaded, or only on disk) is never announced or served, and is left untouched', async () => {
-        const L = newDocId()   // a command log of our fleet written before engine#471 (no engineId, owner unknown): still relayed
+        const L = newDocId()   // a command log of our fleet written before engine#471 (no engineId, owner unknown): not pushed since engine#549
         // a holds a copy of store Y (relayed before the fix): one loaded, Y2 only on disk
         const Y2 = newDocId()
         const a = await startEngine('a', X, { [X]: bx, [Y]: by, [Y2]: by, [L]: A.save(A.from<any>({ traces: {}, recentTraceIds: [] })) }, [X, Y, L])
@@ -414,8 +415,8 @@ describe('store-scoped peering between real Engine repos', () => {
         const c = await startEngine('c', X, { [X]: bx })
         await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
         await until(() => isEnginePeerOf(c, a), 10_000, 'c peered with a')
-        await until(() => hasDoc(c, L), 10_000, 'own-fleet legacy log relayed')   // owner unknown: shared as before (engine#471 a)
         await sleep(1_500)
+        expect(hasDoc(c, L), 'engine#549: an unowned command log is not pushed to another Engine').toBe(false)
         expect(hasDoc(c, Y), 'foreign store doc must not be announced to our own Engine').toBe(false)
         // asked for explicitly: unavailable, from our own Engine and from a Console.
         // (automerge-repo's find() waits until every adapter is ready; the threaded server
@@ -462,13 +463,136 @@ describe('store-scoped peering between real Engine repos', () => {
         }
     }, 90_000)
 
-    it('engine#471 (a): shareCommandLogWith: own log never, another Engine\'s only with its owner, legacy (no engineId) as before', () => {
+    it('engine#549 (1\'): nothing unowned is pushed on connect; asked for, it is still answered (Console through another Engine, and an Engine)', async () => {
+        const U1 = newDocId(), U2 = newDocId()   // archived logs from before engine#471: no engineId
+        const P = newDocId()                     // a plain fleet doc: still shared generously
+        const unowned = (t: string) => A.save(A.from<any>({ traces: { [t]: { id: t } }, recentTraceIds: [t] }))
+        const a = await startEngine('a', X, { [X]: bx, [U1]: unowned('t1'), [U2]: unowned('t2'), [P]: A.save(A.from<any>({ label: 'p' })) }, [X, U1, U2, P])
+        const c = await startEngine('c', X, { [X]: bx })
+        await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
+        await until(() => isEnginePeerOf(c, a), 10_000, 'c peered with a')
+        await until(() => hasDoc(c, P), 10_000, 'plain fleet doc shared')
+        await sleep(1_500)
+        expect(hasDoc(c, U1) || hasDoc(c, U2), 'no unowned command log pushed on connect').toBe(false)
+        expect(docDataOnDisk(c.dir, U1) || docDataOnDisk(c.dir, U2)).toBe(false)
+        // a Console on c asks for U1: c relays the request to a, which answers
+        expect(await findWithTimeout(consoleClient(c.port).repo, X)).toBe('ready')
+        const con = consoleClient(c.port)
+        expect(await findWithTimeout(con.repo, U1)).toBe('ready')
+        expect((await con.repo.find<any>(U1)).doc().recentTraceIds).toEqual(['t1'])
+        expect(await findWithTimeout(c.repo, U2)).toBe('ready')   // an Engine asking explicitly gets it too
+    }, 90_000)
+
+    it('engine#549 (1\'): the Console relayed view of another Engine\'s current log still resyncs after the Engines reconnect (owned-to-owner push kept)', async () => {
+        const OWN = newDocId()   // a's current log, stamped with its engineId
+        const a = await startEngine('a', X, { [X]: bx, [OWN]: A.save(A.from<any>({ traces: {}, recentTraceIds: [], engineId: 'ENGINE_a' })) }, [X, OWN])
+        markOwnCommandLog(a.repo, OWN)
+        const c = await startEngine('c', X, { [X]: bx })
+        await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
+        await until(() => isEnginePeerOf(c, a), 10_000, 'c peered with a')
+        expect(await findWithTimeout(consoleClient(c.port).repo, X)).toBe('ready')
+        const con = consoleClient(c.port)
+        expect(await findWithTimeout(con.repo, OWN)).toBe('ready')
+        const ah = await a.repo.find<any>(OWN)
+        const ch = await con.repo.find<any>(OWN)
+        ah.change((d: any) => { d.recentTraceIds.push('before') })
+        await until(() => (ch.doc()?.recentTraceIds ?? []).includes('before'), 10_000, 'live before the reconnect')
+        // the link c -> a drops and the client adapter redials (as after a network blip)
+        const adapter = network.connections[`${PEER_IP}:${a.port}` as IPAddress]!.adapter as any
+        adapter.socket.close()
+        await until(() => !isEnginePeerOf(c, a), 10_000, 'c lost a')
+        await until(() => isEnginePeerOf(c, a), 20_000, 'c peered with a again')
+        ah.change((d: any) => { d.recentTraceIds.push('after') })
+        await until(() => (ch.doc()?.recentTraceIds ?? []).includes('after'), 15_000, 'Console view resynced after the reconnect')
+    }, 90_000)
+
+    it('engine#549 (2\'): the owner never reloads its own archived command logs that a peer still holds; archive files unchanged', async () => {
+        const ARCH = newDocId()     // a's archived log, stamped (owned-to-owner push would send it back)
+        const LEGACY = newDocId()   // a's archived log from before engine#471 (no engineId)
+        const archDir = tmp('archive')
+        const stamped = A.save(A.from<any>({ traces: {}, recentTraceIds: ['x'], engineId: 'ENGINE_a' }))
+        const legacy = A.save(A.from<any>({ traces: {}, recentTraceIds: ['y'] }))
+        const f1 = path.join(archDir, `command-log-2026-11-15-${ARCH}.automerge`)
+        const f2 = path.join(archDir, `command-log-unknown-${LEGACY}.automerge`)
+        fs.writeFileSync(f1, stamped); fs.writeFileSync(f2, legacy)
+        fs.writeFileSync(path.join(archDir, 'notes.txt'), 'not an archive')
+        const before = [fs.readFileSync(f1), fs.readFileSync(f2)]
+        const mtimes = [fs.statSync(f1).mtimeMs, fs.statSync(f2).mtimeMs]
+        // c (a peer) holds loaded copies of both, as idea01/idea04 did
+        const c = await startEngine('c', X, { [X]: bx, [ARCH]: stamped, [LEGACY]: legacy }, [X, ARCH, LEGACY])
+        const a = await startEngine('a', X, { [X]: bx }, [X], archDir)
+        expect(isOwnArchivedCommandLog(a.repo, ARCH) && isOwnArchivedCommandLog(a.repo, LEGACY)).toBe(true)
+        expect(isRefusedDoc(a.repo as any, X, ARCH)).toBe(true)
+        expect(isOwnArchivedCommandLog(c.repo, ARCH), 'per Engine (Repo)').toBe(false)
+        // both directions: c dials a (a's server guard) and a dials c (a's client guard)
+        await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
+        await connectEngine(a.repo, PEER_IP, 'c' as Hostname, 'ENGINE_c' as EngineID, X, c.port as PortNumber)
+        await until(() => isEnginePeerOf(c, a) && isEnginePeerOf(a, c), 10_000, 'a and c peered')
+        // c announces its loaded docs again to the redialled peer: still nothing reaches a
+        c.store.change((d: any) => { d.label = 'touched on c' })
+        await until(() => a.store.doc().label === 'touched on c', 10_000, 'store still syncs')
+        await sleep(2_000)
+        expect(hasDoc(a, ARCH) || hasDoc(a, LEGACY), 'own archived logs not loaded on the owner').toBe(false)
+        await a.repo.flush()
+        expect(docDataOnDisk(a.dir, ARCH) || docDataOnDisk(a.dir, LEGACY), 'nothing written to store-data').toBe(false)
+        // asked for by exact id (a Console on a): unavailable, not loaded
+        expect(await findWithTimeout(consoleClient(a.port).repo, X)).toBe('ready')
+        expect(await findWithTimeout(consoleClient(a.port).repo, ARCH, 4_000)).not.toBe('ready')
+        expect(hasDoc(a, ARCH) && (a.repo.handles as any)[ARCH].isReady()).toBe(false)
+        // archives on disk unchanged
+        expect(fs.readFileSync(f1).equals(before[0]) && fs.readFileSync(f2).equals(before[1])).toBe(true)
+        expect([fs.statSync(f1).mtimeMs, fs.statSync(f2).mtimeMs]).toEqual(mtimes)
+        expect(fs.readdirSync(archDir).sort()).toEqual([path.basename(f2), path.basename(f1), 'notes.txt'].sort())
+        // c's copies are untouched
+        expect((await c.repo.find<any>(ARCH)).doc().recentTraceIds).toEqual(['x'])
+    }, 90_000)
+
+    it('engine#549: kits meet, separate and meet again: the shared store converges both ways; command logs stay on demand', async () => {
+        const LA = newDocId(), LC = newDocId(), U = newDocId()
+        const owned = (e: string) => A.save(A.from<any>({ traces: {}, recentTraceIds: [], engineId: e }))
+        const a = await startEngine('a', X, { [X]: bx, [LA]: owned('ENGINE_a'), [U]: A.save(A.from<any>({ traces: {}, recentTraceIds: [] })) }, [X, LA, U])
+        markOwnCommandLog(a.repo, LA)
+        const c = await startEngine('c', X, { [X]: bx, [LC]: owned('ENGINE_c') }, [X, LC])
+        markOwnCommandLog(c.repo, LC)
+        const key = `${PEER_IP}:${a.port}` as IPAddress
+        // meet
+        await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
+        await until(() => isEnginePeerOf(c, a) && isEnginePeerOf(a, c), 10_000, 'kits met')
+        a.store.change((d: any) => { d.fromA = 1 }); c.store.change((d: any) => { d.fromC = 1 })
+        await until(() => a.store.doc().fromC === 1 && c.store.doc().fromA === 1, 15_000, 'store converged on meeting')
+        // separate: each kit keeps working on the shared store
+        ;(network.connections[key]!.adapter as any).disconnect()
+        delete (network.connections as any)[key]
+        await until(() => !isEnginePeerOf(c, a) && !isEnginePeerOf(a, c), 10_000, 'kits separated')
+        a.store.change((d: any) => { d.whileApartA = 'a' }); c.store.change((d: any) => { d.whileApartC = 'c' })
+        await sleep(500)
+        expect(a.store.doc().whileApartC).toBeUndefined()
+        // meet again
+        await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
+        await until(() => a.store.doc().whileApartC === 'c' && c.store.doc().whileApartA === 'a', 15_000, 'store converged after meeting again')
+        await sleep(1_000)
+        expect(hasDoc(c, LA) || hasDoc(a, LC) || hasDoc(c, U), 'no command log pushed between the kits').toBe(false)
+        // what a Console needs stays reachable on demand: the other kit's current log through the Engine it is connected to
+        expect(await findWithTimeout(consoleClient(c.port).repo, X)).toBe('ready')
+        expect(await findWithTimeout(consoleClient(c.port).repo, LA)).toBe('ready')
+    }, 90_000)
+
+    it('engine#549: archive file names -> document ids; other names ignored', () => {
+        const id = '3iD2EAQRP7xEkBfM4ka5ic5GvWq9'
+        expect(archivedCommandLogIds([
+            `command-log-2026-11-15-${id}.automerge`, 'command-log-unknown-41RpatCHWCaWxEb3LJnwvcnEcfXy.automerge',
+            'notes.txt', `command-log-2026-11-15-${id}.automerge.tmp`, 'command-log-x-short.automerge',
+        ])).toEqual([id, '41RpatCHWCaWxEb3LJnwvcnEcfXy'])
+    })
+
+    it('engine#471 (a) / engine#549: shareCommandLogWith: own log never, another Engine\'s only with its owner, unowned (no engineId) never', () => {
         expect(shareCommandLogWith({ engineId: 'ENGINE_a' }, 'ENGINE_a', 'ENGINE_b')).toBe(false)
         expect(shareCommandLogWith({ engineId: 'ENGINE_b' }, 'ENGINE_a', 'ENGINE_b')).toBe(true)
         expect(shareCommandLogWith({ engineId: 'ENGINE_b' }, 'ENGINE_a', 'ENGINE_c')).toBe(false)
         expect(shareCommandLogWith({ engineId: 'ENGINE_b' }, 'ENGINE_a', undefined)).toBe(false)
         expect(shareCommandLogWith({ engineId: 'odd id' }, 'ENGINE_a', 'odd_id')).toBe(true)   // peerId character rule
-        expect(shareCommandLogWith({}, 'ENGINE_a', 'ENGINE_c')).toBe(true)
+        expect(shareCommandLogWith({}, 'ENGINE_a', 'ENGINE_c')).toBe(false)               // engine#549: owner unknown, not pushed
+        expect(shareCommandLogWith({ engineId: '' }, 'ENGINE_a', 'ENGINE_c')).toBe(false)
         expect(isCommandLogContent({ traces: {}, recentTraceIds: [] })).toBe(true)
         expect(isCommandLogContent({ engineDB: {} })).toBe(false)
         const r1 = {}, r2 = {}
