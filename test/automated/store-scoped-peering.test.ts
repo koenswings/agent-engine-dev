@@ -55,6 +55,7 @@ import { config } from '../../src/data/Config.js'
 import { localEngineId } from '../../src/data/Engine.js'
 import { EngineID, Hostname, IPAddress, PortNumber } from '../../src/data/CommonTypes.js'
 import { Store } from '../../src/data/Store.js'
+import { docLoadLogEnabled, docKind, DOC_LOAD_LOG_ENV, DOC_LOAD_LOG_MIN_SYNC_MS_ENV } from '../../src/data/DocLoadLog.js'
 
 const PEER_IP = '127.0.0.2' as IPAddress
 
@@ -576,6 +577,93 @@ describe('store-scoped peering between real Engine repos', () => {
         expect(await findWithTimeout(consoleClient(c.port).repo, X)).toBe('ready')
         expect(await findWithTimeout(consoleClient(c.port).repo, LA)).toBe('ready')
     }, 90_000)
+
+    describe('engine#549 follow-up: per-document load log (IDEA_DOC_LOAD_LOG)', () => {
+        const withEnv = async <T>(vars: Record<string, string | undefined>, fn: () => Promise<T>): Promise<T> => {
+            const saved: Record<string, string | undefined> = {}
+            for (const k of Object.keys(vars)) { saved[k] = process.env[k]; if (vars[k] === undefined) delete process.env[k]; else process.env[k] = vars[k] }
+            try { return await fn() } finally { for (const k of Object.keys(saved)) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k] } }
+        }
+        const field = (line: string, k: string) => new RegExp(`\\b${k}=(\\S+)`).exec(line)?.[1]
+
+        it('flag parsing and doc kinds', () => {
+            expect(docLoadLogEnabled({})).toBe(false)
+            expect(docLoadLogEnabled({ [DOC_LOAD_LOG_ENV]: '0' })).toBe(false)
+            expect(docLoadLogEnabled({ [DOC_LOAD_LOG_ENV]: 'false' })).toBe(false)
+            expect(docLoadLogEnabled({ [DOC_LOAD_LOG_ENV]: '1' })).toBe(true)
+            expect(docLoadLogEnabled({ [DOC_LOAD_LOG_ENV]: 'true' })).toBe(true)
+            expect(docKind(X, X, {})).toEqual({ kind: 'store', owner: '-' })
+            expect(docKind(X, 'abc', { traces: {}, recentTraceIds: [], engineId: 'ENGINE_a' })).toEqual({ kind: 'command-log', owner: 'ENGINE_a' })
+            expect(docKind(X, 'abc', { traces: {}, recentTraceIds: [] })).toEqual({ kind: 'command-log', owner: 'unowned' })
+            expect(docKind(X, 'abc', { label: 'p' })).toEqual({ kind: 'other', owner: '-' })
+        })
+
+        it('off by default: no [doc-load]/[doc-sync] lines on start, local loads or peer sync', async () => {
+            const P = newDocId()
+            const cap = captureLogs()
+            try {
+                await withEnv({ [DOC_LOAD_LOG_ENV]: undefined }, async () => {
+                    const a = await startEngine('a', X, { [X]: bx, [P]: A.save(A.from<any>({ label: 'p' })) }, [X, P])
+                    const c = await startEngine('c', X, { [X]: bx, [P]: A.save(A.from<any>({ label: 'p' })) })
+                    await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
+                    await until(() => isEnginePeerOf(c, a) && hasDoc(c, P), 10_000, 'peered and P synced')
+                    a.store.change((d: any) => { d.label = 'x' })
+                    await until(() => c.store.doc().label === 'x', 10_000, 'store synced')
+                })
+            } finally { cap.restore() }
+            expect(cap.lines.filter(l => /\[doc-(load|sync)\]/.test(l))).toEqual([])
+        }, 60_000)
+
+        it('on: local loads name kind/owner/bytes/ms/changes and trigger=local; a peer push names the peer engine and storage id; [doc-sync] for applied peer changes', async () => {
+            const P = newDocId(), CL = newDocId()
+            const pBin = A.save(A.from<any>({ label: 'p' }))
+            const clBin = A.save(A.from<any>({ traces: { t1: { id: 't1' } }, recentTraceIds: ['t1'], engineId: 'ENGINE_a' }))
+            const a = await startEngine('a', X, { [X]: bx, [P]: pBin }, [X, P])
+            const cap = captureLogs()
+            let c!: TestEngine
+            try {
+                await withEnv({ [DOC_LOAD_LOG_ENV]: '1', [DOC_LOAD_LOG_MIN_SYNC_MS_ENV]: '0' }, async () => {
+                    c = await startEngine('c', X, { [X]: bx, [P]: pBin, [CL]: clBin }, [X, CL])   // c loads X and CL itself
+                    await connectEngine(c.repo, PEER_IP, 'a' as Hostname, 'ENGINE_a' as EngineID, X, a.port as PortNumber)
+                    await until(() => isEnginePeerOf(c, a) && hasDoc(c, P) && (c.repo.handles as any)[P].isReady(), 10_000, 'P pushed by a, loaded on c')
+                    a.store.change((d: any) => { d.label = 'from a' })
+                    await until(() => c.store.doc().label === 'from a', 10_000, 'store change synced')
+                    await sleep(300)
+                })
+            } finally { cap.restore() }
+            const lines = cap.lines.filter(l => /\[doc-(load|sync)\] id=/.test(l))
+            const load = (id: string) => lines.find(l => l.startsWith('[doc-load]') && field(l, 'id') === id)
+            const cl = load(CL)!
+            expect(cl, lines.join('\n')).toBeDefined()
+            expect(field(cl, 'kind')).toBe('command-log')
+            expect(field(cl, 'owner')).toBe('ENGINE_a')
+            expect(Number(field(cl, 'bytes'))).toBeGreaterThan(0)
+            expect(Number(field(cl, 'ms'))).toBeGreaterThanOrEqual(0)
+            expect(Number(field(cl, 'changes'))).toBe(1)
+            expect(field(cl, 'source')).toBe('local-storage')
+            expect(field(cl, 'trigger')).toBe('local')
+            expect(field(cl, 'from')).toBe('-')
+            const st = load(X)!
+            expect(field(st, 'kind')).toBe('store')
+            expect(field(st, 'trigger')).toBe('local')
+            // P: in c's storage, not loaded by c; a pushed it on connect -> the load is attributed to a
+            const p = load(P)!
+            expect(p, lines.join('\n')).toBeDefined()
+            expect(field(p, 'kind')).toBe('other')
+            expect(field(p, 'source')).toBe('local-storage')
+            expect(field(p, 'trigger')).toBe('peer-sync')
+            expect(field(p, 'from')).toBe('ENGINE_a')
+            expect(field(p, 'storage')).toBe(String(await a.repo.storageId()))
+            // the store change a made arrives as an applied sync message from a
+            const sy = lines.find(l => l.startsWith('[doc-sync]') && field(l, 'id') === X && field(l, 'from') === 'ENGINE_a')
+            expect(sy, lines.join('\n')).toBeDefined()
+            expect(field(sy!, 'kind')).toBe('store')
+            expect(Number(field(sy!, 'bytes'))).toBeGreaterThan(0)
+            expect(field(sy!, 'storage')).toBe(String(await a.repo.storageId()))
+            // a (flag off) logged nothing of its own: only c's lines carry trigger/source for c's docs
+            expect(lines.every(l => field(l, 'from') !== 'ENGINE_c')).toBe(true)
+        }, 60_000)
+    })
 
     it('engine#549: archive file names -> document ids; other names ignored', () => {
         const id = '3iD2EAQRP7xEkBfM4ka5ic5GvWq9'
