@@ -15,6 +15,7 @@ import { WebSocketServer } from 'ws'
 import { Repo, type PeerId } from '@automerge/automerge-repo'
 import { WebSocketServerAdapter } from '@automerge/automerge-repo-network-websocket'
 import { StoreDocLink } from '../duration/storeDocLink.js'
+import { StoreSyncResourceSampler } from '../duration/storeSyncResource.js'
 import { CommandLogReader } from '../duration/commandLogReader.js'
 import { DocHost, DOC_HOST_WORKER_URL, sharedDocHost, sharedCommandLogHost } from '../duration/docHost.js'
 
@@ -251,12 +252,12 @@ describe('r86p: one shared doc-host worker for all walker Automerge links', () =
     const blockableHost = () => new DocHost(new URL('data:text/javascript,' + encodeURIComponent(
         `import ${JSON.stringify(DOC_HOST_WORKER_URL.href)}; import { parentPort } from 'node:worker_threads'; ` +
         "parentPort.on('message', m => { if (m?.type === 'block') { const u = Date.now() + m.ms; while (Date.now() < u); } })")), 50, 100, 'test-host')
-    const blockedFirstSync = async (hardCap: boolean) => {
+    const blockedFirstSync = async (hardCap: boolean, lines: string[] = []) => {
         const host = blockableHost()
         const e = await startEngine('idea04', 300, 1, { freezeAfterJoin: true })
         const t0 = Date.now()
         const link = new StoreDocLink({ logicalId: 'idea04', url: e.url, docId: String(e.store.documentId), deadline: t0 + 1_500,
-            handshakeMs: 5_000, backstopMs: 300, docHost: host, log: () => {}, ...(hardCap ? { hardDeadline: t0 + 20_000 } : {}) })
+            handshakeMs: 5_000, backstopMs: 300, docHost: host, log: (l: string) => { lines.push(l) }, ...(hardCap ? { hardDeadline: t0 + 20_000 } : {}) })
         try {
             for (let i = 0; i < 100 && link.peerCount === 0; i++) await sleep(10)
             expect(link.peerCount).toBeGreaterThan(0) // handshake done, the doc request is not answered yet
@@ -280,6 +281,47 @@ describe('r86p: one shared doc-host worker for all walker Automerge links', () =
         expect(out.kind).toBe('stall')
         expect((out as { detail: string }).detail).toMatch(/gave no outcome 0s past the doc wait \(wall clock, main thread free\)/)
         expect(tookMs).toBeLessThan(3_000)
+    }, 30_000)
+
+    // engine#564 (Markov c3b30b6 step 91): the backstop outcome said blockedCreditMs=0 while the host was blocked 279 s.
+    it('engine#564: a backstop outcome marks the credit unmeasured and reports how long the host was silent', async () => {
+        const { out } = await blockedFirstSync(false)
+        expect(out.kind).toBe('stall')
+        expect(out.blockedCreditMeasured).toBe(false)
+        expect(out.blockedCreditMs).toBeUndefined()
+        expect(out.hostBlockedMs ?? 0).toBeGreaterThan(500)
+    }, 30_000)
+
+    it('engine#564: a worker-reported outcome has a measured credit; sync messages are logged before they are applied', async () => {
+        const lines: string[] = []
+        const { out } = await blockedFirstSync(true, lines)
+        expect(out.kind).toBe('ready')
+        expect(out.blockedCreditMeasured).toBe(true)
+        const msgs = lines.map(l => JSON.parse(l)).filter(m => m.event === 'store_sync_msg')
+        expect(msgs.length).toBeGreaterThan(0)
+        expect(msgs[0]).toMatchObject({ engine: 'idea04', type: 'sync', n: 1 })
+        expect(msgs[0].bytes).toBeGreaterThan(1_000) // the 300-op first sync payload
+        expect(msgs[0].handle).not.toBe('ready') // posted before the apply made the handle ready
+        expect(msgs.at(-1).totalBytes).toBe(msgs.reduce((a, m) => a + m.bytes, 0))
+    }, 30_000)
+
+    it('engine#564: the link samples resources only while its sync is in flight; no store_sync_msg once ready', async () => {
+        const e = await startEngine('idea03', 20, 1)
+        const lines: string[] = []
+        const sampler = new StoreSyncResourceSampler({ intervalMs: 60_000, log: () => {} })
+        const link = new StoreDocLink({ logicalId: 'idea03', url: e.url, docId: String(e.store.documentId), deadline: Date.now() + 10_000,
+            handshakeMs: 5_000, sampler, log: (l: string) => { lines.push(l) } })
+        try {
+            expect(sampler.running).toBe(true) // the store sync is in flight
+            expect(sampler.inFlight).toBe(1)
+            expect((await link.outcome()).kind).toBe('ready')
+            expect(sampler.running).toBe(false) // stopped with the outcome
+            const before = lines.filter(l => l.includes('store_sync_msg')).length
+            e.store.change(d => { d.engineDB.idea03.hostname = 'changed' })
+            for (let i = 0; i < 100 && (link.doc() as any)?.engineDB?.idea03?.hostname !== 'changed'; i++) await sleep(20)
+            expect((link.doc() as any).engineDB.idea03.hostname).toBe('changed')
+            expect(lines.filter(l => l.includes('store_sync_msg')).length).toBe(before)
+        } finally { await link.close(); await e.close() }
     }, 30_000)
 
     it('r86q: a blocked host thread is named (heartbeat), not reported as a plain sync stall', async () => {
