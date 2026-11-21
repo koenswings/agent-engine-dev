@@ -8,6 +8,7 @@
 import { Worker } from 'node:worker_threads'
 import type { Store } from '../../src/data/Store.js'
 import { sharedDocHost, perLinkWorkers, DocChannel, type DocHost, type WorkerLike } from './docHost.js'
+import { storeSyncSampler, type StoreSyncResourceSampler } from './storeSyncResource.js'
 
 export const STORE_DOC_WORKER_URL = new URL('./storeDocWorker.mjs', import.meta.url)
 
@@ -38,9 +39,12 @@ export const diffOps = (a: unknown, b: unknown, path: string[] = []): JsonOp[] =
     return [{ op: 'set', path, value: b }]
 }
 
+/** engine#564: blockedCreditMeasured=false when the worker never reported (main-thread backstop): blockedCreditMs is
+ *  then unknown, and hostBlockedMs is how long the host thread had been silent when the walker gave up. */
+interface OutcomeCredit { blockedCreditMs?: number; blockedCreditMeasured?: boolean; hostBlockedMs?: number | null }
 export type StoreOutcome =
-    | { kind: 'ready'; tookMs: number; blockedCreditMs?: number }
-    | { kind: 'doc-unavailable' | 'ws-closed' | 'stall' | 'unreachable'; detail: string; tookMs: number; blockedCreditMs?: number }
+    | ({ kind: 'ready'; tookMs: number } & OutcomeCredit)
+    | ({ kind: 'doc-unavailable' | 'ws-closed' | 'stall' | 'unreachable'; detail: string; tookMs: number } & OutcomeCredit)
 
 export interface WorkerMem { heapUsed: number; external: number; arrayBuffers: number; at: number }
 
@@ -57,6 +61,8 @@ export interface StoreDocLinkOpts {
     hardDeadline?: number
     /** Tests: run on this doc host instead of the shared store host. */
     docHost?: DocHost
+    /** Tests: resource sampler for the in-flight sync (default: the walker's storeSyncSampler). */
+    sampler?: StoreSyncResourceSampler
     onWs?: (kind: 'socket-error' | 'error', detail: string) => void
     onPeers?: (n: number) => void
     log?: (s: string) => void
@@ -96,12 +102,23 @@ export class StoreDocLink {
         this.worker = perLinkWorkers() ? new Worker(STORE_DOC_WORKER_URL, { workerData: data, execArgv: [] }) : (o.docHost ?? sharedDocHost).open('store', data)
         this.worker.unref()
         liveStoreLinks.add(this)
-        let settle!: (o: StoreOutcome) => void
-        this.outcomeP = new Promise(r => { settle = r })
+        let settleOutcome!: (o: StoreOutcome) => void
+        this.outcomeP = new Promise(r => { settleOutcome = r })
+        // engine#564: main-thread resource samples while this sync is in flight (the host thread may be blocked)
+        const sampler = o.sampler ?? storeSyncSampler
+        this.endSample = () => sampler.end(this)
+        sampler.begin(this, {
+            engine: o.logicalId, startedAt: Date.now(),
+            hostBlockedMs: () => this.hostBlockedMs(),
+            workerHeapMb: () => (this.mem ? Math.round(this.mem.heapUsed / 1048576) : null),
+        })
+        const settle = (out: StoreOutcome) => { this.endSample(); settleOutcome(out) }
         // engine#560: a silent worker (its host thread blocked) is given up only past the hard cap
         const giveUpAt = Math.max(o.deadline, o.hardDeadline ?? o.deadline)
         const backstop = setTimeout(() => {
-            settle({ kind: 'stall', detail: `store worker gave no outcome ${Math.round((o.backstopMs ?? 15_000) / 1000)}s past the ${giveUpAt > o.deadline ? 'hard cap' : 'doc wait'} (wall clock, main thread free)${this.hostState()}`, tookMs: -1 })
+            // engine#564: the worker never reported, so its blocked-time credit is unknown (not 0)
+            settle({ kind: 'stall', detail: `store worker gave no outcome ${Math.round((o.backstopMs ?? 15_000) / 1000)}s past the ${giveUpAt > o.deadline ? 'hard cap' : 'doc wait'} (wall clock, main thread free)${this.hostState()}`, tookMs: -1,
+                blockedCreditMeasured: false, hostBlockedMs: this.hostBlockedMs() })
         }, Math.max(0, giveUpAt - Date.now()) + (o.backstopMs ?? 15_000))
         backstop.unref()
         this.worker.on('message', (m: Record<string, unknown>) => {
@@ -119,8 +136,14 @@ export class StoreDocLink {
                     clearTimeout(backstop)
                     if (m.kind === 'ready') this.take(m)
                     settle(m.kind === 'ready'
-                        ? { kind: 'ready', tookMs: Number(m.tookMs), blockedCreditMs: Number(m.blockedCreditMs) || 0 }
-                        : { kind: m.kind as 'stall', detail: String(m.detail), tookMs: Number(m.tookMs), blockedCreditMs: Number(m.blockedCreditMs) || 0 })
+                        ? { kind: 'ready', tookMs: Number(m.tookMs), blockedCreditMs: Number(m.blockedCreditMs) || 0, blockedCreditMeasured: true, hostBlockedMs: this.hostBlockedMs() }
+                        : { kind: m.kind as 'stall', detail: String(m.detail), tookMs: Number(m.tookMs), blockedCreditMs: Number(m.blockedCreditMs) || 0, blockedCreditMeasured: true, hostBlockedMs: this.hostBlockedMs() })
+                    break
+                case 'sync-msg':
+                    // engine#564: posted by the session BEFORE the message is applied, so it survives a long apply
+                    log(JSON.stringify({ event: 'store_sync_msg', engine: o.logicalId, docId: o.docId, type: m.type, bytes: Number(m.bytes) || 0,
+                        n: Number(m.n) || 0, totalBytes: Number(m.totalBytes) || 0, sinceMs: Number(m.sinceMs) || 0, handle: m.handle ?? null,
+                        hostBlockedMs: this.hostBlockedMs() }))
                     break
                 case 'snapshot': this.take(m); break
                 case 'peers':
@@ -141,7 +164,7 @@ export class StoreDocLink {
             this.peerCount = 0
             liveStoreLinks.delete(this)
             clearTimeout(backstop)
-            settle({ kind: 'stall', detail: e.message, tookMs: -1 })
+            settle({ kind: 'stall', detail: e.message, tookMs: -1, blockedCreditMeasured: false, hostBlockedMs: this.hostBlockedMs() })
             for (const [, p] of this.pending) { clearTimeout(p.timer); p.reject(e) }
             this.pending.clear()
         }
@@ -156,6 +179,13 @@ export class StoreDocLink {
         this.lastSnapshotParseMs = performance.now() - t0
         this.snapHeads = Array.isArray(m.heads) ? (m.heads as string[]) : null
         this.snapshots++
+    }
+
+    private endSample: () => void = () => {}
+
+    /** engine#564: ms since the shared doc-host thread last answered its heartbeat (null for a per-link worker). */
+    hostBlockedMs(): number | null {
+        return this.worker instanceof DocChannel ? this.worker.host.unresponsiveMs() : null
     }
 
     /** r86q: names a frozen shared host thread in failure details (r86p: it was silent > 3 min). */
@@ -237,6 +267,7 @@ export class StoreDocLink {
         this.onClose?.(reason)
         this.onClose = null
         liveStoreLinks.delete(this)
+        this.endSample()
         if (this.dead) return
         const exited = new Promise<void>(r => this.worker.once('exit', () => r()))
         this.worker.postMessage({ type: 'shutdown' })

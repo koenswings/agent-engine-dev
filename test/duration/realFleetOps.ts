@@ -1925,7 +1925,10 @@ export class RealFleetOps implements FleetOps {
             const mu = process.memoryUsage()
             console.log(JSON.stringify({
                 event: 'store_sync_measured', engine: logicalId, docId, outcome: outcome.kind, offThread: true,
-                tookMs: now - started, docWaitMs, overrunMs: Math.max(0, overrunMs), blockedCreditMs, capMs,
+                tookMs: now - started, docWaitMs, overrunMs: Math.max(0, overrunMs),
+                // engine#564: null (not 0) when the worker never reported; hostBlockedMs = host silence at that time
+                blockedCreditMs: outcome.blockedCreditMeasured === false ? null : blockedCreditMs,
+                blockedCreditMeasured: outcome.blockedCreditMeasured !== false, hostBlockedMs: outcome.hostBlockedMs ?? null, capMs,
                 walkerRssMb: Math.round(mu.rss / 1048576), walkerHeapUsedMb: Math.round(mu.heapUsed / 1048576),
                 workerHeapMb: link.mem ? Math.round(link.mem.heapUsed / 1048576) : null,
                 snapshotParseMs: Math.round(link.lastSnapshotParseMs),

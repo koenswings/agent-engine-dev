@@ -45,6 +45,18 @@ export async function startStoreDocSession(workerData, io) {
             }
             super.send(message)
         }
+        // engine#564: while the store doc is being fetched, report every incoming sync message for it (size,
+        // running count / bytes) BEFORE the Repo applies it, so a long synchronous apply still leaves a trace.
+        emit(event, ...args) {
+            const m = args[0]
+            if (event === 'message' && msgDiag.on && m?.documentId === docId) {
+                const bytes = m.data?.byteLength ?? 0
+                msgDiag.n++
+                msgDiag.bytes += bytes
+                post({ event: 'sync-msg', type: m.type, bytes, n: msgDiag.n, totalBytes: msgDiag.bytes, sinceMs: Date.now() - msgDiag.t0, handle: handle?.state ?? null })
+            }
+            return super.emit(event, ...args)
+        }
         disconnect() {
             this.closedForGood = true
             try { this.socket?.on?.('error', () => {}) } catch { /* ignore */ }
@@ -53,6 +65,8 @@ export async function startStoreDocSession(workerData, io) {
     }
 
 
+    const msgDiag = { on: true, n: 0, bytes: 0, t0: Date.now() }
+    let handle = null
     const adapter = new Adapter()
     const repo = new Repo({ network: [adapter], peerId })
     const ns = repo.networkSubsystem
@@ -65,7 +79,6 @@ export async function startStoreDocSession(workerData, io) {
         post({ event: 'mem', heapUsed: m.heapUsed, external: m.external, arrayBuffers: m.arrayBuffers })
     }, memEveryMs)
 
-    let handle = null
     const snapshot = () => {
         const t0 = performance.now()
         const json = JSON.stringify(handle.doc())
@@ -220,6 +233,7 @@ export async function startStoreDocSession(workerData, io) {
     if (!ok) post({ event: 'outcome', kind: 'unreachable', detail: `no WS handshake within ${handshakeMs}ms`, tookMs: Date.now() - started })
     else {
         const out = await awaitDoc()
+        msgDiag.on = false
         if (out.kind === 'ready' && !closing) {
             handle.on('change', scheduleSnapshot)
             // r86q: a re-established peer re-syncs this handle; push a fresh snapshot once it has.
