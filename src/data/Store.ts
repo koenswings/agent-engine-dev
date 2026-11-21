@@ -2,7 +2,7 @@ import { splitAppId } from './AppIdParse.js'
 import path from 'path'
 import { Engine, localEngineId } from './Engine.js'
 import { Disk } from './Disk.js'
-import { deepPrint, getKeys, log, print } from '../utils/utils.js'
+import { getKeys, log, print } from '../utils/utils.js'
 import { App } from './App.js'
 import { Instance } from './Instance.js'
 import { User } from './User.js'
@@ -96,10 +96,19 @@ export const createServerStore = async (repo: Repo, storeDocId: DocumentId, stor
     await handle.whenReady();
     log("Store document is ready.")
     log(`   Doc in state ${handle.state}`);
-    log(`   Doc contains: ${deepPrint(handle.doc(), 2)}`);
+    // engine#543: counts only. The old deepPrint of the doc printed the whole store (~29.5k console
+    // lines on a big store) and blocked the loop for seconds while the peers waited for the first sync.
+    log(`   Doc contains: ${describeStoreCounts(handle.doc())}`);
     return handle;
 }
 
+
+/** engine#543: one short line with the size of each top-level table (never the content). */
+export const describeStoreCounts = (doc: unknown): string => {
+    const d = (doc ?? {}) as Record<string, unknown>
+    const n = (k: string) => (d[k] && typeof d[k] === 'object' ? Object.keys(d[k] as object).length : 0)
+    return `${n('engineDB')} engine(s), ${n('diskDB')} disk(s), ${n('appDB')} app(s), ${n('instanceDB')} instance(s)`
+}
 
 export const retrieveStore = async (repo: Repo, storeDocId: DocumentId): Promise<DocHandle<Store>> => {
     log(`Binding store to repo with ID: ${storeDocId}`)

@@ -45,6 +45,8 @@ import { startPeerAccess } from './data/PeerAccess.js'
 import { checkAndSetUndockedApps } from './data/UndockedApps.js'
 import { installStaleDocGuard, staleStoreExit } from './data/StaleDocGuard.js'
 import { startLoopStallMonitor } from './monitors/loopStallMonitor.js'
+import { startFirstSyncGate, firstSyncWaitSettings, logFirstSyncOutcome, yieldToEventLoop } from './data/FirstSyncGate.js'
+import { next as Automerge } from '@automerge/automerge'
 export { checkAndSetUndockedApps }
 
 
@@ -160,8 +162,14 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         },
     })
 
+    // engine#543: watch for the first remote peer to be caught up with the store doc (observe only); the
+    // instance bring-up below (the dock pass) waits for it, bounded, so the sync is served before the loop blocks.
+    let storeHeads: () => readonly string[] = () => []
+    const firstSync = startFirstSyncGate(repo as any, { storeDocId: String(storeDocId), heads: () => storeHeads() })
+
     log(`Initialising store`)
     const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, storeIdentity.templatePath)
+    storeHeads = () => Automerge.getHeads(storeHandle.doc() as any)
     staleGuard.watchStoreHandle(storeHandle)
 
     // backupCleanup capability: one helper version check, never fatal (idea#400 §3.1).
@@ -298,6 +306,15 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         startStaticPeers(repo, storeHandle)
     }
 
+
+    // engine#543: hold the dock pass (instance bring-up: status writes, image loads, compose starts, each of
+    // which can block the loop for seconds on a big store) until the first peer's store sync is served.
+    // Bounded (no peer: 5 s grace; else 45 s), off in testMode / IDEA_WATCH_DIR; the dock pass is not skipped.
+    logFirstSyncOutcome(await firstSync.whenServed(firstSyncWaitSettings(process.env, {
+        testMode: config.settings.testMode, watchDirSet: !!process.env.IDEA_WATCH_DIR,
+    })))
+    firstSync.stop()
+    await yieldToEventLoop()
 
     await sleep(1000)
     log(chalk.bgMagenta('STARTING MONITORING OF USB DEVICES'))
