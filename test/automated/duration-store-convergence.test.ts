@@ -1,7 +1,7 @@
 /**
  * store_convergence wait/retry + field-level dump (r41 harness tip B).
  */
-import { describe, expect, it } from 'vitest'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { formatSemanticDivergence, semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants } from '../duration/invariants.js'
 import { FakeFleetOps } from '../duration/actions.js'
@@ -169,21 +169,60 @@ describe('r80 FAIL@57: stale-view guard in waitForConvergence (lagging Pi view r
     const fresh = (id: string) => baseView(id, { status: 'Undocked', dockedTo: null })
     const stale = (id: string) => baseView(id, { status: 'Running', dockedTo: 'idea01' })
     const mk = (views: Record<string, () => SemanticStoreView>, onRefresh?: (id: string) => void) => {
-        const calls: { id: string; reason: string }[] = []
+        const calls: { id: string; reason: string; fresh?: boolean }[] = []
         const ops = {
             getStoreMode: () => 'shared',
             waitReady: async () => ({ wsUp: true }),
             readStore: async (id: string) => views[id]!(),
-            refreshView: async (id: string, reason: string) => {
-                calls.push({ id, reason })
+            refreshView: async (id: string, reason: string, o?: { fresh?: boolean }) => {
+                calls.push({ id, reason, fresh: o?.fresh })
                 onRefresh?.(id)
-                return true
+                return refreshResult
             },
         }
         return { ops: ops as never, calls }
     }
     const ids = ['idea01', 'idea03', 'idea04']
     const opts = { pollMs: 1, staleAfterMs: 5, refreshExtraMs: 200 }
+    let refreshResult: boolean | null = true
+    let logs: string[] = []
+    beforeEach(() => {
+        refreshResult = true; logs = []
+        vi.spyOn(console, 'log').mockImplementation((l: string) => { logs.push(String(l)) })
+    })
+    afterEach(() => { vi.restoreAllMocks() })
+
+    it('engine#557: the lone lagger is re-checked over a FRESH link; agreeing → pass, logged stale-view-recovered', async () => {
+        let idea04 = stale
+        const { ops, calls } = mk({ idea01: () => fresh('idea01'), idea03: () => fresh('idea03'), idea04: () => idea04('idea04') }, () => { idea04 = fresh })
+        const r = await waitForConvergence(ops, ids, 100, opts)
+        expect(r.ok).toBe(true)
+        expect(r.recheck).toEqual({ engine: 'idea04', outcome: 'stale-view-recovered' })
+        expect(calls).toEqual([expect.objectContaining({ id: 'idea04', fresh: true })])
+        expect(logs.some(l => /"event":"convergence_fresh_recheck","engine":"idea04","outcome":"stale-view-recovered"/.test(l))).toBe(true)
+    })
+
+    it('engine#557: the fresh link still disagrees → genuine divergence, fails with the field dump (150 s gate logic unchanged)', async () => {
+        refreshResult = false
+        const { ops, calls } = mk({ idea01: () => fresh('idea01'), idea03: () => fresh('idea03'), idea04: () => stale('idea04') })
+        const r = await waitForConvergence(ops, ids, 60, opts)
+        expect(r.ok).toBe(false)
+        expect(r.recheck).toEqual({ engine: 'idea04', outcome: 'genuine-divergence' })
+        expect(r.reason).toMatch(/\(genuine divergence: a fresh link to idea04 still disagrees\): semantic fields diverge: .*idea04=Running/)
+        expect(calls).toHaveLength(1)
+        const line = logs.find(l => /convergence_fresh_recheck/.test(l))
+        expect(line).toMatch(/"outcome":"genuine-divergence"/)
+        expect(line).toMatch(/"divergence":"semantic fields diverge: /)
+    })
+
+    it('engine#557: the fresh link fails (null) → fails, labelled fresh-link-failed', async () => {
+        refreshResult = null
+        const { ops } = mk({ idea01: () => fresh('idea01'), idea03: () => fresh('idea03'), idea04: () => stale('idea04') })
+        const r = await waitForConvergence(ops, ids, 60, opts)
+        expect(r.ok).toBe(false)
+        expect(r.recheck).toEqual({ engine: 'idea04', outcome: 'fresh-link-failed' })
+        expect(r.reason).toMatch(/fresh link to idea04 failed/)
+    })
 
     it('refreshes the lone lagging view once and converges (recorded reason names the engine)', async () => {
         let idea04 = stale
