@@ -1908,8 +1908,11 @@ export class RealFleetOps implements FleetOps {
             void this.registerOwnCommandLog(logicalId, host)
             const hsMs = Math.max(1, Math.min(this.wsHandshakeTimeoutMs, deadline - Date.now()))
             const tracker = trackWorkerLink(logicalId, url)
+            // engine#560: blocked doc-host time is credited to the doc wait up to this hard cap (from connect start)
+            const capMs = storeSyncCapMs()
+            const hardDeadline = Math.max(deadline, started + capMs)
             const link = new StoreDocLink({
-                logicalId, url, docId: String(docId), deadline, handshakeMs: hsMs,
+                logicalId, url, docId: String(docId), deadline, handshakeMs: hsMs, hardDeadline,
                 backstopMs: CONNECT_OVERRUN_GRACE_MS,
                 onWs: (kind, detail) => noteEngineWs(logicalId, kind, detail, url),
                 onPeers: n => tracker.peers(n),
@@ -1917,11 +1920,12 @@ export class RealFleetOps implements FleetOps {
             link.onClose = reason => tracker.abandon(reason)
             let outcome = await link.outcome()
             const now = Date.now()
-            const overrunMs = now - deadline
+            const blockedCreditMs = outcome.blockedCreditMs ?? 0
+            const overrunMs = now - Math.min(hardDeadline, deadline + blockedCreditMs)
             const mu = process.memoryUsage()
             console.log(JSON.stringify({
                 event: 'store_sync_measured', engine: logicalId, docId, outcome: outcome.kind, offThread: true,
-                tookMs: now - started, docWaitMs, overrunMs: Math.max(0, overrunMs),
+                tookMs: now - started, docWaitMs, overrunMs: Math.max(0, overrunMs), blockedCreditMs, capMs,
                 walkerRssMb: Math.round(mu.rss / 1048576), walkerHeapUsedMb: Math.round(mu.heapUsed / 1048576),
                 workerHeapMb: link.mem ? Math.round(link.mem.heapUsed / 1048576) : null,
                 snapshotParseMs: Math.round(link.lastSnapshotParseMs),
@@ -3930,4 +3934,10 @@ export class RealFleetOps implements FleetOps {
 export const freshRecheckMs = (env: NodeJS.ProcessEnv = process.env): number => {
     const raw = env.DURATION_FRESH_RECHECK_MS?.trim()
     return raw && /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : 180_000
+}
+
+/** engine#560: hard cap of one store connect when the doc-host thread was blocked (credited). DURATION_STORE_SYNC_CAP_MS overrides (default 300 s). */
+export const storeSyncCapMs = (env: NodeJS.ProcessEnv = process.env): number => {
+    const raw = env.DURATION_STORE_SYNC_CAP_MS?.trim()
+    return raw && /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : 300_000
 }

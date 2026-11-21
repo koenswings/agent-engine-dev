@@ -16,12 +16,12 @@ import { Repo, type PeerId } from '@automerge/automerge-repo'
 import { WebSocketServerAdapter } from '@automerge/automerge-repo-network-websocket'
 import { StoreDocLink } from '../duration/storeDocLink.js'
 import { CommandLogReader } from '../duration/commandLogReader.js'
-import { DocHost, sharedDocHost, sharedCommandLogHost } from '../duration/docHost.js'
+import { DocHost, DOC_HOST_WORKER_URL, sharedDocHost, sharedCommandLogHost } from '../duration/docHost.js'
 
 const sleep = (ms: number) => new Promise<void>(r => setTimeout(r, ms))
 const MB = 1048576
 
-const startEngine = async (name: string, ops: number, clTraces: number) => {
+const startEngine = async (name: string, ops: number, clTraces: number, o: { freezeAfterJoin?: boolean } = {}) => {
     const server = http.createServer()
     const wss = new WebSocketServer({ noServer: true })
     const repo = new Repo({ network: [new WebSocketServerAdapter(wss as never)], peerId: `fake-${name}-${Date.now()}` as PeerId, sharePolicy: async () => false })
@@ -39,7 +39,12 @@ const startEngine = async (name: string, ops: number, clTraces: number) => {
         }
     })
     const sockets: any[] = []
-    server.on('upgrade', (req, socket, head) => wss.handleUpgrade(req, socket, head, ws => { sockets.push(ws); wss.emit('connection', ws, req) }))
+    server.on('upgrade', (req, socket, head) => wss.handleUpgrade(req, socket, head, ws => {
+        sockets.push(ws)
+        // engine#560: answer the join handshake, then stop reading — the doc request waits until unfreezeSockets()
+        if (o.freezeAfterJoin) ws.once('message', () => setImmediate(() => { try { (ws as any)._socket.pause() } catch { /* */ } }))
+        wss.emit('connection', ws, req)
+    }))
     await new Promise<void>(r => server.listen(0, '127.0.0.1', () => r()))
     const port = (server.address() as net.AddressInfo).port
     return {
@@ -48,6 +53,7 @@ const startEngine = async (name: string, ops: number, clTraces: number) => {
         /** Stop reading every open socket without closing it: the walker's peer stays listed and its
          *  socket stays OPEN, but nothing (no ping) is answered any more — a stale peer, as in the pool. */
         freezeSockets: () => { for (const s of sockets) { try { (s as any)._socket.pause() } catch { /* */ } } },
+        unfreezeSockets: () => { for (const s of sockets) { try { (s as any)._socket.resume() } catch { /* */ } } },
         dropSockets: () => { for (const s of sockets.splice(0)) { try { s.terminate() } catch { /* */ } } },
         /** engine#557: the Engine silently stops pushing the store doc to every connected walker peer (link
          *  and socket stay up, pings answered) — the frozen replica of Markov step 91. */
@@ -238,6 +244,42 @@ describe('r86p: one shared doc-host worker for all walker Automerge links', () =
             expect(await link.reattach(1_500)).toBe(false) // before c2cbdb0: true on the stale peer entry
             expect(link.lastReattachError).toMatch(/reattach: /)
         } finally { await link.close(); await e.close() }
+    }, 30_000)
+
+    // engine#560 (Markov pre-step-1, 49dcfa4): idea04's first store sync ran while the shared doc-host thread was
+    // blocked (131 s); the silent worker was given up at doc wait + 5 s although the sync was still being applied.
+    const blockableHost = () => new DocHost(new URL('data:text/javascript,' + encodeURIComponent(
+        `import ${JSON.stringify(DOC_HOST_WORKER_URL.href)}; import { parentPort } from 'node:worker_threads'; ` +
+        "parentPort.on('message', m => { if (m?.type === 'block') { const u = Date.now() + m.ms; while (Date.now() < u); } })")), 50, 100, 'test-host')
+    const blockedFirstSync = async (hardCap: boolean) => {
+        const host = blockableHost()
+        const e = await startEngine('idea04', 300, 1, { freezeAfterJoin: true })
+        const t0 = Date.now()
+        const link = new StoreDocLink({ logicalId: 'idea04', url: e.url, docId: String(e.store.documentId), deadline: t0 + 1_500,
+            handshakeMs: 5_000, backstopMs: 300, docHost: host, log: () => {}, ...(hardCap ? { hardDeadline: t0 + 20_000 } : {}) })
+        try {
+            for (let i = 0; i < 100 && link.peerCount === 0; i++) await sleep(10)
+            expect(link.peerCount).toBeGreaterThan(0) // handshake done, the doc request is not answered yet
+            host.send({ type: 'block', ms: 3_000 }) // the host thread is busy (a big first sync of another link)
+            await sleep(300)
+            e.unfreezeSockets() // the Engine answers; the data waits until the host thread is free
+            return { out: await link.outcome(), tookMs: Date.now() - t0, doc: link.doc() as any }
+        } finally { await link.close(); await e.close(); await host.stop() }
+    }
+
+    it('engine#560: a doc-host blocked past the doc wait is credited up to the hard cap — the first sync completes', async () => {
+        const { out, tookMs, doc } = await blockedFirstSync(true)
+        expect(out.kind).toBe('ready')
+        expect(out.blockedCreditMs ?? 0).toBeGreaterThan(2_000)
+        expect(tookMs).toBeGreaterThan(3_000)
+        expect(Object.keys(doc.operationDB)).toHaveLength(300)
+    }, 30_000)
+
+    it('engine#560 control: without a hard cap the same blocked host is a false stall at doc wait + backstop', async () => {
+        const { out, tookMs } = await blockedFirstSync(false)
+        expect(out.kind).toBe('stall')
+        expect((out as { detail: string }).detail).toMatch(/gave no outcome 0s past the doc wait \(wall clock, main thread free\)/)
+        expect(tookMs).toBeLessThan(3_000)
     }, 30_000)
 
     it('r86q: a blocked host thread is named (heartbeat), not reported as a plain sync stall', async () => {

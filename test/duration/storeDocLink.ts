@@ -7,7 +7,7 @@
  */
 import { Worker } from 'node:worker_threads'
 import type { Store } from '../../src/data/Store.js'
-import { sharedDocHost, perLinkWorkers, DocChannel, type WorkerLike } from './docHost.js'
+import { sharedDocHost, perLinkWorkers, DocChannel, type DocHost, type WorkerLike } from './docHost.js'
 
 export const STORE_DOC_WORKER_URL = new URL('./storeDocWorker.mjs', import.meta.url)
 
@@ -39,8 +39,8 @@ export const diffOps = (a: unknown, b: unknown, path: string[] = []): JsonOp[] =
 }
 
 export type StoreOutcome =
-    | { kind: 'ready'; tookMs: number }
-    | { kind: 'doc-unavailable' | 'ws-closed' | 'stall' | 'unreachable'; detail: string; tookMs: number }
+    | { kind: 'ready'; tookMs: number; blockedCreditMs?: number }
+    | { kind: 'doc-unavailable' | 'ws-closed' | 'stall' | 'unreachable'; detail: string; tookMs: number; blockedCreditMs?: number }
 
 export interface WorkerMem { heapUsed: number; external: number; arrayBuffers: number; at: number }
 
@@ -52,6 +52,11 @@ export interface StoreDocLinkOpts {
     handshakeMs: number
     /** Extra wall-clock time past `deadline` before the main thread gives up on a silent worker. */
     backstopMs?: number
+    /** engine#560: hard cap for the doc wait. Time the doc-host thread was blocked is credited past `deadline`
+     *  up to this (the worker judges it); a silent worker is given up at hardDeadline + backstopMs. Default: deadline. */
+    hardDeadline?: number
+    /** Tests: run on this doc host instead of the shared store host. */
+    docHost?: DocHost
     onWs?: (kind: 'socket-error' | 'error', detail: string) => void
     onPeers?: (n: number) => void
     log?: (s: string) => void
@@ -80,6 +85,7 @@ export class StoreDocLink {
         const log = o.log ?? console.log
         const data = {
                 url: o.url, docId: o.docId, logicalId: o.logicalId, deadline: o.deadline, handshakeMs: o.handshakeMs,
+                hardDeadline: Math.max(o.deadline, o.hardDeadline ?? o.deadline),
                 peerId: `duration-${o.logicalId}-${Date.now()}`,
                 snapshotMs: Number(process.env.DURATION_STORE_SNAPSHOT_MS ?? 500),
                 memEveryMs: Number(process.env.DURATION_WORKER_MEM_MS ?? 15_000),
@@ -87,14 +93,16 @@ export class StoreDocLink {
                 syncWaitMs: Number(process.env.DURATION_REATTACH_SYNC_WAIT_MS ?? 1_000),
         }
         // r86p: all links share one doc-host thread (one Automerge WASM) unless DURATION_DOC_HOST=per-link.
-        this.worker = perLinkWorkers() ? new Worker(STORE_DOC_WORKER_URL, { workerData: data, execArgv: [] }) : sharedDocHost.open('store', data)
+        this.worker = perLinkWorkers() ? new Worker(STORE_DOC_WORKER_URL, { workerData: data, execArgv: [] }) : (o.docHost ?? sharedDocHost).open('store', data)
         this.worker.unref()
         liveStoreLinks.add(this)
         let settle!: (o: StoreOutcome) => void
         this.outcomeP = new Promise(r => { settle = r })
+        // engine#560: a silent worker (its host thread blocked) is given up only past the hard cap
+        const giveUpAt = Math.max(o.deadline, o.hardDeadline ?? o.deadline)
         const backstop = setTimeout(() => {
-            settle({ kind: 'stall', detail: `store worker gave no outcome ${Math.round(((o.backstopMs ?? 15_000) + Math.max(0, o.deadline - Date.now())) / 1000)}s (wall clock, main thread free)${this.hostState()}`, tookMs: -1 })
-        }, Math.max(0, o.deadline - Date.now()) + (o.backstopMs ?? 15_000))
+            settle({ kind: 'stall', detail: `store worker gave no outcome ${Math.round((o.backstopMs ?? 15_000) / 1000)}s past the ${giveUpAt > o.deadline ? 'hard cap' : 'doc wait'} (wall clock, main thread free)${this.hostState()}`, tookMs: -1 })
+        }, Math.max(0, giveUpAt - Date.now()) + (o.backstopMs ?? 15_000))
         backstop.unref()
         this.worker.on('message', (m: Record<string, unknown>) => {
             if (typeof m.id === 'number') {
@@ -111,8 +119,8 @@ export class StoreDocLink {
                     clearTimeout(backstop)
                     if (m.kind === 'ready') this.take(m)
                     settle(m.kind === 'ready'
-                        ? { kind: 'ready', tookMs: Number(m.tookMs) }
-                        : { kind: m.kind as 'stall', detail: String(m.detail), tookMs: Number(m.tookMs) })
+                        ? { kind: 'ready', tookMs: Number(m.tookMs), blockedCreditMs: Number(m.blockedCreditMs) || 0 }
+                        : { kind: m.kind as 'stall', detail: String(m.detail), tookMs: Number(m.tookMs), blockedCreditMs: Number(m.blockedCreditMs) || 0 })
                     break
                 case 'snapshot': this.take(m); break
                 case 'peers':

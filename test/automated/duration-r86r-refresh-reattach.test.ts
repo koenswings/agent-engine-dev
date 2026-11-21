@@ -5,7 +5,7 @@
  * through the f702e6a reattach path; a slow-but-recovering host gets more time (bounded); never a fresh sync.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { RealFleetOps, freshRecheckMs } from '../duration/realFleetOps.js'
+import { RealFleetOps, freshRecheckMs, storeSyncCapMs } from '../duration/realFleetOps.js'
 import { reconnectEvents, resetReconnectEvents } from '../duration/staleView.js'
 
 type FakeLink = { alive: boolean; heads: string[]; lastReattachError: string | null; reattach: ReturnType<typeof vi.fn>; hostState: () => string; doc: () => unknown }
@@ -130,5 +130,13 @@ describe('engine#557: refreshView(fresh) — the convergence re-check is always 
         expect(freshRecheckMs({})).toBe(180_000)
         expect(freshRecheckMs({ DURATION_FRESH_RECHECK_MS: '90000' })).toBe(90_000)
         expect(freshRecheckMs({ DURATION_FRESH_RECHECK_MS: 'x' })).toBe(180_000)
+    })
+})
+
+describe('engine#560: storeSyncCapMs', () => {
+    it('default 300 s, env override, junk ignored', () => {
+        expect(storeSyncCapMs({})).toBe(300_000)
+        expect(storeSyncCapMs({ DURATION_STORE_SYNC_CAP_MS: '240000' })).toBe(240_000)
+        expect(storeSyncCapMs({ DURATION_STORE_SYNC_CAP_MS: '0' })).toBe(300_000)
     })
 })
