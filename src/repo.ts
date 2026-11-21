@@ -7,6 +7,7 @@ import { archivedCommandLogIds, enginePeerId, isCommandLogContent, isForeignStor
 import fs from 'fs'
 import path from 'path'
 import { config } from './data/Config.js'
+import { installDocLoadLog } from './data/DocLoadLog.js'
 export { isForeignStoreDoc }
 
 
@@ -172,6 +173,8 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber, iden
     const archiveDir = identity.commandLogArchiveDir ?? path.join('./' + config.settings.storeIdentityFolder, 'command-log-archive')
     const archived = markOwnArchivedCommandLogs(repo, archiveDir)
     network.setDocGuard((documentId) => isRefusedDoc(repo, identity.storeDocId, documentId))
+    // engine#549 follow-up: per-document load log, off unless IDEA_DOC_LOAD_LOG=1 (DocLoadLog.ts)
+    installDocLoadLog(repo, { storeDocId: identity.storeDocId })
     log(`[store-scope] Engine peerId ${peerId}: syncing only with Engines of store ${storeTag(identity.storeDocId)}`)
     log(`[store-scope] Refusing peer sync of ${archived} own archived command log(s) in ${archiveDir} (engine#549)`)
 
