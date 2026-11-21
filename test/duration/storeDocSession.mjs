@@ -10,9 +10,16 @@
 import { Repo } from '@automerge/automerge-repo'
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
 
+/** engine#560: a loop turn this much later than its 100 ms sleep means the thread was blocked (credited). */
+const BLOCK_CREDIT_MIN_MS = 1_000
+
 /** io: { post(m), onMessage(fn), exit(code) } — a worker's parentPort or a doc-host channel. */
 export async function startStoreDocSession(workerData, io) {
     const { url, docId, logicalId, deadline, handshakeMs, peerId, snapshotMs = 500, memEveryMs = 15_000, syncWaitMs = 1_000 } = workerData
+    // engine#560: time this thread was BLOCKED (applying a big first sync — of this doc or of another link on the
+    // shared doc-host) does not count against the doc wait; it is credited up to hardDeadline (default: no credit).
+    const hardDeadline = Math.max(deadline, Number(workerData.hardDeadline) || deadline)
+    let blockedCreditMs = 0
     const post = (m) => { try { io.post(m) } catch { /* parent gone */ } }
     const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
@@ -91,13 +98,22 @@ export async function startStoreDocSession(workerData, io) {
             handle = repo.findWithProgress(docId).handle
             const summary = () => `${syncMsgs} sync msg(s) for the doc, ${drops} WS drop(s), handle ${handle.state}`
             let unavailableSince = null
-            while (Date.now() < deadline) {
+            let budget = deadline
+            let last = Date.now()
+            while (Date.now() < budget) {
                 if (handle.isReady()) return { kind: 'ready' }
                 if (repo.peers.length > 0 && docUnavailable && handle.state === 'unavailable') {
                     unavailableSince ??= Date.now()
                     if (Date.now() - unavailableSince >= 1_500) return { kind: 'doc-unavailable', detail: `engine answered doc-unavailable; ${summary()}` }
                 } else unavailableSince = null
                 await sleep(100)
+                const now = Date.now(), blocked = now - last - 100
+                last = now
+                if (blocked >= BLOCK_CREDIT_MIN_MS) {
+                    const add = Math.min(blocked, Math.max(0, hardDeadline - budget))
+                    blockedCreditMs += add
+                    budget += add
+                }
             }
             if (handle.isReady()) return { kind: 'ready' }
             if (repo.peers.length === 0) return { kind: 'ws-closed', detail: summary() }
@@ -208,8 +224,8 @@ export async function startStoreDocSession(workerData, io) {
             handle.on('change', scheduleSnapshot)
             // r86q: a re-established peer re-syncs this handle; push a fresh snapshot once it has.
             ns.on('peer', () => { if (!closing) scheduleSnapshot() })
-            post({ event: 'outcome', kind: 'ready', tookMs: Date.now() - started, ...snapshot() })
-        } else post({ event: 'outcome', ...out, tookMs: Date.now() - started })
+            post({ event: 'outcome', kind: 'ready', tookMs: Date.now() - started, blockedCreditMs, ...snapshot() })
+        } else post({ event: 'outcome', ...out, tookMs: Date.now() - started, blockedCreditMs })
     }
     return { stop: () => { closing = true; if (memTimer) clearInterval(memTimer); if (snapTimer) clearTimeout(snapTimer); return Promise.resolve().then(() => repo.shutdown()).catch(() => {}) } }
 }
