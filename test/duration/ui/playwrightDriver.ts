@@ -42,6 +42,13 @@ import {
     type SurfacePage,
 } from './consoleSurface.js'
 import { ActiveTabTracker, captureFrameFrom, followContextTabs, type TrackablePage } from './activeTab.js'
+import {
+    assertKolibriSession,
+    kolibriSessionHint,
+    resetKolibriSession,
+    type SessionContext,
+    type SessionPage,
+} from './kolibriSession.js'
 
 export interface PlaywrightUiOptions {
     baseUrl?: string
@@ -410,7 +417,38 @@ export class PlaywrightUiDriver implements UiDriver {
             const consolePage = this.page as SurfacePage
             const leftover = await prepareConsoleSurface(ctx.action, consolePage, tabs)
             await prepareNextcloudSignIn(ctx.action, consolePage, tabs)
-            const result = await bridge.runDurationIntent(runOpts)
+            // FAIL@403 (random-mixed-fd72ee8-7cbaf60-markov): one context for every role, so a learner01 Kolibri
+            // cookie survived into open_kolibri_as_teacher. Role-entry Kolibri Intents start from a fresh session.
+            const kolibriCtx = this.context as unknown as SessionContext | null
+            const kolibriReset = await resetKolibriSession(
+                ctx.action, kolibriCtx, consolePage as SessionPage, tabs as SessionPage[])
+            let result = await bridge.runDurationIntent(runOpts)
+            let kolibriNote = ''
+            if (kolibriReset) {
+                const sessionPages = () => this.contextPages() as unknown as SessionPage[]
+                const active = () => this.activePage() as SessionPage | null
+                const check = async (): Promise<string> =>
+                    assertKolibriSession(ctx.action, kolibriCtx?.request, active(), sessionPages())
+                // Third state (signed in, but not as the requested role): fresh session, then log in once more.
+                let wrong = ''
+                if (result.ok) {
+                    try { kolibriNote = await check() } catch (e) { wrong = (e as Error).message }
+                } else {
+                    const hint = await kolibriSessionHint(ctx.action, kolibriCtx?.request, active(), sessionPages())
+                    if (hint.includes('wrong Kolibri session')) wrong = hint.trim()
+                    else result = { ...result, message: `${result.message ?? 'failed'}${hint}` }
+                }
+                if (wrong) {
+                    await resetKolibriSession(ctx.action, kolibriCtx, consolePage as SessionPage, sessionPages())
+                    result = await bridge.runDurationIntent(runOpts)
+                    if (result.ok) {
+                        kolibriNote = `${await check()} after re-login (${wrong})`
+                    } else {
+                        const hint = await kolibriSessionHint(ctx.action, kolibriCtx?.request, active(), sessionPages())
+                        result = { ...result, message: `${result.message ?? 'failed'}${hint} (re-login after ${wrong})` }
+                    }
+                }
+            }
 
             // Post-Intent capture of the active tab (success or fail — useful for debugging).
             if (ctx.screenshotPath) {
@@ -442,7 +480,8 @@ export class PlaywrightUiDriver implements UiDriver {
             return {
                 ok: true,
                 mode: 'playwright',
-                message: `runDurationIntent ok: ${ctx.action}${leftover ? ` (${leftover})` : ''}`,
+                message: `runDurationIntent ok: ${ctx.action}${leftover ? ` (${leftover})` : ''}` +
+                    `${kolibriReset ? ` (${kolibriReset}; ${kolibriNote})` : ''}`,
             }
         } catch (err) {
             const raw = err instanceof Error ? err.message : String(err)
