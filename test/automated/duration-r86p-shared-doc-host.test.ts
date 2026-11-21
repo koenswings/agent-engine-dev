@@ -49,6 +49,12 @@ const startEngine = async (name: string, ops: number, clTraces: number) => {
          *  socket stays OPEN, but nothing (no ping) is answered any more — a stale peer, as in the pool. */
         freezeSockets: () => { for (const s of sockets) { try { (s as any)._socket.pause() } catch { /* */ } } },
         dropSockets: () => { for (const s of sockets.splice(0)) { try { s.terminate() } catch { /* */ } } },
+        /** engine#557: the Engine silently stops pushing the store doc to every connected walker peer (link
+         *  and socket stay up, pings answered) — the frozen replica of Markov step 91. */
+        stopPushing: () => {
+            const ds = (repo as any).synchronizer.docSynchronizers[store.documentId]
+            for (const p of repo.peers) ds.endSync(p)
+        },
         close: async () => { for (const s of sockets) { try { s.terminate() } catch { /* */ } } await repo.shutdown().catch(() => {}); wss.close(); await new Promise<void>(r => server.close(() => r())) },
     }
 }
@@ -186,6 +192,27 @@ describe('r86p: one shared doc-host worker for all walker Automerge links', () =
             await link.close(); await bystander.close(); await e.close(); await other.close()
         }
     }, 60_000)
+
+    it('engine#557: reattach runs a real sync round — a replica the Engine stopped pushing to catches up', async () => {
+        delete process.env.DURATION_DOC_HOST
+        const e = await startEngine('idea04', 30, 1)
+        const link = openStore(e)
+        try {
+            expect((await link.outcome()).kind).toBe('ready')
+            expect(await link.reattach(5_000)).toBe(true)
+            e.stopPushing()
+            e.store.change(d => { d.instanceDB.k1 = { id: 'k1', status: 'Running' } })
+            await sleep(1_500) // nothing is pushed: the walker's replica stays behind
+            expect((link.doc() as any).instanceDB.k1).toBeUndefined()
+            const before = JSON.stringify(link.heads())
+            // step-91 shape: the link is up and answers pings; before engine#557 reattach only re-read the stale replica
+            expect(await link.reattach(5_000)).toBe(true)
+            expect(link.lastSyncRound).toBe('answered')
+            expect((link.doc() as any).instanceDB.k1).toEqual({ id: 'k1', status: 'Running' })
+            expect(JSON.stringify(link.heads())).not.toBe(before)
+            expect(JSON.stringify(link.heads())).toBe(JSON.stringify(e.store.heads()))
+        } finally { await link.close(); await e.close() }
+    }, 30_000)
 
     it('r86q: reattach always answers — false with a reason when the Engine stays down', async () => {
         const e = await startEngine('idea04', 20, 1)

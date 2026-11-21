@@ -83,6 +83,8 @@ export class StoreDocLink {
                 peerId: `duration-${o.logicalId}-${Date.now()}`,
                 snapshotMs: Number(process.env.DURATION_STORE_SNAPSHOT_MS ?? 500),
                 memEveryMs: Number(process.env.DURATION_WORKER_MEM_MS ?? 15_000),
+                // engine#557: how long a reattach waits for the Engine's answer to its sync round
+                syncWaitMs: Number(process.env.DURATION_REATTACH_SYNC_WAIT_MS ?? 1_000),
         }
         // r86p: all links share one doc-host thread (one Automerge WASM) unless DURATION_DOC_HOST=per-link.
         this.worker = perLinkWorkers() ? new Worker(STORE_DOC_WORKER_URL, { workerData: data, execArgv: [] }) : sharedDocHost.open('store', data)
@@ -100,6 +102,7 @@ export class StoreDocLink {
                 if (!p) return
                 this.pending.delete(m.id)
                 clearTimeout(p.timer)
+                if (typeof m.syncRound === 'string') this.lastSyncRound = m.syncRound
                 if (m.ok) { this.take(m); p.resolve() } else p.reject(new Error(String(m.error)))
                 return
             }
@@ -161,6 +164,8 @@ export class StoreDocLink {
      * `ms` + 2 s, also when the worker never answers.
      */
     lastReattachError: string | null = null
+    /** engine#557: outcome of the last reattach's sync round ('answered' | 'no-answer' | 'unavailable' | 'failed: …'). */
+    lastSyncRound: string | null = null
     reattach(ms: number): Promise<boolean> {
         if (this.dead) { this.lastReattachError = this.dead.message; return Promise.resolve(false) }
         const id = this.nextId++

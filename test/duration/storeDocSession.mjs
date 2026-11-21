@@ -12,7 +12,7 @@ import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websoc
 
 /** io: { post(m), onMessage(fn), exit(code) } — a worker's parentPort or a doc-host channel. */
 export async function startStoreDocSession(workerData, io) {
-    const { url, docId, logicalId, deadline, handshakeMs, peerId, snapshotMs = 500, memEveryMs = 15_000 } = workerData
+    const { url, docId, logicalId, deadline, handshakeMs, peerId, snapshotMs = 500, memEveryMs = 15_000, syncWaitMs = 1_000 } = workerData
     const post = (m) => { try { io.post(m) } catch { /* parent gone */ } }
     const sleep = (ms) => new Promise(r => setTimeout(r, ms))
 
@@ -148,12 +148,38 @@ export async function startStoreDocSession(workerData, io) {
                 }
                 return false
             }
+            // engine#557 (Markov step 91): a ready handle + a live socket only proves the link is up, not that
+            // this replica caught up — after a shared doc-host block the idea04 replica stayed stale while its
+            // Engine had the data. So a reattach runs ONE real sync round: restart the doc synchronizer's sync
+            // with the Engine peer (resets the in-flight sync state, sends our heads; the Engine answers with
+            // what we lack), wait briefly for its answer, then snapshot.
+            let round = null
+            const startRound = () => {
+                const peerId = repo.peers[0]
+                const ds = repo.synchronizer?.docSynchronizers?.[handle.documentId]
+                if (!peerId || typeof ds?.beginSync !== 'function') return { state: 'unavailable', answered: false }
+                const r = { state: 'sent', answered: false, until: Date.now() + syncWaitMs }
+                const onMsg = (msg) => {
+                    if (msg?.documentId === handle.documentId && msg.senderId === peerId && msg.type === 'sync') { r.answered = true; ns.off('message', onMsg) }
+                }
+                r.off = () => ns.off('message', onMsg)
+                ns.on('message', onMsg)
+                try { void ds.beginSync([peerId]) } catch (e) { r.off(); return { state: `failed: ${e?.message ?? e}`, answered: false } }
+                return r
+            }
             const tick = () => {
-                if (closing) return post({ id, ok: false, error: 'session closing' })
+                if (closing) { round?.off?.(); return post({ id, ok: false, error: 'session closing' }) }
                 const ready = !!handle?.isReady(), peer = repo.peers.length > 0 && live()
                 if (ready && peer) {
-                    try { return post({ id, ok: true, reattached: true, tookMs: Date.now() - t0, ...snapshot() }) }
-                    catch (e) { return post({ id, ok: false, error: `snapshot: ${e?.message ?? e}` }) }
+                    round ??= startRound()
+                    if (round.state === 'sent' && !round.answered && Date.now() < Math.min(round.until, until)) return setTimeout(tick, 20)
+                    round.off?.()
+                    // the answer is applied before the next macrotask; give it one turn before the snapshot
+                    return setImmediate(() => {
+                        const syncRound = round.state === 'sent' ? (round.answered ? 'answered' : 'no-answer') : round.state
+                        try { return post({ id, ok: true, reattached: true, syncRound, tookMs: Date.now() - t0, ...snapshot() }) }
+                        catch (e) { return post({ id, ok: false, error: `snapshot: ${e?.message ?? e}` }) }
+                    })
                 }
                 if (Date.now() >= until) return post({ id, ok: false, error: `reattach: ${peer ? 'WS open' : 'no WS peer'}, handle ${handle?.state ?? 'none'} after ${Date.now() - t0}ms` })
                 setTimeout(tick, 100)

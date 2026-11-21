@@ -5,7 +5,7 @@
  * through the f702e6a reattach path; a slow-but-recovering host gets more time (bounded); never a fresh sync.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { RealFleetOps } from '../duration/realFleetOps.js'
+import { RealFleetOps, freshRecheckMs } from '../duration/realFleetOps.js'
 import { reconnectEvents, resetReconnectEvents } from '../duration/staleView.js'
 
 type FakeLink = { alive: boolean; heads: string[]; lastReattachError: string | null; reattach: ReturnType<typeof vi.fn>; hostState: () => string; doc: () => unknown }
@@ -92,5 +92,43 @@ describe('r86r: refreshView re-syncs the existing store link', () => {
         expect(await f.refreshView('idea01', 'stale view')).toBe(true)
         expect(link.reattach).not.toHaveBeenCalled()
         expect(connect).toHaveBeenCalledWith('idea01', true)
+    })
+    it('reattach records the sync round of the link (engine#557)', async () => {
+        const link = mkLink([{ ok: true, blocked: false, heads: ['bbbbbbbb22'] }]) as FakeLink & { lastSyncRound?: string }
+        link.lastSyncRound = 'answered'
+        const { f } = fleet(link)
+        expect(await f.refreshView('idea01', 'stale view')).toBe(true)
+        expect(reconnectEvents()[0]).toMatchObject({ mode: 'reattach', syncRound: 'answered' })
+        expect(logs.some(l => /"mode":"reattach","sync_round":"answered"/.test(l))).toBe(true)
+    })
+})
+
+describe('engine#557: refreshView(fresh) — the convergence re-check is always a fresh link', () => {
+    afterEach(() => { delete process.env.DURATION_FRESH_RECHECK_MS })
+    it('alive link: no reattach, connect(forceNew) replaces it, recorded mode=fresh', async () => {
+        const link = mkLink([{ ok: true, blocked: false }])
+        const { f, connect } = fleet(link)
+        connect.mockImplementation(async () => ({ storeHandle: { heads: () => ['ffffffff66'] } }) as never)
+        expect(await f.refreshView('idea04', 'convergence: only idea04 off the majority', { fresh: true })).toBe(true)
+        expect(link.reattach).not.toHaveBeenCalled()
+        expect(connect).toHaveBeenCalledWith('idea04', true)
+        expect(reconnectEvents()[0]).toMatchObject({ engine: 'idea04', mode: 'fresh', foundNew: true })
+    })
+    it('fresh link not ready within DURATION_FRESH_RECHECK_MS → null, recorded mode=failed with the bound', async () => {
+        process.env.DURATION_FRESH_RECHECK_MS = '60'
+        const link = mkLink([])
+        const { f, connect } = fleet(link)
+        connect.mockImplementation(() => new Promise(() => {}) as never)
+        const t0 = Date.now()
+        expect(await f.refreshView('idea04', 'convergence', { fresh: true })).toBeNull()
+        expect(Date.now() - t0).toBeLessThan(1_000)
+        const ev = reconnectEvents()[0]!
+        expect(ev).toMatchObject({ foundNew: null, mode: 'failed' })
+        expect(ev.error).toMatch(/fresh re-check: fresh link to idea04 not ready within 60ms/)
+    })
+    it('freshRecheckMs: default 180 s, env override, junk ignored', () => {
+        expect(freshRecheckMs({})).toBe(180_000)
+        expect(freshRecheckMs({ DURATION_FRESH_RECHECK_MS: '90000' })).toBe(90_000)
+        expect(freshRecheckMs({ DURATION_FRESH_RECHECK_MS: 'x' })).toBe(180_000)
     })
 })

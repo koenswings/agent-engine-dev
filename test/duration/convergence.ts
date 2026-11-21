@@ -141,11 +141,16 @@ export const formatSemanticDivergence = (views: SemanticStoreView[]): string => 
     return `semantic fields diverge: ${lines.join('; ')}`
 }
 
+/** engine#557: what the fresh-link re-check of a lone lagging view showed. */
+export type FreshRecheckOutcome = 'stale-view-recovered' | 'genuine-divergence' | 'fresh-link-failed'
+
 export interface ConvergenceResult {
     ok: boolean
     elapsedMs: number
     reason?: string
     views?: SemanticStoreView[]
+    /** engine#557: set when a lone lagging view was re-checked over a fresh link during this wait. */
+    recheck?: { engine: string; outcome: FreshRecheckOutcome }
 }
 
 /** Order-independent key of a semantic view (same fields as semanticStoresEqual). */
@@ -215,6 +220,7 @@ export const waitForConvergence = async (
     const lastKey = new Map<string, { key: string; since: number }>()
     let deadline = start + timeoutMs
     let extended = false
+    let recheck: ConvergenceResult['recheck'] | null = null
     while (Date.now() < deadline) {
         const views = await Promise.all(engineIds.map(id => ops.readStore(id)))
         const [first, ...rest] = views
@@ -233,7 +239,19 @@ export const waitForConvergence = async (
             const since = lastKey.get(id)!.since
             if (!refreshed.has(id) && now - since >= staleAfterMs) {
                 refreshed.add(id)
-                await ops.refreshView(id, `convergence: only ${id} off the majority, view unchanged ${Math.round((now - since) / 1000)}s`)
+                // engine#557 (Markov step 91, 6e232f5): the lagging view was the walker's own replica on a link
+                // that froze while the shared doc-host was blocked; a reattach only re-read that replica. The
+                // re-check is a FRESH link (new Repo + peerId, bounded, the stale link closed) to that Engine.
+                const t0 = Date.now()
+                const foundNew = await ops.refreshView(id, `convergence: only ${id} off the majority, view unchanged ${Math.round((now - since) / 1000)}s`, { fresh: true })
+                const after = await Promise.all(engineIds.map(e => ops.readStore(e)))
+                const [a0, ...aRest] = after
+                const agrees = !!a0 && aRest.every(v => semanticStoresEqual(a0, v))
+                const outcome: FreshRecheckOutcome = agrees ? 'stale-view-recovered' : foundNew === null ? 'fresh-link-failed' : 'genuine-divergence'
+                recheck = { engine: id, outcome }
+                console.log(JSON.stringify({ event: 'convergence_fresh_recheck', engine: id, outcome, found_new: foundNew, took_ms: Date.now() - t0,
+                    ...(agrees ? {} : { divergence: formatSemanticDivergence(after) }) }))
+                if (agrees) return { ok: true, elapsedMs: Date.now() - start, views: after, recheck }
                 if (!extended) {
                     extended = true
                     deadline = Math.max(deadline, Date.now() + Math.min(extraMs, timeoutMs))
@@ -246,10 +264,14 @@ export const waitForConvergence = async (
 
     const views = await Promise.all(engineIds.map(id => ops.readStore(id)))
     const dump = formatSemanticDivergence(views)
+    const label = recheck === null ? '' : recheck.outcome === 'genuine-divergence'
+        ? ` (genuine divergence: a fresh link to ${recheck.engine} still disagrees)`
+        : recheck.outcome === 'fresh-link-failed' ? ` (fresh link to ${recheck.engine} failed; its view could not be re-checked)` : ''
     return {
         ok: false,
         elapsedMs: Date.now() - start,
-        reason: `stores did not converge within ${timeoutMs}ms across [${engineIds.join(', ')}]: ${dump}`,
+        reason: `stores did not converge within ${timeoutMs}ms across [${engineIds.join(', ')}]${label}: ${dump}`,
         views,
+        ...(recheck ? { recheck } : {}),
     }
 }

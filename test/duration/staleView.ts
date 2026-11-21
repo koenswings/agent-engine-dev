@@ -22,6 +22,8 @@ export interface ReconnectEvent {
     error?: string
     /** r86r: 'reattach' = existing off-thread link re-synced in its worker; 'fresh' = new connection. */
     mode?: 'reattach' | 'fresh' | 'failed'
+    /** engine#557: the reattach's sync round with the Engine ('answered' | 'no-answer' | 'unavailable' | 'failed: …'). */
+    syncRound?: string
 }
 
 const events: ReconnectEvent[] = []
@@ -32,6 +34,7 @@ export const recordReconnect = (e: ReconnectEvent, log: (line: string) => void =
         event: 'stale_view_reconnect', n: events.length, engine: e.engine, at: new Date(e.at).toISOString(),
         reason: e.reason, found_new: e.foundNew, took_ms: e.tookMs, before_heads: e.beforeHeads, after_heads: e.afterHeads,
         ...(e.mode ? { mode: e.mode } : {}),
+        ...(e.syncRound ? { sync_round: e.syncRound } : {}),
         ...(e.error ? { error: e.error } : {}),
     }))
 }

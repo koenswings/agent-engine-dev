@@ -2342,11 +2342,14 @@ export class RealFleetOps implements FleetOps {
      * whether it sees data the cached view lacked (heads differ). EVERY call is recorded (staleView.ts):
      * run.log line, RECONNECTS.md, duration_summary. Returns foundNew (null when the reconnect failed).
      */
-    async refreshView(engineId: string, reason: string): Promise<boolean | null> {
+    async refreshView(engineId: string, reason: string, opts?: { fresh?: boolean }): Promise<boolean | null> {
         this.assertNotExcluded(engineId, 'refreshView')
         const t0 = Date.now()
         const old = this.conns.get(engineId)
         const beforeHeads = old ? headsKey(this.headsOf(old)) : 'no-conn'
+        // engine#557: the convergence guard's one re-check of a lone lagging view is always a FRESH link
+        // (new Repo + peerId; connect(forceNew) closes the stale one), bounded by freshRecheckMs().
+        if (opts?.fresh) return this.refreshFresh(engineId, reason, t0, beforeHeads)
         // r86r (r86q FAIL@42, Steve): an alive off-thread link is RE-SYNCED in its worker (f702e6a reattach),
         // never replaced by connect(forceNew) — a fresh Repo is a full first sync of 3zoqd (~58 s on a Pi) on
         // an already busy store host. A slow host (heartbeat late but recovering) gets more time, bounded by
@@ -2359,7 +2362,8 @@ export class RealFleetOps implements FleetOps {
                 const afterHeads = headsKey(this.headsOf(old!))
                 const foundNew = afterHeads !== beforeHeads
                 this.viewSeen.set(engineId, { heads: afterHeads, changedAt: Date.now() })
-                recordReconnect({ engine: engineId, at: t0, reason, foundNew, beforeHeads, afterHeads, tookMs: Date.now() - t0, mode: 'reattach' })
+                recordReconnect({ engine: engineId, at: t0, reason, foundNew, beforeHeads, afterHeads, tookMs: Date.now() - t0, mode: 'reattach',
+                    ...(link.lastSyncRound ? { syncRound: link.lastSyncRound } : {}) })
                 return foundNew
             }
             if (r.hostBlocked) {
@@ -2382,6 +2386,36 @@ export class RealFleetOps implements FleetOps {
                 error: e instanceof Error ? e.message : String(e),
             })
             return null
+        }
+    }
+
+    /**
+     * engine#557: replace the cached link of `engineId` by a fresh one, bounded by freshRecheckMs()
+     * (DURATION_FRESH_RECHECK_MS, default 180 s). Recorded like every refresh (mode 'fresh', or 'failed').
+     */
+    private async refreshFresh(engineId: string, reason: string, t0: number, beforeHeads: string): Promise<boolean | null> {
+        const boundMs = freshRecheckMs()
+        let timer: NodeJS.Timeout | undefined
+        const connecting = this.connect(engineId, true)
+        connecting.catch(() => { /* judged below, or after the bound by the next connect */ })
+        try {
+            const fresh = await Promise.race([
+                connecting,
+                new Promise<never>((_, rej) => { timer = setTimeout(() => rej(new Error(`fresh link to ${engineId} not ready within ${boundMs}ms`)), boundMs) }),
+            ])
+            const afterHeads = headsKey(this.headsOf(fresh))
+            const foundNew = afterHeads !== beforeHeads
+            this.viewSeen.set(engineId, { heads: afterHeads, changedAt: Date.now() })
+            recordReconnect({ engine: engineId, at: t0, reason, foundNew, beforeHeads, afterHeads, tookMs: Date.now() - t0, mode: 'fresh' })
+            return foundNew
+        } catch (e) {
+            recordReconnect({
+                engine: engineId, at: t0, reason, foundNew: null, beforeHeads, afterHeads: 'n/a', tookMs: Date.now() - t0, mode: 'failed',
+                error: `fresh re-check: ${e instanceof Error ? e.message : String(e)}`,
+            })
+            return null
+        } finally {
+            if (timer) clearTimeout(timer)
         }
     }
 
@@ -3890,4 +3924,10 @@ export class RealFleetOps implements FleetOps {
 
     getDisksRoot(): string { return this.disksRoot }
     getWatchDir(): string { return this.watchDir }
+}
+
+/** engine#557: bound of the convergence guard's fresh-link re-check. DURATION_FRESH_RECHECK_MS overrides (default 180 s). */
+export const freshRecheckMs = (env: NodeJS.ProcessEnv = process.env): number => {
+    const raw = env.DURATION_FRESH_RECHECK_MS?.trim()
+    return raw && /^\d+$/.test(raw) && Number(raw) > 0 ? Number(raw) : 180_000
 }
