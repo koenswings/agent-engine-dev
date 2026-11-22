@@ -2,6 +2,7 @@ import { log } from './utils/utils.js';
 import { startEngine } from "./start.js";
 import { chalk } from "zx";
 import { staleStoreExitPending } from './data/StaleDocGuard.js';
+import { recordStartupFailure } from './data/StartupFailure.js';
 
 const main = async () => {
     try {
@@ -14,6 +15,8 @@ const main = async () => {
         console.error(error);
         // engine#512: a stale store doc already started a clean exit with its own code (75)
         if (staleStoreExitPending()) return;
+        // engine#567: count this failed start in logs/engine-startup-failure.json (published at the next good start)
+        recordStartupFailure(error);
         process.exit(1); // Exit with an error code if startup fails
     }
 

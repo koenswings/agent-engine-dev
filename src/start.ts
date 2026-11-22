@@ -10,6 +10,8 @@ import { $, chalk, fs, sleep } from 'zx'
 import { deepPrint, log, print } from './utils/utils.js'
 import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
 import { warnIfTestFailUpdateRestartIgnored } from './data/UpdateAppTestHook.js'
+import { takeStartupFailure, publishStartupFailure } from './data/StartupFailure.js'
+import { StoreSelfHeal, publishStoreSelfHeal } from './data/StoreHealth.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkCrossEngineResumeCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
@@ -161,7 +163,9 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     })
 
     log(`Initialising store`)
-    const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, storeIdentity.templatePath)
+    // engine#567: bad chunks are quarantined and the doc rebuilt/merged from the template; reported below
+    const storeSelfHeal: { value: StoreSelfHeal | null } = { value: null }
+    const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, storeIdentity.templatePath, { onSelfHeal: (h) => { storeSelfHeal.value = h } })
     staleGuard.watchStoreHandle(storeHandle)
 
     // backupCleanup capability: one helper version check, never fatal (idea#400 §3.1).
@@ -173,6 +177,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     // Create or update the local engine object
     const engine = await createOrUpdateEngine(storeHandle, localEngineId)
+    if (storeSelfHeal.value) publishStoreSelfHeal(storeHandle, String(localEngineId), storeSelfHeal.value)
     await storeHandle.whenReady()
     await import('./data/DemoApps.js').then(m => m.refreshDemoHb(storeHandle, String(localEngineId))).catch(e => log(`demo hb: ${e}`))
     const store = storeHandle.doc()
@@ -224,7 +229,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     // Create the command log store and initialise the console patcher
     log(chalk.bgMagenta('STARTING COMMAND LOG STORE'))
-    const commandLogHandle = await createCommandLogStore(repo, { storeTag: storeTag(storeDocId), engineId: String(localEngineId) })
+    const commandLogHandle = await createCommandLogStore(repo, { storeTag: storeTag(storeDocId), engineId: String(localEngineId), storeDataDir: STORE_DATA_PATH })
     initCommandLogger(commandLogHandle)
     // idea#183: fresh CommandLog doc each local day, previous one archived
     startCommandLogRotation(repo)
@@ -360,6 +365,10 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         archiveOldOperations(storeHandle).catch(e => print(chalk.red(`archive operations: ${e}`)))
         peerAccess.onHeartbeat().catch(e => print(chalk.red(`peer access heartbeat: ${e}`)))
     })
+
+    // engine#567: this start came up; publish (once) and archive the crash-loop marker
+    const startupFailure = takeStartupFailure()
+    if (startupFailure) publishStartupFailure(storeHandle, String(localEngineId), startupFailure)
 
 
 }

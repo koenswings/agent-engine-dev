@@ -7,6 +7,8 @@ scratchpad/
 
 # Store-data folder
 store-data/
+# engine#567: bad Automerge chunk files moved out of store-data (never deleted)
+store-data-quarantine/
 
 # The Yjs persistent storage folder
 yjs-db

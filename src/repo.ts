@@ -1,5 +1,5 @@
 import { Repo, PeerMetadata, PeerId } from "@automerge/automerge-repo";
-import { NodeFSStorageAdapter } from "@automerge/automerge-repo-storage-nodefs";
+import { DurableNodeFSStorageAdapter } from "./data/DurableStorageAdapter.js";
 import { ThreadedWebSocketServerAdapter } from "./wsServerThread.js";
 import { PortNumber } from "./data/CommonTypes.js";
 import { deepPrint, log, error } from './utils/utils.js'
@@ -146,7 +146,9 @@ export const startAutomergeServer = async (dataDir:string, port:PortNumber, iden
     log(`Using data directory: ${dataDir}`);
 
     // 1. Create a storage adapter for the server to persist data.
-    const storage = new NodeFSStorageAdapter(dataDir);
+    // engine#567: durable writes (temp, fsync, rename, folder fsync) and 0-byte chunks
+    // quarantined on load; same on-disk layout as NodeFSStorageAdapter.
+    const storage = new DurableNodeFSStorageAdapter(dataDir);
 
     // 2. Create the WebSocket server.
     // IDEA04-WS: the server runs in a worker thread (wsServerThread.ts) so that

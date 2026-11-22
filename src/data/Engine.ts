@@ -9,6 +9,8 @@ import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
 import { Store, getAppsOfEngine, getDisksOfEngine, getInstancesOfEngine } from './Store.js';
 import { DocHandle } from '@automerge/automerge-repo';
+import type { StartupFailureRecord } from './StartupFailure.js';
+import type { StoreSelfHeal } from './StoreHealth.js';
 import { currentLanSelection, lanChangeLines, LanSelection } from './LanAddress.js';
 import type { NewDisk, CardReader, ClientCard, DiskCandidate } from './ClientCards.js';
 import type { ClientImageStore } from './ClientImages.js';
@@ -73,6 +75,17 @@ export interface Engine {
    * Optional: do not add to store-template.json.
    */
   tempBackups?: TempBackupPublic[];
+  /**
+   * engine#567: the last crash loop at startup, from logs/engine-startup-failure.json,
+   * published at the next good start (StartupFailure.ts). Absent if there never was one.
+   * Optional: do not add to store-template.json.
+   */
+  lastStartupFailure?: StartupFailureRecord | null;
+  /**
+   * engine#567: the last time the startup guard repaired the store doc (bad chunks
+   * quarantined, rebuilt or merged from store-template.json). Optional: not in the template.
+   */
+  lastStoreSelfHeal?: StoreSelfHeal | null;
 }
 
 /** Engine.tempBackups entry (console#230 option A / deleteTempBackup). */
@@ -443,6 +456,12 @@ export const createOrUpdateEngine = async (storeHandle: DocHandle<Store>, engine
   const lanSel = currentLanSelection()
   const newEngine: Engine = await initialiseLocalEngine(lanSel)
   let engine: Engine
+  // engine#567: without engineDB there is nowhere to put this Engine. Never create the
+  // map here: a new top-level map would conflict with the one in every peer's copy.
+  if (!storeHandle.doc()?.engineDB) {
+    log(chalk.red(`Error initializing engine ${engineId}: the store doc has no engineDB (engine#567); not writing it`))
+    return undefined
+  }
   try {
     // The lanAddress / lanAddresses change lines, same format as the heartbeat's (Liveness.ts)
     for (const l of lanChangeLines(storeHandle.doc()?.engineDB?.[engineId] ?? {}, lanSel)) log(l)
@@ -512,21 +531,29 @@ export const localEngineId: EngineID = process.env.IDEA_IMAGE_BUILD === '1' ? un
 export const cleanupPhantomEngines = (storeHandle: DocHandle<Store>): void => {
   const store = storeHandle.doc()
   const localHostname = os.hostname() as Hostname
-  const validEngineIds = new Set(Object.keys(store.engineDB))
+  // engine#567: read-only defaults; a store doc without these maps must never throw here
+  // (kind-panda crash-looped 817x on Object.keys(undefined)). Nothing is written for them.
+  const engineDB = (store?.engineDB ?? {}) as Store['engineDB']
+  const diskDB = (store?.diskDB ?? {}) as Store['diskDB']
+  if (!store?.engineDB || !store?.diskDB) {
+    log(chalk.red(`[cleanup] store doc has no ${!store?.engineDB ? 'engineDB' : 'diskDB'}: phantom cleanup skipped (engine#567)`))
+    return
+  }
+  const validEngineIds = new Set(Object.keys(engineDB))
 
   // Engines with this hostname but a different id than localEngineId
-  const phantomEngineKeys = Object.keys(store.engineDB).filter(key => {
-    const eng = store.engineDB[key]
+  const phantomEngineKeys = Object.keys(engineDB).filter(key => {
+    const eng = engineDB[key]
     return (
-      (eng.hostname === localHostname && key !== String(localEngineId)) ||
-      (eng.id && String(eng.id) !== key)   // key/id mismatch — CRDT anomaly
+      (eng?.hostname === localHostname && key !== String(localEngineId)) ||
+      (eng?.id && String(eng.id) !== key)   // key/id mismatch — CRDT anomaly
     )
   })
 
   // Disks whose dockedTo points to an engine key that no longer exists
-  const orphanDiskKeys = Object.keys(store.diskDB).filter(key => {
-    const disk = store.diskDB[key]
-    return disk.dockedTo && !validEngineIds.has(String(disk.dockedTo))
+  const orphanDiskKeys = Object.keys(diskDB).filter(key => {
+    const disk = diskDB[key]
+    return disk?.dockedTo && !validEngineIds.has(String(disk.dockedTo))
   })
 
   if (phantomEngineKeys.length === 0 && orphanDiskKeys.length === 0) {
@@ -535,8 +562,8 @@ export const cleanupPhantomEngines = (storeHandle: DocHandle<Store>): void => {
   }
 
   log(chalk.yellow(`[cleanup] Removing ${phantomEngineKeys.length} phantom engine(s) and ${orphanDiskKeys.length} orphan disk(s) from store`))
-  for (const k of phantomEngineKeys) log(chalk.yellow(`  phantom engine: ${k} (hostname=${store.engineDB[k].hostname}, id=${store.engineDB[k].id})`))
-  for (const k of orphanDiskKeys) log(chalk.yellow(`  orphan disk: ${k} (dockedTo=${store.diskDB[k].dockedTo})`))
+  for (const k of phantomEngineKeys) log(chalk.yellow(`  phantom engine: ${k} (hostname=${engineDB[k]?.hostname}, id=${engineDB[k]?.id})`))
+  for (const k of orphanDiskKeys) log(chalk.yellow(`  orphan disk: ${k} (dockedTo=${diskDB[k]?.dockedTo})`))
 
   storeHandle.change(doc => {
     for (const k of phantomEngineKeys) {
