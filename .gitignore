@@ -9,6 +9,8 @@ scratchpad/
 store-data/
 # engine#567: bad Automerge chunk files moved out of store-data (never deleted)
 store-data-quarantine/
+# engine#567: genesis record of the store doc (written once at the first good load)
+store-genesis.json
 
 # The Yjs persistent storage folder
 yjs-db

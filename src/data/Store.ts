@@ -3,7 +3,8 @@ import path from 'path'
 import { Engine, localEngineId } from './Engine.js'
 import { Disk } from './Disk.js'
 import { deepPrint, error, getKeys, log, print } from '../utils/utils.js'
-import { missingStoreMaps, quarantineBadChunks, StoreSelfHeal } from './StoreHealth.js'
+import { Descends, descendsFromTemplate, guardRefusedStore, missingStoreMaps, quarantineBadChunks, readStoreGenesis, recordStoreGenesis, storeGenesisPath, StoreSelfHeal, templateRootHashes } from './StoreHealth.js'
+import { next as A } from '@automerge/automerge'
 import { quarantineDirFor } from './StoreQuarantine.js'
 import { App } from './App.js'
 import { Instance } from './Instance.js'
@@ -43,10 +44,18 @@ export interface Store {
  * checked (StoreHealth.quarantineBadChunks); 0-byte or corrupt chunks are moved to
  * <store-data>-quarantine/<stamp>/ (never deleted). The document is then
  *   1. loaded from the usable chunks that are left, or
- *   2. when none are left (or there were none), created from store-template.json
- *      (read only, never written) under the same document ID.
+ *   2. created from store-template.json (read only, never written) under the same
+ *      document ID: a new store (no chunks, nothing recorded), or a lost one that is
+ *      known to descend from the template.
  * After loading, the template's top-level maps must be there; if one is missing the
  * template is merged into the loaded doc (same genesis, so a no-op for a healthy doc).
+ *
+ * Genesis guard: a template heal (2 for a lost store, or the merge) runs ONLY when the
+ * doc descends from the template: store-genesis.json (written once, at the first good
+ * load, next to store-data) says so, or the loaded doc contains the template's root
+ * change. Otherwise ('no' or 'unknown') the heal is REFUSED (STORE_HEAL_REFUSED): the
+ * doc stays as loaded (or empty), writes are skipped until peer sync brings the maps
+ * (guardRefusedStore), and `onStoreMapsArrived` runs then.
  * No map is ever assigned here. A self-heal is flushed at once and reported through
  * `onSelfHeal` (start.ts publishes it on this Engine's entry).
  *
@@ -56,15 +65,30 @@ export interface Store {
  */
 export const createServerStore = async (
     repo: Repo, storeDocId: DocumentId, storagePath: string, templatePath: string,
-    opts: { onSelfHeal?: (heal: StoreSelfHeal) => void } = {},
+    opts: { onSelfHeal?: (heal: StoreSelfHeal) => void, onStoreMapsArrived?: () => void } = {},
 ): Promise<DocHandle<Store>> => {
     const docPath = path.join(storagePath, storeDocId.slice(0, 2), storeDocId.slice(2));
     log(`Checking for store document at: ${docPath}`);
 
+    const templateBytes = await fs.readFile(templatePath)
+    const templateRoots = templateRootHashes(templateBytes)
+    const genesisFile = storeGenesisPath(storagePath)
+    const recorded = readStoreGenesis(genesisFile, storeDocId)
+    const recordedDescends: Descends | null = recorded ? (recorded.descendsFromTemplate ? 'yes' : 'no') : null
+
     const chunks = await quarantineBadChunks(storagePath, storeDocId)
     const quarantineDir = (): string | null => chunks.quarantined.length > 0 ? quarantineDirFor(storagePath) : null
     let heal: StoreSelfHeal | null = null
+    let refused = false
     let handle: DocHandle<Store>
+    const refuse = (descends: Descends, why: string): void => {
+        refused = true
+        heal = {
+            at: Date.now(), source: 'refused',
+            reason: `${why}; store ${descends === 'no' ? 'does not descend' : 'is not known to descend'} from store-template.json (${recorded ? 'recorded in store-genesis.json' : 'no store-genesis.json record'}): no template heal, waiting for peer sync`,
+            quarantined: chunks.quarantined.length, quarantineDir: quarantineDir(),
+        }
+    }
 
     if (chunks.good.length > 0) {
         // 1. Usable chunks in storage. Load them normally.
@@ -79,42 +103,63 @@ export const createServerStore = async (
         if (chunks.quarantined.length > 0) {
             heal = { at: Date.now(), source: 'chunks', reason: `${chunks.quarantined.length} bad chunk file(s) quarantined; loaded from ${chunks.good.length} usable chunk file(s)`, quarantined: chunks.quarantined.length, quarantineDir: quarantineDir() }
         }
-    } else {
-        // 2. No usable document data: create it from the template (same document ID),
-        // so its history is the shared genesis every Engine of this store has.
-        if (chunks.quarantined.length > 0) {
-            error(`[store-health] store ${storeDocId}: no usable chunks left after quarantine; rebuilding from ${templatePath} (engine#567)`)
-            heal = { at: Date.now(), source: 'template', reason: `all ${chunks.quarantined.length} chunk file(s) unusable; rebuilt from store-template.json`, quarantined: chunks.quarantined.length, quarantineDir: quarantineDir() }
-        } else {
-            log("Document not found. Creating from template to ensure consistent history.")
-        }
-        const templateBytes = await fs.readFile(templatePath);
+    } else if (chunks.quarantined.length === 0 && !recorded) {
+        // 2a. A new store: create it from the template (same document ID), so its history
+        // is the shared genesis every Engine of this store has.
+        log("Document not found. Creating from template to ensure consistent history.")
         handle = repo.import(templateBytes, { docId: storeDocId });
         log("Successfully imported an initial store document with id " + handle.url);
+    } else if (recordedDescends === 'yes') {
+        // 2b. A lost store that is known to descend from the template: rebuild from it.
+        error(`[store-health] store ${storeDocId}: no usable chunks left${chunks.quarantined.length ? ' after quarantine' : ''}; rebuilding from ${templatePath} (store-genesis.json: descends from the template; engine#567)`)
+        heal = { at: Date.now(), source: 'template', reason: `all ${chunks.quarantined.length} chunk file(s) unusable; rebuilt from store-template.json`, quarantined: chunks.quarantined.length, quarantineDir: quarantineDir() }
+        handle = repo.import(templateBytes, { docId: storeDocId });
+        log("Successfully imported an initial store document with id " + handle.url);
+    } else {
+        // 2c. A lost store with another (or an unknown) genesis: an empty doc under the same
+        // ID, holding one change WITHOUT operations (a doc with no change never becomes ready),
+        // so nothing can conflict with the peers' maps; peer sync brings the store back into it.
+        refuse(recordedDescends ?? 'unknown', `all ${chunks.quarantined.length} chunk file(s) unusable`)
+        handle = repo.import<Store>(A.save(A.emptyChange(A.init<Store>(), 'engine#567: refused template heal, waiting for peer sync')), { docId: storeDocId })
     }
 
     // 3. Wait for the document to be fully ready.
     await handle.whenReady();
 
     // 4. engine#567: the template's top-level maps must be there.
+    const live = descendsFromTemplate(handle.doc(), templateRoots)
     const missing = missingStoreMaps(handle.doc())
-    if (missing.length > 0) {
-        error(`[store-health] store ${storeDocId} is missing ${missing.join(', ')}: merging store-template.json into it (engine#567)`)
-        repo.import(await fs.readFile(templatePath), { docId: storeDocId })
-        const still = missingStoreMaps(handle.doc())
-        if (still.length > 0) error(`[store-health] store ${storeDocId} still misses ${still.join(', ')} after the template merge; startup continues with defensive reads`)
-        heal = {
-            at: Date.now(), source: 'template-merge',
-            reason: `missing ${missing.join(', ')}${heal ? ` (after: ${heal.reason})` : ''}${still.length > 0 ? `; still missing ${still.join(', ')}` : ''}`,
-            quarantined: chunks.quarantined.length, quarantineDir: quarantineDir(),
+    if (missing.length > 0 && !refused) {
+        const descends: Descends = recordedDescends ?? live
+        if (descends === 'yes') {
+            error(`[store-health] store ${storeDocId} is missing ${missing.join(', ')}: merging store-template.json into it (engine#567)`)
+            repo.import(templateBytes, { docId: storeDocId })
+            const still = missingStoreMaps(handle.doc())
+            if (still.length > 0) error(`[store-health] store ${storeDocId} still misses ${still.join(', ')} after the template merge; startup continues with defensive reads`)
+            heal = {
+                at: Date.now(), source: 'template-merge',
+                reason: `missing ${missing.join(', ')}${heal ? ` (after: ${(heal as StoreSelfHeal).reason})` : ''}${still.length > 0 ? `; still missing ${still.join(', ')}` : ''}`,
+                quarantined: chunks.quarantined.length, quarantineDir: quarantineDir(),
+            }
+        } else {
+            refuse(descends, `missing ${missing.join(', ')}${heal ? ` (after: ${(heal as StoreSelfHeal).reason})` : ''}`)
         }
     }
+    // 5. First good load: record the genesis once (never overwritten).
+    if (!recorded && !refused && live !== 'unknown' && missingStoreMaps(handle.doc()).length === 0) {
+        recordStoreGenesis(genesisFile, { docId: storeDocId, descendsFromTemplate: live === 'yes', templateRoots, recordedAt: Date.now() })
+    }
+    if (refused) {
+        guardRefusedStore(handle, opts.onStoreMapsArrived)
+    }
     if (heal) {
+        const h = heal as StoreSelfHeal
         // Make the repaired document durable before anything else runs (a crash now would
         // otherwise find an empty doc folder next to other docs: engine#391 refusal).
         await repo.flush([handle.documentId])
-        error(`[store-health] STORE_SELF_HEALED ${storeDocId}: ${heal.source}: ${heal.reason}${heal.quarantineDir ? `; quarantine ${heal.quarantineDir}` : ''}`)
-        opts.onSelfHeal?.(heal)
+        if (refused) error(`[store-health] STORE_HEAL_REFUSED ${storeDocId}: ${h.reason}${h.quarantineDir ? `; quarantine ${h.quarantineDir}` : ''}`)
+        else error(`[store-health] STORE_SELF_HEALED ${storeDocId}: ${h.source}: ${h.reason}${h.quarantineDir ? `; quarantine ${h.quarantineDir}` : ''}`)
+        opts.onSelfHeal?.(h)
     }
 
     log("Store document is ready.")

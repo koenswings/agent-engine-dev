@@ -25,7 +25,7 @@ import { Repo, DocumentId, generateAutomergeUrl, parseAutomergeUrl } from '@auto
 import { Store, createServerStore, getRunningEngines } from '../../src/data/Store.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId } from '../../src/data/Engine.js'
 import { DurableNodeFSStorageAdapter } from '../../src/data/DurableStorageAdapter.js'
-import { StoreSelfHeal, chunkProblem, missingStoreMaps, publishStoreSelfHeal } from '../../src/data/StoreHealth.js'
+import { StoreSelfHeal, chunkProblem, missingStoreMaps, publishStoreSelfHeal, templateRootHashes, storeGenesisPath, readStoreGenesis, recordStoreGenesis, descendsFromTemplate } from '../../src/data/StoreHealth.js'
 import { quarantineRootFor, resetQuarantineDirsForTest } from '../../src/data/StoreQuarantine.js'
 import { createCommandLogStore, localDay } from '../../src/data/CommandLogStore.js'
 import { isCommandLogContent } from '../../src/data/StoreScope.js'
@@ -44,7 +44,9 @@ beforeEach(() => {
     docId = parseAutomergeUrl(generateAutomergeUrl()).documentId
     resetQuarantineDirsForTest()
 })
-afterEach(() => {
+afterEach(async () => {
+    // a Repo saves storage-adapter-id in the background (not awaited by shutdown): let it land before the folder goes
+    await new Promise(r => setTimeout(r, 100))
     expect(sha(templatePath), 'store-template.json is never modified').toBe(templateSha)
     expect(sha(TRACKED_TEMPLATE), 'the tracked template is untouched').toBe(templateSha)
     fs.rmSync(tmp, { recursive: true, force: true })
@@ -62,6 +64,7 @@ const open = async <T>(fn: (h: any, repo: Repo, heal: StoreSelfHeal | null) => P
     const h = await createServerStore(repo, docId, dataDir, templatePath, { onSelfHeal: x => { healed.v = x } })
     const out = await fn(h, repo, healed.v)
     await repo.flush()
+    await repo.storageId()   // the Repo saves storage-adapter-id in the background: let it finish before the folder goes
     await repo.shutdown()
     return out
 }
@@ -88,6 +91,7 @@ describe('createServerStore startup guard (engine#567 b)', () => {
         expect(Object.keys(r.doc).sort()).toEqual(['appDB', 'diskDB', 'engineDB', 'instanceDB'])
         expect(r.heal?.source).toBe('template')
         expect(r.heal?.quarantined).toBe(files.length)
+        expect(readStoreGenesis(storeGenesisPath(dataDir), docId)?.descendsFromTemplate, 'recorded at the first good load').toBe(true)
         const q = allFiles(quarantineRootFor(dataDir))
         expect(q.length).toBe(files.length)
         expect(q.every(f => fs.statSync(f).size === 0)).toBe(true)
@@ -124,22 +128,37 @@ describe('createServerStore startup guard (engine#567 b)', () => {
         expect(r.heal?.source).toBe('template')
     })
 
-    it('a doc without engineDB: the template is merged in; engineDB is the template\'s own map (never a new {})', async () => {
-        // valid chunks of a doc with unrelated history and no maps (e.g. a stray incremental only)
+    it('a template-born doc without engineDB: the template is merged in; engineDB is the template\'s own map (never a new {})', async () => {
+        // template genesis, then engineDB deleted (descends from the template, so the merge is safe)
+        let born = A.load<any>(fs.readFileSync(TRACKED_TEMPLATE))
+        born = A.change(born, d => { d.foo = 1; delete d.engineDB })
+        const dir = path.join(docDir(), 'snapshot')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(path.join(dir, 'born'), A.save(born))
+        const r = await open((h, _repo, heal) => ({
+            foo: h.doc().foo, missing: missingStoreMaps(h.doc()), heal,
+        }))
+        expect(r.foo, 'the loaded content is kept').toBe(1)
+        expect(r.heal?.source).toBe('template-merge')
+        expect(r.heal?.reason).toContain('engineDB')
+        expect(allFiles(quarantineRootFor(dataDir))).toEqual([])
+    })
+
+    it('a doc with its own genesis and no maps (a stray chunk): the template heal is REFUSED, nothing is merged or written', async () => {
         const stray = A.change(A.init<any>(), d => { d.foo = 1 })
         const dir = path.join(docDir(), 'snapshot')
         fs.mkdirSync(dir, { recursive: true })
         fs.writeFileSync(path.join(dir, 'stray'), A.save(stray))
-        const r = await open((h, _repo, heal) => ({
-            foo: h.doc().foo, missing: missingStoreMaps(h.doc()),
-            engineDbObj: A.getObjectId(h.doc().engineDB), heal,
-        }))
-        expect(r.missing).toEqual([])
-        expect(r.foo, 'the loaded content is kept').toBe(1)
-        expect(r.engineDbObj, 'engineDB comes from the template genesis, not from a new assignment').toBe(templateEngineDbObjId())
-        expect(r.heal?.source).toBe('template-merge')
-        expect(r.heal?.reason).toContain('engineDB')
-        expect(allFiles(quarantineRootFor(dataDir))).toEqual([])
+        const r = await open((h, _repo, heal) => {
+            h.change((d: any) => { d.engineDB = {} })   // any write is skipped while refused
+            return { foo: h.doc().foo, keys: Object.keys(h.doc()), heal, hasTemplate: A.hasHeads(h.doc(), templateRootHashes(fs.readFileSync(TRACKED_TEMPLATE))) }
+        })
+        expect(r.foo).toBe(1)
+        expect(r.keys).toEqual(['foo'])
+        expect(r.hasTemplate, 'no template merge').toBe(false)
+        expect(r.heal?.source).toBe('refused')
+        expect(r.heal?.reason).toMatch(/does not descend/)
+        expect(fs.existsSync(storeGenesisPath(dataDir)), 'a refused doc records no genesis').toBe(false)
     })
 
     it('a healthy store merges nothing and reports no heal; the template merge would be a no-op anyway', async () => {
@@ -241,4 +260,122 @@ describe('command log guard (engine#567 b)', () => {
         const r = await loadLog(url)
         expect(r.url).toBe(url)
     }, 20_000)
+})
+
+
+describe('genesis guard: no template heal on a store with its own genesis (engine#567, 2VroE finding)', () => {
+    /** A store like idea04's 2VroE: its own root change creates the maps (not the template's). */
+    const ownGenesis = () => A.from<any>({
+        engineDB: { e1: { id: 'e1', hostname: 'a' }, e2: { id: 'e2', hostname: 'b' } },
+        diskDB: { d1: { id: 'd1' } }, instanceDB: { i1: { id: 'i1' } },
+        appDB: Object.fromEntries(Array.from({ length: 57 }, (_, i) => [`app${i}`, { id: `app${i}` }])),
+    })
+    const seedOwn = async () => {
+        const full = ownGenesis()
+        const dir = path.join(docDir(), 'snapshot')
+        fs.mkdirSync(dir, { recursive: true })
+        fs.writeFileSync(path.join(dir, 'own'), A.save(full))
+        const r = await open((_h, _r, heal) => heal)   // first good load: records descendsFromTemplate=false
+        expect(r).toBeNull()
+        expect(readStoreGenesis(storeGenesisPath(dataDir), docId)?.descendsFromTemplate).toBe(false)
+        return full
+    }
+
+    it('descendsFromTemplate: yes for a template-born doc, no for an own genesis, unknown for an empty doc', () => {
+        const roots = templateRootHashes(fs.readFileSync(TRACKED_TEMPLATE))
+        expect(roots.length).toBe(1)
+        expect(descendsFromTemplate(A.change(A.load<any>(fs.readFileSync(TRACKED_TEMPLATE)), d => { d.x = 1 }), roots)).toBe('yes')
+        expect(descendsFromTemplate(ownGenesis(), roots)).toBe('no')
+        expect(descendsFromTemplate(A.init(), roots)).toBe('unknown')
+    })
+
+    it('all chunks 0 bytes on an own-genesis store: STORE_HEAL_REFUSED, no template, no throw, the marker is set, writes skipped', async () => {
+        await seedOwn()
+        for (const f of chunkFiles()) fs.truncateSync(f, 0)
+        const r = await open((h, _repo, heal) => {
+            h.change((d: any) => { d.engineDB = {} })
+            return { keys: Object.keys(h.doc()), heal, id: h.documentId }
+        })
+        expect(r.id).toBe(docId)
+        expect(r.keys, 'no map created, no template merged').toEqual([])
+        expect(r.heal?.source).toBe('refused')
+        expect(r.heal?.quarantined).toBeGreaterThan(0)
+        expect(r.heal?.reason).toMatch(/does not descend.*recorded in store-genesis.json/)
+        expect(allFiles(quarantineRootFor(dataDir)).length).toBeGreaterThan(0)
+    })
+
+    it('all chunks 0 bytes and NO genesis record: refused as unknown (never a template heal on a guess)', async () => {
+        await seedOwn()
+        fs.renameSync(storeGenesisPath(dataDir), storeGenesisPath(dataDir) + '.moved')
+        for (const f of chunkFiles()) fs.truncateSync(f, 0)
+        const heal = await open((_h, _r, heal) => heal)
+        expect(heal?.source).toBe('refused')
+        expect(heal?.reason).toMatch(/is not known to descend/)
+    })
+
+    it('a lost snapshot with incrementals left: refused; the remaining chunks are kept and used', async () => {
+        const full = await seedOwn()
+        await open(async (h) => { h.change((d: any) => { d.engineDB.e1.hostname = 'a2' }) })   // an incremental on top
+        const snaps = allFiles(path.join(docDir(), 'snapshot'))
+        for (const f of snaps) fs.writeFileSync(f, fs.readFileSync(f).subarray(0, 40))   // truncated
+        const r = await open((h, _repo, heal) => ({ keys: Object.keys(h.doc()), heal }))
+        expect(r.heal?.source).toBe('refused')
+        expect(r.keys).toEqual([])
+        expect(chunkFiles().length, 'the usable incremental chunks stay in store-data').toBeGreaterThan(0)
+        expect(full).toBeTruthy()
+    })
+
+    it('a refused doc merged with the full original (peer sync) keeps ALL data: appDB 57 stays 57', async () => {
+        const full = await seedOwn()
+        for (const f of chunkFiles()) fs.truncateSync(f, 0)
+        const refusedBytes = await open(async (h) => {
+            h.change((d: any) => { d.engineDB = {}; d.appDB = {} })   // skipped
+            return A.save(h.doc())
+        })
+        const merged = A.merge(A.clone(full), A.load<any>(refusedBytes))
+        expect(Object.keys(merged.appDB).length).toBe(57)
+        expect(Object.keys(merged.engineDB).sort()).toEqual(['e1', 'e2'])
+        expect(A.getConflicts(merged, 'appDB'), 'one appDB object, no competing map').toBeUndefined()
+        // the old behaviour (template rebuild) gives competing top-level maps: one of each pair is hidden
+        const templ = A.load<any>(fs.readFileSync(TRACKED_TEMPLATE))
+        const hidden = A.merge(A.clone(full), templ)
+        expect(Object.keys(A.getConflicts(hidden, 'appDB') ?? {}).length).toBe(2)
+        expect(Object.keys(A.getConflicts(hidden, 'engineDB') ?? {}).length).toBe(2)
+    })
+
+    it('when peer sync brings the maps, writes are enabled again and onStoreMapsArrived runs', async () => {
+        const full = await seedOwn()
+        for (const f of chunkFiles()) fs.truncateSync(f, 0)
+        const repo = new Repo({ storage: new DurableNodeFSStorageAdapter(dataDir), network: [] })
+        let arrived = 0
+        const h: any = await createServerStore(repo, docId, dataDir, templatePath, { onStoreMapsArrived: () => { arrived++ } })
+        h.change((d: any) => { d.x = 1 })
+        expect(h.doc().x).toBeUndefined()
+        repo.import(A.save(full), { docId })   // what a peer's sync delivers
+        await new Promise(r => setTimeout(r, 50))
+        expect(arrived).toBe(1)
+        expect(Object.keys(h.doc().appDB).length).toBe(57)
+        h.change((d: any) => { d.engineDB.e1.hostname = 'z' })
+        expect(h.doc().engineDB.e1.hostname).toBe('z')
+        await repo.flush(); await repo.storageId(); await repo.shutdown()
+    })
+
+    it('store-genesis.json is written once and never overwritten', async () => {
+        await seedOwn()
+        const f = storeGenesisPath(dataDir)
+        const before = fs.readFileSync(f, 'utf8')
+        expect(recordStoreGenesis(f, { docId, descendsFromTemplate: true, templateRoots: [], recordedAt: 1 })).toBe(false)
+        await open(async () => undefined)
+        expect(fs.readFileSync(f, 'utf8')).toBe(before)
+        expect(readStoreGenesis(f, 'otherDoc')).toBeNull()
+    })
+
+    it('a template-born store still heals from the template when all chunks are 0 bytes', async () => {
+        await seedStore()
+        expect(readStoreGenesis(storeGenesisPath(dataDir), docId)?.descendsFromTemplate).toBe(true)
+        for (const f of chunkFiles()) fs.truncateSync(f, 0)
+        const r = await open((h, _repo, heal) => ({ missing: missingStoreMaps(h.doc()), heal }))
+        expect(r.heal?.source).toBe('template')
+        expect(r.missing).toEqual([])
+    })
 })

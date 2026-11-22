@@ -165,7 +165,18 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     log(`Initialising store`)
     // engine#567: bad chunks are quarantined and the doc rebuilt/merged from the template; reported below
     const storeSelfHeal: { value: StoreSelfHeal | null } = { value: null }
-    const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, storeIdentity.templatePath, { onSelfHeal: (h) => { storeSelfHeal.value = h } })
+    // engine#567 genesis guard: a refused heal skips every store write until peer sync brings the
+    // top-level maps; then this Engine's entry is written (and the refusal published) after all.
+    const storeMapsArrived = { handler: (): void => {} }
+    const storeHandle = await createServerStore(repo, storeDocId, STORE_DATA_PATH, storeIdentity.templatePath, {
+        onSelfHeal: (h) => { storeSelfHeal.value = h },
+        onStoreMapsArrived: () => storeMapsArrived.handler(),
+    })
+    storeMapsArrived.handler = () => {
+        createOrUpdateEngine(storeHandle, localEngineId)
+            .then(() => { if (storeSelfHeal.value) publishStoreSelfHeal(storeHandle, String(localEngineId), { ...storeSelfHeal.value, reason: `${storeSelfHeal.value.reason}; maps arrived by peer sync at ${new Date().toISOString()}` }) })
+            .catch(e => log(`[store-health] writing this Engine's entry after peer sync failed: ${e}`))
+    }
     staleGuard.watchStoreHandle(storeHandle)
 
     // backupCleanup capability: one helper version check, never fatal (idea#400 §3.1).
