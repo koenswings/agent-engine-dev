@@ -48,6 +48,9 @@ export const nodeIo: DurableIo = {
 }
 
 export const TEMP_PREFIX = '.tmp-'
+// One counter per process, not per adapter: two adapters on one folder (a test's next Repo
+// while the previous one still saves storage-adapter-id) must never share a temp file name.
+let tempSeq = 0
 
 const getKey = (key: StorageKey | string[]): string => path.join(...key)
 
@@ -60,7 +63,6 @@ export const tempFilePid = (name: string): number | null => {
 export class DurableNodeFSStorageAdapter implements StorageAdapterInterface {
     readonly baseDirectory: string
     private cache: Record<string, Uint8Array> = {}
-    private seq = 0
     private readonly io: DurableIo
 
     constructor(baseDirectory = 'automerge-repo-data', io: DurableIo = nodeIo) {
@@ -92,7 +94,7 @@ export class DurableNodeFSStorageAdapter implements StorageAdapterInterface {
         const filePath = this.getFilePath(keyArray)
         const dir = path.dirname(filePath)
         await this.mkdirDurable(dir)
-        const tmp = path.join(dir, `${TEMP_PREFIX}${process.pid}-${++this.seq}-${path.basename(filePath)}`)
+        const tmp = path.join(dir, `${TEMP_PREFIX}${process.pid}-${++tempSeq}-${path.basename(filePath)}`)
         const fh = await this.io.open(tmp, 'w')
         try {
             await fh.writeFile(binary)

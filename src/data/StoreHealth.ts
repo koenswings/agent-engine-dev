@@ -141,8 +141,9 @@ export const missingStoreMaps = (doc: unknown): string[] => {
 /** What the startup guard did to the store document (published on this Engine's entry). */
 export interface StoreSelfHeal {
     at: number
-    /** 'chunks': loaded from the usable chunks; 'template': rebuilt from store-template.json; 'template-merge': template merged into the loaded doc */
-    source: 'chunks' | 'template' | 'template-merge'
+    /** 'chunks': loaded from the usable chunks; 'template': rebuilt from store-template.json; 'template-merge': template merged into the loaded doc;
+     *  'refused': the doc does not (or is not known to) descend from the template, so no template heal: peers must fill it */
+    source: 'chunks' | 'template' | 'template-merge' | 'refused'
     reason: string
     quarantined: number
     quarantineDir: string | null
@@ -158,4 +159,115 @@ export const publishStoreSelfHeal = (storeHandle: { change: (fn: (doc: any) => v
         done = true
     })
     return done
+}
+
+// ── engine#567 genesis guard ──────────────────────────────────────────────────
+// A template heal (rebuild or merge) is only harmless when the store doc descends from
+// store-template.json: then the template's maps are the very objects every peer has.
+// A store with its own root change (idea04's pool store 2VroE: one 355k-op root change
+// of 13 Oct) would get a SECOND set of top-level maps; after peer sync Automerge keeps
+// one per key and hides the other (seen: appDB 57 -> 0 on every Engine).
+
+/** Root change hashes (no deps) of store-template.json. */
+export const templateRootHashes = (templateBytes: Uint8Array): string[] =>
+    A.getAllChanges(A.load(templateBytes)).map(c => A.decodeChange(c)).filter(c => c.deps.length === 0).map(c => c.hash!)
+
+export type Descends = 'yes' | 'no' | 'unknown'
+
+/**
+ * Does the loaded doc contain the template's root change(s)? 'unknown' when the doc has
+ * no applied changes (empty, or only changes queued for a missing base, e.g. a lost snapshot).
+ * A doc with applied changes but without the template root has its own root: 'no'.
+ */
+export const descendsFromTemplate = (doc: unknown, roots: string[]): Descends => {
+    if (!doc || roots.length === 0) return 'unknown'
+    let heads: string[]
+    try { heads = A.getHeads(doc as A.Doc<unknown>) } catch { return 'unknown' }
+    if (heads.length === 0) return 'unknown'
+    try { return A.hasHeads(doc as A.Doc<unknown>, roots) ? 'yes' : 'no' } catch { return 'unknown' }
+}
+
+/** store-genesis.json: recorded once, at the first good load of a store doc (never overwritten). */
+export interface StoreGenesis {
+    docId: string
+    descendsFromTemplate: boolean
+    templateRoots: string[]
+    recordedAt: number
+}
+
+export const STORE_GENESIS_FILE = 'store-genesis.json'
+/** Next to store-data (in the Engine folder), not inside it. */
+export const storeGenesisPath = (dataDir: string): string => path.join(path.dirname(path.resolve(dataDir)), STORE_GENESIS_FILE)
+
+/** The record for this doc, or null (missing, unreadable, or recorded for another doc ID). */
+export const readStoreGenesis = (file: string, docId: string): StoreGenesis | null => {
+    try {
+        const r = JSON.parse(fs.readFileSync(file, 'utf8'))
+        if (r && r.docId === docId && typeof r.descendsFromTemplate === 'boolean') return r as StoreGenesis
+        if (r?.docId && r.docId !== docId) log(`[store-health] ${file} is for doc ${r.docId}, not ${docId}: ignored (engine#567)`)
+    } catch { /* missing or unreadable */ }
+    return null
+}
+
+/**
+ * Write the record once: temp file, fsync, hard link to the final name (fails when it
+ * already exists, so it is never overwritten), folder fsync. Returns true when written.
+ */
+export const recordStoreGenesis = (file: string, rec: StoreGenesis): boolean => {
+    if (fs.existsSync(file)) return false
+    const dir = path.dirname(file)
+    const tmp = path.join(dir, `.${path.basename(file)}.tmp-${process.pid}-${Date.now()}`)
+    let written = false
+    try {
+        const fd = fs.openSync(tmp, 'wx')
+        try { fs.writeSync(fd, JSON.stringify(rec, null, 2) + '\n'); fs.fsyncSync(fd) } finally { fs.closeSync(fd) }
+        try { fs.linkSync(tmp, file); written = true } catch { /* exists: never overwritten */ }
+        let dfd: number | undefined
+        try { dfd = fs.openSync(dir, 'r'); fs.fsyncSync(dfd) } catch { /* best effort */ } finally { if (dfd !== undefined) fs.closeSync(dfd) }
+    } catch (e) {
+        log(`[store-health] could not record ${file}: ${e instanceof Error ? e.message : e}`)
+    } finally {
+        try { fs.unlinkSync(tmp) } catch { /* gone */ }
+    }
+    if (written) log(`[store-health] recorded ${file}: doc ${rec.docId} descendsFromTemplate=${rec.descendsFromTemplate} (engine#567)`)
+    return written
+}
+
+/**
+ * Refused heal: until peer sync brings the top-level maps, every write to the store doc
+ * is skipped (logged), so this Engine can never create a top-level map that would compete
+ * with the peers' ones. Reads stay defensive (?? {}). When the maps arrive, writes are
+ * enabled again and onMapsArrived runs (start.ts then writes this Engine's entry).
+ * Returns a function that tells whether the guard is still closed.
+ */
+export const guardRefusedStore = (handle: any, onMapsArrived?: () => void): (() => boolean) => {
+    const origChange = handle.change.bind(handle)
+    const origChangeAt = typeof handle.changeAt === 'function' ? handle.changeAt.bind(handle) : undefined
+    let open = false
+    let skipped = 0
+    const ready = (): boolean => missingStoreMaps(handle.doc()).length === 0
+    const release = (): void => {
+        if (open) return
+        open = true
+        handle.change = origChange
+        if (origChangeAt) handle.changeAt = origChangeAt
+        handle.off?.('change', check)
+        log(`[store-health] the store doc has its top-level maps now (peer sync); writes enabled again after ${skipped} skipped (engine#567)`)
+        try { onMapsArrived?.() } catch (e) { log(`[store-health] onMapsArrived: ${e instanceof Error ? e.message : e}`) }
+    }
+    const check = (): void => { if (!open && ready()) release() }
+    handle.change = (fn: any, opts?: any) => {
+        if (!open && ready()) release()
+        if (open) return origChange(fn, opts)
+        skipped++
+        if (skipped <= 20 || skipped % 100 === 0) log(`[store-health] store write skipped: STORE_HEAL_REFUSED, waiting for peer sync (${skipped} so far, engine#567)`)
+    }
+    if (origChangeAt) handle.changeAt = (heads: any, fn: any, opts?: any) => {
+        if (!open && ready()) release()
+        if (open) return origChangeAt(heads, fn, opts)
+        skipped++
+        return undefined
+    }
+    handle.on?.('change', check)
+    return () => !open
 }
