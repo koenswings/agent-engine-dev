@@ -15,7 +15,8 @@ import path from 'path'
 import { redactString } from '../utils/redact.js'
 import { config, commandLogArchiveMaxBytes } from './Config.js'
 import { stopPeriodicFlush } from '../repo.js'
-import { markOwnCommandLog } from './StoreScope.js'
+import { isCommandLogContent, markOwnCommandLog } from './StoreScope.js'
+import { quarantineBadChunks } from './StoreHealth.js'
 
 // ── Types (also exported for use in CommonTypes consumers) ───────────────────
 
@@ -153,6 +154,8 @@ export interface CommandLogStoreOptions {
   storeTag?: string
   /** engine#471 (a): this Engine's id, stamped on every log this Engine creates (and backfilled on load). */
   engineId?: string
+  /** engine#567: store-data folder; when set, the log's chunk files are checked (bad ones quarantined) before loading. */
+  storeDataDir?: string
 }
 
 /** storeTag stamped on new command logs (#158); set by createCommandLogStore. */
@@ -229,12 +232,29 @@ export const createCommandLogStore = async (
     log(`[commandLog] Loading existing CommandLogStore from ${existingUrl} (timeout ${timeoutMs} ms)`)
     // engine#471 (a): ours (by our url file), so it is never announced to peers, also while loading
     if (isValidAutomergeUrl(existingUrl)) markOwnCommandLog(repo, existingUrl)
-    try {
-      handle = await findCommandLogWithTimeout(repo, existingUrl, timeoutMs)
-      log(`[commandLog] CommandLogStore loaded, state: ${handle.state}`)
-    } catch (e) {
-      log(`[commandLog] Could not load ${existingUrl}: ${e instanceof Error ? e.message : e}. Creating a fresh CommandLogStore and rewriting ${urlFile}`)
+    // engine#567: 0-byte / corrupt chunk files go to quarantine first; with none left
+    // there is nothing to load (no need to wait for a peer that should never send it)
+    let unusable = false
+    if (options.storeDataDir && isValidAutomergeUrl(existingUrl)) {
+      const report = await quarantineBadChunks(options.storeDataDir, existingUrl.slice('automerge:'.length))
+      unusable = report.quarantined.length > 0 && report.good.length === 0
+    }
+    if (unusable) {
+      log(`[commandLog] ${existingUrl} has no usable chunks left (quarantined, engine#567). Creating a fresh CommandLogStore and rewriting ${urlFile}`)
       handle = await _createFresh(repo, urlFile)
+    } else {
+      try {
+        handle = await findCommandLogWithTimeout(repo, existingUrl, timeoutMs)
+        log(`[commandLog] CommandLogStore loaded, state: ${handle.state}`)
+      } catch (e) {
+        log(`[commandLog] Could not load ${existingUrl}: ${e instanceof Error ? e.message : e}. Creating a fresh CommandLogStore and rewriting ${urlFile}`)
+        handle = await _createFresh(repo, urlFile)
+      }
+      // engine#567: a doc that loads but is not a command log (e.g. {}) is replaced, not repaired
+      if (!isCommandLogContent(handle.doc())) {
+        log(`[commandLog] ${existingUrl} loaded without traces/recentTraceIds (invalid content, engine#567). Creating a fresh CommandLogStore and rewriting ${urlFile}`)
+        handle = await _createFresh(repo, urlFile)
+      }
     }
   } else {
     log(`[commandLog] No existing CommandLogStore found, creating fresh one`)

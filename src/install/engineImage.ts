@@ -583,7 +583,8 @@ export const sshdEffectiveConfig = async (root: string): Promise<SshdEffective> 
 }
 
 /** Under the Engine tree: runtime store state. store-identity/ keeps exactly the git-tracked files. */
-export const ENGINE_RUNTIME_PATHS = ['store-data', 'yjs-db', 'logs', 'test/testresults']
+// engine#567: store-data-quarantine (bad chunk files moved out of store-data) is runtime state too
+export const ENGINE_RUNTIME_PATHS = ['store-data', 'yjs-db', 'logs', 'test/testresults', 'store-data-quarantine']
 
 const globRel = async (root: string, pattern: string): Promise<string[]> => {
     const dir = path.join(root, path.dirname(pattern))
