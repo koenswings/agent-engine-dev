@@ -236,19 +236,39 @@ export const recordStoreGenesis = (file: string, rec: StoreGenesis): boolean => 
 /**
  * Refused heal: until peer sync brings the top-level maps, every write to the store doc
  * is skipped (logged), so this Engine can never create a top-level map that would compete
- * with the peers' ones. Reads stay defensive (?? {}). When the maps arrive, writes are
+ * with the peers' ones. Reads get the doc behind a Proxy with a frozen {} for each missing
+ * map (never written). When the maps arrive, writes are
  * enabled again and onMapsArrived runs (start.ts then writes this Engine's entry).
  * Returns a function that tells whether the guard is still closed.
  */
 export const guardRefusedStore = (handle: any, onMapsArrived?: () => void): (() => boolean) => {
+    const origDoc = handle.doc.bind(handle)
     const origChange = handle.change.bind(handle)
     const origChangeAt = typeof handle.changeAt === 'function' ? handle.changeAt.bind(handle) : undefined
     let open = false
     let skipped = 0
-    const ready = (): boolean => missingStoreMaps(handle.doc()).length === 0
+    const ready = (): boolean => missingStoreMaps(origDoc()).length === 0
+    // Reads: while maps are missing, doc() is the real doc behind a Proxy that answers a
+    // frozen empty object for each missing map, so the ~200 plain `doc.engineDB[...]` reads in
+    // the Engine never throw. Everything else (incl. Automerge's internal state symbol, so the
+    // Repo can still save and sync it) goes to the real doc. Nothing is ever written for it.
+    const EMPTY = Object.freeze({})
+    const required = new Set<string | symbol>(REQUIRED_STORE_MAPS)
+    const view = (): any => {
+        const d = origDoc()
+        if (open || !d || missingStoreMaps(d).length === 0) return d
+        return new Proxy(d, {
+            get: (t, prop) => {
+                const v = Reflect.get(t, prop, t)
+                return required.has(prop) && (v === undefined || v === null) ? EMPTY : v
+            },
+        })
+    }
+    handle.doc = view
     const release = (): void => {
         if (open) return
         open = true
+        handle.doc = origDoc
         handle.change = origChange
         if (origChangeAt) handle.changeAt = origChangeAt
         handle.off?.('change', check)
