@@ -56,6 +56,8 @@ const docDir = () => path.join(dataDir, docId.slice(0, 2), docId.slice(2))
 const allFiles = (d: string): string[] => !fs.existsSync(d) ? [] :
     fs.readdirSync(d, { withFileTypes: true }).flatMap(e => e.isDirectory() ? allFiles(path.join(d, e.name)) : [path.join(d, e.name)])
 const chunkFiles = () => allFiles(docDir()).filter(f => /\/(snapshot|incremental)\//.test(f))
+/** The doc as persisted (all usable chunk files), read straight from store-data. */
+const diskDoc = (): any => chunkFiles().reduce((d, f) => { const b = fs.readFileSync(f); return b.length ? A.loadIncremental(d, b) : d }, A.init<any>())
 
 /** One Engine start: open the store with the durable adapter, run fn, flush, shut down. */
 const open = async <T>(fn: (h: any, repo: Repo, heal: StoreSelfHeal | null) => Promise<T> | T): Promise<T> => {
@@ -151,11 +153,13 @@ describe('createServerStore startup guard (engine#567 b)', () => {
         fs.writeFileSync(path.join(dir, 'stray'), A.save(stray))
         const r = await open((h, _repo, heal) => {
             h.change((d: any) => { d.engineDB = {} })   // any write is skipped while refused
-            return { foo: h.doc().foo, keys: Object.keys(h.doc()), heal, hasTemplate: A.hasHeads(h.doc(), templateRootHashes(fs.readFileSync(TRACKED_TEMPLATE))) }
+            return { foo: h.doc().foo, view: h.doc(), heal }
         })
         expect(r.foo).toBe(1)
-        expect(r.keys).toEqual(['foo'])
-        expect(r.hasTemplate, 'no template merge').toBe(false)
+        expect(Object.isFrozen(r.view.engineDB) && Object.keys(r.view.engineDB)).toEqual([])   // read-only default
+        const disk = diskDoc()
+        expect(Object.keys(disk), 'nothing written: no map created').toEqual(['foo'])
+        expect(A.hasHeads(disk, templateRootHashes(fs.readFileSync(TRACKED_TEMPLATE))), 'no template merge').toBe(false)
         expect(r.heal?.source).toBe('refused')
         expect(r.heal?.reason).toMatch(/does not descend/)
         expect(fs.existsSync(storeGenesisPath(dataDir)), 'a refused doc records no genesis').toBe(false)
@@ -294,10 +298,11 @@ describe('genesis guard: no template heal on a store with its own genesis (engin
         for (const f of chunkFiles()) fs.truncateSync(f, 0)
         const r = await open((h, _repo, heal) => {
             h.change((d: any) => { d.engineDB = {} })
-            return { keys: Object.keys(h.doc()), heal, id: h.documentId }
+            expect(() => Object.keys(h.doc().engineDB[localEngineId] ?? {}), 'plain reads do not throw').not.toThrow()
+            return { heal, id: h.documentId }
         })
         expect(r.id).toBe(docId)
-        expect(r.keys, 'no map created, no template merged').toEqual([])
+        expect(Object.keys(diskDoc()), 'no map created, no template merged').toEqual([])
         expect(r.heal?.source).toBe('refused')
         expect(r.heal?.quarantined).toBeGreaterThan(0)
         expect(r.heal?.reason).toMatch(/does not descend.*recorded in store-genesis.json/)
@@ -318,9 +323,9 @@ describe('genesis guard: no template heal on a store with its own genesis (engin
         await open(async (h) => { h.change((d: any) => { d.engineDB.e1.hostname = 'a2' }) })   // an incremental on top
         const snaps = allFiles(path.join(docDir(), 'snapshot'))
         for (const f of snaps) fs.writeFileSync(f, fs.readFileSync(f).subarray(0, 40))   // truncated
-        const r = await open((h, _repo, heal) => ({ keys: Object.keys(h.doc()), heal }))
+        const r = await open((h, _repo, heal) => ({ heal }))
         expect(r.heal?.source).toBe('refused')
-        expect(r.keys).toEqual([])
+        expect(Object.keys(diskDoc()).filter(k => k !== 'foo')).toEqual([])
         expect(chunkFiles().length, 'the usable incremental chunks stay in store-data').toBeGreaterThan(0)
         expect(full).toBeTruthy()
     })
@@ -328,10 +333,10 @@ describe('genesis guard: no template heal on a store with its own genesis (engin
     it('a refused doc merged with the full original (peer sync) keeps ALL data: appDB 57 stays 57', async () => {
         const full = await seedOwn()
         for (const f of chunkFiles()) fs.truncateSync(f, 0)
-        const refusedBytes = await open(async (h) => {
+        await open(async (h) => {
             h.change((d: any) => { d.engineDB = {}; d.appDB = {} })   // skipped
-            return A.save(h.doc())
         })
+        const refusedBytes = A.save(diskDoc())
         const merged = A.merge(A.clone(full), A.load<any>(refusedBytes))
         expect(Object.keys(merged.appDB).length).toBe(57)
         expect(Object.keys(merged.engineDB).sort()).toEqual(['e1', 'e2'])
