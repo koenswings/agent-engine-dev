@@ -69,7 +69,10 @@ from outside this Pi; `summariseDisk` and other read-only commands need no confi
     Summary `{ command, targetId, label, sizeBytes, device, apps: ["<name> <version>"] }`.
     Confirm field `label`; the confirm text is the label exactly as in the summary.
   - `flashCard`: the card is present here with no refusal and the size shown; the version
-    is a known client image. Summary `{ command, candidateId, sizeBytes, model, version }`.
+    is a known client image. Summary `{ command, candidateId, sizeBytes, model, version, contents }`,
+    where `contents` is what is on the card now, as in `Engine.clientCards[].contents`
+    (`{ kind: 'idea-client', imageName, version }`, `raspios`, `ubuntu`, `empty`, `{ kind: 'other', summary }`, `unknown`).
+    This summary is the single flash confirmation.
     Confirm field `sizeBytes`; the confirm text is the size in bytes as a decimal string.
 - `issueConfirm` returns `{ confirmId, summary, confirmField, expiresInMs: 60000 }`.
 - `checkConfirm` accepts a confirmation once: same session, same command text, confirm text
