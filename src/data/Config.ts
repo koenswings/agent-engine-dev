@@ -44,7 +44,6 @@ export interface Settings {
 export interface Defaults {
     user: string;
     machine: string;
-    password: string;
     engine: string;
     network: string;
     language: string;
@@ -221,7 +220,7 @@ function validateConfig(obj: any): string[] {
 
 /**
  * One-line summary of a config.yaml read/parse error. YAML parse errors quote
- * the offending lines of the file, which can hold credentials (defaults.password),
+ * the offending lines of the file, which can hold credentials,
  * so only the first line (message + line/column) is kept (idea#111).
  */
 export const configErrorSummary = (e: unknown): string => {

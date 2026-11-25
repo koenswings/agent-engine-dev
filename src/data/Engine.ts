@@ -1511,7 +1511,6 @@ export const tailscaleDownloadScript = (version = TAILSCALE_VERSION, sha256 = TA
 /** Where installTailscale stores the auth key on the Pi (root-only, 0600). */
 export const TAILSCALE_AUTHKEY_PATH = '/etc/tailscale/debug-authkey'
 const TAILSCALE_AUTHKEY_DIR = '/etc/tailscale'
-const TAILSCALE_AUTHKEY_SECRETS_FILE = '/home/pi/openclaw/secrets/tailscale_authkey.txt'
 
 /**
  * Removes TAILSCALE_AUTHKEY from this process's environment (and zx's $.env, which
@@ -1522,14 +1521,11 @@ export const scrubTailscaleAuthKeyEnv = () => {
   if ($.env && $.env !== process.env) delete $.env.TAILSCALE_AUTHKEY
 }
 
-/** TAILSCALE_AUTHKEY env var first, then the secrets file on the management Pi. */
-export const resolveTailscaleAuthKey = (): string | null => {
-  const fromEnv = process.env.TAILSCALE_AUTHKEY?.trim()
-  if (fromEnv) return fromEnv
-  return fs.existsSync(TAILSCALE_AUTHKEY_SECRETS_FILE)
-    ? fs.readFileSync(TAILSCALE_AUTHKEY_SECRETS_FILE, 'utf-8').trim() || null
-    : null
-}
+/**
+ * The key from the TAILSCALE_AUTHKEY env var only (provision-fleet.sh sets it from
+ * --authkey-file or ~/.config/idea/fleet-authkey). No other file is read.
+ */
+export const resolveTailscaleAuthKey = (): string | null => process.env.TAILSCALE_AUTHKEY?.trim() || null
 
 /**
  * Store the Tailscale auth key on the Pi without it ever being a command-line
@@ -1565,9 +1561,8 @@ export const storeTailscaleAuthKey = async (exec: any, authKey: string): Promise
  * The Pi remains fully offline during normal operation.
  * A coordinator activates debug mode by running the activation script over SSH.
  *
- * Auth key source (in priority order), see resolveTailscaleAuthKey:
- *   1. TAILSCALE_AUTHKEY env var (set on the management Pi running buildEngine)
- *   2. /home/pi/openclaw/secrets/tailscale_authkey.txt (Atlas's secrets dir on this Pi)
+ * Auth key source, see resolveTailscaleAuthKey: the TAILSCALE_AUTHKEY env var on the
+ * machine running buildEngine (provision-fleet.sh sets it from --authkey-file).
  * Use a short-lived, single-use key (docs/PI_FLEET.md). The key is never logged
  * and never passed as a command argument (idea#115).
  */
@@ -1580,7 +1575,7 @@ export const installTailscale = async (exec: any, enginePath: string) => {
   scrubTailscaleAuthKeyEnv()
 
   if (!authKey) {
-    console.error(chalk.red(`installTailscale: no auth key found. Set TAILSCALE_AUTHKEY env var or ensure ${TAILSCALE_AUTHKEY_SECRETS_FILE} exists.`))
+    console.error(chalk.red('installTailscale: no auth key found. Set the TAILSCALE_AUTHKEY env var (provision-fleet.sh: --authkey-file).'))
     process.exit(1)
   }
 
