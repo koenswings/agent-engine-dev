@@ -273,6 +273,18 @@ Refusal codes (start of the error text): `NOT_FOUND`, `AMBIGUOUS`, `NOT_DOCKED`,
 
 `Disk.appBundles` (idea#76 gap 1): `[{appId, version, sumsListed, sizeBytes, updatesFrom?, healthTimeout?, migrationNote?}]`, or null/missing when unknown (readers then fall back to the `--source` disk). Written only by the Engine the disk is docked to, on dock and only when the list changes; cleared on undock. Other Engines use it for the hint: a bundle with `sumsListed` true on a disk docked to an Engine that advertises `updateAppFetch` is offered with that Engine as `sourceEngineId`, and `sizeBytes` plus transfer time is added to the estimate. Hints are refreshed on any change to a disk's `dockedTo` or `appBundles`; a hint on an instance whose disk is docked nowhere is cleared.
 
+
+### `pushAppBundle`
+- **Description:** Source-side half of a cross-Engine `updateApp --source` Fetch (#263). The target Engine asks this Engine to push `apps/<appId>/` from a disk docked here into a token-protected root on the target. Operators do not run this by hand; `updateApp` dispatches it. Implemented in `src/data/UpdateFetch.ts`.
+- **Usage:** `pushAppBundle <sourceDiskId> <appId> <targetEngineId> <targetRoot> <requestId> <instanceId>`
+- **Scope:** `engine`
+- **Result / refusals:** the trace records `{ requestId, appId, targetEngineId, ok }` and `why` on failure. A failed push throws `TRANSFER_FAILED: <why>`. The source then answers the target with `appFetchResult`.
+
+### `appFetchResult`
+- **Description:** Target-side completion of a `#263` Fetch. The source Engine sends this to the waiting target to resolve the in-flight push (`handleAppFetchResult` in `src/data/UpdateFetch.ts`). Operators do not run this by hand.
+- **Usage:** `appFetchResult <requestId> ok|TRANSFER_FAILED [<why…>]`
+- **Scope:** `engine`
+
 ### `deleteTempBackup`
 - **Description:** Removes one temporary pre-update backup from this Engine's system disk (idea#374 exception, engine#469 naming and location only). The path is built from the two tokens as `/.idea-temp-backups/<instanceId>/<stamp>`; nothing else is deleted. The instance id is the exact folder name (no name fallback), so a leftover of an App that is no longer on the Pi can still be removed. After a successful (or failed) delete, and after every temp-backup create and at boot, the Engine rewrites `Engine.tempBackups` from the helper's `temp-backups` list (whole-list replace). A failed boot or list refresh leaves the stored field as it was, so an older Engine that never published the field stays distinguishable from "no backups left". Deleting is allowed here only: it is Koen's explicit exception from idea#374. The helper already has `temp-backup-delete` (v18); this command does not bump the helper.
 - **Usage:** `deleteTempBackup <instanceId> <stamp>`
@@ -327,6 +339,24 @@ Refusal codes (start of the error text): `NOT_FOUND`, `AMBIGUOUS`, `NOT_DOCKED`,
 - **Usage:** `initialiseDisk <candidateId> [empty|files|backup]`. The role is required at dispatch.
 - **Minimum size (role `backup`, engine#452):** the same 8 GiB floor as `makeBackupDisk` (`MAKE_BACKUP_DISK_MIN_BYTES`). Compared against the newly registered disk's `sizeBytes`, or the candidate size if that is what Check would have used. A smaller disk, or one whose size cannot be read, is refused with `TOO_SMALL` and the same wording; `BACKUP.yaml` is not written and the disk is not left as a Backup Disk. Roles `empty` and `files` are not subject to this size rule. Exactly 8 GiB is allowed.
 - **Scope:** `engine`
+
+
+### `flashCard`
+- **Description:** Flashes a client image onto a removable USB card present in this Engine's current `clientCards` scan (idea#201 §10, Engine API contract v2; `src/data/FlashCard.ts`). IDs only. Accepted work runs as an Operation (`kind: flashCard`) in the background so the command queue stays free for `cancelFlash`. The root helper `/usr/local/sbin/idea-flash-card` re-checks the target itself (USB `by-id` re-resolve before and during the write, removable, not the system/boot disk, nothing mounted, no IDEA META, image SHA, read-back SHA) and powers the card off. Progress steps: `checking`, `verifying-image`, `writing`, `reading-back`, `flushing`, `powering-off`.
+- **Usage:** `flashCard <candidateId> <version|current> <confirmSizeBytes>`
+- **Scope:** `engine`
+- **Refusals** throw `CODE: text` (trace ends `error`) before any Operation is created, including: `BAD_ARGS`, `BUSY`, `NOT_FOUND`, `NOT_REMOVABLE`, `SYSTEM_DISK`, `HELPER_MISSING`, `SIZE_CHANGED`, `IMAGE_TOO_LARGE`, plus any `card.refusal` from the scan. A running flash ends the Operation `Done` with `safeToRemove`, or `Failed` `CODE: text`. A cancel ends `Failed` `CANCELLED: …` (there is no `Cancelled` status for a flash; decision 1).
+
+### `cancelFlash`
+- **Description:** Cancels an in-flight `flashCard` Operation by id (`cancelFlash` in `src/data/FlashCard.ts`).
+- **Usage:** `cancelFlash <operationId>`
+- **Scope:** `engine`
+
+### `cancelOperation`
+- **Description:** Cancels a general Operation by id (`cancelOperation` in `src/data/Operations.ts`). Pending: the matching command is removed from `engine.commands[]` and the Operation is marked `Cancelled`. Running: SIGTERM is sent to the registered process (typically rsync) and the Operation is marked `Cancelled`. Failed: marked `Cancelled` (the lock was already released). Done or already Cancelled: no-op. A Running operation with no registered cancellable process is refused.
+- **Usage:** `cancelOperation <opId>`
+- **Scope:** `engine`
+- **Note:** `flashCard` is cancelled with `cancelFlash`, not this command.
 
 ### `summariseDisk`
 - **Description:** Content summary for erase confirmation (idea#134). Walks a mounted IDEA disk (or reports `readable: false` for an unformatted candidate) and stores the JSON `contentSummary` on `CommandTrace.result`. Caps: 100 000 entries or 10 s → `partial: true`. Backups from `BACKUP.yaml` + store (no `borg list`).
