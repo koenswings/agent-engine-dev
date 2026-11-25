@@ -172,3 +172,14 @@ export const verifyEntry = (raw: string, engineId: string, dir: string = authFol
 
 /** The command text of a queue entry, signed or not (for display and read-only checks). */
 export const entryCommandText = (raw: string): string => parseEntry(raw)?.command ?? raw
+
+/**
+ * A queue entry for the Engine log: the seq and source of a signed entry and its command text,
+ * never the mac. An entry with an unreadable @v1 prefix is shown without that prefix.
+ */
+export const entryLogText = (raw: string): string => {
+    const p = parseEntry(raw)
+    if (p) return `[seq ${p.seq}, src ${p.src}] ${p.command}`
+    if (raw.startsWith('@v1.')) return `[unreadable signature] ${raw.replace(/^@v1\.\S*\s?/, '')}`
+    return raw
+}

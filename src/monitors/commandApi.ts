@@ -93,7 +93,7 @@ export const routeCommand = async (req: http.IncomingMessage, pathname: string, 
         if (!command || command.length > MAX_COMMAND_CHARS || /[\r\n\0]/.test(command)) throw new HttpError(400, 'BAD_REQUEST', "'command' must be one line of text.")
         const remoteAddr = clientAddressOf(req)
         const store = ctx.storeHandle?.doc() as Store | undefined
-        if (!ctx.storeHandle || !store?.engineDB?.[self as any]) throw new HttpError(503, 'BAD_REQUEST', 'The store is not ready yet.')
+        if (!ctx.storeHandle || !store?.engineDB?.[self as any]) throw new HttpError(503, 'STORE_NOT_READY', 'The store is not ready yet.')
         const { commands, } = await import('../data/Commands.js')
         const { LOCAL_ONLY_COMMANDS } = await import('../utils/commandUtils.js')
         const name = firstWord(command)

@@ -167,7 +167,12 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
     const dir = dirOf(ctx)
     const client = clientAddressOf(req)
     // The body is read (size-checked) before any token check: an oversized body is 413 for everyone.
-    const raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readRawBody(req)
+    let raw: Buffer
+    try { raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readRawBody(req) } catch (e) {
+        // engine#582: every error of the grant route names this Engine as issuerEngineId
+        if (route === '/api/auth/grant' && e instanceof HttpError) e.extra = { issuerEngineId: ctx.engineId, ...e.extra }
+        throw e
+    }
     const body = (): Record<string, unknown> => parseJsonBody(raw)
 
     if (route === '/api/auth/info' && method === 'GET') return { status: 200, body: buildAuthInfo(ctx) }
@@ -229,7 +234,7 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
         const self = ctx.engineId
         try {
             const s = authenticate(req)
-            const b = await readJsonBody(req)
+            const b = body()
             const to = str(b.toEngineId, 'toEngineId', 80)
             if (!/^[A-Za-z0-9_-]{1,80}$/.test(to) || to === self) throw new HttpError(400, 'BAD_REQUEST', "'toEngineId' must be another Engine's id.")
             const store = ctx.storeHandle?.doc() as Store | undefined
