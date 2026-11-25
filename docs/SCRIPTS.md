@@ -152,6 +152,20 @@ This document provides a reference for the main provisioning and utility scripts
 
 ---
 
+### `dump-store.ts` (`script/dump-store.ts`)
+
+-   **Purpose:** Pretty-print engines, disks, instances, apps and operations from an Automerge store (no writes). Useful when diagnosing store identity, genesis, or a self-heal.
+-   **Usage:** `pnpm dump-store` or `npx tsx script/dump-store.ts` (local `store-data` / `store-url.txt`). `npx tsx script/dump-store.ts --host <ipv4>` opens the store via the Engine WebSocket on that host (port `settings.port`, default 4321).
+-   **Details:** Read-only. Default `--host` is `127.0.0.1`. Do not point it at a kit or at production. Never run `cleanup-store` on a live or kit store.
+
+---
+
+### Fleet scripts `provision-fleet.sh` and `check-fleet.sh`
+
+Provisioning and status of idea01–idea04 are documented in [PI_FLEET.md](PI_FLEET.md), not repeated here. `sync-engine.ts` and `reset-engine.ts` are above. `script/install-root-helpers.ts` is the `./install-root-helpers` entry point used by `sync-engine` and `build-engine` (`installRootHelpers`).
+
+---
+
 ### `write-build-info.mjs` (`script/write-build-info.mjs`)
 -   **Description:** Run by `pnpm build` after `tsc` (idea#400 PR C, Steve Q12). Writes `dist/build-info.json` = `{ commit, commitTimeMs }` from `git rev-parse HEAD` and `git log -1 --format=%ct`. The scheduled-backup clock check uses `commitTimeMs` as its floor (`BEFORE_BUILD`). Without git the file is removed and the check is skipped. Optional argument: the output path.
 

@@ -1,6 +1,6 @@
 # Scheduled Backup Disk (idea#400)
 
-**Status:** Draft. It describes the design as agreed and grows with each PR (A to D, plus idea#404 `makeBackupDisk`). Only the parts marked *landed* exist in the code.
+**Status:** Authoritative. idea#400 PRs A–D and idea#404 (`makeBackupDisk`) are on Engine main. This document describes the behaviour as implemented, not an in-flight design.
 
 **Sources:**
 - [`proposals/scheduled-backup-disk.md`](https://github.com/koenswings/idea/blob/main/proposals/scheduled-backup-disk.md) (idea repo, accepted by Koen 30 Oct 2026).
@@ -17,17 +17,17 @@ A Backup Disk in `scheduled` mode, docked to an Engine, backs up its instances o
 - Consequence: removing the last link of a scheduled disk (`removeBackupLink`) makes it back up every App on the Pi. The empty list is not rewritten in BACKUP.yaml or in `Disk.backupConfig.links`; a Console shows "all Apps" for a `scheduled` disk whose `backupConfig.links` is empty.
 - `immediate` and `on-demand` are unchanged: with no links, `immediate` backs up nothing on dock, and `on-demand` only runs `backupApp`.
 
-## Pieces and PRs
+## Pieces (landed on main)
 
-| PR | What | State |
+| Piece | What | State |
 |---|---|---|
-| A | `src/utils/backupSchedule.ts`: schedule parsing, Pi-local slots, the due decision, missed runs, the uptime counter, clock trust, jump detection, the skipped-run catch-up rule and the test clock offset. Pure functions, with unit tests (`test/automated/backup-schedule.test.ts`), plus the type-only store fields below. | *landed with PR A* |
-| B | `src/data/BackupYamlDoc.ts`: document-preserving BACKUP.yaml edits (#344's atomic writer, now shared) for the link `lastBackup` and the state keys `schedule` / `lastRun` / `uptimeCounter` / `missedRuns` / `lastAttempt`, plus a lenient state reader. `processBackupDisk` mirrors `schedule` / `missedRuns` / `lastAttempt`. `src/data/BackupResults.ts` and `backupInstance` write `lastResult` / `backupHistory` for every attempt. Manual refusals start with `BUSY`; automatic ones record `SKIPPED_LOCKED`; a stale lock found at dock is recorded once as `INTERRUPTED`. `createBackupDisk scheduled` adds the 02:30 default. | *landed with PR B* |
-| C | `src/monitors/backupScheduler.ts`: the tick, sequential runs per disk, locks, retry and catch-up, a one-change-per-run store summary (`freePct`, `clockTrusted` / `clockReason`, `cleaning` / `cleaningStartedAt`), `backupConfig.scheduleError`, and the build timestamp baked in at build (`script/write-build-info.mjs`, `src/utils/buildInfo.ts`). Tests: `test/automated/backup-scheduler.test.ts`. | *landed with PR C* |
-| D | `src/data/BackupModeCommand.ts`: the `setBackupMode` command (registered in `Commands.ts`) and the `scheduledBackups` capability. Tests: `test/automated/set-backup-mode.test.ts`. | *landed with PR D* |
-| idea#404 | `src/data/MakeBackupDisk.ts`: `makeBackupDisk` (Check / Erase / Re-dock / Create), the always-on `makeBackupDisk` capability, and `initialiseDisk … backup` using the same Create defaults (`scheduled` / 02:30, `backups/` root). Tests: `test/automated/make-backup-disk.test.ts`. | *this PR* |
+| A | `src/utils/backupSchedule.ts`: schedule parsing, Pi-local slots, the due decision, missed runs, the uptime counter, clock trust, jump detection, the skipped-run catch-up rule and the test clock offset. Pure functions, with unit tests (`test/automated/backup-schedule.test.ts`), plus the type-only store fields below. | Landed |
+| B | `src/data/BackupYamlDoc.ts`: document-preserving BACKUP.yaml edits (#344's atomic writer, now shared) for the link `lastBackup` and the state keys `schedule` / `lastRun` / `uptimeCounter` / `missedRuns` / `lastAttempt`, plus a lenient state reader. `processBackupDisk` mirrors `schedule` / `missedRuns` / `lastAttempt`. `src/data/BackupResults.ts` and `backupInstance` write `lastResult` / `backupHistory` for every attempt. Manual refusals start with `BUSY`; automatic ones record `SKIPPED_LOCKED`; a stale lock found at dock is recorded once as `INTERRUPTED`. `createBackupDisk scheduled` adds the 02:30 default. | Landed |
+| C | `src/monitors/backupScheduler.ts`: the tick, sequential runs per disk, locks, retry and catch-up, a one-change-per-run store summary (`freePct`, `clockTrusted` / `clockReason`, `cleaning` / `cleaningStartedAt`), `backupConfig.scheduleError`, and the build timestamp baked in at build (`script/write-build-info.mjs`, `src/utils/buildInfo.ts`). Tests: `test/automated/backup-scheduler.test.ts`. | Landed |
+| D | `src/data/BackupModeCommand.ts`: the `setBackupMode` command (registered in `Commands.ts`) and the `scheduledBackups` capability. Tests: `test/automated/set-backup-mode.test.ts`. | Landed |
+| idea#404 | `src/data/MakeBackupDisk.ts`: `makeBackupDisk` (Check / Erase / Re-dock / Create), the always-on `makeBackupDisk` capability, and `initialiseDisk … backup` using the same Create defaults (`scheduled` / 02:30, `backups/` root). Tests: `test/automated/make-backup-disk.test.ts`. | Landed on main |
 
-The 05:00 reboot wrapper (it waits while `/run/idea/backup-running` exists, with a 90-minute cap) is its own small PR, separate from #292 and from this work. The Engine already writes that marker for every backup (`beginUsageSkip('backup')`, idea#411).
+The Engine writes `/run/idea/backup-running` for every backup (`beginUsageSkip('backup')` in `src/usage/opFlags.ts`, idea#411). The host **05:00 reboot wrapper** that would wait while that flag exists (90-minute cap) is **not** in Engine main: `script/build_image_assets/crondefs` still ships a plain `0 5 * * * /sbin/shutdown -r now`. That wrapper remains a follow-up (idea proposal `scheduled-backup-disk.md`).
 
 ## BACKUP.yaml (on the disk: the source of truth)
 

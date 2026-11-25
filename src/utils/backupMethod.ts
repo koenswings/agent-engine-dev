@@ -20,7 +20,10 @@
  *   timeout --signal=TERM --kill-after=10s <hookTimeout>
  *     docker compose exec -T [--user <user>] -- <service> <command…>
  * from the instance directory, while backupInstance already holds the instance
- * lock. No helper bump (stay on v8).
+ * lock. Hooks do not call idea-app-data (they run `docker compose exec` as pi),
+ * so this file does not require a helper bump. The shipped helper is v25
+ * (`APP_DATA_HELPER_VERSION` in `src/utils/appDataHelper.ts`); backup excludes
+ * still require at least v8 (`BACKUP_EXCLUDE_HELPER_MIN`).
  */
 
 import { spawn } from 'node:child_process'
