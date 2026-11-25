@@ -16,7 +16,7 @@ The **Engine** is a Node.js/TypeScript process on each school Raspberry Pi, mana
 The core software is a Node.js application called the **Engine**, managed by `pm2` for persistence and auto-restart. The architecture relies on a local-first, distributed state model using **Automerge** to synchronize data between devices without a central server.
 
 #### **A. State Management (Automerge Repo)**
-The project moved away from Yjs/Valtio (referenced in brainstorming notes) to **Automerge** for conflict-free data synchronization.
+The shared state is an Automerge CRDT document, synchronised by `@automerge/automerge-repo` (`startAutomergeServer` in `repo.ts`).
 
 *   **The Store:** The central data structure is a single shared Automerge CRDT document containing maps for Engines, Disks, Apps, and Instances. Every Engine on the network maintains its own local copy of this document and continuously merges it with copies from its peers. The result is that **every Engine holds a complete, up-to-date view of the entire network** — which engines exist, which disks are inserted into which engine, and which app instances are running where — without any central coordinator.
 *   **Initialization (The "Golden Template"):** To solve the "offline-first" initialization problem (where two offline nodes create diverging documents that can never be merged), the code implements a specific pattern found in `repo.ts` and `Store.ts`.
@@ -35,7 +35,7 @@ The project moved away from Yjs/Valtio (referenced in brainstorming notes) to **
     *   **System `/META.yaml` at startup (idea#145):** the Engine id comes from `/META.yaml` (`localEngineId` in `Engine.ts`, read at import). If the file is missing (a freshly flashed Pi that never ran `build-engine --personalize`), `readMetaUpdateId` first calls `ensureSystemMeta`, which writes one with `sudo tee /META.yaml` (10-engine): diskId from the root disk's hardware serial when `readHardwareId` finds one, otherwise a generated id; `diskName` = diskId; the Engine version from `package.json`. In testMode/isDev nothing is written and the Engine stops with an error that says how to fix it (as it does when the write fails); `getLocalEngineId` prints that reason before exiting instead of a bare crash.
     *   **Engine id freeze (idea#524, Koen 15 Nov 2026):** once the system `/META.yaml` has a diskId, `readMetaUpdateId` keeps it (`systemDiskIdFrozen`) and does no hardware id lookup, whatever `skipHardwareId` says, so a redeploy or update never replaces it with a newly readable serial (engine#361 had flipped golden to `ENGINE_AA000000000000055000` and production to `ENGINE_AA000000000000000724`; both now stay as they are). Only a first boot with no diskId (a sanitised image, or no `/META.yaml`) takes the root drive serial (`isHardwareId: true`), or a random id without one. A full `build-engine` run calls `addMeta(..., { keepExistingId: true })` and leaves an existing `/META.yaml` alone; `--personalize` (MASTER clone first boot) and `reset-engine --meta` still regenerate it on purpose. App Disk partitions keep the idea#168 D4 rules. Tests: `test/automated/engine-id-freeze.test.ts`.
     *   On startup, the Engine attempts to load the main document from local storage. If it does not exist (first boot), it imports this binary template. This ensures all nodes start with the **same document ID**, allowing them to merge seamlessly when they eventually connect — even if each has been operating independently for days.
-*   **Storage:** Data is persisted to the local filesystem using `NodeFSStorageAdapter`. Each Engine's local copy survives reboots and is incrementally merged with peers on reconnection.
+*   **Storage:** Data is persisted to the local filesystem using `DurableNodeFSStorageAdapter` (`src/data/DurableStorageAdapter.ts`; same on-disk layout as the stock `NodeFSStorageAdapter`). Each Engine's local copy survives reboots and is incrementally merged with peers on reconnection.
 
 #### **B. Data Flow: Monitors & The Repo**
 The application uses a "Monitor" pattern. Monitors listen for system events (USB insertion, network changes, time) and update the Automerge Repo. The Repo then syncs these changes to other peers.
@@ -121,7 +121,7 @@ The application uses a "Monitor" pattern. Monitors listen for system events (USB
 
 The system forms a self-organising mesh on the local network with no configuration required.
 
-*   **Engine ↔ Engine (peer sync):** Each Engine runs a WebSocket server (set up in `repo.ts`). When mDNS discovery finds a new Engine, a WebSocket connection is opened and Automerge sync begins. Changes flow in both directions and are merged automatically using CRDTs — no conflict resolution logic is needed. Once synced, every Engine's local document contains the aggregated state of all engines: every disk, every app instance, and every engine heartbeat visible on the network.
+*   **Engine ↔ Engine (peer sync):** Each Engine runs a WebSocket server (set up in `repo.ts`). When mDNS discovery finds a new Engine, a WebSocket connection is opened and Automerge sync begins. Changes flow in both directions and are merged automatically using CRDTs — no conflict resolution logic is needed. Once synced, every Engine's local document contains the aggregated state of all Engines of that store: every disk, every app instance, and every Engine. Heartbeats and metrics are Automerge ephemeral messages (`idea/hb` every 10 s, and `idea/metrics`; `src/data/Liveness.ts`). They are relayed to every peer of the doc and are never written into the store history. The stored "last seen" is still `engineDB[self].lastRun`, written at boot and at most once an hour (`LAST_SEEN_INTERVAL_MS`). A peer's Engine key expires after `settings.peerStaleHours` (default 168 = 7 days) without a heartbeat (`peerStaleMs()` in `src/data/Config.ts`); the stale rule uses max(stored `lastRun`, last ephemeral ping).
 
 *   **Engine ↔ Console UI (read path):** A Console UI connects to any one Engine on the network via WebSocket. Because that Engine already holds the merged view of the whole network, the Console UI immediately receives the complete picture — all engines, all disks, all running apps — without needing to connect to each engine individually. The Automerge document is the single source of truth, and the Console UI subscribes to it like any other peer.
 
@@ -137,11 +137,11 @@ The system forms a self-organising mesh on the local network with no configurati
 
 ---
 
-### **3. Implementation of Brainstorming Decisions**
+### **3. Implemented design decisions**
 
-| Brainstorming Concept | Implemented Decision (Source Code) |
+| Design question | What main does |
 | :--- | :--- |
-| **Data Sync:** Use Yjs with Valtio | **Switched to Automerge:** The code explicitly uses `@automerge/automerge-repo` and implements `startAutomergeServer` in `repo.ts`. |
+| **Data sync** | Automerge via `@automerge/automerge-repo` (`startAutomergeServer` in `repo.ts`). |
 | **Object Identity:** Objects need unique IDs | **Implemented:** The `Meta.ts` and `CommonTypes.ts` define strongly typed IDs (`EngineID`, `DiskID`) derived from hardware UUIDs or generated UUIDs stored in `META.yaml` files. |
 | **Initialization:** Preventing data overwrite on boot | **Implemented:** `start.ts` calls `assertStoreIdentityMatchesData` then `prepareStoreIdentity` (`StoreIdentity.ts`). A non-empty `store-data` whose identity is unusable or names a document that is not in `store-data` stops startup with `STORE_IDENTITY_MISMATCH` and no writes (engine#391; override `--allow-new-store` / `IDEA_ALLOW_NEW_STORE=1` only). A missing `store-url.txt` stops startup (restored with the fleet store URL, the kit store, only with `IDEA_ALLOW_STORE_URL_FALLBACK=true`), an existing one is kept, and a missing `store-template.json` is an error (idea#120). `createServerStore` in `Store.ts` imports the binary template under the store's document ID when the document is not yet in local storage, so all nodes share one document ID and history. |
 | **App Execution:** Docker Containers | **Implemented:** `Instance.ts` uses `node-docker-api` and `zx` shell scripts to manage Docker containers. Apps are defined by `compose.yaml` files found on the disk. |

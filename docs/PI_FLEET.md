@@ -151,6 +151,8 @@ Org-level policy, ACLs, tags and remaining gaps are in koenswings/idea `docs/ops
 
 The pool and golden Pis are reached over Tailscale at the addresses above (current ops practice is always-on). Do not treat the older “latent debug” flow as the current fleet state: `tailscale-debug-activate.sh` still exists for an intervention, but a proof must not take Tailscale down on a fleet Pi.
 
+**First-boot join (engine#291, [merged](https://github.com/koenswings/agent-engine-dev/pull/291) 13 Nov 2026 as `d38774a165103406cb212b8ceb509e1e79edcdef`).** On an Engine image, `boot.sh` runs the root helper `idea-engine-identity` at every boot (`script/build_image_assets/idea-engine-identity`). When the flash tool left a Tailscale key on the boot partition, the helper moves it to `/etc/tailscale/debug-authkey` (`0600 root:root`), then runs `systemctl enable --now tailscaled` and `tailscale up` (no `--ephemeral`), so the join survives later reboots. After a successful join the stored key is deleted; a failed join is retried on the same boot (bounded) and again at the next boot. See also `docs/ENGINE_IMAGE.md` and `docs/ARCHITECTURE.md` (flash-time identity).
+
 **Fresh Pi provisioning:** `buildEngine` calls `installTailscale()` automatically. The key is read from the `TAILSCALE_AUTHKEY` environment variable, or, as a fallback still in code, `/home/pi/openclaw/secrets/tailscale_authkey.txt` on the machine running the provisioner (`src/data/Engine.ts`). Prefer the env var or `provision-fleet.sh`'s `--authkey-file` / `~/.config/idea/fleet-authkey` path. Never put the key on a command line.
 
 **How the auth key is handled (idea#115):** the key is never a command-line argument, so it can't be seen with `ps`, and it never goes into logs, shell history or Console History.
