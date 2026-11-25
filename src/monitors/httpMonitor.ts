@@ -90,6 +90,50 @@ const mimeType = (filePath: string): string => {
     return MIME_TYPES[ext] ?? 'application/octet-stream'
 }
 
+/** Result of resolveStaticPath: a file to serve, or a status to answer with (no body detail). */
+export type StaticPathResult =
+    | { kind: 'file', filePath: string }
+    | { kind: 'reject', status: 400 | 404 }
+
+const isInside = (root: string, p: string): boolean => p === root || p.startsWith(root + path.sep)
+
+/**
+ * Map a raw request target to a file under consolePath, or refuse it.
+ *
+ * - The query and fragment are dropped; the target must start with '/'.
+ * - Encoded dots, slashes, backslashes and NUL (%2e, %2f, %5c, %00), raw
+ *   backslashes and NUL bytes, malformed escapes, double-encoded forms of these
+ *   and '.' or '..' segments → 400.
+ * - The decoded path is resolved under the real consolePath and must stay inside it.
+ * - An existing file must also be inside after symlinks are resolved (realpath);
+ *   a symlink that leads out of the folder → 404.
+ * - A path inside the folder that is no file (missing or a directory) gets
+ *   index.html, the SPA fallback, as before.
+ */
+export const resolveStaticPath = (consolePath: string, rawUrl: string): StaticPathResult => {
+    const bad: StaticPathResult = { kind: 'reject', status: 400 }
+    const target = String(rawUrl ?? '/').split('?')[0].split('#')[0]
+    if (!target.startsWith('/')) return bad
+    if (target.includes('\\') || target.includes('\0') || /%(2e|2f|5c|00)/i.test(target)) return bad
+    let decoded: string
+    try { decoded = decodeURIComponent(target) } catch { return bad }
+    if (decoded.includes('\0') || decoded.includes('\\') || /%(2e|2f|5c|00)/i.test(decoded)) return bad  // also double-encoded
+    if (decoded.split('/').some(seg => seg === '..' || seg === '.')) return bad
+
+    let root: string
+    try { root = fs.realpathSync(path.resolve(consolePath)) } catch { return { kind: 'reject', status: 404 } }
+    const index = path.join(root, 'index.html')
+    const rel = decoded === '/' ? 'index.html' : '.' + decoded
+    const candidate = path.resolve(root, rel)
+    if (!isInside(root, candidate)) return bad
+
+    let real: string
+    try { real = fs.realpathSync(candidate) } catch { return { kind: 'file', filePath: index } }  // missing → SPA fallback
+    if (!isInside(root, real)) return { kind: 'reject', status: 404 }
+    try { if (!fs.statSync(real).isFile()) return { kind: 'file', filePath: index } } catch { return { kind: 'file', filePath: index } }
+    return { kind: 'file', filePath: real }
+}
+
 /**
  * Start the Engine HTTP server.
  *
@@ -178,17 +222,16 @@ export const enableHttpMonitor = (
             return
         }
 
-        // Resolve the requested path to a file under consolePath.
-        // Any path that doesn't resolve to a real file falls back to index.html
-        // (SPA client-side routing).
-        let filePath = path.join(consolePath, url === '/' ? 'index.html' : url)
-
-        // Strip query strings
-        filePath = filePath.split('?')[0]
-
-        if (!fs.existsSync(filePath) || fs.statSync(filePath).isDirectory()) {
-            filePath = path.join(consolePath, 'index.html')
+        // Resolve the requested path to a file strictly under consolePath (resolveStaticPath).
+        // A path that stays inside but is not a file falls back to index.html (SPA
+        // client-side routing); anything that tries to leave the folder is refused.
+        const resolved = resolveStaticPath(consolePath, url)
+        if (resolved.kind === 'reject') {
+            res.writeHead(resolved.status, { 'Content-Type': 'text/plain' })
+            res.end(resolved.status === 400 ? 'Bad request' : 'Not found')
+            return
         }
+        const filePath = resolved.filePath
 
         try {
             const data = await fs.readFile(filePath)
