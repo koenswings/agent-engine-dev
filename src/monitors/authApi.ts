@@ -89,30 +89,42 @@ export const clientOf = (req: http.IncomingMessage, store?: Store | null): { cli
 }
 export const clientAddressOf = (req: http.IncomingMessage, store?: Store | null): string => clientOf(req, store).client
 
-/** Read a JSON object body, at most MAX_BODY_BYTES. */
-export const readJsonBody = (req: http.IncomingMessage): Promise<Record<string, unknown>> => new Promise((resolve, reject) => {
+/**
+ * Read a request body, at most MAX_BODY_BYTES (413 PAYLOAD_TOO_LARGE beyond that). Routes read
+ * the body before they check the token, so an oversized body always gets 413, signed in or not.
+ */
+export const readRawBody = (req: http.IncomingMessage): Promise<Buffer> => new Promise((resolve, reject) => {
     const chunks: Buffer[] = []
     let size = 0
     let done = false
     const fail = (e: HttpError) => { if (!done) { done = true; reject(e) } }
+    const declared = Number(req.headers?.['content-length'])
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+        fail(new HttpError(413, 'PAYLOAD_TOO_LARGE', `Request body is larger than ${MAX_BODY_BYTES / 1024} KB.`))
+        req.resume()
+        return
+    }
     req.on('data', (c: Buffer) => {
         size += c.length
         if (size > MAX_BODY_BYTES) { fail(new HttpError(413, 'PAYLOAD_TOO_LARGE', `Request body is larger than ${MAX_BODY_BYTES / 1024} KB.`)); req.resume(); return }
         if (!done) chunks.push(c)
     })
-    req.on('end', () => {
-        if (done) return
-        done = true
-        const text = Buffer.concat(chunks).toString('utf8').trim()
-        if (!text) { resolve({}); return }
-        try {
-            const j = JSON.parse(text)
-            if (!j || typeof j !== 'object' || Array.isArray(j)) { reject(new HttpError(400, 'BAD_REQUEST', 'Body must be a JSON object.')); return }
-            resolve(j)
-        } catch { reject(new HttpError(400, 'BAD_REQUEST', 'Body is not valid JSON.')) }
-    })
+    req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks)) } })
     req.on('error', () => fail(new HttpError(400, 'BAD_REQUEST', 'Request body could not be read.')))
 })
+
+/** Parse a body read by readRawBody as a JSON object (empty body = {}). */
+export const parseJsonBody = (raw: Buffer): Record<string, unknown> => {
+    const text = raw.toString('utf8').trim()
+    if (!text) return {}
+    let j: unknown
+    try { j = JSON.parse(text) } catch { throw new HttpError(400, 'BAD_REQUEST', 'Body is not valid JSON.') }
+    if (!j || typeof j !== 'object' || Array.isArray(j)) throw new HttpError(400, 'BAD_REQUEST', 'Body must be a JSON object.')
+    return j as Record<string, unknown>
+}
+
+/** Read a JSON object body, at most MAX_BODY_BYTES. */
+export const readJsonBody = async (req: http.IncomingMessage): Promise<Record<string, unknown>> => parseJsonBody(await readRawBody(req))
 
 /** Check the Bearer token of a request (renewing the session); throws a 401 HttpError. */
 export const authenticate = (req: http.IncomingMessage): Session => {
@@ -163,11 +175,19 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
     const method = req.method ?? 'GET'
     const dir = dirOf(ctx)
     const client = clientAddressOf(req, ctx.storeHandle?.doc() as Store | undefined)
+    // The body is read (size-checked) before any token check: an oversized body is 413 for everyone.
+    let raw: Buffer
+    try { raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readRawBody(req) } catch (e) {
+        // engine#582: every error of the grant route names this Engine as issuerEngineId
+        if (route === '/api/auth/grant' && e instanceof HttpError) e.extra = { issuerEngineId: ctx.engineId, ...e.extra }
+        throw e
+    }
+    const body = (): Record<string, unknown> => parseJsonBody(raw)
 
     if (route === '/api/auth/info' && method === 'GET') return { status: 200, body: buildAuthInfo(ctx) }
 
     if (route === '/api/auth/setup' && method === 'POST') {
-        const b = await readJsonBody(req)
+        const b = body()
         if (!setupRequired(ctx)) throw new HttpError(409, 'SETUP_DONE', 'This Engine already has an operator. Sign in instead.')
         const username = str(b.username, 'username', 64)
         if (!validUsername(username)) throw new HttpError(400, 'BAD_REQUEST', 'Username must be 1–64 characters without control characters.')
@@ -186,14 +206,14 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
     }
 
     if (route === '/api/auth/challenge' && method === 'POST') {
-        const b = await readJsonBody(req)
+        const b = body()
         const username = str(b.username, 'username', 64)
         if (setupRequired(ctx)) throw new HttpError(403, 'SETUP_REQUIRED', 'This Engine has no operator yet. Enter the setup code shown on this Engine.')
         return { status: 200, body: createChallenge(username, dir) }
     }
 
     if (route === '/api/auth/login' && method === 'POST') {
-        const b = await readJsonBody(req)
+        const b = body()
         const username = str(b.username, 'username', 64)
         const challengeId = str(b.challengeId, 'challengeId', 64)
         const proof = str(b.proof, 'proof', 128)
@@ -223,7 +243,7 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
         const self = ctx.engineId
         try {
             const s = authenticate(req)
-            const b = await readJsonBody(req)
+            const b = body()
             const to = str(b.toEngineId, 'toEngineId', 80)
             if (!/^[A-Za-z0-9_-]{1,80}$/.test(to) || to === self) throw new HttpError(400, 'BAD_REQUEST', "'toEngineId' must be another Engine's id.")
             const store = ctx.storeHandle?.doc() as Store | undefined
@@ -246,7 +266,7 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
 
     if (route === '/api/auth/password' && method === 'POST') {
         const s = authenticate(req)
-        const b = await readJsonBody(req)
+        const b = body()
         const challengeId = str(b.challengeId, 'challengeId', 64)
         const proof = str(b.proof, 'proof', 128)
         if (!isAcceptableNewHash(b.newPasswordHash)) throw new HttpError(400, 'BAD_REQUEST', "'newPasswordHash' must be a bcrypt hash with cost 10 to 12.")
@@ -271,7 +291,7 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
 
     if (route === '/api/auth/operators' && method === 'POST') {
         const s = authenticate(req)
-        const b = await readJsonBody(req)
+        const b = body()
         const username = str(b.username, 'username', 64)
         const op = addOperator(username, b.passwordHash as string, dir)
         auditAuth(ctx, 'operator-added', { by: s.username, username })
