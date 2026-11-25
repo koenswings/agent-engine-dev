@@ -87,6 +87,7 @@ import { parseBackupSpec, BackupMethod } from '../utils/backupMethod.js'
 import type { PreUpdateBackupOptions } from '../monitors/backupMonitor.js'
 import { backupArchiveName } from '../utils/backupArchiveName.js'
 import { shouldFailUpdateRestart, TEST_FAIL_UPDATE_FAILURE_MESSAGE, TEST_FAIL_UPDATE_RESTART_MESSAGE } from './UpdateAppTestHook.js'
+import { stableStringify } from '../utils/stableJson.js'
 
 /** v14 (idea#396): snapshot/estimate excludes under data/, 24 h pre-update quarantine. */
 export const UPDATE_HELPER_MIN = 14
@@ -1532,7 +1533,7 @@ export const publishAppBundles = async (storeHandle: DocHandle<Store>, disk: Dis
         }
     } catch (e) { log(`publishAppBundles ${disk.id}: ${(e as Error).message}`); return false }
     const cur = storeHandle.doc().diskDB[disk.id as DiskID]
-    if (!cur || JSON.stringify(cur.appBundles ?? null) === JSON.stringify(list)) return false
+    if (!cur || stableStringify(cur.appBundles ?? null) === stableStringify(list)) return false
     storeHandle.change(doc => {
         const x = doc.diskDB[disk.id as DiskID]
         if (x) x.appBundles = list.map(b => ({
@@ -1640,7 +1641,7 @@ export const refreshUpdateAvailable = async (storeHandle: DocHandle<Store>, engi
         for (const [id, u] of Object.entries(updates)) {
             const i = doc.instanceDB[id as InstanceID]
             if (!i) continue
-            const cur = JSON.stringify(i.updateAvailable ?? null), next = JSON.stringify(u ?? null)
+            const cur = stableStringify(i.updateAvailable ?? null), next = stableStringify(u ?? null)
             if (cur !== next) i.updateAvailable = u ? { ...u } : null
         }
     })

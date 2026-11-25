@@ -40,10 +40,14 @@ import {
 
 const newDocId = (): DocumentId => parseAutomergeUrl(generateAutomergeUrl()).documentId
 
+/** automerge-repo >= 2.5 takes a Ref factory as the 2nd DocHandle argument (Repo passes one); these handles never use refs. */
+const noRefs = (() => { throw new Error('refs not used in this test') }) as unknown as ConstructorParameters<typeof DocHandle>[1]
+const bareHandle = (documentId: DocumentId, timeoutDelay: number): DocHandle<unknown> => new DocHandle(documentId, noRefs, { timeoutDelay })
+
 /** A REAL library timeout: a handle that never becomes ready, short timeoutDelay. */
 const realTimeoutFor = async (documentId: string): Promise<unknown> => {
     installWhenReadyAnnotation()
-    const handle = new DocHandle(documentId as DocumentId, { timeoutDelay: 20 })
+    const handle = bareHandle(documentId as DocumentId, 20)
     try {
         await handle.whenReady()
     } catch (e) {
@@ -101,7 +105,7 @@ describe('automergeTimeoutGuard — whenReady annotation', () => {
 
     it('install is idempotent and leaves resolution unchanged', async () => {
         installWhenReadyAnnotation(); installWhenReadyAnnotation()
-        const h = new DocHandle(newDocId(), { timeoutDelay: 1000 })
+        const h = bareHandle(newDocId(), 1000)
         h.update(d => d)
         h.doneLoading()
         await expect(h.whenReady()).resolves.toBeUndefined()
@@ -224,7 +228,7 @@ describe('automergeTimeoutGuard — per-engine own-store verdict (r32)', () => {
     /** A real library timeout on a handle that lives in `repo`'s handle cache. */
     const timeoutOwnedBy = async (repo: { handles: Record<string, unknown> }, id: string): Promise<unknown> => {
         installWhenReadyAnnotation()
-        const h = new DocHandle(id as DocumentId, { timeoutDelay: 20 })
+        const h = bareHandle(id as DocumentId, 20)
         repo.handles[id] = h
         try { await h.whenReady() } catch (e) { return e }
         throw new Error('expected whenReady to time out')
@@ -363,7 +367,7 @@ describe('automergeTimeoutGuard — real process exit codes', () => {
     it('a foreign-doc automerge timeout is tolerated and the process keeps running (exit 0)', () => {
         const r = run(`
             const { DocHandle } = await import('@automerge/automerge-repo');
-            const h = new DocHandle('${PRODUCTION_FLEET_STORE_DOC_ID}', { timeoutDelay: 20 });
+            const h = new DocHandle('${PRODUCTION_FLEET_STORE_DOC_ID}', () => { throw new Error('no refs') }, { timeoutDelay: 20 });
             void h.whenReady();
             setTimeout(() => { console.log('still-alive'); process.exit(0) }, 300)`)
         expect(r.status).toBe(0)
@@ -375,7 +379,7 @@ describe('automergeTimeoutGuard — real process exit codes', () => {
         const r = run(`
             const { DocHandle } = await import('@automerge/automerge-repo');
             g.registerOwnDoc('automerge:3zoqdSVsEtj4ygNJPNcDyKWvdxo6', 'store', 'idea01');
-            const h = new DocHandle('3zoqdSVsEtj4ygNJPNcDyKWvdxo6', { timeoutDelay: 20 });
+            const h = new DocHandle('3zoqdSVsEtj4ygNJPNcDyKWvdxo6', () => { throw new Error('no refs') }, { timeoutDelay: 20 });
             void h.whenReady();
             setTimeout(() => process.exit(0), 2000)`)
         expect(r.status).toBe(2)

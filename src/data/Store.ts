@@ -421,7 +421,7 @@ export const findDisksByApp = (store: Store, appId: AppID): Disk[] => {
 export const extractAppName = (appId: AppID): string => splitAppId(String(appId)).name
 
 export const getDisk = (store: Store, diskId: DiskID): Disk | undefined => {
-    if (store.diskDB.hasOwnProperty(diskId)) {
+    if (Object.prototype.hasOwnProperty.call(store.diskDB, diskId)) {
         return store.diskDB[diskId]
     } else {
         return undefined
@@ -429,7 +429,7 @@ export const getDisk = (store: Store, diskId: DiskID): Disk | undefined => {
 }
 
 export const getApp = (store: Store, appId: AppID): App | undefined => {
-    if (store.appDB.hasOwnProperty(appId)) {
+    if (Object.prototype.hasOwnProperty.call(store.appDB, appId)) {
         return store.appDB[appId]
     } else {
         return undefined
@@ -437,7 +437,7 @@ export const getApp = (store: Store, appId: AppID): App | undefined => {
 }
 
 export const getInstance = (store: Store, instanceId: InstanceID): Instance | undefined => {
-    if (store.instanceDB.hasOwnProperty(instanceId)) {
+    if (Object.prototype.hasOwnProperty.call(store.instanceDB, instanceId)) {
         return store.instanceDB[instanceId]
     } else {
         return undefined

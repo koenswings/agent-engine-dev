@@ -51,6 +51,9 @@
     "@types/mocha": "^10.0.10",
     "@types/netmask": "^2.0.5",
     "@types/node": "^20.19.10",
+    "automerge-compat-old": "npm:@automerge/automerge@3.2.4",
+    "automerge-repo-compat-old": "npm:@automerge/automerge-repo@2.3.1",
+    "automerge-repo-network-websocket-compat-old": "npm:@automerge/automerge-repo-network-websocket@2.3.1",
     "chai": "^5.2.1",
     "markdown-it": "^14.1.1",
     "mocha": "^10.8.2",
@@ -63,10 +66,10 @@
     "vitest": "^4.1.2"
   },
   "dependencies": {
-    "@automerge/automerge": "3.1.1-alpha.0",
-    "@automerge/automerge-repo": "2.3.1",
-    "@automerge/automerge-repo-network-websocket": "2.3.1",
-    "@automerge/automerge-repo-storage-nodefs": "^2.2.0",
+    "@automerge/automerge": "3.5.0",
+    "@automerge/automerge-repo": "2.5.6",
+    "@automerge/automerge-repo-network-websocket": "2.5.6",
+    "@automerge/automerge-repo-storage-nodefs": "2.5.6",
     "@homebridge/ciao": "^1.3.4",
     "chokidar": "^3.6.0",
     "dbus-next": "0.10.2",
@@ -91,7 +94,8 @@
       "picomatch@2": "^2.3.2",
       "postcss": "^8.5.10",
       "vite@8": "^8.0.5",
-      "serialize-javascript@6": "^7.0.3"
+      "serialize-javascript@6": "^7.0.3",
+      "@automerge/automerge-repo@2.3.1>@automerge/automerge": "3.2.4"
     },
     "ignoredOptionalDependencies": [
       "usocket"

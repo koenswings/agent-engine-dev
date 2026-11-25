@@ -14,6 +14,7 @@ import { isSystemDevice, driveNameOf } from './SystemDisk.js'
 import { readHardwareId } from './Meta.js'
 import { log, uuid } from '../utils/utils.js'
 import { localEngineId } from './Engine.js'
+import { stableStringify } from '../utils/stableJson.js'
 
 export interface UnformattedDisk {
     candidateId: string
@@ -217,10 +218,10 @@ export const refreshUnformattedDisks = async (
 
 /** The stored list, in the same shape refreshUnformattedDisks writes (for change detection). */
 const storedFingerprint = (storeHandle: DocHandle<Store>, engineId: EngineID): string =>
-    JSON.stringify(storeHandle.doc()?.engineDB?.[engineId]?.unformattedDisks ?? [])
+    stableStringify(storeHandle.doc()?.engineDB?.[engineId]?.unformattedDisks ?? [])
 
 const listFingerprint = (list: UnformattedDisk[]): string =>
-    JSON.stringify(list.map(({ candidateId, device, sizeBytes, model, fsType, label, serial }) => ({
+    stableStringify(list.map(({ candidateId, device, sizeBytes, model, fsType, label, serial }) => ({
         candidateId, device, sizeBytes, model, fsType, label, serial,
     })))
 
