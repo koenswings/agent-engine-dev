@@ -119,7 +119,11 @@ export class StoreScopedWebSocketServerAdapter extends WebSocketServerAdapter {
 
     override receiveMessage(messageBytes: Uint8Array, socket: any): void {
         let message: any
-        try { message = cbor.decode(new Uint8Array(messageBytes as any)) } catch { socket.close(); return }
+        try { message = cbor.decode(new Uint8Array(messageBytes as any)) } catch {
+            // undecodable: the stock path logs and closes the socket (same as before the join check)
+            if (!this.ownTag || this.#admitted.has(socket)) return super.receiveMessage(messageBytes, socket)
+            socket.close(); return
+        }
         if (!this.ownTag || this.#admitted.has(socket)) return this.#forward(message, messageBytes, socket)
         if (message?.type !== 'join') return   // nothing before the join is processed
         const verdict = peerVerdict(this.ownTag, message.senderId, message.peerMetadata)
@@ -137,22 +141,23 @@ export class StoreScopedWebSocketServerAdapter extends WebSocketServerAdapter {
     }
 
     /**
-     * The stock non-join path, plus relayed ephemeral messages. Since
+     * Everything goes through the stock receiveMessage, except one case. Since
      * automerge-repo-network-websocket 2.4 (upstream 6b80ad83) the stock adapter
      * drops every message whose senderId is not the peer of the socket it came
      * in on, to ignore a stale socket after a reconnect. A relayed ephemeral
      * message keeps its original senderId (DocSynchronizer.receiveEphemeralMessage),
-     * so a Console broadcast relayed by the Engine it is connected to was dropped
-     * here. Ephemeral messages on a socket that is still a current peer socket are
-     * forwarded as in 2.3.1; a stale socket stays ignored for everything.
+     * so a Console broadcast relayed by the Engine it is connected to was dropped.
+     * Only that message (ephemeral, senderId not this socket's peer, socket still
+     * a current peer socket) is forwarded here, as in 2.3.1.
      */
     #forward(message: any, messageBytes: Uint8Array, socket: any): void {
-        if (message?.type === 'join') return super.receiveMessage(messageBytes, socket)
-        const senderId = message?.senderId
-        if (this.sockets[senderId] === socket
-            || (message?.type === 'ephemeral' && Object.values(this.sockets).includes(socket))) {
+        if (message?.type === 'ephemeral' && this.sockets[message.senderId] !== socket
+            && Object.values(this.sockets).includes(socket)) {
+            // Accepts any senderId on a current peer socket, no worse than 2.3.1; sender authentication is tracked by the engine-03 command-auth work.
             this.emit('message', message)
+            return
         }
+        super.receiveMessage(messageBytes, socket)
     }
 }
 
