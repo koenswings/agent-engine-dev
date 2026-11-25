@@ -18,7 +18,7 @@ import {
     CommandLogStore, CommandTrace, createCommandLogStore, rotateCommandLog, setCommandLogHandle,
     addTrace, closeTrace, flushLogs, commandLogText, commandLogJson, isLogImmutable, logStr, shutdownRepo,
 } from '../../src/data/CommandLogStore.js'
-import { readSummaryFromTrace, attachTraceResult } from '../../src/data/SummariseDisk.js'
+import { readSummaryFromTrace, attachTraceResult, rememberOwnSummaryTrace } from '../../src/data/SummariseDisk.js'
 import { REDACTED } from '../../src/utils/redact.js'
 
 let dir = ''
@@ -87,6 +87,9 @@ describe('command-log text fields as ImmutableString (engine#471 b)', () => {
         expect(repoIsImmutable(h.doc()!.traces['new1'].result)).toBe(true)
 
         // readSummaryFromTrace on both kinds; '' result -> null on both kinds
+        // (engine#582: only traces this Engine wrote count; a foreign one is ignored)
+        expect(readSummaryFromTrace({} as any, 'old1', 'd1')).toBeNull()
+        for (const id of ['old1', 'new1', 'old3', 'new3']) rememberOwnSummaryTrace(id)
         expect(readSummaryFromTrace({} as any, 'old1', 'd1')?.targetId).toBe('d1')
         expect(readSummaryFromTrace({} as any, 'new1', 'd2')?.targetId).toBe('d2')
         expect(readSummaryFromTrace({} as any, 'old3', 'd1')).toBeNull()

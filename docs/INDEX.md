@@ -26,6 +26,14 @@ Reference for all Engine CLI commands: inspection, management, and diagnostic co
 with usage examples.
 → [docs/COMMANDS.md](COMMANDS.md)
 
+## COMMAND_AUTH.md
+**Status:** Authoritative for the steps on main (engine#582, built in steps)  ·  **Maintained by:** Axle
+Operator sign-in and signed commands: Engine-local auth folder, CORS for own Console origins,
+second confirmation for wipe/flash/app create, `createInstance` local-only and the git account
+pin, command source on traces and the local audit log; later steps add sign-in, signed
+commands, the relay and the firewall script.
+→ [docs/COMMAND_AUTH.md](COMMAND_AUTH.md)
+
 ## BACKUP_SCHEDULE.md
 **Status:** Authoritative (idea#400 PRs A–D and idea#404 are on main)  ·  **Maintained by:** Axle
 Scheduled Backup Disk: in-Engine daily schedule, due/catch-up rules, uptime fallback and clock

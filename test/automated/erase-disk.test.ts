@@ -16,7 +16,7 @@ import {
     eraseBlocker, IDEA_DISK_LABEL, isEraseDeviceLocked, isSlotEraseDevice,
     eraseLockRefusesAdd, eraseLockedDevicesForTests, setEraseAddDevice,
 } from '../../src/data/EraseDisk.js'
-import { summariseDisk, attachTraceResult, SUMMARY_MAX_AGE_MS, setSummariseOpsForTests } from '../../src/data/SummariseDisk.js'
+import { summariseDisk, attachTraceResult, SUMMARY_MAX_AGE_MS, setSummariseOpsForTests, rememberOwnSummaryTrace } from '../../src/data/SummariseDisk.js'
 import { scanUnformattedDisks, setUnformattedOpsForTests, uniquifyLabels, clearGeneratedUnformattedIdsForTests, labelForUnformatted } from '../../src/data/UnformattedDisks.js'
 import { setSystemDiskOpsForTests, isSystemDevice, driveNameOf } from '../../src/data/SystemDisk.js'
 import { SUDO_MOUNT_PATTERN, mountExt4Command } from '../../src/monitors/mounts.js'
@@ -226,6 +226,7 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
                 computedAt: Date.now(),
             }),
         } as any)
+        rememberOwnSummaryTrace(traceId)
         return traceId
     }
 

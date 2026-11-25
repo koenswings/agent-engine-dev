@@ -6,6 +6,7 @@
  * script (never a real stick).
  */
 import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest'
+import { rememberOwnSummaryTrace } from '../../src/data/SummariseDisk.js'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
@@ -62,6 +63,7 @@ const putSummary = (logHandle: DocHandle<CommandLogStore>, targetId: string, lab
             readable: false, computedAt: Date.now(),
         }),
     } as any)
+    rememberOwnSummaryTrace(traceId)
     return traceId
 }
 

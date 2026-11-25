@@ -5,6 +5,7 @@
  * after unmounting mounts and registers the partition again.
  */
 import { describe, it, beforeEach, afterEach, expect } from 'vitest'
+import { rememberOwnSummaryTrace } from '../../src/data/SummariseDisk.js'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
@@ -54,6 +55,7 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
                 usedBytes: null, readable: true, apps: [], instances: [], backups: [], files: null, other: null,
                 otherPartitions: [], computedAt: Date.now() }),
         } as any)
+        rememberOwnSummaryTrace('sum-whole')
         return 'sum-whole'
     }
 

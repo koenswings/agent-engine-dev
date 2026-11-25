@@ -320,7 +320,7 @@ export const eraseDisk = async (
     if (eng.eraseInProgress) throw new Error(`try again later: an erase is already in progress`)
 
     const summary = readSummaryFromTrace(store, summaryTraceId, targetId)
-    if (!summary) throw new Error(`The summary is missing, for another disk, or older than 10 minutes. Check the disk again.`)
+    if (!summary) throw new Error(`The summary is missing, for another disk, older than 10 minutes, or not made by this Engine. Check the disk again.`)
     if (summary.label !== confirmName) throw new Error(`Typed name does not match the disk label '${summary.label}'.`)
 
     const target = resolveSummaryTarget(store, targetId)
