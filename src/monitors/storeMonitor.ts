@@ -7,7 +7,7 @@ import { commands } from '../data/Commands.js';
 import { localEngineId } from '../data/Engine.js';
 import { CommandLogStore } from '../data/CommandLogStore.js';
 import type { CommandSource } from '../data/CommandSource.js';
-import { verifyEntry, markSeqDone, entryCommandText } from '../data/CommandKey.js';
+import { verifyEntry, markSeqDone, entryCommandText, entryLogText } from '../data/CommandKey.js';
 import { sourceForEntry } from '../data/SignedQueue.js';
 import { recordRefusalTrace } from '../utils/commandUtils.js';
 
@@ -88,11 +88,11 @@ const drainReadOnlyCommands = (storeHandle: DocHandle<Store>, engineId: EngineID
         const command = queuedText(raw)
         if (!isReadOnlyQueuedCommand(command) || running.has(command)) continue
         running.add(command)
-        log(`Processing read-only command for engine ${engineId} (parallel): ${command}`)
+        log(`Processing read-only command for engine ${engineId} (parallel): ${entryLogText(command)}`)
         // Same #262 setImmediate: do not run inside the store 'change' event.
         new Promise<void>(resolve => setImmediate(resolve))
             .then(() => runQueueEntry(storeHandle, engineId, command, cmdLogHandle))
-            .catch(e => log(`Command '${command}' failed outside its trace: ${e?.message ?? e}`))
+            .catch(e => log(`Command '${entryLogText(command)}' failed outside its trace: ${e?.message ?? e}`))
             .finally(() => {
                 running!.delete(command)
                 removeQueuedCommand(storeHandle, engineId, command)
@@ -113,14 +113,14 @@ export const processCommandQueue = (storeHandle: DocHandle<Store>, engineId: Eng
     if (idx === -1) return
     const command = queuedText(queue[idx])
     busy.add(String(engineId))
-    log(`Processing command for engine ${engineId}: ${command}`)
+    log(`Processing command for engine ${engineId}: ${entryLogText(command)}`)
     // agent-engine-dev#262: never run a command inside the store 'change' event that announced
     // it. A storeHandle.change() made from inside that event is applied only after the event
     // returns, so a command that changes the store and then checks the result (forgetDisk)
     // saw its own change as not done. setImmediate runs it on a clean stack.
     new Promise<void>(resolve => setImmediate(resolve))
         .then(() => runQueueEntry(storeHandle, engineId, command, cmdLogHandle))
-        .catch(e => log(`Command '${command}' failed outside its trace: ${e?.message ?? e}`))
+        .catch(e => log(`Command '${entryLogText(command)}' failed outside its trace: ${e?.message ?? e}`))
         .finally(() => {
             busy!.delete(String(engineId))
             removeQueuedCommand(storeHandle, engineId, command)

@@ -215,7 +215,8 @@ and the CORS rule above. Errors are `{ error, message, … }`.
 
 Tokens: no `Authorization` header → `401 AUTH_REQUIRED`; a malformed or unknown token →
 `401 TOKEN_INVALID`; a known session past its expiry → `401 TOKEN_EXPIRED` (once; after
-that the token is unknown, `TOKEN_INVALID`). A body over 16 KB → `413 PAYLOAD_TOO_LARGE`.
+that the token is unknown, `TOKEN_INVALID`). A body over 16 KB → `413 PAYLOAD_TOO_LARGE`; the
+size is checked before the token, so this holds with or without a (valid) token.
 An unknown `/api/*` route → `404 { error: "NOT_FOUND", message }`. An older Engine
 answers `404` on `/api/auth/info`. Sign-in events go to `command-audit.log` as
 `auth:<event>` lines (username, client address; never hashes, proofs or tokens).
@@ -254,13 +255,16 @@ src = op-<session8> | peer-<engineId> | cli | engine
 | `COMMAND_SIGNATURE_INVALID` | Changed text, another Engine's entry, or a forged prefix. |
 | `COMMAND_REPLAYED` | The seq already ran, is out of the window, or was never issued. |
 
+The Engine log shows a queue entry as `[seq <seq>, src <src>] <command>`; the mac is never
+logged.
+
 `sendCommand` only queues on this Engine (signed, `src engine`). Commands for another
 Engine go through that Engine's API (peer follow-ups below). Scripts that run on the Pi as
 the Engine user sign with `script/cli-queue-entry.ts` (`src cli`).
 
 ## POST /api/command (step 3)
 
-`src/monitors/commandApi.ts`. Order: token → validation → `GRANT_REQUIRED` →
+`src/monitors/commandApi.ts`. Order: body size → token → validation → `GRANT_REQUIRED` →
 `CONFIRM_REQUIRED` → signed entry.
 
 | Auth | Body | Answer |
@@ -268,7 +272,8 @@ the Engine user sign with `script/cli-queue-entry.ts` (`src cli`).
 | `Bearer <token>` | `{ command, confirmId?, confirmText?, grants?: { <engineId>: <grant> } }` | `202 { engineId, seq }` |
 | `Grant <grant>` (another Engine) | `{ command, fromEngineId, replyGrant? }` | `202 { engineId, seq }` |
 
-Errors: `400 BAD_REQUEST` (not one line of text), `401` token codes, `422 COMMAND_REFUSED`
+Errors: `413 PAYLOAD_TOO_LARGE` (before the token), `400 BAD_REQUEST` (not one line of text),
+`503 STORE_NOT_READY` (the Engine has not loaded its store yet; try again), `401` token codes, `422 COMMAND_REFUSED`
 with `reason` `unknown` / `local-only` (`createInstance`) / `validation` /
 `not-a-follow-up`, `409 GRANT_REQUIRED { engineIds }`, `403 GRANT_INVALID` /
 `GRANT_EXPIRED`, `409 ENGINE_VERSION_MISMATCH { engineId, version }`,
@@ -299,6 +304,15 @@ signs its own entries:
 A keeps one trace per follow-up it sent: `ok` with B's seq, or `error` with the code and
 `issuerEngineId` in the result. Grant errors from B always name B as `issuerEngineId`;
 errors from `/api/auth/grant` also carry it.
+
+**A grant is checked by B, at the follow-up.** A only checks that a grant names B as issuer
+and A as receiver; it cannot tell whether B still knows it. A grant that went stale (6 h
+passed, or B restarted) is therefore accepted by A (`202`), and the operation starts. When A
+sends the follow-up, B answers `403 GRANT_EXPIRED`; A drops the grant and the follow-up's
+trace on A is `status: error`, `errorCode: GRANT_EXPIRED`, with `issuerEngineId: B` and
+`dispatchedTo: B` in its result. The operation then fails at that step like any other
+follow-up error; the Console asks B for a new grant and starts again. This is intended: the
+grant check happens where the grant was issued.
 
 Peer addresses come from B's `engineDB` row (`lanAddress`, `lanAddresses`, then
 `<hostname>.local`; private ranges only) on `httpPort`. Before the first request A checks
@@ -353,7 +367,15 @@ command traces) when the signature verifies against the sender's published key a
 is within 60 s of B's clock; otherwise the socket address. The header never authorises
 anything. A client's own `X-Idea-Relay` header is never passed on.
 
-**Capability `engineRelay1`.**
+**Capability `engineRelay1`.** The page's Engine advertises it in `/api/auth/info` (and its
+`engineDB` capabilities) when it relays `/api/engines/<id>/…` for the Engines it knows from
+the store. A Console uses the relay only when the page's Engine advertises `engineRelay1`;
+the target Engine itself does not need it (it only needs `engineSignIn1` /
+`signedCommands1` for the request being relayed). A page Engine without `engineRelay1`
+(older Engine) answers `404` on these paths; the Console then talks to other Engines as it
+did before the relay. Relaying adds no rights: B checks the token, grant and confirmation
+of every relayed request exactly as for a direct one, and the relay only answers with its
+own errors (table above) when it could not get an answer from B.
 
 ## Firewall for the Engine ports (step 5, Ops)
 

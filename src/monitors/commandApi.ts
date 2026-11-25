@@ -94,7 +94,7 @@ export const routeCommand = async (req: http.IncomingMessage, pathname: string, 
         const store = ctx.storeHandle?.doc() as Store | undefined
         const { client: remoteAddr, viaEngineId } = clientOf(req, store)
         const via = viaEngineId ? { viaEngineId } : {}
-        if (!ctx.storeHandle || !store?.engineDB?.[self as any]) throw new HttpError(503, 'BAD_REQUEST', 'The store is not ready yet.')
+        if (!ctx.storeHandle || !store?.engineDB?.[self as any]) throw new HttpError(503, 'STORE_NOT_READY', 'The store is not ready yet.')
         const { commands, } = await import('../data/Commands.js')
         const { LOCAL_ONLY_COMMANDS } = await import('../utils/commandUtils.js')
         const name = firstWord(command)

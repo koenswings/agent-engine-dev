@@ -25,7 +25,7 @@ import { createOrUpdateEngine, localEngineId, rebootEngine } from '../../src/dat
 import { CommandLogStore, CommandTrace, commandLogText, setCommandLogHandle } from '../../src/data/CommandLogStore.js'
 import { enableStoreMonitor } from '../../src/monitors/storeMonitor.js'
 import {
-    signEntry, verifyEntry, markSeqDone, parseEntry, nextSeq, maxIssuedSeq, entryCommandText,
+    signEntry, verifyEntry, markSeqDone, parseEntry, nextSeq, maxIssuedSeq, entryCommandText, entryLogText,
     COMMAND_UNSIGNED, COMMAND_SIGNATURE_INVALID, COMMAND_REPLAYED,
 } from '../../src/data/CommandKey.js'
 import { enqueueSigned, clearPendingSourcesForTests } from '../../src/data/SignedQueue.js'
@@ -71,6 +71,15 @@ describe('signed queue entries (CommandKey)', () => {
         expect(verifyEntry(b.entry, SELF)).toEqual({ ok: true, seq: b.seq, src: 'op-0123abcd', command: 'ejectDisk d1' })
         expect(entryCommandText(b.entry)).toBe('ejectDisk d1')
         expect(entryCommandText('reboot')).toBe('reboot')
+    })
+
+    it('the log form of an entry shows seq and source, never the mac', () => {
+        const b = signEntry('ejectDisk d1', 'op-0123abcd', SELF)
+        const mac = parseEntry(b.entry)!.mac
+        expect(entryLogText(b.entry)).toBe(`[seq ${b.seq}, src op-0123abcd] ejectDisk d1`)
+        expect(entryLogText(b.entry)).not.toContain(mac)
+        expect(entryLogText('reboot')).toBe('reboot')
+        expect(entryLogText('@v1.12.cli.short reboot')).toBe('[unreadable signature] reboot')
     })
 
     it('unsigned (an older Console writing the store) → COMMAND_UNSIGNED', () => {
@@ -244,8 +253,17 @@ describe('peer follow-ups (PeerCommands / PeerHttp), mixed versions', () => {
     it('the peer refuses the grant: its code and issuerEngineId, and the grant is dropped', async () => {
         rememberGrant(issueGrant(PEER, SELF).grant, SELF)
         answer = { status: 403, body: { error: 'GRANT_EXPIRED', message: 'expired', issuerEngineId: PEER } }
+        const before = traces(log).filter(x => x.command === 'startInstance' && x.errorCode === 'GRANT_EXPIRED').length
         expect(await dispatchToPeer(h, PEER, 'startInstance i1 disk-peer')).toMatchObject({ ok: false, code: 'GRANT_EXPIRED', issuerEngineId: PEER })
         expect(grantFrom(PEER)).toBeNull()
+        // A stale grant is accepted when the operation starts (202 on this Engine); the peer
+        // refuses it only at the follow-up, and that follow-up's trace says so.
+        const after = traces(log).filter(x => x.command === 'startInstance' && x.errorCode === 'GRANT_EXPIRED')
+        expect(after.length).toBe(before + 1)
+        const t = after[after.length - 1]
+        expect(t.status).toBe('error')
+        expect(commandLogText(t.result)).toContain(`"issuerEngineId":"${PEER}"`)
+        expect(commandLogText(t.result)).toContain(`"dispatchedTo":"${PEER}"`)
     })
 
     it('a peer that answers 404 on /api/auth/info is an older Engine: ENGINE_VERSION_MISMATCH', async () => {
@@ -295,6 +313,29 @@ describe('POST /api/command and POST /api/auth/grant', () => {
         expect(r.status).toBe(401)
         expect((await r.json()).error).toBe('AUTH_REQUIRED')
         expect(queue(h)).toEqual([])
+    })
+
+    it('an oversized body → 413 PAYLOAD_TOO_LARGE, with or without a token; nothing queued', async () => {
+        for (const auth of [undefined, `Bearer ${token}`, 'Grant junk']) {
+            const r = await post('/api/command', { command: 'ejectDisk d1', pad: 'x'.repeat(20_000) }, auth)
+            expect(r.status, String(auth)).toBe(413)
+            expect((await r.json()).error).toBe('PAYLOAD_TOO_LARGE')
+        }
+        expect(queue(h)).toEqual([])
+    })
+
+    it('store not ready → 503 STORE_NOT_READY', async () => {
+        const empty = new Repo({ network: [], storage: undefined }).create<Store>({ engineDB: {}, diskDB: {}, appDB: {}, instanceDB: {}, userDB: {}, operationDB: {} } as any)
+        await empty.whenReady()
+        const s2 = enableHttpMonitor(0, '', null, undefined, { engineId: SELF, auth: { engineId: SELF, storeHandle: empty, capabilities: () => ['engineSignIn1', 'signedCommands1'] } })
+        await new Promise<void>(r => (s2.listening ? r() : s2.once('listening', () => r())))
+        try {
+            const r = await fetch(`http://127.0.0.1:${(s2.address() as AddressInfo).port}/api/command`, {
+                method: 'POST', body: JSON.stringify({ command: 'ejectDisk d1' }), headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+            })
+            expect(r.status).toBe(503)
+            expect(await r.json()).toMatchObject({ error: 'STORE_NOT_READY' })
+        } finally { await new Promise<void>(r => s2.close(() => r())) }
     })
 
     it('operator → 202 {engineId, seq}; the entry is signed with src op-<session8>', async () => {
@@ -387,5 +428,8 @@ describe('POST /api/command and POST /api/auth/grant', () => {
         const self = await post('/api/auth/grant', { toEngineId: SELF }, `Bearer ${token}`)
         expect(self.status).toBe(400)
         expect(await self.json()).toMatchObject({ error: 'BAD_REQUEST', issuerEngineId: SELF })
+        const big = await post('/api/auth/grant', { toEngineId: PEER, pad: 'x'.repeat(20_000) })
+        expect(big.status).toBe(413)
+        expect(await big.json()).toMatchObject({ error: 'PAYLOAD_TOO_LARGE', issuerEngineId: SELF })
     })
 })

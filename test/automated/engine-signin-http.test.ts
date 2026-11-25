@@ -168,6 +168,21 @@ describe('/api/auth/* (engine#582)', () => {
         const big = await fetch(`${base}/api/auth/challenge`, { method: 'POST', body: JSON.stringify({ username: 'x'.repeat(20_000) }) })
         expect(big.status).toBe(413)
         expect((await big.json()).error).toBe('PAYLOAD_TOO_LARGE')
+        // The size is checked before the token: no token, a bad token and a good token all get 413
+        const huge = JSON.stringify({ username: 'x'.repeat(20_000), passwordHash: 'y' })
+        for (const t of [undefined, 'not-a-token', token]) {
+            const r = await post('/api/auth/operators', JSON.parse(huge), t)
+            expect(r.status, String(t)).toBe(413)
+            expect((await r.json()).error).toBe('PAYLOAD_TOO_LARGE')
+        }
+        // Chunked (no Content-Length) and without a token: still 413, not 401
+        const chunked = await fetch(`${base}/api/auth/password`, {
+            method: 'POST', duplex: 'half',
+            body: new ReadableStream({ start(c) { c.enqueue(new TextEncoder().encode(huge)); c.close() } }),
+        } as any)
+        expect(chunked.status).toBe(413)
+        // A small body without a token is still 401
+        expect((await post('/api/auth/operators', { username: 'z', passwordHash: 'y' })).status).toBe(401)
         const miss = await post('/api/auth/login', { username: 'admin' })
         expect(miss.status).toBe(400)
         expect((await miss.json()).error).toBe('BAD_REQUEST')

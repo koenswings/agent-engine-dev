@@ -11,7 +11,7 @@ import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { createOrUpdateDisk, processDisk, isSystemDisk, setRootDeviceForTests } from '../../src/data/Disk.js'
-import { eraseDisk, isEspPartType, parseHiddenPartitions, setEraseOpsForTests, setEraseAddDevice, ERASE_STAGING_ROOT, isEraseDeviceLocked } from '../../src/data/EraseDisk.js'
+import { eraseDisk, isEspPartType, parseHiddenPartitions, setEraseOpsForTests, setEraseAddDevice, ERASE_STAGING_ROOT, isEraseDeviceLocked, eraseLockRefusesAdd } from '../../src/data/EraseDisk.js'
 import { setSystemDiskOpsForTests } from '../../src/data/SystemDisk.js'
 import { CommandLogStore, setCommandLogHandle, addTrace } from '../../src/data/CommandLogStore.js'
 import { DeviceName, DiskID, DiskName, EngineID, Timestamp } from '../../src/data/CommonTypes.js'
@@ -224,6 +224,29 @@ describe('eraseDisk whole-disk checks and remount on failure (#188)', () => {
         expect(d.device).toBe('sdc1')
         expect(d.dockedTo).toBe(LOCAL)
         expect(h.doc()!.engineDB[LOCAL].eraseInProgress ?? null).toBeNull()
+        expect(isEraseDeviceLocked('sdc')).toBe(false)
+    })
+
+    it('a failure after unmounting re-adds the partition after the erase lock is released (addDevice honours the lock)', async () => {
+        await dock('sdc1', 'f-disk', 'Files F')
+        const tid = await summary('f-disk', 'Files F')
+        const skipped: string[] = []
+        // Same guard as the real addDevice in usbDeviceMonitor: a locked device is skipped, not added.
+        setEraseAddDevice(async (p) => {
+            const device = p.split('/').pop()!
+            if (eraseLockRefusesAdd(device)) { skipped.push(device); return }
+            addCalls.push(p)
+            const meta = YAML.parse(await fs.readFile(path.join(DISKS_ROOT, device, 'META.yaml'), 'utf8'))
+            const d = createOrUpdateDisk(h, LOCAL, device as DeviceName, meta.diskId as DiskID, meta.diskName as DiskName, 2 as Timestamp)
+            await processDisk(h, d)
+        })
+        scriptError = new Error('refused: /dev/sdc is busy')
+        await expect(eraseDisk(h, 'f-disk', tid, 'Files F')).rejects.toThrow(/busy/)
+        expect(skipped).toEqual([])
+        expect(addCalls).toEqual(['/dev/engine/sdc1'])
+        const d = h.doc()!.diskDB['f-disk' as DiskID]
+        expect(d).toBeTruthy()
+        expect(d.dockedTo).toBe(LOCAL)
         expect(isEraseDeviceLocked('sdc')).toBe(false)
     })
 
