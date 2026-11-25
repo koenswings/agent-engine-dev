@@ -19,10 +19,13 @@ const PREP = { summary: { label: 'Disk One' }, confirmField: 'label' as const, e
 describe('confirmation lifecycle', () => {
     beforeEach(() => clearConfirmsForTests())
 
-    it('gated commands: eraseDisk, flashCard, installApp; not others', () => {
+    it('gated: eraseDisk, makeBackupDisk with erase, flashCard; not installApp, summariseDisk or others', () => {
         expect(commandNeedsConfirm('eraseDisk d1 t1 Disk One')).toBe(true)
+        expect(commandNeedsConfirm('makeBackupDisk d1 t1 Disk One')).toBe(true)
+        expect(commandNeedsConfirm('makeBackupDisk d1')).toBe(false)
         expect(commandNeedsConfirm('flashCard c1 current 32000')).toBe(true)
-        expect(commandNeedsConfirm('installApp kolibri-1.0 d1')).toBe(true)
+        expect(commandNeedsConfirm('installApp kolibri-1.0 d1')).toBe(false)
+        expect(commandNeedsConfirm('summariseDisk d1')).toBe(false)
         expect(commandNeedsConfirm('startInstance i1 d1')).toBe(false)
         expect(commandNeedsConfirm('createInstance a b c d e')).toBe(false)
     })
@@ -125,15 +128,16 @@ describe('prepareConfirm: strict checks and summaries', () => {
         await expect(prepareConfirm(h, 'flashCard c1 current 1', deps)).rejects.toThrow(/MOUNTED/)
     })
 
-    it('installApp: docked target → appName confirmation; bad id, undocked target refused', async () => {
-        const p = await prepareConfirm(h, 'installApp kolibri-1.0 d1 --name "Kolibri Demo"')
-        expect(p).toMatchObject({ confirmField: 'appName', expected: 'kolibri', summary: { appId: 'kolibri-1.0', targetDiskName: 'Disk One', instanceName: 'Kolibri Demo', source: 'catalog' } })
-        await expect(prepareConfirm(h, 'installApp ../x-1.0 d1')).rejects.toBeInstanceOf(ConfirmRefusal)
-        await expect(prepareConfirm(h, 'installApp kolibri-1.0 away')).rejects.toBeInstanceOf(ConfirmRefusal)
-        await expect(prepareConfirm(h, 'installApp kolibri-1.0 d1 --source away')).rejects.toThrow(/Source disk/)
+    it('makeBackupDisk with erase: same checks and summary as eraseDisk', async () => {
+        putSummary('sum-mb', 'd1', 'Disk One')
+        rememberOwnSummaryTrace('sum-mb')
+        const p = await prepareConfirm(h, 'makeBackupDisk d1 sum-mb Disk One')
+        expect(p).toMatchObject({ confirmField: 'label', expected: 'Disk One', summary: { command: 'makeBackupDisk', label: 'Disk One' } })
+        await expect(prepareConfirm(h, 'makeBackupDisk d1')).rejects.toThrow(/erases only with/)
     })
 
     it('other commands have no confirmation', async () => {
         await expect(prepareConfirm(h, 'startInstance i1 d1')).rejects.toThrow(/does not use a confirmation/)
+        await expect(prepareConfirm(h, 'installApp kolibri-1.0 d1')).rejects.toThrow(/does not use a confirmation/)
     })
 })

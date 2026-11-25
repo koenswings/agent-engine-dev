@@ -13,6 +13,7 @@ const { config } = await import('../../src/data/Config.js')
 config.settings.storeIdentityFolder = emptyDir
 const { enableHttpMonitor } = await import('../../src/monitors/httpMonitor.js')
 const { isOwnConsoleOrigin, ownConsoleHosts } = await import('../../src/monitors/consoleOrigins.js')
+const { isWsOriginAllowed } = await import('../../src/utils/originCheck.js')
 
 const IFACES = {
     eth0: [{ address: '10.42.0.17', family: 'IPv4', internal: false } as any],
@@ -50,6 +51,21 @@ describe('own Console origins (unit)', () => {
     it('settings.devConsoleOrigins adds exact origins only', () => {
         expect(isOwnConsoleOrigin('http://localhost:5173', [80], hosts, ['http://localhost:5173'])).toBe(true)
         expect(isOwnConsoleOrigin('http://localhost:5174', [80], hosts, ['http://localhost:5173'])).toBe(false)
+    })
+})
+
+describe('store WebSocket origin rule (unit)', () => {
+    const hosts = ownConsoleHosts('idea03', IFACES)
+    it('no Origin (Engines, CLI) and extensions pass; own Console origins pass; others refused', () => {
+        expect(isWsOriginAllowed(undefined, [80], [], hosts)).toBe(true)
+        expect(isWsOriginAllowed('', [80], [], hosts)).toBe(true)
+        expect(isWsOriginAllowed('chrome-extension://abcdefghijklmnopabcdefghijklmnop', [80], [], hosts)).toBe(true)
+        expect(isWsOriginAllowed('chrome-extension://short', [80], [], hosts)).toBe(false)
+        expect(isWsOriginAllowed('http://idea03.local', [80, 8080], [], hosts)).toBe(true)
+        expect(isWsOriginAllowed('http://10.42.0.17:8080', [80, 8080], [], hosts)).toBe(true)
+        expect(isWsOriginAllowed('http://idea04.local', [80], [], hosts)).toBe(false)
+        expect(isWsOriginAllowed('http://evil.example', [80], [], hosts)).toBe(false)
+        expect(isWsOriginAllowed('http://localhost:5173', [80], ['http://localhost:5173'], hosts)).toBe(true)
     })
 })
 

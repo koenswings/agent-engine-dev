@@ -1,8 +1,10 @@
 /**
  * ConfirmGate.ts — second confirmation for the heaviest commands (engine#582).
  *
- * Disk wipe (eraseDisk), card flash (flashCard) and app create (installApp) run
- * only after two steps through the Engine API:
+ * Disk wipe (eraseDisk, and makeBackupDisk when it erases) and card flash
+ * (flashCard) run only after two steps through the Engine API. App installs are
+ * not gated (Koen, 25 Nov: too heavy for teachers); createInstance never runs from
+ * outside this Pi. Steps:
  *
  *   1. The command is sent without a confirmation. The Engine checks it strictly
  *      (prepareConfirm), builds a summary from its own data and answers
@@ -14,8 +16,7 @@
  *      and is used up by the first check, whatever its outcome.
  *
  * The command itself still runs every existing check (EraseDisk.ts, FlashCard.ts,
- * InstallApp.ts) when it executes. createInstance is not gated: it never runs
- * from outside this Pi (commandUtils LOCAL_ONLY_COMMANDS).
+ * MakeBackupDisk.ts) when it executes.
  */
 
 import crypto from 'crypto'
@@ -25,14 +26,11 @@ import { localEngineId } from './Engine.js'
 import { splitArgs } from '../utils/commandUtils.js'
 import { readSummaryFromTrace, resolveSummaryTarget } from './SummariseDisk.js'
 import { findClientCard, resolveFlashImage } from './FlashCard.js'
-import { parseInstallAppArgs } from './InstallApp.js'
-import { resolveDiskArg } from './DiskArg.js'
-import { appIdentity } from './AppIdParse.js'
 import { monoNow } from '../utils/monoClock.js'
 
 export const CONFIRM_TTL_MS = 60_000
-export const GATED_COMMANDS: readonly string[] = ['eraseDisk', 'flashCard', 'installApp']
-export type ConfirmField = 'label' | 'sizeBytes' | 'appName'
+export const GATED_COMMANDS: readonly string[] = ['eraseDisk', 'makeBackupDisk', 'flashCard']
+export type ConfirmField = 'label' | 'sizeBytes'
 
 export interface ConfirmPrep {
     /** What the operator is about to do, from the Engine's own data. */
@@ -70,8 +68,16 @@ const commandRest = (command: string): string => {
     return i === -1 ? '' : t.slice(i + 1)
 }
 
-/** Whether `command` needs the second confirmation. */
-export const commandNeedsConfirm = (command: string): boolean => GATED_COMMANDS.includes(commandName(command))
+/**
+ * Whether `command` needs the second confirmation. makeBackupDisk only when it
+ * erases (it carries a summaryTraceId); adopting an IDEA disk erases nothing.
+ */
+export const commandNeedsConfirm = (command: string): boolean => {
+    const name = commandName(command)
+    if (!GATED_COMMANDS.includes(name)) return false
+    if (name === 'makeBackupDisk') return splitArgs(commandRest(command)).length >= 2
+    return true
+}
 
 const prune = (now: number): void => {
     for (const [id, p] of pending) if (p.expiresAt <= now) pending.delete(id)
@@ -111,9 +117,6 @@ export interface ConfirmDeps {
 }
 const defaultDeps: ConfirmDeps = { findCard: findClientCard, resolveImage: resolveFlashImage }
 
-/** App name of an installApp app id (`name-version` or `name@ref`). */
-const installAppName = (appId: string): string => appId.includes('@') ? appId.slice(0, appId.indexOf('@')) : appIdentity(appId).name
-
 /**
  * Strictly check a gated command against this Engine's own data and build its
  * confirmation summary. Throws ConfirmRefusal when the command cannot go on.
@@ -127,9 +130,13 @@ export const prepareConfirm = async (
     const name = commandName(command)
     const args = splitArgs(commandRest(command))
 
-    if (name === 'eraseDisk') {
+    if (name === 'eraseDisk' || name === 'makeBackupDisk') {
         const [targetId, summaryTraceId] = args
-        if (!targetId || !summaryTraceId) throw new ConfirmRefusal('usage: eraseDisk <targetId> <summaryTraceId> <confirmName…>')
+        if (!targetId || !summaryTraceId) {
+            throw new ConfirmRefusal(name === 'eraseDisk'
+                ? 'usage: eraseDisk <targetId> <summaryTraceId> <confirmName…>'
+                : 'makeBackupDisk erases only with <targetId> <summaryTraceId> <confirmName…>')
+        }
         const target = resolveSummaryTarget(store, targetId)
         if (!target) throw new ConfirmRefusal(`No disk or unformatted candidate '${targetId}' on this Engine.`)
         if (target.kind === 'disk') {
@@ -142,7 +149,7 @@ export const prepareConfirm = async (
         if (!summary) throw new ConfirmRefusal('The summary is missing, for another disk, older than 10 minutes, or not made by this Engine. Check the disk again.')
         return {
             summary: {
-                command: 'eraseDisk', targetId, label: summary.label, sizeBytes: summary.sizeBytes,
+                command: name, targetId, label: summary.label, sizeBytes: summary.sizeBytes,
                 device: target.kind === 'disk' ? target.disk!.device ?? null : target.candidate!.device,
                 apps: (summary.apps ?? []).map(a => `${a.name} ${a.version}`.trim()),
             },
@@ -162,33 +169,12 @@ export const prepareConfirm = async (
         if (card.sizeBytes !== Number(sizeArg)) throw new ConfirmRefusal(`Card size is ${card.sizeBytes}, the dialog showed ${sizeArg}.`)
         let image: { version: string }
         try { image = await d.resolveImage(storeHandle, versionArg) } catch (e: any) { throw new ConfirmRefusal(e?.message ?? `Unknown client image '${versionArg}'.`) }
+        // confirmText is the card size in bytes as a decimal string (the Console echoes
+        // summary.sizeBytes once the operator confirms the Engine-built summary)
         return {
             summary: { command: 'flashCard', candidateId, sizeBytes: card.sizeBytes, model: card.model, version: image.version },
             confirmField: 'sizeBytes',
             expected: String(card.sizeBytes),
-        }
-    }
-
-    if (name === 'installApp') {
-        let parsed
-        try { parsed = parseInstallAppArgs(commandRest(command)) } catch (e: any) { throw new ConfirmRefusal(e?.message ?? 'installApp: bad arguments') }
-        let target
-        try { target = resolveDiskArg(store, localEngineId as any, String(parsed.targetDiskId), 'installApp') } catch (e: any) { throw new ConfirmRefusal(e?.message ?? `Disk '${parsed.targetDiskId}' not found.`) }
-        if (target.dockedTo !== localEngineId || !target.device) throw new ConfirmRefusal(`${target.name} is not docked on this Engine.`)
-        let source: string = 'catalog'
-        if (parsed.sourceDiskId) {
-            const src = store.diskDB[parsed.sourceDiskId as any]
-            if (!src || src.dockedTo !== localEngineId) throw new ConfirmRefusal(`Source disk '${parsed.sourceDiskId}' is not docked on this Engine.`)
-            source = String(src.name ?? src.id)
-        }
-        const appName = installAppName(String(parsed.appId))
-        return {
-            summary: {
-                command: 'installApp', appId: String(parsed.appId), appName, targetDiskId: String(target.id),
-                targetDiskName: String(target.name), instanceName: parsed.instanceName ?? null, source, fresh: parsed.fresh,
-            },
-            confirmField: 'appName',
-            expected: appName,
         }
     }
 

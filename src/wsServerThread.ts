@@ -32,6 +32,7 @@ import { Worker } from 'worker_threads'
 import { next as A } from '@automerge/automerge'
 import { NetworkAdapter, Message, PeerId, PeerMetadata } from '@automerge/automerge-repo'
 import { log, error, print } from './utils/utils.js'
+import { config, devConsoleOrigins } from './data/Config.js'
 import type { WsServerThreadData, StoreRefusal } from './wsServerThreadWorker.js'
 import { describeRefusal, RefusalLog } from './data/StoreScope.js'
 import { guardOutgoing } from './data/StoreScopedClientAdapter.js'
@@ -146,7 +147,11 @@ export class ThreadedWebSocketServerAdapter extends NetworkAdapter {
     }
 
     #spawn(): void {
-        const data: WsServerThreadData = { port: this.port, keepAliveIntervalMs: this.keepAliveIntervalMs }
+        const data: WsServerThreadData = {
+            port: this.port, keepAliveIntervalMs: this.keepAliveIntervalMs,
+            consolePorts: [config.settings.httpPort, config.settings.ideaLocalHttpPort ?? 80],
+            devOrigins: devConsoleOrigins(),
+        }
         const worker = startWorker(data)
         this.#worker = worker
         worker.on('message', (m: any) => this.#onWorkerMessage(m))

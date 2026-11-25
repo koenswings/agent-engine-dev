@@ -34,8 +34,16 @@ import { WebSocketServer } from 'ws'
 import { WebSocketServerAdapter } from '@automerge/automerge-repo-network-websocket'
 import { cbor } from '@automerge/automerge-repo'
 import { parseEnginePeerId, peerVerdict, refusalMessage, PeerVerdict } from './data/StoreScope.js'
+import { isWsOriginAllowed } from './utils/originCheck.js'
 
-export interface WsServerThreadData { port: number, keepAliveIntervalMs: number }
+export interface WsServerThreadData {
+    port: number
+    keepAliveIntervalMs: number
+    /** engine#582: Console ports (httpPort, ideaLocalHttpPort) whose page origins may open the store WebSocket. */
+    consolePorts?: number[]
+    /** engine#582: settings.devConsoleOrigins. */
+    devOrigins?: string[]
+}
 
 const FORWARDED_EVENTS = ['peer-candidate', 'peer-disconnected', 'message'] as const
 
@@ -161,9 +169,19 @@ export class StoreScopedWebSocketServerAdapter extends WebSocketServerAdapter {
     }
 }
 
+/** At most one refusal log line per origin per minute (a browser retries in a loop). */
+const lastOriginRefusalLog = new Map<string, number>()
+const shouldLogOriginRefusal = (origin: string, now: number = Date.now()): boolean => {
+    const last = lastOriginRefusalLog.get(origin) ?? 0
+    if (now - last < 60_000) return false
+    if (lastOriginRefusalLog.size > 200) lastOriginRefusalLog.clear()
+    lastOriginRefusalLog.set(origin, now)
+    return true
+}
+
 if (parentPort) {
     const port = parentPort
-    const { port: listenPort, keepAliveIntervalMs } = workerData as WsServerThreadData
+    const { port: listenPort, keepAliveIntervalMs, consolePorts, devOrigins } = workerData as WsServerThreadData
     const post = (m: unknown) => port.postMessage(m)
     const logError = (message: string) => post({ type: 'log', level: 'error', message })
 
@@ -180,7 +198,16 @@ if (parentPort) {
                     if (adapter) return
                     // Listen only once the adapter has its peerId: a join that arrived
                     // before connect() would hit the adapter's peerId assertion.
-                    const wss = new WebSocketServer({ port: listenPort })
+                    // engine#582: a browser may only open the store socket from this Engine's
+                    // own Console origins (same allow-list as CORS); peers send no Origin.
+                    const wss = new WebSocketServer({
+                        port: listenPort,
+                        verifyClient: (info: { origin?: string, req: { socket?: { remoteAddress?: string } } }) => {
+                            const ok = isWsOriginAllowed(info.origin, consolePorts ?? [80], devOrigins ?? [])
+                            if (!ok && shouldLogOriginRefusal(String(info.origin))) post({ type: 'log', level: 'warn', message: `[ws] refused a WebSocket from origin ${String(info.origin).slice(0, 200)} (${info.req?.socket?.remoteAddress ?? '?'}): not this Engine's Console` })
+                            return ok
+                        },
+                    })
                     wss.on('error', (err) => post({ type: 'server-error', message: err.message }))
                     wss.on('listening', () => post({ type: 'listening' }))
                     // Our keepalive (startKeepalive) replaces the stock one, which

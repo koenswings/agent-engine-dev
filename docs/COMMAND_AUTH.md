@@ -9,7 +9,7 @@ Design record: [engine#582](https://github.com/koenswings/agent-engine-dev/issue
 
 | Step | What | State |
 |---|---|---|
-| 1 | CORS for own Console origins, second confirmation gate (module), `createInstance` local-only, git account pin, command source on traces, local audit log | this page |
+| 1 | CORS and store WebSocket Origin check for own Console origins, second confirmation gate (module), `createInstance` local-only, git account pin, command source on traces, local audit log | this page |
 | 2 | Engine-local operator accounts, setup code, challenge sign-in, sessions | later |
 | 3 | Command key, signed queue entries, `POST /api/command`, peer grants, mixed-version refusal | later |
 | 4 | `/api/engines/<id>/…` relay | later |
@@ -42,6 +42,13 @@ A request without `Origin` gets no CORS header. `OPTIONS` on `/api/*` answers 20
 allowed origin it also allows `GET, POST, DELETE, OPTIONS` and the `Authorization` and
 `Content-Type` headers.
 
+**Store WebSocket (port `settings.port`, and the Upgrade pass-through on the HTTP ports).**
+The same allow-list applies to a browser `Origin` on the WebSocket handshake
+(`src/utils/originCheck.ts` `isWsOriginAllowed`, checked in the server thread). A request
+without `Origin` (Engines, the CLI) goes on to the store-scoped peering check as before. A
+`chrome-extension://<id>` origin (the Console side panel) is let through; a web page cannot
+send that origin. Any other origin gets HTTP 401 and is logged at most once a minute per origin.
+
 **Console impact:** a Console page served by one Engine can no longer read another
 Engine's `/api/store-url` or `/api/command-log-url` directly (remote command logs,
 probing another Engine in Connection management). Step 4 adds the relay the Console uses
@@ -49,22 +56,23 @@ instead. The Console extension is not affected (host permissions, no CORS).
 
 ## Second confirmation (module)
 
-`src/data/ConfirmGate.ts`. Disk wipe (`eraseDisk`), card flash (`flashCard`) and app
-create (`installApp`) are gated:
+`src/data/ConfirmGate.ts`. Disk wipe (`eraseDisk`, and `makeBackupDisk` when it erases,
+that is when it carries a summary trace) and card flash (`flashCard`) are gated. App
+installs are not (decision of 25 Nov: too heavy for teachers); `createInstance` never runs
+from outside this Pi; `summariseDisk` and other read-only commands need no confirmation.
 
 - `prepareConfirm` checks the command against this Engine's own data and builds a summary:
-  - `eraseDisk`: the target is a disk docked here or an unformatted candidate here, not
-    the system disk; the summary trace is this Engine's own `summariseDisk` trace (see
-    below) and at most 10 minutes old. Summary: label, size, device, apps. Confirm field:
-    `label`.
+  - `eraseDisk` / `makeBackupDisk`: the target is a disk docked here or an unformatted
+    candidate here, not the system disk; the summary trace is this Engine's own
+    `summariseDisk` trace (see below) and at most 10 minutes old.
+    Summary `{ command, targetId, label, sizeBytes, device, apps: ["<name> <version>"] }`.
+    Confirm field `label`; the confirm text is the label exactly as in the summary.
   - `flashCard`: the card is present here with no refusal and the size shown; the version
-    is a known client image. Summary: size, model, version. Confirm field: `sizeBytes`.
-  - `installApp`: the arguments parse (name checks of #575); the target disk, and the
-    source disk if given, are docked here. Summary: app id and name, target, instance
-    name, source. Confirm field: `appName`.
+    is a known client image. Summary `{ command, candidateId, sizeBytes, model, version }`.
+    Confirm field `sizeBytes`; the confirm text is the size in bytes as a decimal string.
 - `issueConfirm` returns `{ confirmId, summary, confirmField, expiresInMs: 60000 }`.
-- `checkConfirm` accepts a confirmation once: same session, same command text, typed text
-  equal to the confirm field, within 60 s on the monotonic clock. Any check uses it up.
+- `checkConfirm` accepts a confirmation once: same session, same command text, confirm text
+  equal to the expected value, within 60 s on the monotonic clock. Any check uses it up.
 
 Step 3 wires this into `POST /api/command`; the store queue path is unchanged in step 1.
 

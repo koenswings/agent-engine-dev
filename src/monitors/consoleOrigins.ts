@@ -14,25 +14,11 @@
  * carry Access-Control-Allow-Origin also carry Vary: Origin.
  */
 
-import os from 'os'
 import type http from 'http'
 import { devConsoleOrigins } from '../data/Config.js'
+import { ownConsoleHosts, isOwnConsoleOrigin as isOwnOriginPure } from '../utils/originCheck.js'
 
-/** Hosts this Engine's Console is served under (lowercase). */
-export const ownConsoleHosts = (
-    hostname: string = os.hostname(),
-    interfaces: NodeJS.Dict<os.NetworkInterfaceInfo[]> = os.networkInterfaces(),
-): Set<string> => {
-    const h = hostname.toLowerCase().replace(/\.local$/, '')
-    const hosts = new Set<string>(['idea.local', 'localhost', '127.0.0.1'])
-    if (h) { hosts.add(h); hosts.add(`${h}.local`) }
-    for (const list of Object.values(interfaces)) {
-        for (const a of list ?? []) {
-            if (!a.internal && (a.family === 'IPv4' || (a.family as unknown) === 4)) hosts.add(a.address)
-        }
-    }
-    return hosts
-}
+export { ownConsoleHosts }
 
 /**
  * Whether `origin` is one of this Engine's own Console origins (or a configured
@@ -43,17 +29,7 @@ export const isOwnConsoleOrigin = (
     ports: readonly (number | undefined | null)[],
     hosts: Set<string> = ownConsoleHosts(),
     devOrigins: readonly string[] = devConsoleOrigins(),
-): boolean => {
-    if (!origin || origin === 'null') return false
-    if (devOrigins.includes(origin)) return true
-    let u: URL
-    try { u = new URL(origin) } catch { return false }
-    if (u.protocol !== 'http:') return false
-    if (u.origin !== origin.toLowerCase()) return false   // no path, user info or trailing parts
-    const port = u.port === '' ? 80 : Number(u.port)
-    if (!ports.some(p => typeof p === 'number' && p > 0 && p === port)) return false
-    return hosts.has(u.hostname.toLowerCase())
-}
+): boolean => isOwnOriginPure(origin, ports, hosts, devOrigins)
 
 /** CORS headers for a response to `req`: empty unless the origin is allowed. */
 export const corsHeadersFor = (
