@@ -112,6 +112,10 @@ export interface Config {
 // Validation Logic
 // ##################################################################################################
 
+// IPv4 CIDR check for settings.lanPreferCidrs. Declared before the validators: readConfig() runs them
+// while this module loads, so a constant declared further down is not initialised yet.
+const LAN_CIDR = /^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\/(3[0-2]|[12]?\d)$/
+
 function validate<T>(obj: any, validator: (obj: any, path: string) => string[]): string[] {
     return validator(obj, '');
 }
@@ -386,7 +390,6 @@ export const autoStartChannelBuilder = (): boolean => config.settings.autoStartC
 
 /** The school/kit LAN range: every school uses 10.42.x. */
 export const LAN_PREFER_CIDRS_DEFAULT: readonly string[] = ['10.42.0.0/16']
-const LAN_CIDR = /^((25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.){3}(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\/(3[0-2]|[12]?\d)$/
 /** settings.lanPreferCidrs (default ['10.42.0.0/16']; [] switches the preference off). See LanAddress.ts. */
 export const lanPreferCidrs = (): string[] => [...(config.settings.lanPreferCidrs ?? LAN_PREFER_CIDRS_DEFAULT)]
 /** idea#396: 24 h before a pre-update snapshot is quarantined. */
