@@ -6,16 +6,18 @@ Update this file whenever an authoritative doc is added or significantly revised
 
 ---
 
-## SOLUTION_DESCRIPTION.md
-**Status:** Authoritative  ·  **Maintained by:** Axle
-Full requirements and vision for the Engine: mission, App Disk model, offline-first
-constraints, key design decisions, and feature inventory. Axle reads this in full every session.
-→ [docs/SOLUTION_DESCRIPTION.md](SOLUTION_DESCRIPTION.md)
+## proposals/solution-description.md
+**Status:** Historical proposal (not current)  ·  **Maintained by:** Axle
+The original requirements and vision write-up. It is **not** an authoritative description of
+Engine main (the file `docs/SOLUTION_DESCRIPTION.md` does not exist). Current behaviour is in
+ARCHITECTURE.md and COMMANDS.md.
+→ [proposals/solution-description.md](../proposals/solution-description.md)
 
 ## ARCHITECTURE.md
 **Status:** Authoritative  ·  **Maintained by:** Axle
 Technical architecture of the Engine: distributed physical web app management, App Disk
-detection, Docker container lifecycle, state synchronisation via Automerge CRDTs.
+detection, Docker container lifecycle, state synchronisation via Automerge CRDTs,
+store durability and self-heal (engine#567 / #568), HTTP Console ports and idea.local (idea#203).
 → [docs/ARCHITECTURE.md](ARCHITECTURE.md)
 
 ## COMMANDS.md
@@ -25,7 +27,7 @@ with usage examples.
 → [docs/COMMANDS.md](COMMANDS.md)
 
 ## BACKUP_SCHEDULE.md
-**Status:** Draft (grows with idea#400 PRs A–D)  ·  **Maintained by:** Axle
+**Status:** Authoritative (idea#400 PRs A–D and idea#404 are on main)  ·  **Maintained by:** Axle
 Scheduled Backup Disk: in-Engine daily schedule, due/catch-up rules, uptime fallback and clock
 trust, locks and retries, BACKUP.yaml fields, store summary fields, `setBackupMode`, and `makeBackupDisk` (idea#404).
 → [docs/BACKUP_SCHEDULE.md](BACKUP_SCHEDULE.md)

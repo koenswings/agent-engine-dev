@@ -2,61 +2,67 @@
 
 ## Overview
 
-The IDEA test fleet consists of four Raspberry Pi nodes used for remote automated testing — specifically for simulating disk dock/undock operations that require real USB hardware. These nodes are managed by the Engine Developer agent (Axle) and are used to replace manual testing with real hardware.
+The IDEA test fleet is four Raspberry Pi nodes used for hardware-backed Engine tests and PR review (real USB dock/undock, helpers, sudoers). **Atlas (Ops)** owns deploy and the live inventory in `fleet-state.json` in [koenswings/idea](https://github.com/koenswings/idea). **Axle (Engine Dev)** may claim a *pool* Pi for a proof, then release it. This document describes standing roles and how to reach and provision the nodes; it does not replace `fleet-state.json`.
 
-## Fleet Nodes
+Production `idea` (wizardly-hugle) and the Zimbabwe kit Engines (kind-panda, sunny-robin, happy-zebra) are **not** fleet test nodes. Never deploy a proof there, and never connect those kits to each other or to the pool for a test.
 
-| Node | Model | Storage | Role |
-|------|-------|---------|------|
-| idea01 | Raspberry Pi 5 | 240 GB SSD | Primary test node (Pi 5) |
-| idea02 | Raspberry Pi 4 | 240 GB SSD | Primary test node (Pi 4) |
-| idea03 | Raspberry Pi 5 | 240 GB SSD | Secondary test node (Pi 5) |
-| idea04 | Raspberry Pi 4 | 240 GB SSD | Secondary test node (Pi 4) |
+## Fleet nodes (standing roles)
 
-## Network Configuration
+| Node | Model | Storage | Standing role |
+|------|-------|---------|----------------|
+| idea01 | Raspberry Pi 5 | 240 GB SSD | **Golden.** Always runs merged `main`. Never used for PR proofs or reviews. |
+| idea02 | Raspberry Pi 4 | (see fleet-state) | **LAN client and test-walk host** (`role: fleet-pending`). Never claimed and never deployed to. |
+| idea03 | Raspberry Pi 5 | 240 GB SSD | **Test / review pool** (`role: spare`). Claim before use; restore `main`, restart pm2 as `pi`, and set `status: idle` when done. |
+| idea04 | Raspberry Pi 4 | 240 GB SSD | **Test / review pool** (`role: spare`). Same claim/release rules as idea03. |
 
-| Node | IP | mDNS name | SSH user |
-|------|----|-----------|----|
-| idea01 | TBD | idea01.local | pi |
-| idea02 | TBD | idea02.local | pi |
-| idea03 | TBD | idea03.local | pi |
-| idea04 | TBD | idea04.local | pi |
+The shared test/review pool is **idea03 and idea04** only. One pool Pi down at a time. Leave each Pi's store, `config.yaml`, and existing `note` field alone unless the proof requires a documented, temporary change that you revert before release.
 
-IPs are assigned by the local DHCP server (see router for current assignments).  
-These nodes are on the local LAN. Tailscale is not yet active on the fleet — see [Tailscale status](#tailscale-status) below.
+## Network
+
+Addresses as recorded in idea `fleet-state.json` on `origin/main` at `b298083106b0c3446823eb8923b5b42b5b4987dd` (25 Nov 2026). If they disagree with the live file, the live file wins.
+
+| Node | Tailscale IPv4 | LAN IPv4 | mDNS name |
+|------|----------------|----------|-----------|
+| idea01 | 100.99.231.94 | 192.168.0.138 | idea01.local |
+| idea02 | 100.85.108.118 | 10.99.0.12 | (client LAN; do not assume idea02.local) |
+| idea03 | 100.126.117.80 | 192.168.0.228 | idea03.local |
+| idea04 | 100.108.39.45 | 192.168.0.113 | idea04.local |
+
+idea01, idea03 and idea04 sit on the office LAN (`192.168.0.0/24`). idea02 is on a different LAN (`10.99.0.0/16`). mDNS names resolve via avahi on the LAN of that node. The Console HTTP port is `settings.httpPort`: **80** on a default install, often **8080** on the pool (`src/install/stickerName.ts` tries both).
 
 ## Access
 
-SSH key: `/home/node/workspace/.ssh/id_ed25519` (openclaw-axle@idea)
-
-SSH to a Pi by its Tailscale address or LAN IP. The provisioner no longer writes `~/.ssh/config`.  
-mDNS names (`idea0N.local`) resolve via avahi on the LAN.
+SSH **directly** to the Tailscale IPv4 as `pi`, key-only, with **no jump host**. Do not use the fleet Tailscale auth key from the box, and do not run `tailscale up`, reauth, or restart `tailscaled` on the box; if Tailscale drops, ask Ops.
 
 ```bash
-ssh pi@idea01.local          # Direct SSH
-./script/check-fleet.sh      # Status of all nodes
+ssh pi@100.99.231.94          # idea01 (golden, read-only use)
+ssh pi@100.126.117.80         # idea03
+ssh pi@100.108.39.45          # idea04
+./script/check-fleet.sh       # Status of fleet nodes the script knows
 ```
 
-## Engine Installation
+The provisioner no longer writes `~/.ssh/config`.
+
+## Engine installation
 
 Engine path on each node: `/home/pi/idea/agents/agent-engine-dev`  
-Started via pm2, auto-starts on boot.
+Started via pm2 (`engine` and `idea-usage`), auto-starts on boot.
 
 ### Provisioning a node
 
 Key-only SSH (idea#146). The Pi must already accept this machine's key and give `pi` passwordless sudo. The script never uses a password, never edits `/etc/hosts` on the runner, and never writes `~/.ssh/config`.
 
+Standing access is direct Tailscale SSH (above). `provision-fleet.sh` still accepts `--jump` for an unusual network path; that is a script flag, not the normal way to reach the fleet, and it is not used from the box.
+
 ```bash
-# Pi 5 reached through idea03 as a jump host; fleet key from ~/.config/idea/fleet-authkey
-./script/provision-fleet.sh --jump pi@100.126.117.80 \
-  idea01=192.168.0.138,model=pi5
+# Direct, key already on the Pi; fleet key from ~/.config/idea/fleet-authkey when that file exists
+./script/provision-fleet.sh idea04=192.168.0.113,model=pi4
 
 # Same, with an explicit key file (override)
-./script/provision-fleet.sh --jump pi@100.126.117.80 --authkey-file /path/to/key \
-  idea01=192.168.0.138,model=pi5
+./script/provision-fleet.sh --authkey-file /path/to/key idea04=192.168.0.113,model=pi4
 
-# Two Pis on the same LAN; the Pi already holds the Tailscale key
-./script/provision-fleet.sh idea04=192.168.0.113,model=pi4 idea05=192.168.0.120,model=pi5
+# Optional: --jump <user@host> is a ProxyJump for the script only (not standing access).
+# The `idea05=…` token in older examples is not a fleet node; do not treat it as one.
 ```
 
 What it does per node:
@@ -68,7 +74,7 @@ What it does per node:
 
 Allow 15–20 minutes per node. The Pi reboots at the end.
 
-**Fleet key file on the operator machine.** The box/operator fleet Tailscale key lives at `~/.config/idea/fleet-authkey` (mode `0600`, `tag:idea`, reusable, non-ephemeral, about 90-day expiry). `provision-fleet.sh` uses this file by default; `--authkey-file <path>` overrides it. The file is preflighted (must exist, be mode `600`, owned by you, and non-empty) and sent over stdin into `/etc/tailscale/debug-authkey` on the Pi. A missing default file is not fatal by itself; a missing explicit `--authkey-file` is.
+**Fleet key file on the operator machine.** The operator fleet Tailscale key, when present, lives at `~/.config/idea/fleet-authkey` (mode `0600`). `provision-fleet.sh` uses this file by default; `--authkey-file <path>` overrides it. The file is preflighted (must exist, be mode `600`, owned by you, and non-empty) and sent over stdin into `/etc/tailscale/debug-authkey` on the Pi. A missing default file is not fatal by itself; a missing explicit `--authkey-file` is. Do not use this key from the box. Expiry, reuse and tag claims belong in the org Tailscale doc (see below); do not copy unverified console facts here.
 
 The router enrol tool (`tools/router-image/idea-router-enrol` in koenswings/idea) reads `~/.config/idea-router/fleet-authkey`. On the ops box that path is a **hard link** to the same file (one inode, one copy) — not a symlink. Enrol's preflight runs `stat -c %a` without `-L`, which would see a symlink's mode `777` and refuse it.
 
@@ -83,10 +89,10 @@ Off flags for a manual local `build-engine` run (same as the provisioner):
 
 ### Syncing a code update
 
-After provisioning, use `sync-engine` for code updates (no full reinstall needed):
+After provisioning, use `sync-engine` for code updates (no full reinstall needed). Only sync a Pi you have claimed, and never sync idea01 as a proof or idea02 at all:
 
 ```bash
-./script/sync-engine idea01 idea02 idea03 idea04
+./script/sync-engine idea03
 ```
 
 ### Checking fleet status
@@ -116,11 +122,9 @@ The provisioner and `build-engine --model pi5` refuse `--gadget` on a Pi 5. Spar
 
 ## Using the Fleet for Tests
 
-The test suite connects to fleet nodes via SSH to simulate disk operations.  
-Test targets are configured in `config.yaml` under `testSetup.engines`.
+The test suite can connect to a *claimed pool* node via SSH to simulate disk operations. Do not point tests at idea01 or idea02. Do not use the live pool store (`2VroE…`) as a test fixture store.
 
-The run-tests.sh SSH restriction on wizardly-hugle does **not** apply here —  
-fleet Pis have direct SSH access for all commands.
+The `testSetup.engines` block in `config.yaml` is a **legacy interactive/automated scenario outline**; it is not the current pool inventory.
 
 A scratch Engine checkout that must share another tree's `config.yaml`,
 `store-identity` or `store-data` should use `script/link-scratch-store.sh`
@@ -130,10 +134,10 @@ Plain `ln -sfn` into an existing `store-identity/` directory nests the link
 
 ## Maintenance
 
-- **Engine update:** `./script/sync-engine idea01 idea02 idea03 idea04`
-- **Reset a node:** `./script/reset-engine --machine idea01.local --all`
+- **Engine update (claimed pool Pi only):** `./script/sync-engine idea03`
+- **Reset a node:** `./script/reset-engine --machine idea03.local --all` (only on a Pi you have claimed; never idea01 or idea02)
 - **Check status:** `./script/check-fleet.sh`
-- **Re-provision (clean slate):** Re-flash SD card and run provision-fleet.sh again
+- **Re-provision (clean slate):** Re-flash SD card and run provision-fleet.sh again (Ops)
 
 ## Notes
 
@@ -141,30 +145,19 @@ Plain `ln -sfn` into an existing `store-identity/` directory nests the link
 - 240 GB SSD provides ample space for Docker images and test data
 - borgbackup is installed on all nodes for Backup Disk tests
 
-## Tailscale Status
+## Tailscale
 
-Tailscale latent remote-access is **installed and ready** on all three fleet nodes (2026-04-11).
+Org-level policy, ACLs, tags and remaining gaps are in koenswings/idea `docs/ops/tailscale-field-access.md` (and `docs/ops/security-overview.md`). This section only records how the Engine install stores the key and how you reach the fleet.
 
-| Node | Binary | Service | Auth key | Activation script |
-|------|--------|---------|----------|-------------------|
-| idea01 (192.168.0.138) | ✅ | disabled | ✅ 600 root | ✅ |
-| idea02 (192.168.0.180) | ✅ | disabled | ✅ 600 root | ✅ |
-| idea03 (192.168.0.228) | ✅ | disabled | ✅ 600 root | ✅ |
+The pool and golden Pis are reached over Tailscale at the addresses above (current ops practice is always-on). Do not treat the older “latent debug” flow as the current fleet state: `tailscale-debug-activate.sh` still exists for an intervention, but a proof must not take Tailscale down on a fleet Pi.
 
-**To activate debug mode on a fleet Pi:**
-```bash
-ssh pi@idea01.local
-sudo /usr/local/bin/tailscale-debug-activate.sh
-```
-The script checks internet connectivity, joins the IDEA Tailnet with `--advertise-tags=tag:idea` (not `--ephemeral`: an ephemeral node vanishes after it has been offline, and the D-2 key is non-ephemeral), and prints the Tailscale IP. Press Enter when done — the script runs `tailscale down` and stops tailscaled; the node stays registered.
-
-**Fresh Pi provisioning:** `buildEngine` now calls `installTailscale()` automatically. Auth key is read from `TAILSCALE_AUTHKEY` env var or `/home/pi/openclaw/secrets/tailscale_authkey.txt` on wizardly-hugle.
+**Fresh Pi provisioning:** `buildEngine` calls `installTailscale()` automatically. The key is read from the `TAILSCALE_AUTHKEY` environment variable, or, as a fallback still in code, `/home/pi/openclaw/secrets/tailscale_authkey.txt` on the machine running the provisioner (`src/data/Engine.ts`). Prefer the env var or `provision-fleet.sh`'s `--authkey-file` / `~/.config/idea/fleet-authkey` path. Never put the key on a command line.
 
 **How the auth key is handled (idea#115):** the key is never a command-line argument, so it can't be seen with `ps`, and it never goes into logs, shell history or Console History.
 - `installTailscale()` sends it over the stdin of `umask 077 && sudo tee /etc/tailscale/debug-authkey` (through ssh). The file is `0600 root:root`, in a `0700` folder.
 - `tailscale-debug-activate.sh` passes `--auth-key=file:/etc/tailscale/debug-authkey`, so `tailscale up` reads the key from the file.
 - The key never reaches pm2: build-engine drops `TAILSCALE_AUTHKEY` from its environment once `installTailscale()` has read it, and runs pm2 under `env -u TAILSCALE_AUTHKEY`, so it is not in `~/.pm2/dump.pm2` (idea#273).
-- Never put the key on a command line yourself, e.g. `tailscale up --authkey tskey-…` or `echo tskey-… | …`.
+- Never put the key on a command line yourself, e.g. `tailscale up --authkey …` or `echo … | …`.
 
 **Target design: Tailscale always on, one fleet tag and one fleet key (Koen, 2026-10-13, idea#117).** See `proposals/2026-10-13-tailscale-single-fleet-tag.md` in koenswings/idea.
 - Tailscale is always on at schools, on the router and on every Pi. There are no per-school tags or keys, so a Pi can move between schools without admin work.
@@ -172,21 +165,13 @@ The script checks internet connectivity, joins the IDEA Tailnet with `--advertis
 - **ACL:** admins → `tag:idea` allowed; `tag:idea` → anything denied. Pis talk to each other only over the school LAN websocket, never over Tailscale.
 - The key is a secret: never in docs, issues or chat.
 
-**Current state (not yet the target design).**
-- The routers already enrol with `--advertise-tags=tag:idea` and no `--ephemeral` (`tools/router-image/idea-router-enrol` in koenswings/idea). The kit Engines' nodes carry `tag:idea` and stay registered while offline.
-- The Engine still uses the latent-debug activate script during an intervention (`tailscale-debug-activate.sh` starts tailscaled, joins, then `tailscale down`). It joins with `--advertise-tags=tag:idea` and no `--ephemeral` (an ephemeral node vanishes after it has been offline, and the D-2 key is non-ephemeral; idea#117 D-2 option 3). Always-on first-boot join remains [engine#291](https://github.com/koenswings/agent-engine-dev/pull/291).
-- The fleet Pis (idea01–idea04) and the ops box are untagged members of the tailnet.
-
-**Not yet confirmed (idea#117 audit, 2026-10-29).** The fleet key's expiry, whether it is reusable or ephemeral, whether it carries `tag:idea`, and what the ACL allows `tag:idea` to reach have not been checked in the admin console. Treat any expiry date or the "at most 90 days" limit as unverified until Koen's console read (idea#375) is recorded on idea#117. Don't revoke the current key ("idea fleet authentication"): Koen is keeping it.
-
-**Refresh the key before it expires.** Once the stored key has expired, a Pi that still has to join with it can't, so every Pi's stored key has to be replaced with the new fleet key before the real expiry date. Atlas writes the rotation plan on idea#117 once the console facts are known.
+Whether each *pool* node is already tagged, and the current key expiry, are recorded in the idea-repo Tailscale docs (idea#375). Do not repeat unverified admin-console facts here.
 
 To replace the stored key on a Pi you can reach, without the key appearing on any command line:
 1. Put the new key in a local file only you can read (`chmod 600`).
 2. Run:
 ```bash
-ssh pi@idea01.local 'sudo install -d -m 700 /etc/tailscale && umask 077 && sudo tee /etc/tailscale/debug-authkey > /dev/null' < ./new-authkey.txt
+ssh pi@100.99.231.94 'sudo install -d -m 700 /etc/tailscale && umask 077 && sudo tee /etc/tailscale/debug-authkey > /dev/null' < ./new-authkey.txt
 shred -u ./new-authkey.txt
 ```
-
-See `design/tailscale-remote-management.md` for full design and Phase 2 (Console UI toggle).
+(Use the target Pi's Tailscale IPv4, not a jump host.)
