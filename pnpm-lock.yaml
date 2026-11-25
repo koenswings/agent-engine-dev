@@ -1680,8 +1680,8 @@ snapshots:
       cbor-x: 1.6.0
       debug: 4.4.3
       eventemitter3: 5.0.4
-      isomorphic-ws: 5.0.0(ws@8.19.0)
-      ws: 8.19.0
+      isomorphic-ws: 5.0.0(ws@8.23.0)
+      ws: 8.23.0
     transitivePeerDependencies:
       - bufferutil
       - supports-color
