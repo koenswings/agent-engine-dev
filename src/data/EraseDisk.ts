@@ -622,6 +622,9 @@ export const eraseDisk = async (
         if (undocked && !erased && devicePartition) {
             try {
                 const add = addDeviceImpl ?? ops.addDevice
+                // Nothing was erased: release the erase lock first, or addDevice skips this add
+                // ("locked for erase") and the disk, already removed from diskDB above, stays gone.
+                lockedDevices.delete(whole)
                 await add(`/dev/engine/${devicePartition}`)
                 log(`Erase of ${summary.label} failed after unmounting; ${devicePartition} was mounted and registered again`)
             } catch (re: any) {
