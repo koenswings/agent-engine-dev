@@ -29,7 +29,7 @@ with usage examples.
 ## COMMAND_AUTH.md
 **Status:** Authoritative for the steps on main (engine#582, built in steps)  ·  **Maintained by:** Axle
 Operator sign-in and signed commands: Engine-local auth folder, CORS for own Console origins,
-second confirmation for wipe/flash/app create, `createInstance` local-only and the git account
+second confirmation for disk wipe and card flash, `createInstance` local-only and the git account
 pin, command source on traces and the local audit log; later steps add sign-in, signed
 commands, the relay and the firewall script.
 → [docs/COMMAND_AUTH.md](COMMAND_AUTH.md)
