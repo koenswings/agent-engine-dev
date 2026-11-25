@@ -367,4 +367,12 @@ command traces) when the signature verifies against the sender's published key a
 is within 60 s of B's clock; otherwise the socket address. The header never authorises
 anything. A client's own `X-Idea-Relay` header is never passed on.
 
-**Capability `engineRelay1`.**
+**Capability `engineRelay1`.** The page's Engine advertises it in `/api/auth/info` (and its
+`engineDB` capabilities) when it relays `/api/engines/<id>/…` for the Engines it knows from
+the store. A Console uses the relay only when the page's Engine advertises `engineRelay1`;
+the target Engine itself does not need it (it only needs `engineSignIn1` /
+`signedCommands1` for the request being relayed). A page Engine without `engineRelay1`
+(older Engine) answers `404` on these paths; the Console then talks to other Engines as it
+did before the relay. Relaying adds no rights: B checks the token, grant and confirmation
+of every relayed request exactly as for a direct one, and the relay only answers with its
+own errors (table above) when it could not get an answer from B.
