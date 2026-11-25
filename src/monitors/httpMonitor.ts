@@ -44,6 +44,7 @@ import { config } from '../data/Config.js'
 import type { DocHandle } from '@automerge/automerge-repo'
 import type { CommandLogStore } from '../data/CommandLogStore.js'
 import { corsHeadersFor, CORS_PREFLIGHT_HEADERS } from './consoleOrigins.js'
+import { handleAuthApi, AuthContext } from './authApi.js'
 
 const STORE_URL_FILE = path.join(
     config.settings.storeIdentityFolder,
@@ -150,7 +151,7 @@ export const enableHttpMonitor = (
     consolePath: string = config.settings.consolePath,
     _commandLogHandle?: DocHandle<CommandLogStore> | null,  // unused at runtime — URL comes from disk
     alsoPort?: number,     // idea#203: also serve on this port (idea.local, :80) when it differs from `port`
-    opts: { engineId?: string, wsPort?: number } = {},  // engineId for /api/store-url; wsPort = Engine WebSocket port for Upgrade pass-through
+    opts: { engineId?: string, wsPort?: number, auth?: AuthContext } = {},  // engineId for /api/store-url; wsPort = Engine WebSocket port for Upgrade pass-through; auth = /api/auth/* (engine#582)
 ): http.Server => {
 
     // agent-engine-dev#264: the Console is not settled at startup. A build that lands after
@@ -205,6 +206,11 @@ export const enableHttpMonitor = (
                 res.end(JSON.stringify({ error: 'Command log URL not available yet' }))
             }
             return
+        }
+
+        // engine#582: Engine sign-in (authApi.ts). Without an auth context (older callers) these are 404s.
+        if (opts.auth && (apiPathOnly === '/api/auth' || apiPathOnly.startsWith('/api/auth/'))) {
+            if (await handleAuthApi(req, res, apiPathOnly, cors, opts.auth)) return
         }
 
         // engine#357: unknown /api/* is a JSON 404, never the Console SPA fallback.
