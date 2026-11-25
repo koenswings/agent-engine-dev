@@ -1,7 +1,7 @@
 # Operator sign-in and signed commands (engine#582)
 
-**Status:** being built in steps (see "Steps" below). This page describes what is on the
-branch it ships with; later steps add their sections.
+**Status:** built in steps (see "Steps" below). This page describes what is on the branch
+it ships with.
 
 Design record: [engine#582](https://github.com/koenswings/agent-engine-dev/issues/582).
 
@@ -13,7 +13,7 @@ Design record: [engine#582](https://github.com/koenswings/agent-engine-dev/issue
 | 2 | Engine-local operator accounts, setup code, challenge sign-in, sessions, rate limits, `/api/auth/*`, `idea-engine-auth` CLI | this page |
 | 3 | Command key, signed queue entries, `POST /api/command`, peer grants, mixed-version refusal | this page |
 | 4 | `/api/engines/<id>/…` relay | this page |
-| 5 | Firewall script for Ops | later |
+| 5 | Firewall script for Ops; cleanup (`defaults.password`, Tailscale key source) | this page |
 
 ## Engine-local auth folder
 
@@ -354,3 +354,38 @@ is within 60 s of B's clock; otherwise the socket address. The header never auth
 anything. A client's own `X-Idea-Relay` header is never passed on.
 
 **Capability `engineRelay1`.**
+
+## Firewall for the Engine ports (step 5, Ops)
+
+`script/ops/idea-engine-firewall.sh`, run by Ops as root on an Engine Pi. Defence in depth:
+sign-in and signed commands do not depend on it.
+
+```
+sudo script/ops/idea-engine-firewall.sh --dry-run [--allow <cidr>]... [--ports 80,8080,4321]
+sudo script/ops/idea-engine-firewall.sh apply  [--allow <cidr>]... [--rollback-seconds 120]
+sudo script/ops/idea-engine-firewall.sh confirm | status | remove
+```
+
+- Its own nftables table `inet idea_engine_fw`; other rules are never touched. Only TCP to
+  the Engine ports (default 80, 8080, 4321) is filtered; ssh, mDNS and apps are not.
+- Accepted on those ports: loopback; established/related; `10.42.0.0/16` (the Engine
+  hotspot) plus `/etc/idea/firewall-allow` and `--allow` (one CIDR per line, `#`
+  comments; `--allow` on `apply` is added to the file); IPv6 link-local `fe80::/10`;
+  Docker bridges (`docker0`, `br-*`); Tailscale (`tailscale0`), only from the ranges in
+  `/etc/idea/firewall-admins` when that file exists. Everything else is dropped.
+- `--dry-run` prints the ruleset and changes nothing (no root needed).
+- `apply` checks the ruleset with `nft -c`, loads it and rolls back after 120 s unless
+  `confirm` runs in time (the previous table, if any, is restored).
+- `confirm` writes `/etc/nftables.d/idea-engine-fw.nft` and enables
+  `idea-engine-fw.service`, which loads it at boot.
+- `remove` unloads the table, disables the unit and moves the boot file and unit aside.
+- Exit codes: 0 ok, 1 failed, 2 usage or bad input.
+
+Pool and kit Engines must allow each other on `httpPort` (relay and peer follow-ups):
+add the pool LAN or Tailscale ranges with `--allow` or the allow file.
+
+## Cleanup (step 5)
+
+- `config.yaml` no longer has `defaults.password` (it was unused).
+- `installTailscale()` reads the Tailscale key only from `TAILSCALE_AUTHKEY`
+  (`provision-fleet.sh` sets it from `--authkey-file`); see docs/PI_FLEET.md.
