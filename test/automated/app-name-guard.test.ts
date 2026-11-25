@@ -80,3 +80,12 @@ describe('buildInstance refuses a bad app name before any rm -rf', () => {
         }
     })
 })
+
+describe('restore: an unsafe instanceOf from the store builds no path', () => {
+    it('ensureAppFilesOnTarget returns without touching disks for a traversal id', async () => {
+        const { ensureAppFilesOnTarget } = await import('../../src/data/RestoreAppFiles.js')
+        const target = { id: 'sdz9-id', device: 'sdz9' } as any
+        const res = await ensureAppFilesOnTarget('../../home/pi/idea', [], target, [])
+        expect(res).toEqual({ appMasterFrom: null, servicesCopied: [], servicesMissing: [] })
+    })
+})

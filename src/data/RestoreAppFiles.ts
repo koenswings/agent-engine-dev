@@ -7,6 +7,7 @@
  * first, the same way moveApp/copyApp sync them.
  */
 
+import { isValidAppId } from './NameCheck.js'
 import { fs } from 'zx'
 import { log } from '../utils/utils.js'
 import { rsyncDirectory } from '../utils/rsync.js'
@@ -33,6 +34,10 @@ export const ensureAppFilesOnTarget = async (
     target: Disk,
     candidates: Disk[],
 ): Promise<RestoreAppFilesResult> => {
+    if (!isValidAppId(appId)) {
+        log(`restoreApp: app id '${appId}' is not one safe folder name; not restoring apps/ or service tars for it`)
+        return { appMasterFrom: null, servicesCopied: [], servicesMissing: [] }
+    }
     const targetRoot = await diskMountRoot(target)
     const roots: string[] = []
     for (const d of candidates) {
