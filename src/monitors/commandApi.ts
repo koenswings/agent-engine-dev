@@ -18,7 +18,7 @@
 import type http from 'http'
 import type { DocHandle } from '@automerge/automerge-repo'
 import type { Store } from '../data/Store.js'
-import { authenticate, clientAddressOf, readJsonBody, HttpError } from './authApi.js'
+import { authenticate, clientOf, readJsonBody, HttpError } from './authApi.js'
 import { sessionShortId } from '../data/Sessions.js'
 import { checkGrant, GrantError, isPeerFollowUp, parseGrant, rememberGrant } from '../data/PeerGrants.js'
 import { hasSignedCommands } from '../data/PeerCommands.js'
@@ -91,8 +91,9 @@ export const routeCommand = async (req: http.IncomingMessage, pathname: string, 
         const b = await readJsonBody(req)
         const command = typeof b.command === 'string' ? b.command.trim() : ''
         if (!command || command.length > MAX_COMMAND_CHARS || /[\r\n\0]/.test(command)) throw new HttpError(400, 'BAD_REQUEST', "'command' must be one line of text.")
-        const remoteAddr = clientAddressOf(req)
         const store = ctx.storeHandle?.doc() as Store | undefined
+        const { client: remoteAddr, viaEngineId } = clientOf(req, store)
+        const via = viaEngineId ? { viaEngineId } : {}
         if (!ctx.storeHandle || !store?.engineDB?.[self as any]) throw new HttpError(503, 'BAD_REQUEST', 'The store is not ready yet.')
         const { commands, } = await import('../data/Commands.js')
         const { LOCAL_ONLY_COMMANDS } = await import('../utils/commandUtils.js')
@@ -100,7 +101,7 @@ export const routeCommand = async (req: http.IncomingMessage, pathname: string, 
 
         if (isPeer) {
             const from = typeof b.fromEngineId === 'string' ? b.fromEngineId : ''
-            const source: CommandSource = { kind: 'peer', peerEngineId: from || undefined, remoteAddr }
+            const source: CommandSource = { kind: 'peer', peerEngineId: from || undefined, remoteAddr, ...via }
             try { checkGrant(auth.slice(6).trim(), self, from, undefined, ctx.dir ?? authFolder()) } catch (e) {
                 if (e instanceof GrantError) await refuse(source, command, new HttpError(403, e.code, e.message))
                 throw e
@@ -118,7 +119,7 @@ export const routeCommand = async (req: http.IncomingMessage, pathname: string, 
         }
 
         const session = authenticate(req)
-        const source: CommandSource = { kind: 'operator', operator: session.username, session: sessionShortId(session), remoteAddr }
+        const source: CommandSource = { kind: 'operator', operator: session.username, session: sessionShortId(session), remoteAddr, ...via }
         if (!commands.some(c => c.name === name)) await refuse(source, command, new HttpError(422, 'COMMAND_REFUSED', `Unknown command: ${name}`, { reason: 'unknown' }))
         if (LOCAL_ONLY_COMMANDS.includes(name)) await refuse(source, command, new HttpError(422, 'COMMAND_REFUSED', `'${name}' only runs from the command line on this Engine. Use installApp instead.`, { reason: 'local-only' }))
 

@@ -34,6 +34,7 @@ import { setupOpen, useSetupCode } from '../data/SetupCode.js'
 import { appendAudit } from '../data/CommandAudit.js'
 import { cleanCommandSource } from '../data/CommandSource.js'
 import { issueGrant } from '../data/PeerGrants.js'
+import { RELAY_HEADER, verifyRelayHeader } from '../data/RelayKey.js'
 
 export const AUTH_VERSION = 1
 export const MAX_BODY_BYTES = 16 * 1024
@@ -77,8 +78,16 @@ export const buildAuthInfo = (ctx: AuthContext): AuthInfo => {
     }
 }
 
-/** The original client address: the socket peer (the relay step adds a vouched address). */
-export const clientAddressOf = (req: http.IncomingMessage): string => String(req.socket?.remoteAddress ?? 'unknown')
+/**
+ * The original client of a request: the address a relaying Engine vouches for in a valid
+ * X-Idea-Relay header (RelayKey.ts), else the socket peer. Feeds rate limits and the
+ * audit log only, never authorisation.
+ */
+export const clientOf = (req: http.IncomingMessage, store?: Store | null): { client: string, viaEngineId?: string } => {
+    const v = req.headers[RELAY_HEADER] !== undefined ? verifyRelayHeader(req.headers[RELAY_HEADER], store ?? undefined) : null
+    return v ? { client: v.client, viaEngineId: v.viaEngineId } : { client: String(req.socket?.remoteAddress ?? 'unknown') }
+}
+export const clientAddressOf = (req: http.IncomingMessage, store?: Store | null): string => clientOf(req, store).client
 
 /** Read a JSON object body, at most MAX_BODY_BYTES. */
 export const readJsonBody = (req: http.IncomingMessage): Promise<Record<string, unknown>> => new Promise((resolve, reject) => {
@@ -153,7 +162,7 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
     const route = pathname.replace(/\/+$/, '')
     const method = req.method ?? 'GET'
     const dir = dirOf(ctx)
-    const client = clientAddressOf(req)
+    const client = clientAddressOf(req, ctx.storeHandle?.doc() as Store | undefined)
 
     if (route === '/api/auth/info' && method === 'GET') return { status: 200, body: buildAuthInfo(ctx) }
 
