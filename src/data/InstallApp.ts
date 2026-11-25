@@ -23,7 +23,8 @@ import * as net from 'net'
 import { log } from '../utils/utils.js'
 import { Store, getDisk, getLocalEngine } from './Store.js'
 import { resolveDiskArg } from './DiskArg.js'
-import { buildInstance, versionDirName } from './Instance.js'
+import { assertGitRef, buildInstance, versionDirName } from './Instance.js'
+import { assertAppId, assertAppName } from './NameCheck.js'
 import { parseAppId } from './App.js'
 import { AppID, AppName, DiskID, DiskName, InstanceID, InstanceName, Version } from './CommonTypes.js'
 import { DocHandle } from '@automerge/automerge-repo'
@@ -72,6 +73,23 @@ export const validateInstanceName = (name: string): string => {
     return name
 }
 
+/**
+ * Check the appId argument of installApp before any path is built from it:
+ * `<name>@<git ref>` needs a valid app name and git ref, any other id must be
+ * one safe path component (NameCheck.APP_ID_RE, no '..').
+ */
+export const validateInstallAppId = (appId: string): AppID => {
+    const id = String(appId ?? '')
+    const at = id.indexOf('@')
+    if (at >= 0) {
+        assertAppName(id.slice(0, at), 'installApp app name')
+        assertGitRef(id.slice(at + 1))
+    } else {
+        assertAppId(id, 'installApp app id')
+    }
+    return id as AppID
+}
+
 export interface ParsedInstallAppArgs {
     appId: AppID
     targetDiskId: string
@@ -89,6 +107,7 @@ export const parseInstallAppArgs = (argsString: string): ParsedInstallAppArgs =>
     const appId = parts[0] as AppID
     const targetDiskId = parts[1]
     if (!appId || !targetDiskId || targetDiskId.startsWith('--')) throw new Error(INSTALL_APP_USAGE)
+    validateInstallAppId(appId)
     const known = new Set(['--source', '--name', '--fresh'])
     for (let i = 2; i < parts.length; i++) {
         const p = parts[i]
@@ -155,6 +174,7 @@ export const installAppFromDisk = async (
     if (!targetDevice) throw new Error(`Target disk '${targetDisk.name}' is not docked`)
 
     // Locate app bundle on source disk (App Disk: apps/<appId>/, Backup Disk: apps/<appId>/)
+    assertAppId(appId, 'installApp app id')
     const sourceMountRoot = await diskMountRoot(sourceDisk)
     const sourcePath = `${sourceMountRoot}/apps/${appId}`
     if (!await fs.pathExists(sourcePath)) {
@@ -270,6 +290,7 @@ export interface InstallAppOptions {
 /** True when docked disk still has apps/<appId> on disk (not stale appDB). */
 const diskHasAppBundle = async (disk: Disk, appId: AppID): Promise<boolean> => {
     if (!disk.device) return false
+    assertAppId(appId, 'installApp app id')
     const root = await diskMountRoot(disk)
     return fs.pathExists(`${root}/apps/${appId}`)
 }
@@ -301,8 +322,8 @@ const installAppRouted = async (
     opts: InstallAppOptions
 ): Promise<InstanceID> => {
     // `<name>@<ref>` (Kid, #221): the ref goes to git as given; disks use the folder-safe id
-    const refAppId = opts.appId
-    opts = { ...opts, appId: diskAppId(opts.appId) }
+    const refAppId = validateInstallAppId(opts.appId)
+    opts = { ...opts, appId: assertAppId(diskAppId(refAppId), 'installApp app id') as AppID }
     const store = storeHandle.doc()
     const instanceName = (opts.instanceName === undefined ? opts.appId : validateInstanceName(String(opts.instanceName))) as InstanceName
     const gitAccount = opts.gitAccount ?? 'koenswings'

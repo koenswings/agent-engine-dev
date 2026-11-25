@@ -46,6 +46,7 @@
  * tar, verified before COMPLETE) and restored on rollback; a previous snapshot is renamed into
  * .idea-quarantine first (never copied or removed).
  */
+import { assertAppId } from './NameCheck.js'
 import { DocHandle } from '@automerge/automerge-repo'
 import { $, fs, path, YAML, sleep } from 'zx'
 import type { Store } from './Store.js'
@@ -459,6 +460,8 @@ export const parseUpdateAppArgs = (argsString: string): { instanceArg: string, n
         else pos.push(words[i])
     }
     if (pos.length !== 2) throw new Error(UPDATE_APP_USAGE)
+    // newAppId becomes apps/<newAppId> on a disk: one safe path component only
+    assertAppId(pos[1], 'updateApp app id')
     return { instanceArg: pos[0], newAppId: pos[1], opts }
 }
 
