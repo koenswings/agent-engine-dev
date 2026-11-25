@@ -11,7 +11,7 @@ Design record: [engine#582](https://github.com/koenswings/agent-engine-dev/issue
 |---|---|---|
 | 1 | CORS and store WebSocket Origin check for own Console origins, second confirmation gate (module), `createInstance` local-only, git account pin, command source on traces, local audit log | this page |
 | 2 | Engine-local operator accounts, setup code, challenge sign-in, sessions, rate limits, `/api/auth/*`, `idea-engine-auth` CLI | this page |
-| 3 | Command key, signed queue entries, `POST /api/command`, peer grants, mixed-version refusal | later |
+| 3 | Command key, signed queue entries, `POST /api/command`, peer grants, mixed-version refusal | this page |
 | 4 | `/api/engines/<id>/…` relay | later |
 | 5 | Firewall script for Ops | later |
 
@@ -215,3 +215,93 @@ answers `404` on `/api/auth/info`. Sign-in events go to `command-audit.log` as
 **Capability `engineSignIn1`.** Step 2 advertises it so a Console can use sign-in before
 commands move to `POST /api/command` (`signedCommands1`, step 3). In step 2 commands still
 go through the store queue as before; nothing about them changes.
+
+## Command key and signed queue entries (step 3)
+
+`src/data/CommandKey.ts`, `src/data/SignedQueue.ts`. On first start the Engine creates
+`<authFolder>/command-key` (32 random bytes, 0600). It is never synced, logged or copied.
+
+The queue `engineDB[<id>].commands` keeps its shape (an array of strings). The Engine runs
+only entries it signed itself:
+
+```
+@v1.<seq>.<src>.<mac> <command>
+mac = base64url(HMAC-SHA256(command-key, "idea-cmd-v1\n" + engineId + "\n" + seq + "\n" + src + "\n" + command))
+src = op-<session8> | peer-<engineId> | cli | engine
+```
+
+- `seq` comes from `<authFolder>/command-seq` (started at the time of the first start, +1
+  per entry, under a lock file so the CLI and the Engine never issue the same number).
+- A seq is recorded as run in `<authFolder>/command-done` when it **starts** (a command that
+  crashes the Engine is not run again by the startup replay). Entries older than the last
+  4096 seqs, or above the highest issued seq, are refused too.
+- Refusals get an error trace (`seq` when the prefix parses) and an audit line; the entry
+  is removed like any finished head, so it never blocks the queue:
+
+| Code | When |
+|---|---|
+| `COMMAND_UNSIGNED` | No `@v1` prefix: written into the store by an older Console or tool. Message: "Refused: this Engine only runs commands from a signed-in operator. Open this Engine's own Console to sign in." |
+| `COMMAND_SIGNATURE_INVALID` | Changed text, another Engine's entry, or a forged prefix. |
+| `COMMAND_REPLAYED` | The seq already ran, is out of the window, or was never issued. |
+
+`sendCommand` only queues on this Engine (signed, `src engine`). Commands for another
+Engine go through that Engine's API (peer follow-ups below). Scripts that run on the Pi as
+the Engine user sign with `script/cli-queue-entry.ts` (`src cli`).
+
+## POST /api/command (step 3)
+
+`src/monitors/commandApi.ts`. Order: token → validation → `GRANT_REQUIRED` →
+`CONFIRM_REQUIRED` → signed entry.
+
+| Auth | Body | Answer |
+|---|---|---|
+| `Bearer <token>` | `{ command, confirmId?, confirmText?, grants?: { <engineId>: <grant> } }` | `202 { engineId, seq }` |
+| `Grant <grant>` (another Engine) | `{ command, fromEngineId, replyGrant? }` | `202 { engineId, seq }` |
+
+Errors: `400 BAD_REQUEST` (not one line of text), `401` token codes, `422 COMMAND_REFUSED`
+with `reason` `unknown` / `local-only` (`createInstance`) / `validation` /
+`not-a-follow-up`, `409 GRANT_REQUIRED { engineIds }`, `403 GRANT_INVALID` /
+`GRANT_EXPIRED`, `409 ENGINE_VERSION_MISMATCH { engineId, version }`,
+`428 CONFIRM_REQUIRED { confirmId, summary, confirmField, expiresInMs }` (the flash summary
+includes `contents`), `409 CONFIRM_INVALID { reason }`. Every error on a `Grant` request
+carries `issuerEngineId` (this Engine).
+
+## Peer grants (step 3)
+
+`src/data/PeerGrants.ts`, `src/data/PeerCommands.ts`, `src/data/PeerHttp.ts`.
+
+A copy, move or update with `--source` across Engines needs follow-ups on the other Engine
+(`startInstance`, `verifyMoveTarget`, `cleanupMoveTarget`, `pushAppBundle`,
+`appFetchResult`; nothing else). Engines hold no keys of each other, so the other Engine
+signs its own entries:
+
+1. The Console asks the other Engine B (`POST /api/auth/grant { toEngineId: A }`, Bearer
+   token for B) → `200 { grant, expiresInMs, issuerEngineId: B }`.
+   `grant = v1.<issuerEngineId>.<toEngineId>.<grantId>.<mac>`, valid 6 hours, kept in B's
+   memory (a restart of B ends it: `GRANT_EXPIRED`).
+2. The Console sends the command to A with `grants: { B: <grant> }`. Without it A answers
+   `409 GRANT_REQUIRED { engineIds: [B] }`.
+3. A sends each follow-up as `POST http://<B>/api/command`, `Authorization: Grant <grant>`,
+   `{ command, fromEngineId: A, replyGrant }`. The reply grant (issued by A for B) lets B
+   answer (`appFetchResult`). B checks the grant (issued by B, for A, not expired) and the
+   follow-up list, then signs the entry with `src peer-A`.
+
+A keeps one trace per follow-up it sent: `ok` with B's seq, or `error` with the code and
+`issuerEngineId` in the result. Grant errors from B always name B as `issuerEngineId`;
+errors from `/api/auth/grant` also carry it.
+
+Peer addresses come from B's `engineDB` row (`lanAddress`, `lanAddresses`, then
+`<hostname>.local`; private ranges only) on `httpPort`. Before the first request A checks
+B's `GET /api/auth/info` reports B's engine id. Connect timeout 3 s → `ENGINE_UNREACHABLE`.
+
+## Mixed versions (step 3)
+
+**Capability `signedCommands1`** (stamped as in idea#128). A Console uses
+`POST /api/command` only on an Engine that advertises it.
+
+| Situation | Result |
+|---|---|
+| Older Console writes a command into the store queue of a new Engine | Refused `COMMAND_UNSIGNED` (trace + audit), never run |
+| New Engine needs a follow-up on an Engine without `signedCommands1` | Refused before anything starts: `409 ENGINE_VERSION_MISMATCH { engineId, version }` |
+| Peer answers `404` on `/api/auth/info` | `ENGINE_VERSION_MISMATCH` |
+| Follow-up after B restarted | `GRANT_EXPIRED` with `issuerEngineId: B`; start the operation again |

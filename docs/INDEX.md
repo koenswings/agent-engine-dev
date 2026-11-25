@@ -31,8 +31,9 @@ with usage examples.
 Operator sign-in and signed commands: Engine-local auth folder, CORS for own Console origins,
 second confirmation for disk wipe and card flash, `createInstance` local-only and the git account
 pin, command source on traces and the local audit log; Engine-local operator accounts, the
-setup code, challenge sign-in, sessions and `/api/auth/*`; later steps add signed commands,
-the relay and the firewall script.
+setup code, challenge sign-in, sessions and `/api/auth/*`; the command key, signed queue
+entries, `POST /api/command`, peer grants and the mixed-version refusals; later steps add the
+relay and the firewall script.
 → [docs/COMMAND_AUTH.md](COMMAND_AUTH.md)
 
 ## BACKUP_SCHEDULE.md
