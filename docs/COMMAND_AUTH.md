@@ -12,7 +12,7 @@ Design record: [engine#582](https://github.com/koenswings/agent-engine-dev/issue
 | 1 | CORS and store WebSocket Origin check for own Console origins, second confirmation gate (module), `createInstance` local-only, git account pin, command source on traces, local audit log | this page |
 | 2 | Engine-local operator accounts, setup code, challenge sign-in, sessions, rate limits, `/api/auth/*`, `idea-engine-auth` CLI | this page |
 | 3 | Command key, signed queue entries, `POST /api/command`, peer grants, mixed-version refusal | this page |
-| 4 | `/api/engines/<id>/…` relay | later |
+| 4 | `/api/engines/<id>/…` relay | this page |
 | 5 | Firewall script for Ops | later |
 
 ## Engine-local auth folder
@@ -315,3 +315,42 @@ B's `GET /api/auth/info` reports B's engine id. Connect timeout 3 s → `ENGINE_
 | New Engine needs a follow-up on an Engine without `signedCommands1` | Refused before anything starts: `409 ENGINE_VERSION_MISMATCH { engineId, version }` |
 | Peer answers `404` on `/api/auth/info` | `ENGINE_VERSION_MISMATCH` |
 | Follow-up after B restarted | `GRANT_EXPIRED` with `issuerEngineId: B`; start the operation again |
+
+## Relay: /api/engines/<id>/… (step 4)
+
+`src/monitors/relayApi.ts`, `src/data/RelayKey.ts`. A Console page talks only to its own
+origin. For another Engine B of the store it calls its own Engine A at
+`/api/engines/<B>/<path>`; A forwards server-to-server to B's `/api/<path>` and returns
+B's answer unchanged (status, body, `Retry-After`).
+
+- **Paths:** `auth/info`, `auth/setup`, `auth/challenge`, `auth/login`, `auth/renew`,
+  `auth/logout`, `auth/password`, `auth/operators`, `auth/operators/<id>`, `auth/grant`,
+  `command`, `store-url`, `command-log-url`. Anything else: `404 NOT_FOUND`.
+- **Own id:** `/api/engines/<A>/<path>` on A is answered by A itself.
+- **Address:** as for peer follow-ups (step 3): `lanAddress`, `lanAddresses`,
+  `<hostname>.local`, private ranges only, on `httpPort`, after B's `/api/auth/info`
+  reported engine id B.
+
+| Situation | Answer |
+|---|---|
+| `<id>` not in the store | `404 ENGINE_UNKNOWN { engineId }` |
+| Connect timeout 3 s, or no answer in 10 s (`auth/*`, info) / 15 s (`command`) | `502 ENGINE_UNREACHABLE { engineId }`, message "<Engine name> cannot be reached right now." |
+| B answers `404` on `/api/auth/info` (older Engine) | `409 ENGINE_VERSION_MISMATCH { engineId, version }`; `store-url` and `command-log-url` are still forwarded |
+| Body over 16 KB | `413 PAYLOAD_TOO_LARGE` (nothing forwarded) |
+| A request to `auth/grant` | every error the relay itself makes also carries `issuerEngineId` (= B) |
+
+**Original client (rate limit per client).** A adds
+
+```
+X-Idea-Relay: v1.<fromEngineId>.<clientAddr base64url>.<t>.<sig>
+sig = base64url(Ed25519(relay key, "idea-relay-v1\n" + fromEngineId + "\n" + clientAddr + "\n" + t))
+```
+
+The relay key is `<authFolder>/relay-key.pem` (created on first start, 0600, never
+synced); its public half is in A's `engineDB` entry as `relayPublicKey`. B uses
+`clientAddr` for the sign-in rate limit and the audit `remoteAddr` (and `viaEngineId` on
+command traces) when the signature verifies against the sender's published key and `t`
+is within 60 s of B's clock; otherwise the socket address. The header never authorises
+anything. A client's own `X-Idea-Relay` header is never passed on.
+
+**Capability `engineRelay1`.**
