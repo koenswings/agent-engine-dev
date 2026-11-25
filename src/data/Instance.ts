@@ -17,6 +17,7 @@ import { updateInFlightRefusal } from './UpdateInFlight.js'
 import { localEngineId } from "./Engine.js";
 import { network } from "./Network.js";
 import { createAppId, parseAppId } from "./App.js";
+import { assertAppName, assertGitAccount, childPathInside } from './NameCheck.js'
 import { appIdentity } from "./AppIdParse.js";
 import { healthTimeoutSeconds, DEFAULT_HEALTH_TIMEOUT_S } from "./AppHealthTimeout.js";
 import { Docker } from "node-docker-api";
@@ -366,8 +367,17 @@ export type Status = 'Undocked'      // Disk is not currently docked; instance d
   | 'Missing'       // Instance directory no longer found on the disk (deleted or moved to another disk)
   | 'Error';
 
+/** Scratch folder for App clones; buildInstance only ever removes <APPS_TMP_ROOT>/<appName>. */
+export const APPS_TMP_ROOT = '/tmp/apps'
+
 export const buildInstance = async (instanceName: InstanceName, appName: AppName, gitAccount: string, version: Version, device: DeviceName): Promise<InstanceID | undefined> => {
   print(`Building new instance '${instanceName}' from version ${version} of app '${appName}' on device '${device}' of the local engine.`)
+
+  // Every path below is built from appName: refuse anything that is not one safe
+  // name, and keep the scratch clone strictly inside APPS_TMP_ROOT.
+  assertAppName(appName)
+  assertGitAccount(gitAccount)
+  const tmpApp = childPathInside(APPS_TMP_ROOT, String(appName))
 
   // CODING STYLE: only use absolute pathnames !
   // CODING STYLE: use try/catch for error handling
@@ -401,15 +411,15 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // **************************
 
     // Clone the app from the repository
-    // Remove /tmp/apps/${typeName} if it exists
-    await $`rm -rf /tmp/apps/${appName}`
+    // Remove the scratch clone <APPS_TMP_ROOT>/<appName> if it exists
+    await $`rm -rf ${tmpApp}`
     let appVersion = ""
     print(`Cloning version ${version} of app ${appName} from git account ${gitAccount}`)
     if (version === "latest") {
       print(`Cloning the latest development version of app ${appName} from git account ${gitAccount}`)
-      await $`git clone https://github.com/${gitAccount}/app-${appName} /tmp/apps/${appName}`
+      await $`git clone https://github.com/${gitAccount}/app-${appName} ${tmpApp}`
       // Set appVersion to the latest commit hash
-      const gitLog = await $`cd /tmp/apps/${appName} && git log -n 1 --pretty=format:%H`
+      const gitLog = await $`cd ${tmpApp} && git log -n 1 --pretty=format:%H`
       appVersion = gitLog.stdout.trim()
       print(`App version: ${appVersion}`)
 
@@ -420,10 +430,10 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
       assertGitRef(version)
       if (isCommitSha(version)) {
         // A commit SHA is not a branch or tag: clone, then check the commit out (Kid, #221)
-        await $`git ${['clone', '--', `https://github.com/koenswings/app-${appName}`, `/tmp/apps/${appName}`]}`
-        await $`git ${['-C', `/tmp/apps/${appName}`, 'checkout', '--detach', version]}`
+        await $`git ${['clone', '--', `https://github.com/koenswings/app-${appName}`, tmpApp]}`
+        await $`git ${['-C', tmpApp, 'checkout', '--detach', version]}`
       } else {
-        await $`git ${appCloneArgs('koenswings', appName, version, `/tmp/apps/${appName}`)}`
+        await $`git ${appCloneArgs('koenswings', appName, version, tmpApp)}`
       }
       appVersion = versionDirName(version)
       if (appVersion !== version) log(`App ref '${version}' is stored as version '${appVersion}' (folder ${appName}-${appVersion})`)
@@ -433,7 +443,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     // Overwrite if it exists
     // We want to copy the content of a directory and rename the directory at the same time: 
     //   See https://unix.stackexchange.com/questions/412259/how-can-i-copy-a-directory-and-rename-it-in-the-same-command
-    await $`cp -fr /tmp/apps/${appName}/. ${root}/apps/${appName}-${appVersion}/`
+    await $`cp -fr ${tmpApp}/. ${root}/apps/${appName}-${appVersion}/`
 
     // **************************
     // STEP 2 - App Instance creation
@@ -441,7 +451,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
 
     // Create the app instance
     // Again use /. to specify the content of the dir, not the dir itself 
-    await $`cp -fr /tmp/apps/${appName}/. ${root}/instances/${instanceId}/`
+    await $`cp -fr ${tmpApp}/. ${root}/instances/${instanceId}/`
 
     // If the app has an init_data.tar.gz file, unpack it in the app folder
     if (fs.existsSync(`${root}/instances/${instanceId}/init_data.tar.gz`)) {
@@ -468,7 +478,7 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
     await $`echo ${composeYAML} > ${root}/instances/${instanceId}/compose.yaml`
 
     // Remove the temporary app folder
-    await $`rm -rf /tmp/apps/${appName}`
+    await $`rm -rf ${tmpApp}`
 
     // **************************
     // STEP 3 - Persist the services

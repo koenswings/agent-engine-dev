@@ -11,6 +11,7 @@
  *   receive / receive-files, receive-service, delete); none is a plain ssh command.
  */
 
+import { childPathInside } from './NameCheck.js'
 import { chalk, fs, $ } from 'zx'
 import { log, isEngineOnline } from '../utils/utils.js'
 import { rsyncDirectory, rsyncInstanceData, rsyncToPeer, PeerEngine } from '../utils/rsync.js'
@@ -846,7 +847,7 @@ const finishRegisteredMove = async (storeHandle: DocHandle<Store>, opId: string,
         const stillNeedsAppMaster = getInstancesOfDisk(storeHandle.doc(), sourceDisk).some(i => i.instanceOf === appId)
         if (!stillNeedsAppMaster && await fs.pathExists(appMasterSrc)) {
             log(`moveApp: removing app master ${appMasterSrc} (no other instances on source disk)`)
-            await fs.remove(appMasterSrc)
+            await fs.remove(childPathInside(`${sourceMountRoot}/apps`, appId))
         }
         await clearInFlight(targetRoot, id, opId)
         setOperationArgs(storeHandle, opId, { phase: 'done' })
@@ -1104,7 +1105,7 @@ export const moveApp = async (
         const stillNeedsAppMaster = remainingInstances.some(i => i.instanceOf === appId)
         if (!stillNeedsAppMaster) {
             log(`moveApp: removing app master ${appMasterSrc} (no other instances on source disk)`)
-            await fs.remove(appMasterSrc)
+            await fs.remove(childPathInside(`${sourceMountRootMove}/apps`, appId))
         } else {
             log(`moveApp: keeping app master ${appMasterSrc} (other instances still use it)`)
         }
