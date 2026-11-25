@@ -27,7 +27,7 @@ import {
     openSetup, closeSetup, useSetupCode, setupOpen, normaliseSetupCode, newSetupCode, currentSetupCodeForTests,
     SETUP_CODE_TTL_MS, SETUP_LOCK_MS, SETUP_CODE_FILE,
 } from '../../src/data/SetupCode.js'
-import { syncEngineAuth } from '../../src/data/EngineAuth.js'
+import { syncEngineAuth, watchStoreAccounts, storeImportPending } from '../../src/data/EngineAuth.js'
 import { clearAuthSecretCacheForTests } from '../../src/data/AuthSecret.js'
 
 // Pixel's reference vector (agent-console-dev, engine#582 review point 16)
@@ -73,13 +73,13 @@ describe('operators.json and the one-time import', () => {
             u4: { id: 'u4', username: 'admin', passwordHash: VEC.hash },
         } }
         const r = importOperatorsOnce(store, dir, 100)
-        expect(r).toEqual({ created: true, imported: ['admin', 'teacher'] })
+        expect(r).toEqual({ created: true, imported: ['admin', 'teacher'], skipped: [] })
         const f = readOperatorsFile(dir)!
         expect(f.importedFromStore).toEqual({ at: 100, count: 2 })
         expect(f.operators.find(o => o.username === 'teacher')!.passwordHash).toBe(h12)
         expect((fs.statSync(path.join(dir, OPERATORS_FILE)).mode & 0o777).toString(8)).toBe('600')
         store.userDB.u5 = { id: 'u5', username: 'late', passwordHash: VEC.hash }
-        expect(importOperatorsOnce(store, dir)).toEqual({ created: false, imported: [] })
+        expect(importOperatorsOnce(store, dir)).toEqual({ created: false, imported: [], skipped: [] })
         expect(listOperators(dir).map(o => o.username)).toEqual(['admin', 'teacher'])
     })
     it('an empty userDB still writes the file, so a later userDB is not imported', () => {
@@ -180,8 +180,15 @@ describe('sessions', () => {
     })
     it('bearerToken parses only "Bearer <token>"', () => {
         expect(bearerToken('Bearer ' + 'a'.repeat(43))).toBe('a'.repeat(43))
-        expect(bearerToken('Basic abc')).toBeNull()
+        // only a missing header is AUTH_REQUIRED; anything else that is not a valid token is TOKEN_INVALID
+        expect(bearerToken('Basic abc')).toBe('')
         expect(bearerToken(undefined)).toBeNull()
+        expect(bearerToken('')).toBeNull()
+        expect(bearerToken('Bearer short')).toBe('short')
+        expect(checkToken(bearerToken('Bearer short'))).toEqual({ ok: false, code: 'TOKEN_INVALID' })
+        expect(checkToken(bearerToken('Basic abc'))).toEqual({ ok: false, code: 'TOKEN_INVALID' })
+        expect(checkToken(bearerToken('Bearer ' + 'b'.repeat(43)))).toEqual({ ok: false, code: 'TOKEN_INVALID' })
+        expect(checkToken(bearerToken(undefined))).toEqual({ ok: false, code: 'AUTH_REQUIRED' })
     })
 })
 
@@ -262,6 +269,41 @@ describe('startup (syncEngineAuth)', () => {
         expect(readOperatorsFile(dir)).toBeNull()
         doc.userDB = { u: { id: 'u', username: 'admin', passwordHash: VEC.hash } }
         expect(syncEngineAuth(handle(doc), { dir, tty: false })).toMatchObject({ operators: 1, imported: ['admin'], setupOpen: false })
+    })
+    it('setup wrote operators.json before the store synced: the import still runs once, this Engine\'s accounts win', () => {
+        const doc: any = {}
+        expect(syncEngineAuth(handle(doc), { dir, tty: false })).toMatchObject({ setupOpen: true, waitingForStore: true })
+        addOperator('pixel', VEC.hash, dir)   // what POST /api/auth/setup does
+        expect(readOperatorsFile(dir)!.importedFromStore).toBeNull()
+        const other = '$2b$10$' + 'c'.repeat(53)
+        doc.engineDB = {}
+        doc.userDB = { a: { id: 'a', username: 'admin', passwordHash: VEC.hash }, p: { id: 'p', username: 'pixel', passwordHash: other } }
+        expect(syncEngineAuth(handle(doc), { dir, tty: false })).toMatchObject({ operators: 2, imported: ['admin'] })
+        expect(listOperators(dir).find(o => o.username === 'pixel')!.passwordHash).toBe(VEC.hash)   // local wins
+        expect(readOperatorsFile(dir)!.importedFromStore).toMatchObject({ count: 1 })
+        doc.userDB.late = { id: 'l', username: 'late', passwordHash: VEC.hash }
+        expect(syncEngineAuth(handle(doc), { dir, tty: false }).imported).toEqual([])   // once only
+    })
+    it('a loaded store without userDB (store-template.json): nothing to import, no waiting; a userDB synced later is still imported once', () => {
+        const doc: any = { engineDB: {}, diskDB: {} }
+        expect(syncEngineAuth(handle(doc), { dir, tty: false })).toMatchObject({ waitingForStore: false, imported: [], setupOpen: true })
+        expect(readOperatorsFile(dir)!.importedFromStore).toMatchObject({ count: 0, none: true })
+        expect(syncEngineAuth(handle(doc), { dir, tty: false })).toMatchObject({ waitingForStore: false })
+        doc.userDB = { a: { id: 'a', username: 'admin', passwordHash: VEC.hash } }
+        expect(syncEngineAuth(handle(doc), { dir, tty: false })).toMatchObject({ operators: 1, imported: ['admin'], setupOpen: false })
+        expect(readOperatorsFile(dir)!.importedFromStore).toEqual({ at: expect.any(Number), count: 1 })
+    })
+    it('watchStoreAccounts: a userDB arriving by sync triggers the import, then stops watching', async () => {
+        const { Repo } = await import('@automerge/automerge-repo')
+        const h = new Repo({ network: [], storage: undefined }).create<any>({ engineDB: {}, diskDB: {} })
+        await h.whenReady()
+        syncEngineAuth(h, { dir, tty: false })
+        const stop = watchStoreAccounts(h, { dir })
+        h.change((d: any) => { d.userDB = { a: { id: 'a', username: 'admin', passwordHash: VEC.hash } } })
+        await new Promise(r => setTimeout(r, 50))
+        expect(listOperators(dir).map(o => o.username)).toEqual(['admin'])
+        expect(storeImportPending(dir)).toBe(false)
+        stop()
     })
 })
 

@@ -14,7 +14,7 @@ import { takeStartupFailure, publishStartupFailure } from './data/StartupFailure
 import { StoreSelfHeal, publishStoreSelfHeal } from './data/StoreHealth.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkCrossEngineResumeCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
-import { syncEngineAuth } from './data/EngineAuth.js'
+import { syncEngineAuth, watchStoreAccounts } from './data/EngineAuth.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
 import { DocumentId, Repo } from '@automerge/automerge-repo'
@@ -198,6 +198,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
 
     // engine#582: Engine-local operator accounts (one-time import from the store), setup code
     try { syncEngineAuth(storeHandle) } catch (e) { log(`[auth] sign-in setup failed: ${e}`) }
+    watchStoreAccounts(storeHandle)
 
     // Remove any phantom engine entries and orphan disks that accumulated
     // from previous boots (e.g. before the sudo-hdparm fix). Runs before any

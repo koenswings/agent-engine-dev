@@ -126,13 +126,20 @@ redacted like the command log. It rotates at 10 MB and keeps 5 older files
   "operators": [{ "id": "user-…", "username": "admin", "passwordHash": "$2b$10$…", "role": "operator", "created": 1795600000000 }] }
 ```
 
-- **One-time import.** On the first start of a build with sign-in, when the file does not
-  exist, the Engine imports every store `userDB` entry with a well-formed bcrypt hash
-  (`$2a$`/`$2b$`/`$2y$`, any cost; the cost is kept until the next password change). The
-  file is written even when nothing was imported, so later `userDB` changes are never
-  imported. The log shows the count and the usernames, never hashes. When the store maps
-  have not arrived yet (a fresh store waiting for peer sync), the import waits for them.
-  The store `userDB` itself is not changed.
+- **One-time import.** The Engine imports the store `userDB` entries with a well-formed
+  bcrypt hash (`$2a$`/`$2b$`/`$2y$`, any cost; the cost is kept until the next password
+  change) once, recorded in `importedFromStore`. Later `userDB` changes are never imported.
+  The log shows the count and the usernames, never hashes. The store `userDB` itself is
+  not changed.
+  - **Merge rule.** When operators.json already has operators (setup or the CLI ran before
+    the store synced), this Engine's accounts win: a store account with a username that
+    already exists here is skipped; the others are added.
+  - **Waiting for the store.** When the store maps have not arrived yet (a fresh store
+    waiting for peer sync), the import waits for them; setup stays open meanwhile.
+  - **No userDB.** A loaded store without `userDB` (made from `store-template.json`) has
+    nothing to import: the log says so and the Engine stops waiting
+    (`importedFromStore.none`). If a `userDB` arrives later by peer sync, it is imported
+    once by the same rule.
 - New hashes (setup, add operator, password change) must be bcrypt cost 10–12; the
   Console makes them at cost 10.
 - Usernames are 1–64 characters without control characters; across Engines the Console
@@ -206,7 +213,10 @@ and the CORS rule above. Errors are `{ error, message, … }`.
 | `POST /api/auth/operators` | Bearer | `{ username, passwordHash }` | `201 { operator: { id, username, created } }`; `409 OPERATOR_EXISTS` |
 | `DELETE /api/auth/operators/<id>` | Bearer | | `204`; `404 OPERATOR_UNKNOWN`, `409 LAST_OPERATOR` |
 
-Missing or bad tokens: `401 AUTH_REQUIRED`, `TOKEN_INVALID`, `TOKEN_EXPIRED`. An older Engine
+Tokens: no `Authorization` header → `401 AUTH_REQUIRED`; a malformed or unknown token →
+`401 TOKEN_INVALID`; a known session past its expiry → `401 TOKEN_EXPIRED` (once; after
+that the token is unknown, `TOKEN_INVALID`). A body over 16 KB → `413 PAYLOAD_TOO_LARGE`.
+An unknown `/api/*` route → `404 { error: "NOT_FOUND", message }`. An older Engine
 answers `404` on `/api/auth/info`. Sign-in events go to `command-audit.log` as
 `auth:<event>` lines (username, client address; never hashes, proofs or tokens).
 
