@@ -215,7 +215,8 @@ and the CORS rule above. Errors are `{ error, message, … }`.
 
 Tokens: no `Authorization` header → `401 AUTH_REQUIRED`; a malformed or unknown token →
 `401 TOKEN_INVALID`; a known session past its expiry → `401 TOKEN_EXPIRED` (once; after
-that the token is unknown, `TOKEN_INVALID`). A body over 16 KB → `413 PAYLOAD_TOO_LARGE`.
+that the token is unknown, `TOKEN_INVALID`). A body over 16 KB → `413 PAYLOAD_TOO_LARGE`; the
+size is checked before the token, so this holds with or without a (valid) token.
 An unknown `/api/*` route → `404 { error: "NOT_FOUND", message }`. An older Engine
 answers `404` on `/api/auth/info`. Sign-in events go to `command-audit.log` as
 `auth:<event>` lines (username, client address; never hashes, proofs or tokens).
