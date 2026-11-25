@@ -217,13 +217,16 @@ export interface EraseInProgress {
  *               at startup. A source refuses a target without it (TARGET_OUTDATED).
  * engineSignIn1 (engine#582): /api/auth/* (Engine-local operators, challenge sign-in,
  *               setup code). Commands still use the store queue until signedCommands1.
+ * signedCommands1 (engine#582): POST /api/command and /api/auth/grant; the queue runs
+ *               only entries signed by this Engine (unsigned → COMMAND_UNSIGNED); peer
+ *               follow-ups need a grant from the target Engine.
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'traceInstanceId', 'makeBackupDisk', 'engineSignIn1']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'traceInstanceId', 'makeBackupDisk', 'engineSignIn1', 'signedCommands1']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'

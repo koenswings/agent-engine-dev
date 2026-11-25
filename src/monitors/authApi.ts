@@ -33,6 +33,7 @@ import { loginWaitMs, recordLoginFailure, recordLoginSuccess } from '../data/Log
 import { setupOpen, useSetupCode } from '../data/SetupCode.js'
 import { appendAudit } from '../data/CommandAudit.js'
 import { cleanCommandSource } from '../data/CommandSource.js'
+import { issueGrant } from '../data/PeerGrants.js'
 
 export const AUTH_VERSION = 1
 export const MAX_BODY_BYTES = 16 * 1024
@@ -205,6 +206,26 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
     if (route === '/api/auth/renew' && method === 'POST') {
         const s = authenticate(req)
         return { status: 200, body: { expiresInMs: Math.max(0, Math.min(SESSION_IDLE_MS, s.expiresAt - s.lastUsed)) } }
+    }
+
+    if (route === '/api/auth/grant' && method === 'POST') {
+        // engine#582: permission for another Engine to send follow-ups here. Every
+        // error names this Engine as issuerEngineId.
+        const self = ctx.engineId
+        try {
+            const s = authenticate(req)
+            const b = await readJsonBody(req)
+            const to = str(b.toEngineId, 'toEngineId', 80)
+            if (!/^[A-Za-z0-9_-]{1,80}$/.test(to) || to === self) throw new HttpError(400, 'BAD_REQUEST', "'toEngineId' must be another Engine's id.")
+            const store = ctx.storeHandle?.doc() as Store | undefined
+            if (!store?.engineDB?.[to as any]) throw new HttpError(404, 'ENGINE_UNKNOWN', `Engine ${to} is not known to this Engine.`)
+            const g = issueGrant(self, to, s.username, undefined, dirOf(ctx))
+            auditAuth(ctx, 'grant', { username: to, by: s.username, session: sessionShortId(s) })
+            return { status: 200, body: { grant: g.grant, expiresInMs: g.expiresInMs, issuerEngineId: self } }
+        } catch (e) {
+            if (e instanceof HttpError) e.extra = { issuerEngineId: self, ...e.extra }
+            throw e
+        }
     }
 
     if (route === '/api/auth/logout' && method === 'POST') {

@@ -6,7 +6,7 @@
  * Phase 1: same-engine — source and target on local engine.
  * Phase 2: cross-engine — source on local engine, target on remote engine;
  *   rsync over ssh with this Engine's own key (per-Pi Engine keys,
- *   data/PeerAccess.ts, utils/peerSsh.ts), remote start via sendCommand. Every
+ *   data/PeerAccess.ts, utils/peerSsh.ts), remote start via PeerCommands.dispatchToPeer (peer grant). Every
  *   remote step runs the peer's helper through its gate (ensure-dirs, receive-app,
  *   receive / receive-files, receive-service, delete); none is a plain ssh command.
  */
@@ -36,7 +36,7 @@ import {
     engineCanResume, peerInFlight, markPeerInFlight, clearPeerInFlight, verifyPeerCopyOrThrow,
 } from './InFlight.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
-import { sendCommand } from '../utils/commandUtils.js'
+import { dispatchToPeer } from './PeerCommands.js'
 import { getEngineAddress, getLiveEngineAddress, getLiveEngineEndpoint } from './Network.js'
 import { peerLiveSeen, PEER_CLOCK_STALE_MS } from './Liveness.js'
 import { serviceImageTarName } from './ImageRef.js'
@@ -461,7 +461,7 @@ export const copyApp = async (
             (resumedArgs.phase === 'registered' || String(storeHandle.doc()?.instanceDB?.[newInstanceId]?.storedOn ?? '') === String(targetDisk.id))) {
             await clearPeerInFlight(peer.host, peer.engineId, targetRoot, newInstanceId, opId)
             setOperationArgs(storeHandle, opId, { phase: 'done' })
-            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd` as any)
+            void dispatchToPeer(storeHandle, String(targetDisk.dockedTo), `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd`)
             updateOperation(storeHandle, opId, { status: 'Done', progressPercent: 100, error: null, completedAt: Date.now() as Timestamp })
             log(chalk.green(`copyApp: done — instance ${newInstanceId} was already registered on '${targetDisk.name}' (Engine ${peer.engineId}); cleared its in-flight marker there`))
             return newInstanceId
@@ -690,7 +690,7 @@ export const copyApp = async (
             log(`copyApp: kept instance id ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id}); storedOn is unchanged until verify`)
         } else if (isCrossEngine) {
             // Cross-engine: create instance record in shared store (as Docked),
-            // then tell the remote engine to start it via sendCommand.
+            // then tell the remote engine to start it (dispatchToPeer, peer grant).
             log(`copyApp: registering new instance ${newInstanceId} on remote disk '${targetDisk.name}' (${targetDisk.id})`)
             const composeContent = (await $`cat ${instanceSrc}/compose.yaml`).stdout
             const { parse: parseYAML } = await import('yaml')
@@ -728,7 +728,7 @@ export const copyApp = async (
             }
             // Tell the remote engine to start this instance, by id (idea#168)
             log(`copyApp: sending startInstance command to remote engine '${targetDisk.dockedTo}'`)
-            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd` as any)
+            void dispatchToPeer(storeHandle, String(targetDisk.dockedTo), `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd`)
         } else {
             // Local: use existing processInstance flow
             log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)

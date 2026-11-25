@@ -43,7 +43,7 @@ import { InstanceID, InstanceName, DiskID, EngineID, OperationCause, Timestamp, 
 import { createOperation, updateOperation, setOperationArgs, peerResumeProbe } from './Operations.js'
 import { engineCanResume, peerInFlight } from './InFlight.js'
 import { attachTraceResult } from './SummariseDisk.js'
-import { sendCommand } from '../utils/commandUtils.js'
+import { dispatchToPeer } from './PeerCommands.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { instanceDataBytes, helperAtLeast, deleteInstanceData, deleteRemoteInstanceData, remoteInstanceFolderExists } from '../utils/appDataHelper.js'
 import { REMOVE_HELPER_MIN, RemoveError, quarantineInstanceOnDisk } from './RemoveInstance.js'
@@ -189,9 +189,9 @@ const defaultDeps: MoveDeps = {
         if (!id) throw new Error('the copy did not finish')
         return id
     },
-    requestVerify: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
-    requestStart: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
-    requestCleanup: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
+    requestVerify: (storeHandle, engineId, command) => { void dispatchToPeer(storeHandle, String(engineId), String(command)) },
+    requestStart: (storeHandle, engineId, command) => { void dispatchToPeer(storeHandle, String(engineId), String(command)) },
+    requestCleanup: (storeHandle, engineId, command) => { void dispatchToPeer(storeHandle, String(engineId), String(command)) },
     targetFolderExists: defaultTargetFolderExists,
     startSource: (storeHandle, instance, disk) => startInstance(storeHandle, instance, disk, 'post-move'),
     removeSource: async (storeHandle, instanceId, _engineId, sourceDiskId) => {

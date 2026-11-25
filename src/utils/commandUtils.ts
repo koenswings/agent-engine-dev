@@ -11,6 +11,7 @@ import { lookupInstanceArg } from '../data/InstanceArg.js';
 import { CommandSource, cleanCommandSource, isRemoteSource } from '../data/CommandSource.js';
 import { appendAudit } from '../data/CommandAudit.js';
 import { localEngineId } from '../data/Engine.js';
+import { enqueueSigned } from '../data/SignedQueue.js';
 
 
 /**
@@ -46,6 +47,25 @@ const recordErrorTrace = (
         ...(typeof opts.seq === 'number' ? { seq: opts.seq } : {}),
     });
     closeTrace(commandLogHandle, traceId, 'error', redactString(message), undefined, errorCode);
+}
+
+/**
+ * engine#582: error trace + audit line for a queue entry refused before it is
+ * parsed (unsigned, bad signature, replayed). `commandText` is the entry's command
+ * text; the trace gets its first word as command and the rest as args.
+ */
+export const recordRefusalTrace = (
+    commandLogHandle: DocHandle<CommandLogStore> | null | undefined,
+    commandText: string,
+    message: string,
+    errorCode: string,
+    opts: HandleCommandOptions = {},
+): void => {
+    const text = String(commandText ?? '').trim()
+    const i = text.indexOf(' ')
+    const name = (i === -1 ? text : text.slice(0, i)).slice(0, 80)
+    const rest = i === -1 ? [] : splitArgs(text.slice(i + 1))
+    recordErrorTrace(commandLogHandle, name, JSON.stringify(rest), message, opts, errorCode)
 }
 
 /**
@@ -281,43 +301,28 @@ export const addTraceInstanceIdentity = (
 }
 
 /**
- * A dependency-free utility to add a command to a specific engine's command array in the store.
- * This is used by tests and the 'send' command definition.
+ * Put a command on THIS Engine's own queue, signed by this Engine (engine#582,
+ * src `engine`, or `cli` for the local command line). Used by tests, the `send`
+ * command and the Engine's own scheduling.
+ *
+ * Commands for another Engine are never written into its queue: that Engine
+ * would refuse them (only it can sign its queue). Cross-Engine follow-ups go
+ * through PeerCommands.dispatchToPeer (peer grants, POST /api/command).
  */
-export const sendCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, command: Command): void => {
+export const sendCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, command: Command, src: 'engine' | 'cli' = 'engine'): number | null => {
+    if (String(engineId) !== String(localEngineId)) {
+        const message = `Cannot send '${String(command).split(' ')[0]}' to Engine ${engineId}: commands for another Engine go through that Engine's API (sign in to it).`
+        console.error(message)
+        recordRefusalTrace(getCommandLogHandle(), String(command), message, 'COMMAND_REFUSED', { source: { kind: src === 'cli' ? 'cli' : 'engine' } })
+        return null
+    }
     print(`Sending command '${command}' to engine ${engineId}`);
-
     const store = storeHandle.doc();
     if (!store?.engineDB[engineId]) {
         console.error(`Cannot send command: Engine ${engineId} not found in store.`);
-        return;
+        return null
     }
-
-    // Trace the dispatch on the originating engine so the Console shows
-    // cross-engine commands in history (e.g. copyApp dispatching startInstance
-    // to a remote engine). This is a one-shot trace with no log lines.
-    const cmdLogHandle = getCommandLogHandle()
-    if (cmdLogHandle) {
-        const commandName = String(command).split(' ')[0]
-        const traceId = crypto.randomUUID()
-        addTrace(cmdLogHandle, {
-            traceId,
-            command: commandName,
-            args: JSON.stringify({ dispatchedTo: engineId, command: String(command) }),
-            startedAt: Date.now(),
-            completedAt: Date.now(),
-            status: 'running',
-            errorMessage: null,
-        })
-        closeTrace(cmdLogHandle, traceId, 'ok')
-    }
-
-    storeHandle.change(doc => {
-        const engine = doc.engineDB[engineId];
-        if (engine) {
-            engine.commands.push(command);
-        }
-    });
+    return enqueueSigned(storeHandle, String(command), src)
 }
 const convertToType = (str: string, descriptor: ArgumentDescriptor): any => {
     switch (descriptor.type) {

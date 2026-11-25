@@ -36,6 +36,19 @@ const sshCalls = vi.hoisted(() => [] as string[])
 const instanceTransfers = vi.hoisted(() => [] as any[])
 const helperDeletes = vi.hoisted(() => [] as string[][])
 
+// engine#582: follow-ups to another Engine go through PeerCommands (POST /api/command with a grant);
+// here the "delivery" is simulated by appending the command to the target's queue row.
+vi.mock('../../src/data/PeerCommands.js', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    return {
+        ...actual,
+        dispatchToPeer: vi.fn(async (sh: any, engineId: string, command: string) => {
+            sh.change((d: any) => { d.engineDB[engineId].commands.push(command) })
+            return { ok: true, seq: 1, issuerEngineId: engineId }
+        }),
+    }
+})
+
 vi.mock('../../src/utils/rsync.js', () => ({
     rsyncDirectory: vi.fn(async (src: string, dest: string, onProgress?: (p: { progressPercent: number }) => void) => {
         const { fs } = await import('zx')
@@ -167,6 +180,7 @@ import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { disksRoot } from '../../src/data/Config.js'
 import { setRootDeviceForTests } from '../../src/data/Disk.js'
 import { network } from '../../src/data/Network.js'
+import { dispatchToPeer } from '../../src/data/PeerCommands.js'
 import { copyApp, moveApp } from '../../src/data/CopyMoveApp.js'
 import { installAppFromDisk } from '../../src/data/InstallApp.js'
 import { findExternalLinks, uniqueCopyName, clearEnginePort, setComposeInstanceName } from '../../src/data/InstanceCopy.js'
@@ -466,6 +480,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
             expect(overlay.files['.env']).not.toMatch(/^port=/m)
             expect(toCopy[1].files['.idea-rebind-morango']).toBe('r40\n')
             expect(h.doc().engineDB[REMOTE].commands).toEqual([`startInstance ${newRow.id} ${TGT} --cause cross-engine-cmd`])
+            expect(vi.mocked(dispatchToPeer)).toHaveBeenCalledWith(h, String(REMOTE), `startInstance ${newRow.id} ${TGT} --cause cross-engine-cmd`)
             expect(order).toEqual([`stop:${ORIG}`, `start:${ORIG}`])
         } finally {
             delete network.connections['10.0.0.35:4321' as any]

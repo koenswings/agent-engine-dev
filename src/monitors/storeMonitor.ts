@@ -7,9 +7,26 @@ import { commands } from '../data/Commands.js';
 import { localEngineId } from '../data/Engine.js';
 import { CommandLogStore } from '../data/CommandLogStore.js';
 import type { CommandSource } from '../data/CommandSource.js';
+import { verifyEntry, markSeqDone, entryCommandText } from '../data/CommandKey.js';
+import { sourceForEntry } from '../data/SignedQueue.js';
+import { recordRefusalTrace } from '../utils/commandUtils.js';
 
-/** engine#582: entries from the store queue; the writer is not known on this path. */
-const QUEUE_SOURCE: CommandSource = { kind: 'queue' }
+/**
+ * engine#582: every queue entry must be signed by this Engine (CommandKey.ts).
+ * Verify it, mark its seq as run, and hand the command text to handleCommand with
+ * its source and seq. A refused entry gets an error trace (with seq when the prefix
+ * parses) and is removed like any finished head; nothing runs.
+ */
+const runQueueEntry = async (storeHandle: DocHandle<Store>, engineId: EngineID, raw: string, cmdLogHandle?: DocHandle<CommandLogStore> | null): Promise<void> => {
+    const v = verifyEntry(raw, String(engineId))
+    if (!v.ok) {
+        const source: CommandSource = v.src ? sourceForEntry(v.src, v.seq ?? -1) : { kind: 'queue' }
+        recordRefusalTrace(cmdLogHandle ?? null, v.command, v.message, v.code, { source, ...(v.seq !== null ? { seq: v.seq } : {}) })
+        return
+    }
+    markSeqDone(v.seq)
+    await handleCommand(commands, storeHandle, 'engine', v.command, cmdLogHandle ?? null, { source: sourceForEntry(v.src, v.seq), seq: v.seq })
+}
 
 
 
@@ -39,7 +56,7 @@ const queuedText = (c: unknown): string => typeof c === 'string' ? c : String(c 
 
 /** Read-only Engine commands that may run in parallel with a mutating command (idea#498). */
 export const isReadOnlyQueuedCommand = (command: string): boolean =>
-    command.trim().split(/\s+/)[0] === 'verifyMoveTarget'
+    entryCommandText(command).trim().split(/\s+/)[0] === 'verifyMoveTarget'
 
 const removeQueuedCommand = (storeHandle: DocHandle<Store>, engineId: EngineID, command: string): void => {
     storeHandle.change(doc => {
@@ -74,7 +91,7 @@ const drainReadOnlyCommands = (storeHandle: DocHandle<Store>, engineId: EngineID
         log(`Processing read-only command for engine ${engineId} (parallel): ${command}`)
         // Same #262 setImmediate: do not run inside the store 'change' event.
         new Promise<void>(resolve => setImmediate(resolve))
-            .then(() => handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null, { source: QUEUE_SOURCE }))
+            .then(() => runQueueEntry(storeHandle, engineId, command, cmdLogHandle))
             .catch(e => log(`Command '${command}' failed outside its trace: ${e?.message ?? e}`))
             .finally(() => {
                 running!.delete(command)
@@ -102,7 +119,7 @@ export const processCommandQueue = (storeHandle: DocHandle<Store>, engineId: Eng
     // returns, so a command that changes the store and then checks the result (forgetDisk)
     // saw its own change as not done. setImmediate runs it on a clean stack.
     new Promise<void>(resolve => setImmediate(resolve))
-        .then(() => handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null, { source: QUEUE_SOURCE }))
+        .then(() => runQueueEntry(storeHandle, engineId, command, cmdLogHandle))
         .catch(e => log(`Command '${command}' failed outside its trace: ${e?.message ?? e}`))
         .finally(() => {
             busy!.delete(String(engineId))

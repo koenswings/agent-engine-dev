@@ -38,6 +38,19 @@ import { engineCapabilities } from '../../src/data/Engine.js'
 import { shouldAutoStart, moveInFlightFromSource } from '../../src/data/AutoStart.js'
 
 const { startInstanceMock } = vi.hoisted(() => ({ startInstanceMock: vi.fn(async (..._a: any[]) => undefined) }))
+// engine#582: follow-ups to another Engine go through PeerCommands (POST /api/command with a grant);
+// here the "delivery" is simulated by appending the command to the target's queue row.
+vi.mock('../../src/data/PeerCommands.js', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    return {
+        ...actual,
+        dispatchToPeer: vi.fn(async (sh: any, engineId: string, command: string) => {
+            sh.change((d: any) => { d.engineDB[engineId].commands.push(command) })
+            return { ok: true, seq: 1, issuerEngineId: engineId }
+        }),
+    }
+})
+
 vi.mock('../../src/data/Instance.js', async (importOriginal) => {
     const actual = await importOriginal<any>()
     return { ...actual, startInstance: (...a: any[]) => startInstanceMock(...a) }
