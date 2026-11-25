@@ -19,6 +19,7 @@ import { localEngineId } from './Engine.js'
 import { ENGINE_STATE_DIR } from './FilesMount.js'
 import { log } from '../utils/utils.js'
 import { ClientImageVersion } from './ClientCards.js'
+import { stableStringify } from '../utils/stableJson.js'
 
 export interface ClientImage {
     version: ClientImageVersion
@@ -133,8 +134,8 @@ export const refreshClientImages = async (
 ): Promise<ClientImageStore> => {
     const st = await scanClientImages()
     lastImages = st
-    const prev = JSON.stringify(storeHandle.doc()?.engineDB?.[engineId]?.clientImages ?? null)
-    if (prev !== JSON.stringify(st)) {
+    const prev = stableStringify(storeHandle.doc()?.engineDB?.[engineId]?.clientImages ?? null)
+    if (prev !== stableStringify(st)) {
         storeHandle.change(doc => {
             const e = doc.engineDB[engineId]
             if (e) e.clientImages = JSON.parse(JSON.stringify(st))
