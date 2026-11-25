@@ -255,13 +255,16 @@ src = op-<session8> | peer-<engineId> | cli | engine
 | `COMMAND_SIGNATURE_INVALID` | Changed text, another Engine's entry, or a forged prefix. |
 | `COMMAND_REPLAYED` | The seq already ran, is out of the window, or was never issued. |
 
+The Engine log shows a queue entry as `[seq <seq>, src <src>] <command>`; the mac is never
+logged.
+
 `sendCommand` only queues on this Engine (signed, `src engine`). Commands for another
 Engine go through that Engine's API (peer follow-ups below). Scripts that run on the Pi as
 the Engine user sign with `script/cli-queue-entry.ts` (`src cli`).
 
 ## POST /api/command (step 3)
 
-`src/monitors/commandApi.ts`. Order: token → validation → `GRANT_REQUIRED` →
+`src/monitors/commandApi.ts`. Order: body size → token → validation → `GRANT_REQUIRED` →
 `CONFIRM_REQUIRED` → signed entry.
 
 | Auth | Body | Answer |
@@ -269,7 +272,8 @@ the Engine user sign with `script/cli-queue-entry.ts` (`src cli`).
 | `Bearer <token>` | `{ command, confirmId?, confirmText?, grants?: { <engineId>: <grant> } }` | `202 { engineId, seq }` |
 | `Grant <grant>` (another Engine) | `{ command, fromEngineId, replyGrant? }` | `202 { engineId, seq }` |
 
-Errors: `400 BAD_REQUEST` (not one line of text), `401` token codes, `422 COMMAND_REFUSED`
+Errors: `413 PAYLOAD_TOO_LARGE` (before the token), `400 BAD_REQUEST` (not one line of text),
+`503 STORE_NOT_READY` (the Engine has not loaded its store yet; try again), `401` token codes, `422 COMMAND_REFUSED`
 with `reason` `unknown` / `local-only` (`createInstance`) / `validation` /
 `not-a-follow-up`, `409 GRANT_REQUIRED { engineIds }`, `403 GRANT_INVALID` /
 `GRANT_EXPIRED`, `409 ENGINE_VERSION_MISMATCH { engineId, version }`,
@@ -300,6 +304,15 @@ signs its own entries:
 A keeps one trace per follow-up it sent: `ok` with B's seq, or `error` with the code and
 `issuerEngineId` in the result. Grant errors from B always name B as `issuerEngineId`;
 errors from `/api/auth/grant` also carry it.
+
+**A grant is checked by B, at the follow-up.** A only checks that a grant names B as issuer
+and A as receiver; it cannot tell whether B still knows it. A grant that went stale (6 h
+passed, or B restarted) is therefore accepted by A (`202`), and the operation starts. When A
+sends the follow-up, B answers `403 GRANT_EXPIRED`; A drops the grant and the follow-up's
+trace on A is `status: error`, `errorCode: GRANT_EXPIRED`, with `issuerEngineId: B` and
+`dispatchedTo: B` in its result. The operation then fails at that step like any other
+follow-up error; the Console asks B for a new grant and starts again. This is intended: the
+grant check happens where the grant was issued.
 
 Peer addresses come from B's `engineDB` row (`lanAddress`, `lanAddresses`, then
 `<hostname>.local`; private ranges only) on `httpPort`. Before the first request A checks
