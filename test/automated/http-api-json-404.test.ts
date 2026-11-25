@@ -8,7 +8,7 @@ import { mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'fs'
 /**
  * engine#357: unknown /api/* paths return a JSON 404 before the Console SPA
  * fallback, in the same shape as the existing API error replies
- * ({ error: string }, Content-Type application/json; CORS only for the
+ * ({ error: 'NOT_FOUND', message } since engine#582, Content-Type application/json; CORS only for the
  * Engine's own Console origins since engine#582, so a request without Origin gets none).
  * Non-/api paths still get the SPA fallback (or the no-console 404 text).
  */
@@ -23,7 +23,7 @@ const expectJson404 = async (res: Response) => {
     expect(res.status).toBe(404)
     expect(res.headers.get('content-type')).toContain('application/json')
     expect(res.headers.get('access-control-allow-origin')).toBeNull()
-    expect(await res.json()).toEqual({ error: 'Not found' })
+    expect(await res.json()).toEqual({ error: 'NOT_FOUND', message: expect.stringMatching(/^No API route \/api/) })
 }
 
 describe('unknown /api/* paths return JSON 404 (engine#357)', () => {

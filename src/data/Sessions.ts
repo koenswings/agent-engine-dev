@@ -51,16 +51,24 @@ export const createSession = (operator: { id: string, username: string }, now: n
     return { token, session, expiresInMs: session.expiresAt - now }
 }
 
-/** Token from an Authorization header value ("Bearer <token>"), or null. */
+const TOKEN_RE = /^[A-Za-z0-9_-]{20,200}$/
+
+/**
+ * Token from an Authorization header value ("Bearer <token>"). null only when there is
+ * no Authorization header at all (AUTH_REQUIRED); any other value that is not a
+ * well-formed Bearer token comes back as '' so checkToken answers TOKEN_INVALID.
+ */
 export const bearerToken = (header: string | string[] | undefined): string | null => {
     const h = Array.isArray(header) ? header[0] : header
-    const m = typeof h === 'string' ? /^Bearer ([A-Za-z0-9_-]{20,200})$/.exec(h.trim()) : null
-    return m ? m[1] : null
+    if (typeof h !== 'string' || h.trim() === '') return null
+    const m = /^Bearer\s+(\S+)$/i.exec(h.trim())
+    return m ? m[1] : ''
 }
 
 /** Check a token; on success the session is renewed (idle TTL, within the cap). */
 export const checkToken = (token: string | null, now: number = monoNow(), renew: boolean = true): SessionCheck => {
-    if (!token) return { ok: false, code: 'AUTH_REQUIRED' }
+    if (token === null) return { ok: false, code: 'AUTH_REQUIRED' }
+    if (!TOKEN_RE.test(token)) return { ok: false, code: 'TOKEN_INVALID' }
     const s = sessions.get(keyOf(token))
     if (!s) return { ok: false, code: 'TOKEN_INVALID' }
     if (s.expiresAt <= now) { sessions.delete(s.key); return { ok: false, code: 'TOKEN_EXPIRED' } }

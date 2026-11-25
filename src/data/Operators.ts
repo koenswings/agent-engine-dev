@@ -29,7 +29,8 @@ export interface OperatorRecord {
 
 export interface OperatorsFile {
     version: 1
-    importedFromStore: { at: number, count: number } | null
+    /** Set once the store's accounts were imported; `none` when the store had no userDB then (import again if one arrives). */
+    importedFromStore: { at: number, count: number, none?: true } | null
     operators: OperatorRecord[]
 }
 
@@ -63,7 +64,9 @@ export const readOperatorsFile = (dir?: string): OperatorsFile | null => {
     if (!j || j.version !== 1 || !Array.isArray(j.operators)) throw new Error(`${OPERATORS_FILE}: unknown format`)
     return {
         version: 1,
-        importedFromStore: j.importedFromStore ?? null,
+        importedFromStore: j.importedFromStore && typeof j.importedFromStore === 'object'
+            ? { at: Number(j.importedFromStore.at) || 0, count: Number(j.importedFromStore.count) || 0, ...(j.importedFromStore.none ? { none: true as const } : {}) }
+            : null,
         operators: j.operators.filter((o: any) => o && validUsername(o.username) && isBcryptHash(o.passwordHash) && typeof o.id === 'string')
             .map((o: any) => ({ id: o.id, username: o.username, passwordHash: o.passwordHash, role: 'operator', created: Number(o.created) || 0 })),
     }
@@ -80,29 +83,48 @@ export const findOperatorByUsername = (username: string, dir?: string): Operator
     listOperators(dir).find(o => o.username === username) ?? null
 
 /**
- * First start with Engine sign-in: create operators.json, importing the synced
- * store's userDB entries that have a well-formed bcrypt hash. Does nothing when the
- * file already exists. Returns what happened.
+ * The one-time import of the store's userDB accounts (engine#582). Runs until it has
+ * happened once (importedFromStore set), also when operators.json already exists
+ * because setup or the CLI created an operator first. Rule: accounts on this Engine
+ * win; a store account whose username already exists here is skipped; the others are
+ * added when they have a well-formed bcrypt hash. Returns what happened.
  */
 export const importOperatorsOnce = (store: Store | null | undefined, dir?: string, now: number = Date.now()):
-    { created: boolean, imported: string[] } => {
-    if (readOperatorsFile(dir)) return { created: false, imported: [] }
-    const seen = new Set<string>()
-    const operators: OperatorRecord[] = []
+    { created: boolean, imported: string[], skipped: string[] } => {
+    const existing = readOperatorsFile(dir)
+    if (existing?.importedFromStore && !existing.importedFromStore.none) return { created: false, imported: [], skipped: [] }
+    const local = existing?.operators ?? []
+    const seen = new Set<string>(local.map(o => o.username))
+    const added: OperatorRecord[] = []
+    const skipped: string[] = []
     for (const u of Object.values((store as any)?.userDB ?? {}) as any[]) {
         const username = u?.username != null ? String(u.username) : ''
         const hash = u?.passwordHash != null ? String(u.passwordHash) : ''
-        if (!validUsername(username) || !isBcryptHash(hash) || seen.has(username)) continue
+        if (!validUsername(username) || !isBcryptHash(hash)) continue
+        if (seen.has(username)) { if (local.some(o => o.username === username)) skipped.push(username); continue }
         seen.add(username)
-        operators.push({
-            id: typeof u.id === 'string' && u.id ? String(u.id) : newOperatorId(),
+        added.push({
+            id: typeof u.id === 'string' && u.id && !local.some(o => o.id === u.id) ? String(u.id) : newOperatorId(),
             username, passwordHash: hash, role: 'operator', created: Number(u.created) || now,
         })
     }
-    writeOperatorsFile({ version: 1, importedFromStore: { at: now, count: operators.length }, operators }, dir)
-    const names = operators.map(o => o.username)
-    log(`[auth] operator accounts are now kept on this Engine: imported ${names.length} from the store${names.length ? ` (${names.join(', ')})` : ''}`)
-    return { created: true, imported: names }
+    writeOperatorsFile({ version: 1, importedFromStore: { at: now, count: added.length }, operators: [...local, ...added] }, dir)
+    const names = added.map(o => o.username)
+    log(`[auth] operator accounts are now kept on this Engine: imported ${names.length} from the store${names.length ? ` (${names.join(', ')})` : ''}${skipped.length ? `; kept this Engine's own ${skipped.join(', ')}` : ''}`)
+    return { created: !existing, imported: names, skipped }
+}
+
+/**
+ * The loaded store has no userDB (a store made from store-template.json): nothing to
+ * import now. Recorded with `none`, so the Engine stops waiting; if a userDB arrives
+ * later by peer sync, importOperatorsOnce still runs once.
+ */
+export const finishImportWithNothing = (dir?: string, now: number = Date.now()): boolean => {
+    const existing = readOperatorsFile(dir)
+    if (existing?.importedFromStore) return false
+    writeOperatorsFile({ version: 1, importedFromStore: { at: now, count: 0, none: true }, operators: existing?.operators ?? [] }, dir)
+    log('[auth] the store has no operator accounts: nothing to import')
+    return true
 }
 
 export class OperatorError extends Error {

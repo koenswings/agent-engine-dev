@@ -219,11 +219,11 @@ export const enableHttpMonitor = (
         }
 
         // engine#357: unknown /api/* is a JSON 404, never the Console SPA fallback.
-        // Same error shape and CORS headers as the 503s above ({ error: string }).
+        // engine#582: contract error shape { error: 'NOT_FOUND', message }; CORS headers as the 503s above.
         const apiPath = (url.split('?')[0] ?? '/')
         if (apiPath === '/api' || apiPath.startsWith('/api/')) {
             res.writeHead(404, { 'Content-Type': 'application/json', ...cors })
-            res.end(JSON.stringify({ error: 'Not found' }))
+            res.end(JSON.stringify({ error: 'NOT_FOUND', message: `No API route ${apiPath} on this Engine.` }))
             return
         }
 

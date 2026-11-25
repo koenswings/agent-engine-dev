@@ -54,7 +54,7 @@ describe('/api/auth/* (engine#582)', () => {
     it('an older Engine answers 404 on /api/auth/info (the relay maps this to ENGINE_VERSION_MISMATCH)', async () => {
         const r = await fetch(`${oldBase}/api/auth/info`)
         expect(r.status).toBe(404)
-        expect(await r.json()).toEqual({ error: 'Not found' })
+        expect(await r.json()).toEqual({ error: 'NOT_FOUND', message: expect.any(String) })
     })
 
     let token = ''
@@ -100,6 +100,8 @@ describe('/api/auth/* (engine#582)', () => {
         expect(after.status).toBe(401)
         expect((await after.json()).error).toBe('TOKEN_INVALID')
         expect((await (await post('/api/auth/renew', {})).json()).error).toBe('AUTH_REQUIRED')
+        expect((await (await post('/api/auth/renew', {}, 'bad')).json()).error).toBe('TOKEN_INVALID')
+        expect((await (await get('/api/auth/operators', 'x'.repeat(43))).json()).error).toBe('TOKEN_INVALID')
         expect(r.headers.get('cache-control')).toBe('no-store')
     })
 
@@ -165,6 +167,7 @@ describe('/api/auth/* (engine#582)', () => {
         expect(inv.status).toBe(400)
         const big = await fetch(`${base}/api/auth/challenge`, { method: 'POST', body: JSON.stringify({ username: 'x'.repeat(20_000) }) })
         expect(big.status).toBe(413)
+        expect((await big.json()).error).toBe('PAYLOAD_TOO_LARGE')
         const miss = await post('/api/auth/login', { username: 'admin' })
         expect(miss.status).toBe(400)
         expect((await miss.json()).error).toBe('BAD_REQUEST')

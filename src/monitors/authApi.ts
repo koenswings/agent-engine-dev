@@ -88,7 +88,7 @@ export const readJsonBody = (req: http.IncomingMessage): Promise<Record<string, 
     const fail = (e: HttpError) => { if (!done) { done = true; reject(e) } }
     req.on('data', (c: Buffer) => {
         size += c.length
-        if (size > MAX_BODY_BYTES) { fail(new HttpError(413, 'BAD_REQUEST', 'Request body too large.')); req.resume(); return }
+        if (size > MAX_BODY_BYTES) { fail(new HttpError(413, 'PAYLOAD_TOO_LARGE', `Request body is larger than ${MAX_BODY_BYTES / 1024} KB.`)); req.resume(); return }
         if (!done) chunks.push(c)
     })
     req.on('end', () => {
@@ -281,7 +281,7 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
         return { status: 204 }
     }
 
-    return { status: 404, body: { error: 'Not found' } }
+    return { status: 404, body: { error: 'NOT_FOUND', message: `No API route ${route} on this Engine.` } }
 }
 
 const OPERATOR_STATUS: Record<OperatorError['code'], number> = { OPERATOR_EXISTS: 409, OPERATOR_UNKNOWN: 404, LAST_OPERATOR: 409, BAD_REQUEST: 400 }
