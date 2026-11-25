@@ -27,7 +27,7 @@ A Backup Disk in `scheduled` mode, docked to an Engine, backs up its instances o
 | D | `src/data/BackupModeCommand.ts`: the `setBackupMode` command (registered in `Commands.ts`) and the `scheduledBackups` capability. Tests: `test/automated/set-backup-mode.test.ts`. | Landed |
 | idea#404 | `src/data/MakeBackupDisk.ts`: `makeBackupDisk` (Check / Erase / Re-dock / Create), the always-on `makeBackupDisk` capability, and `initialiseDisk … backup` using the same Create defaults (`scheduled` / 02:30, `backups/` root). Tests: `test/automated/make-backup-disk.test.ts`. | Landed on main |
 
-The Engine writes `/run/idea/backup-running` for every backup (`beginUsageSkip('backup')` in `src/usage/opFlags.ts`, idea#411). The host **05:00 reboot wrapper** that would wait while that flag exists (90-minute cap) is **not** in Engine main: `script/build_image_assets/crondefs` still ships a plain `0 5 * * * /sbin/shutdown -r now`. That wrapper remains a follow-up (idea proposal `scheduled-backup-disk.md`).
+The Engine writes `/run/idea/backup-running` for every backup (`beginUsageSkip('backup')` in `src/usage/opFlags.ts`, idea#411). The host **05:00 reboot wrapper** that would wait while that flag exists (90-minute cap) is **not** in Engine main: `script/build_image_assets/crondefs` still ships a plain `0 5 * * * /sbin/shutdown -r now`. That wrapper remains a follow-up ([engine#571](https://github.com/koenswings/agent-engine-dev/issues/571); idea proposal `scheduled-backup-disk.md`).
 
 ## BACKUP.yaml (on the disk: the source of truth)
 
