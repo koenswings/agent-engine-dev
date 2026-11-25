@@ -40,6 +40,8 @@ pnpm install        # first time or after package.json changes
 pnpm build          # TypeScript → dist/ (pnpm clean && tsc)
 ```
 
+`patches/` holds pnpm patches applied at `pnpm install` (`pnpm.patchedDependencies` in package.json). `@automerge/automerge-repo@2.5.6`: the save throttle clamps its delay to 0 or more, so Node no longer prints `TimeoutNegativeWarning` at start (engine#582). When upgrading automerge-repo, drop or redo the patch (`pnpm patch`).
+
 ## Test (required before any PR)
 
 ```bash
