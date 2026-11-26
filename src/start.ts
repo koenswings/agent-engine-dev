@@ -16,6 +16,7 @@ import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackup
 import { PortNumber } from './data/CommonTypes.js'
 import { syncEngineAuth, watchStoreAccounts } from './data/EngineAuth.js'
 import { commandKey } from './data/CommandKey.js'
+import { publishRelayPublicKey } from './data/RelayKey.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
 import { DocumentId, Repo } from '@automerge/automerge-repo'
@@ -179,6 +180,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // engine#582: the one-time account import waits for the store maps
         try { syncEngineAuth(storeHandle) } catch (e) { log(`[auth] account import after peer sync failed: ${e}`) }
         createOrUpdateEngine(storeHandle, localEngineId)
+            .then(() => { try { publishRelayPublicKey(storeHandle, String(localEngineId)) } catch (e) { log(`[auth] relay key could not be published: ${e}`) } })
             .then(() => { if (storeSelfHeal.value) publishStoreSelfHeal(storeHandle, String(localEngineId), { ...storeSelfHeal.value, reason: `${storeSelfHeal.value.reason}; maps arrived by peer sync at ${new Date().toISOString()}` }) })
             .catch(e => log(`[store-health] writing this Engine's entry after peer sync failed: ${e}`))
     }
@@ -203,6 +205,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     watchStoreAccounts(storeHandle)
     // engine#582: this Engine's command key (signs its own queue entries); created on first start
     try { commandKey() } catch (e) { log(`[auth] command key could not be created: ${e}`) }
+    // engine#582: relay key; the public half goes into this Engine's engineDB entry
+    try { publishRelayPublicKey(storeHandle, String(localEngineId)) } catch (e) { log(`[auth] relay key could not be published: ${e}`) }
 
     // Remove any phantom engine entries and orphan disks that accumulated
     // from previous boots (e.g. before the sudo-hdparm fix). Runs before any

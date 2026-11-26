@@ -46,6 +46,7 @@ import type { CommandLogStore } from '../data/CommandLogStore.js'
 import { corsHeadersFor, CORS_PREFLIGHT_HEADERS } from './consoleOrigins.js'
 import { handleAuthApi, AuthContext } from './authApi.js'
 import { handleCommandApi } from './commandApi.js'
+import { handleRelay, relayRoute } from './relayApi.js'
 
 const STORE_URL_FILE = path.join(
     config.settings.storeIdentityFolder,
@@ -172,14 +173,23 @@ export const enableHttpMonitor = (
     consoleState()
 
     const handler: http.RequestListener = async (req, res) => {
-        const url = req.url ?? '/'
+        let url = req.url ?? '/'
         // engine#582: CORS only for this Engine's own Console origins (consoleOrigins.ts)
         const cors = corsHeadersFor(req, [port, alsoPort, config.settings.httpPort, config.settings.ideaLocalHttpPort ?? 80])
-        const apiPathOnly = (url.split('?')[0] ?? '/')
+        let apiPathOnly = (url.split('?')[0] ?? '/')
         if (req.method === 'OPTIONS' && (apiPathOnly === '/api' || apiPathOnly.startsWith('/api/'))) {
             res.writeHead(204, cors['Access-Control-Allow-Origin'] ? { ...cors, ...CORS_PREFLIGHT_HEADERS } : cors)
             res.end()
             return
+        }
+
+        // engine#582 step 4: /api/engines/<id>/<path> — another Engine through this one (relayApi.ts);
+        // this Engine's own id is answered here as /api/<path>.
+        if (opts.auth && apiPathOnly.startsWith('/api/engines/')) {
+            const route = relayRoute(apiPathOnly, opts.auth.engineId)
+            const query = url.includes('?') ? url.slice(url.indexOf('?')) : ''
+            if (route.kind === 'remote') { await handleRelay(req, res, route.engineId, route.path, query, cors, opts.auth); return }
+            if (route.kind === 'local') { apiPathOnly = route.path; url = route.path + query }
         }
 
         // ── API routes ──────────────────────────────────────────────────────

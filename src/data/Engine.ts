@@ -30,6 +30,8 @@ export interface Engine {
   capabilities?: string[];
   /** The lastBooted of the startup that wrote `capabilities` (idea#128) */
   capabilitiesBootedAt?: Timestamp;
+  /** engine#582: public half of this Engine's relay key (Ed25519, raw 32 bytes, base64url); see RelayKey.ts */
+  relayPublicKey?: string;
   /** Set by eraseDisk for its whole run (Files Disk step 3, not built yet); createFilesDisk refuses that disk meanwhile (idea#131) */
   eraseInProgress?: EraseInProgress | null;
   /** Whole non-system disks without ext4 (idea#134); rebuilt on dock/undock and at startup */
@@ -220,13 +222,15 @@ export interface EraseInProgress {
  * signedCommands1 (engine#582): POST /api/command and /api/auth/grant; the queue runs
  *               only entries signed by this Engine (unsigned → COMMAND_UNSIGNED); peer
  *               follow-ups need a grant from the target Engine.
+ * engineRelay1 (engine#582): /api/engines/<id>/… forwards auth, command, store-url and
+ *               command-log-url to another Engine; relayPublicKey in the engineDB entry.
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'traceInstanceId', 'makeBackupDisk', 'engineSignIn1', 'signedCommands1']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'traceInstanceId', 'makeBackupDisk', 'engineSignIn1', 'signedCommands1', 'engineRelay1']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
