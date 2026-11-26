@@ -8,6 +8,7 @@
 
 import { existsSync } from 'node:fs'
 import { dispatchAction, markovRedockAfter, markovRedockBefore, noteStepPreconditionProgress, randomStepPrecondition, readPoolSnapshot, type ActionContext, type PoolSnapshot } from './actions.js'
+import { assertMixedFleetWalkAllowed, MIXED_FLEET_COPY_REFUSAL_WALK, mixedFleetProofEnvSet } from './peerTicketsHarness.js'
 import { DEFAULT_INFRA_INVARIANTS, evaluateInvariants } from './invariants.js'
 import {
     assembleWalkVideo,
@@ -131,6 +132,7 @@ export const runDeterministicWalk = async (
         startFrom?: number | string
     },
 ): Promise<WalkerResult> => {
+    assertMixedFleetWalkAllowed(walk.name)
     const startIndex = opts.startFrom !== undefined
         ? resolveWalkStartIndex(walk.steps, opts.startFrom)
         : 0
@@ -148,6 +150,7 @@ export const runDeterministicWalk = async (
         initialCurrent: seedCurrent,
         initialLayer: seedLayer,
         stepNumberBase: startIndex,
+        mixedFleetProof: opts.mixedFleetProof === true || (walk.name === MIXED_FLEET_COPY_REFUSAL_WALK && mixedFleetProofEnvSet()),
     })
 }
 
