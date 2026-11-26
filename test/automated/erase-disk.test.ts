@@ -15,6 +15,7 @@ import {
     eraseDisk, setEraseOpsForTests, clearStaleEraseStaging, ERASE_STAGING_ROOT,
     eraseBlocker, IDEA_DISK_LABEL, isEraseDeviceLocked, isSlotEraseDevice,
     eraseLockRefusesAdd, eraseLockedDevicesForTests, setEraseAddDevice,
+    ERASE_HELPER_MISSING, eraseHelperErrorMessage,
 } from '../../src/data/EraseDisk.js'
 import { summariseDisk, attachTraceResult, SUMMARY_MAX_AGE_MS, setSummariseOpsForTests, rememberOwnSummaryTrace } from '../../src/data/SummariseDisk.js'
 import { scanUnformattedDisks, setUnformattedOpsForTests, uniquifyLabels, clearGeneratedUnformattedIdsForTests, labelForUnformatted } from '../../src/data/UnformattedDisks.js'
@@ -144,6 +145,25 @@ describe('unformattedDisks scan (idea#134)', () => {
             }],
         })
         expect(await scanUnformattedDisks()).toEqual([])
+    })
+})
+
+describe('erase helper missing — plain error sentence', () => {
+    const zxLike = () => new Error(
+        'Error: Command failed with exit code 127: sudo -n /usr/local/sbin/idea-erase-disk --check-table /dev/sdb\n' +
+        'sudo: /usr/local/sbin/idea-erase-disk: command not found\n' +
+        '    at ProcessOutput.toError (/workspace/x/node_modules/zx/index.js:1:1)\n' +
+        '    at file:///workspace/x/src/data/EraseDisk.ts:152:21\n' +
+        '    at async eraseDisk (file:///workspace/x/src/data/EraseDisk.ts:425:22)',
+    )
+
+    it('eraseHelperErrorMessage returns a plain sentence, not a stack frame', () => {
+        const msg = eraseHelperErrorMessage(zxLike())
+        expect(msg).toBe(ERASE_HELPER_MISSING)
+        expect(msg).not.toMatch(/^\s*at /m)
+        expect(msg).not.toContain('EraseDisk.ts')
+        expect(msg).not.toContain('ProcessOutput')
+        expect(eraseHelperErrorMessage(new Error('Typed name did not match the disk label.'))).toBeNull()
     })
 })
 
@@ -294,6 +314,37 @@ describe('summariseDisk + eraseDisk (idea#134)', () => {
         expect([...disk.diskTypes]).toEqual(['empty'])
         expect(h.doc()!.engineDB[LOCAL].eraseInProgress).toBeNull()
         expect(isEraseDeviceLocked('sdb')).toBe(false)
+    })
+
+    it('eraseDisk: missing root helper → plain sentence, no stack, in the thrown error (trace uses error.message)', async () => {
+        const zxLike = new Error(
+            'Error: Command failed with exit code 127: sudo -n /usr/local/sbin/idea-erase-disk --check-table /dev/sdb\n' +
+            'sudo: /usr/local/sbin/idea-erase-disk: command not found\n' +
+            '    at ProcessOutput.toError (/workspace/x/node_modules/zx/index.js:1:1)\n' +
+            '    at file:///workspace/x/src/data/EraseDisk.ts:152:21\n' +
+            '    at async eraseDisk (file:///workspace/x/src/data/EraseDisk.ts:425:22)',
+        )
+        setEraseOpsForTests({
+            mountedPartitions: async () => [],
+            hiddenTablePartitions: async () => { throw zxLike },
+            isEspPartition: async () => false,
+            isMountPoint: async () => false,
+            runScript: async () => { throw new Error('must not reach runScript') },
+        })
+        h.change(doc => {
+            doc.engineDB[LOCAL].unformattedDisks = [{
+                candidateId: 'CAND1', device: 'sdb', sizeBytes: 32e9,
+                model: 'SanDisk', fsType: 'exfat', label: 'SanDisk 32 GB', serial: 'FAKE1',
+            }]
+        })
+        const tid = putSummary('CAND1', 'SanDisk 32 GB')
+        const err = await eraseDisk(h, 'CAND1', tid, 'SanDisk 32 GB').then(() => null, e => e as Error)
+        expect(err).toBeInstanceOf(Error)
+        expect(err!.message).toBe(ERASE_HELPER_MISSING)
+        expect(err!.message).not.toMatch(/^\s*at /m)
+        expect(err!.message).not.toContain('EraseDisk.ts')
+        expect(err!.message).not.toContain('ProcessOutput')
+        expect(err!.stack ?? '').toContain('at ')  // the JS stack exists, but errorMessage/message does not
     })
 
     // idea#310: an old Engine SSD (ext4 OS rootfs) is only in diskCandidates, not in unformattedDisks
