@@ -41,6 +41,14 @@ const QNOTE = /; previous files copied to (\S+\/\.peer-quarantine\/[0-9]{8}T[0-9
 const authLines = async () => (await fs.readFile(sb.peerAuthFile, 'utf8')).split('\n').filter(l => l && !l.startsWith('#'))
 const knownLines = async () => (await fs.readFile(sb.peerKnownHosts, 'utf8')).split('\n').filter(l => l && !l.startsWith('#'))
 const SERVER = ['--server', '-logDtpre.iLsfxCIvu', '--numeric-ids', '.', '.']
+// engine#595 (helper v26): the ledger and marker tests below run with live tickets for both peers,
+// the way the receiving Engine registers them when it accepts a grant
+const TICKET_IDS = ['new1', 'new2', 'new3', 'there', 'empty1', 'users-data', 'nomark']
+const openTickets = async () => {
+    for (const [peer, grant] of [['ENGINE_a', 'GrantAaaaaaaaaaa'], ['ENGINE_b', 'GrantBbbbbbbbbbb']]) {
+        for (const id of TICKET_IDS) await sb.addTicket(peer, 'sdc1', 'instance', id, '-', 600, grant)
+    }
+}
 
 describe('idea-app-data sync-peers', () => {
     it('writes one restricted line per peer (prefix added by the helper) and pins each host key by Engine id', async () => {
@@ -268,7 +276,7 @@ describe('idea-app-data clear-peers (v15, engine#376: Ops only, the only way to 
 
 describe('idea-app-data peer-receive / peer-delete / peer-receive-files (the ledger)', () => {
     let dst: string
-    beforeEach(async () => { dst = await sb.addDisk('sdc1') })
+    beforeEach(async () => { dst = await sb.addDisk('sdc1'); await openTickets() })
 
     it('peer-receive creates a NEW folder, records <time> <peer> <root> <id>, then runs rrsync -wo there', async () => {
         const r = await sb.run(['peer-receive', 'ENGINE_a', 'sdc1', 'new1', ...SERVER], { FAKE_STDIN: 'bytes' })
@@ -370,7 +378,7 @@ describe('idea-app-data v23 (engine#497 a): the peer in-flight marker, resume an
     const OP = 'Ab3dEf5hJk7mNp9qRs1'
     const DRY = ['--server', '-nlHogDtpAXrxe.iLsfxCIvu', '--log-format=%i', '--numeric-ids', '.', '.']
     let dst: string
-    beforeEach(async () => { dst = await sb.addDisk('sdc1') })
+    beforeEach(async () => { dst = await sb.addDisk('sdc1'); await openTickets() })
     const marker = () => path.join(dst, 'instances', 'new1.idea-op-in-flight')
 
     it('peer-mark-in-flight writes a root-owned 0644 marker naming the PEER (not the caller) and is journaled; the same op again is fine', async () => {
@@ -448,5 +456,164 @@ describe('idea-app-data v23 (engine#497 a): the peer in-flight marker, resume an
         expect(await fs.pathExists(marker())).toBe(false)
         expect((await sb.run(['peer-clear-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
         expect(await sb.journalText()).toMatch(/peer-clear-in-flight: .*new1\.idea-op-in-flight of operation Ab3dEf5hJk7mNp9qRs1 of Engine ENGINE_a/)
+    })
+})
+
+describe('idea-app-data v26 (engine#595): peer transfer tickets', () => {
+    const OP = 'Ab3dEf5hJk7mNp9qRs1'
+    const G = 'GrantAaaaaaaaaaa'
+    let dst: string
+    beforeEach(async () => { dst = await sb.addDisk('sdc1') })
+    const files = async () => (await fs.pathExists(sb.ticketDir)) ? (await fs.readdir(sb.ticketDir)).sort() : []
+    const nothingWritten = async () => {
+        expect(await fs.readdir(path.join(dst, 'instances'))).toEqual([])
+        expect(await fs.pathExists(path.join(sb.ledgerDir, 'received'))).toBe(false)
+        expect(await sb.calls('rrsync')).toEqual([])
+    }
+
+    it('every peer write verb refuses GRANT_EXPIRED without a ticket, before it writes anything', async () => {
+        await fs.ensureDir(path.join(dst, 'apps')); await fs.ensureDir(path.join(dst, 'services'))
+        const cases: string[][] = [
+            ['peer-ensure-dirs', 'ENGINE_a', 'sdc1'],
+            ['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP],
+            ['peer-receive', 'ENGINE_a', 'sdc1', 'new1', ...SERVER],
+            ['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER],
+            ['peer-verify-receive', 'ENGINE_a', 'sdc1', 'new1', OP, '--server', '-n', '.', '.'],
+            ['peer-receive-files', 'ENGINE_a', 'sdc1', 'new1', ...SERVER],
+            ['peer-receive-app', 'ENGINE_a', 'sdc1', 'kolibri-1.0', ...SERVER],
+            ['peer-receive-service', 'ENGINE_a', 'sdc1', ...SERVER],
+        ]
+        for (const c of cases) refused(await sb.run(c), /GRANT_EXPIRED: Engine ENGINE_a has no live permission from this Engine/)
+        expect(await fs.readdir(path.join(dst, 'apps'))).toEqual([])
+        await fs.remove(path.join(dst, 'apps')); await fs.remove(path.join(dst, 'services'))
+        await nothingWritten()
+    })
+
+    it('a ticket covers only its peer, root, kind and id (and its op when it names one)', async () => {
+        await sb.addDisk('sdd1')
+        await sb.addTicket('ENGINE_a', 'sdc1', 'instance', 'new1', OP, 600, G)
+        refused(await sb.run(['peer-receive', 'ENGINE_b', 'sdc1', 'new1', ...SERVER]), /GRANT_EXPIRED: Engine ENGINE_b/)
+        refused(await sb.run(['peer-receive', 'ENGINE_a', 'sdd1', 'new1', ...SERVER]), /GRANT_EXPIRED/)
+        refused(await sb.run(['peer-receive', 'ENGINE_a', 'sdc1', 'new2', ...SERVER]), /GRANT_EXPIRED/)
+        refused(await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', 'Other0p']), /GRANT_EXPIRED/)
+        refused(await sb.run(['peer-receive-app', 'ENGINE_a', 'sdc1', 'new1', ...SERVER]), /GRANT_EXPIRED/)
+        await nothingWritten()
+        const ok = await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])
+        expect(ok.exitCode, ok.stderr).toBe(0)
+        expect((await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER])).exitCode).toBe(0)
+        expect((await sb.run(['peer-receive-files', 'ENGINE_a', 'sdc1', 'new1', ...SERVER])).exitCode).toBe(0)
+        // any ticket of the peer for that root allows ensure-dirs
+        expect((await sb.run(['peer-ensure-dirs', 'ENGINE_a', 'sdc1'])).exitCode).toBe(0)
+        refused(await sb.run(['peer-ensure-dirs', 'ENGINE_a', 'sdd1']), /GRANT_EXPIRED/)
+    })
+
+    it('expires on the uptime clock, dies with a reboot (boot id) and with an Engine start (peer-tickets-reset)', async () => {
+        await sb.addTicket('ENGINE_a', 'sdc1', 'instance', 'new1', '-', 60, G)   // uptime 1000 → deadline 1060
+        await sb.setUptime(1059)
+        expect((await sb.run(['peer-mark-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
+        await sb.setUptime(1060)
+        refused(await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER]), /GRANT_EXPIRED/)
+        await sb.setUptime(1000)
+        await sb.setBootId('0b1d2c3e-aaaa-bbbb-cccc-000000000002')
+        refused(await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER]), /GRANT_EXPIRED/)
+        await sb.setBootId('0b1d2c3e-aaaa-bbbb-cccc-000000000001')
+        expect((await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER])).exitCode).toBe(0)
+        const reset = await sb.run(['peer-tickets-reset'])
+        expect(reset.exitCode, reset.stderr).toBe(0)
+        expect(reset.stdout.trim()).toBe('ok: dropped 1 ticket(s)')
+        expect(await files()).toEqual([])
+        refused(await sb.run(['peer-resume-receive', 'ENGINE_a', 'sdc1', 'new1', OP, ...SERVER]), /GRANT_EXPIRED/)
+        // cleanup of the peer's own partial copy stays possible without a ticket
+        expect((await sb.run(['peer-clear-in-flight', 'ENGINE_a', 'sdc1', 'new1', OP])).exitCode).toBe(0)
+        const del = await sb.run(['peer-delete', 'ENGINE_a', 'sdc1', 'new1'])
+        expect(del.exitCode, del.stderr).toBe(0)
+        expect(await fs.pathExists(path.join(dst, 'instances', 'new1'))).toBe(false)
+        expect(await sb.journalText()).toMatch(/peer-tickets-reset: 1 ticket\(s\) dropped/)
+    })
+
+    it('peer-ticket-add: root 0700 folder, 0600 files, strict arguments; drop by grant; limits', async () => {
+        await sb.addTicket('ENGINE_a', 'sdc1', 'instance', 'new1', OP, 600, G)
+        await sb.addTicket('ENGINE_a', 'sdc1', 'app', 'kolibri-1.0', OP, 600, G)
+        await sb.addTicket('ENGINE_a', 'sdc1', 'services', '-', OP, 600, G)
+        expect((await fs.stat(sb.ticketDir)).mode & 0o777).toBe(0o700)
+        expect(await files()).toEqual([`${G}.app.kolibri-1.0.ticket`, `${G}.instance.new1.ticket`, `${G}.services.-.ticket`])
+        const line = await fs.readFile(path.join(sb.ticketDir, `${G}.instance.new1.ticket`), 'utf8')
+        expect(line).toBe(`v1 ENGINE_a sdc1 instance new1 ${OP} ${G} 0b1d2c3e-aaaa-bbbb-cccc-000000000001 1600\n`)
+        expect((await fs.stat(path.join(sb.ticketDir, `${G}.instance.new1.ticket`))).mode & 0o777).toBe(0o600)
+        const add = (...a: string[]) => sb.run(['peer-ticket-add', ...a])
+        refused(await add('ENGINE_a', 'sdc1', 'instance', '../x', '-', G, '60'), /instance id/)
+        refused(await add('ENGINE_a', 'sdc1', 'app', 'a..b', '-', G, '60'), /app id/)
+        refused(await add('ENGINE_a', 'sdc1', 'services', 'x', '-', G, '60'), /services ticket takes '-'/)
+        refused(await add('ENGINE_a', 'sdc1', 'root', 'x', '-', G, '60'), /not instance, app or services/)
+        refused(await add('ENGINE_a', 'sdc1', 'instance', 'new1', '-', 'short', '60'), /grant id/)
+        refused(await add('ENGINE_a', 'sdc1', 'instance', 'new1', '-', G, '0'), /must be 1\.\.21600/)
+        refused(await add('ENGINE_a', 'sdc1', 'instance', 'new1', '-', G, '21601'), /must be 1\.\.21600/)
+        refused(await add('ENGINE_a', '/etc', 'instance', 'new1', '-', G, '60'), /root/)
+        refused(await add('-x', 'sdc1', 'instance', 'new1', '-', G, '60'), /Engine id/)
+        refused(await add('ENGINE_a', 'sdc1', 'instance', 'new1', '-', G), /takes exactly 7 argument/)
+        const drop = await sb.run(['peer-ticket-drop', G])
+        expect(drop.stdout.trim()).toBe('ok: dropped 3 ticket(s)')
+        expect(await files()).toEqual([])
+        refused(await sb.run(['peer-ticket-drop', '../../etc/x']), /grant id/)
+        // an expired or other-boot ticket is pruned at the next add
+        await sb.addTicket('ENGINE_a', 'sdc1', 'instance', 'old1', '-', 5, 'GrantOldddddddd1')
+        await sb.setUptime(2000)
+        await sb.addTicket('ENGINE_a', 'sdc1', 'instance', 'new1', '-', 5, G)
+        expect(await files()).toEqual([`${G}.instance.new1.ticket`])
+    })
+
+    it('refuses an untrustworthy ticket folder', async () => {
+        await sb.addTicket('ENGINE_a', 'sdc1', 'instance', 'new1', '-', 600, G)
+        await fs.chmod(sb.ticketDir, 0o755)
+        refused(await sb.run(['peer-receive', 'ENGINE_a', 'sdc1', 'new1', ...SERVER]), /ticket folder .* must be root-owned 0700/)
+        await nothingWritten()
+    })
+
+    it('peer-receive-app: as pi, never deletes, keeps existing files (rrsync flags or --ignore-existing)', async () => {
+        await fs.ensureDir(path.join(dst, 'apps'))
+        await sb.addTicket('ENGINE_a', 'sdc1', 'app', 'kolibri-1.0', OP, 600, G)
+        refused(await sb.run(['peer-receive-app', 'ENGINE_a', 'sdc1', 'kolibri-1.0', '--server', '-logDtpre.iLsfxCIvu', '--delete', '.', '.']), /never deletes, moves or backs up files: rsync option --delete/)
+        refused(await sb.run(['peer-receive-app', 'ENGINE_a', 'sdc1', 'kolibri-1.0', '--server', '-blogDtpre.iLsfxCIvu', '.', '.']), /rsync flag -b is not allowed/)
+        refused(await sb.run(['peer-receive-app', 'ENGINE_a', 'sdc1', 'kolibri-1.0', '--server', '-logDtpr', '--backup-dir=x', '.', '.']), /--backup-dir/)
+        // the fake rrsync has none of the flags: the helper adds --ignore-existing itself
+        const r = await sb.run(['peer-receive-app', 'ENGINE_a', 'sdc1', 'kolibri-1.0', ...SERVER])
+        expect(r.exitCode, r.stderr).toBe(0)
+        let call = (await sb.calls('rrsync')).at(-1)!
+        expect(call.argv).toEqual(['-wo', path.join(dst, 'apps', 'kolibri-1.0')])
+        expect(call.env.SSH_ORIGINAL_COMMAND).toBe(`rsync --server --ignore-existing ${SERVER.slice(1).join(' ')}`)
+        expect((await sb.calls('runuser')).at(-1)!.argv.slice(0, 3)).toEqual(['-u', expect.any(String), '--'])
+        // an rrsync with the flags (3.2.4+; idea03 has rsync 3.4.1) gets them instead
+        await sb.fake('rrsync', `# arg_parser.add_argument('-no-del') ('-no-overwrite') ('-munge')
+${process.execPath} -e 'const fs=require("fs");fs.appendFileSync(process.argv[1], JSON.stringify({argv:process.argv.slice(2),cwd:process.cwd(),env:{SSH_ORIGINAL_COMMAND:process.env.SSH_ORIGINAL_COMMAND}})+"\\n")' ${path.join(sb.tmp, 'calls')}/rrsync.log "$@"`)
+        expect((await sb.run(['peer-receive-app', 'ENGINE_a', 'sdc1', 'kolibri-1.0', ...SERVER])).exitCode).toBe(0)
+        call = (await sb.calls('rrsync')).at(-1)!
+        expect(call.argv).toEqual(['-wo', '-no-del', '-no-overwrite', path.join(dst, 'apps', 'kolibri-1.0')])
+        expect(call.env.SSH_ORIGINAL_COMMAND).toBe(`rsync ${SERVER.join(' ')}`)
+    })
+
+    it('peer-receive-app overwrites only into this Engine\'s own Fetch (.idea-fetching names the ticket op)', async () => {
+        const REQ = '1b4e28ba-2fa1-11d2-883f-0016d3cca427'
+        const app = path.join(dst, 'apps', 'kolibri-2.0')
+        await fs.ensureDir(app)
+        await fs.writeFile(path.join(app, '.idea-fetching'), `${REQ}\n`)
+        await sb.addTicket('ENGINE_a', 'sdc1', 'app', 'kolibri-2.0', REQ, 600, 'FetchTicket00001')
+        expect((await sb.run(['peer-receive-app', 'ENGINE_a', 'sdc1', 'kolibri-2.0', '--server', '-logDtpre.iLsfxCIvu', '--partial', '.', '.'])).exitCode).toBe(0)
+        expect((await sb.calls('rrsync')).at(-1)!.env.SSH_ORIGINAL_COMMAND).toBe('rsync --server -logDtpre.iLsfxCIvu --partial . .')
+        await fs.writeFile(path.join(app, '.idea-fetching'), 'another-request\n')
+        expect((await sb.run(['peer-receive-app', 'ENGINE_a', 'sdc1', 'kolibri-2.0', ...SERVER])).exitCode).toBe(0)
+        expect((await sb.calls('rrsync')).at(-1)!.env.SSH_ORIGINAL_COMMAND).toMatch(/--ignore-existing/)
+        expect(await sb.journalText()).toMatch(/peer-receive-app: .*kolibri-2\.0 for Engine ENGINE_a \(overwrite=yes\)/)
+    })
+
+    it('peer-receive-service: under a services ticket, never deletes or overwrites, symlinks munged', async () => {
+        await fs.ensureDir(path.join(dst, 'services'))
+        await sb.addTicket('ENGINE_a', 'sdc1', 'services', '-', OP, 600, G)
+        refused(await sb.run(['peer-receive-service', 'ENGINE_b', 'sdc1', ...SERVER]), /GRANT_EXPIRED: Engine ENGINE_b has no live permission from this Engine to write service images/)
+        refused(await sb.run(['peer-receive-service', 'ENGINE_a', 'sdc1', '--server', '-logDtpr', '--remove-source-files', '.', '.']), /--remove-source-files/)
+        const r = await sb.run(['peer-receive-service', 'ENGINE_a', 'sdc1', ...SERVER])
+        expect(r.exitCode, r.stderr).toBe(0)
+        const call = (await sb.calls('rrsync')).at(-1)!
+        expect(call.argv).toEqual(['-wo', path.join(dst, 'services')])
+        expect(call.env.SSH_ORIGINAL_COMMAND).toBe(`rsync --server --ignore-existing --munge-links ${SERVER.slice(1).join(' ')}`)
     })
 })

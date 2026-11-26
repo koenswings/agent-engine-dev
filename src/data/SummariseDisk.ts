@@ -286,12 +286,36 @@ export const attachTraceResult = (result: unknown, traceId?: string): void => {
     })
 }
 
-/** Read a summariseDisk result from a trace; null if missing/invalid/too old. */
+/**
+ * engine#582: summariseDisk traces this Engine process wrote itself (traceId → when).
+ * The command-log document is reachable by peers, so eraseDisk and makeBackupDisk only
+ * accept a summary whose trace this Engine produced: a trace that only appears in the
+ * document is ignored. Entries older than SUMMARY_MAX_AGE_MS are pruned; a restart
+ * forgets them all (the disk is checked again).
+ */
+const ownSummaryTraces = new Map<string, number>()
+
+/** Remember that this Engine wrote the summariseDisk trace `traceId` (default: the active trace). */
+export const rememberOwnSummaryTrace = (traceId?: string, now: number = Date.now()): void => {
+    const id = traceId ?? getActiveTrace()?.traceId
+    if (!id) return
+    for (const [k, at] of ownSummaryTraces) if (now - at > SUMMARY_MAX_AGE_MS) ownSummaryTraces.delete(k)
+    ownSummaryTraces.set(id, now)
+}
+
+/** Whether `traceId` is a summariseDisk trace this Engine wrote (engine#582). */
+export const isOwnSummaryTrace = (traceId: string): boolean => ownSummaryTraces.has(traceId)
+
+/** Tests only. */
+export const clearOwnSummaryTracesForTests = (): void => ownSummaryTraces.clear()
+
+/** Read a summariseDisk result from a trace; null if missing/invalid/too old, or not written by this Engine (engine#582). */
 export const readSummaryFromTrace = (
     store: Store,
     traceId: string,
     expectTargetId: string,
 ): ContentSummary | null => {
+    if (!isOwnSummaryTrace(traceId)) return null
     const h = getCommandLogHandle()
     if (!h) return null
     const t = h.doc()?.traces[traceId]

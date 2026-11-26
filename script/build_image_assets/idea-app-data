@@ -12,7 +12,8 @@
 # tars are pi-owned and stay plain pi operations. A PEER Engine reaches this helper
 # only through the forced command /usr/local/sbin/idea-peer-gate <peerEngineId>
 # (its key's line in /etc/ssh/idea_authorized_keys/pi, written by sync-peers), which
-# maps receive/delete/receive-files to the peer-* subcommands with the peer's id.
+# maps receive/delete/receive-files to the peer-* subcommands with the peer's id
+# and also allows the read-only size <root> <id> verb (same helper subcommand).
 #
 # Why root: app containers write instance data as root (Kolibri sessions 0600),
 # 999 (MariaDB, 0700 folders) and www-data (Nextcloud 0640/0770). pi cannot read
@@ -20,7 +21,7 @@
 #
 # Usage (exact argument counts; no options are accepted from the caller):
 #   idea-app-data version
-#   idea-app-data size         <root> <id>
+#   idea-app-data size         <root> <id>   (also through idea-peer-gate; read-only, no ticket)
 #   idea-app-data copy         <srcRoot> <srcId> <dstRoot> <dstId> [<opId>]
 #                                    (v20, engine#497: with <opId>, a NON-EMPTY destination is accepted
 #                                    only when instances/<dstId>.idea-op-in-flight marks that operation;
@@ -66,6 +67,12 @@
 #   idea-app-data receive-app        <root> <appId> <rsync server args...>   (as pi)
 #   idea-app-data receive-service    <root> <rsync server args...>           (as pi)
 #   idea-app-data ensure-dirs        <root>   (apps/ instances/ services/, owned by pi)
+#   idea-app-data peer-ensure-dirs     <peerEngineId> <root>                       (v26: needs a ticket)
+#   idea-app-data peer-receive-app     <peerEngineId> <root> <appId> <rsync server args...>   (v26)
+#   idea-app-data peer-receive-service <peerEngineId> <root> <rsync server args...>           (v26)
+#   idea-app-data peer-ticket-add      <peerEngineId> <root> <instance|app|services> <id|-> <opId|-> <grantId> <seconds>
+#   idea-app-data peer-ticket-drop     <grantId>
+#   idea-app-data peer-tickets-reset          (v26: the Engine, at start; drops every ticket)
 #   idea-app-data erase-slot       <slot> <stagingDir>   (TEST-ONLY: umount+mkfs+remount a loop-backed slot)
 #   idea-app-data put-files        <root> <id> <stagingDir>  (local Engine: copy basenames from staging into instance as root)
 #   idea-app-data kolibri-rebind   <root> <id>   (v21, engine#503: give a Kolibri copy a fresh morango id as root;
@@ -193,6 +200,23 @@
 #        -9). stdout: absent=<path> lines, quarantine=<folder|none>, moved=<path> lines. Journaled.
 #        Same sudoers line (no argument list); not in the peer gate's allowlist.
 #   v25: version bump only, after #510 landed on main as v24 and #511's v23 verbs merged on top.
+#   v26 (engine#595, engine-03 follow-up): peer TRANSFER TICKETS. A peer write needs a live ticket
+#        this Engine registered when it accepted that peer's grant (grantCheck) or asked it to push a
+#        bundle (updateApp fetch):
+#          peer-ticket-add <peer> <root> <instance|app|services> <id|-> <opId|-> <grantId> <seconds>
+#          peer-ticket-drop <grantId>        peer-tickets-reset   (the Engine, at start)
+#        Tickets live in root-only tmpfs ($TICKET_DIR), carry the boot id and a /proc/uptime deadline
+#        (no wall clock), and are gone after a reboot or an Engine start. peer-ensure-dirs,
+#        peer-mark-in-flight, peer-receive, peer-resume-receive, peer-verify-receive,
+#        peer-receive-files, peer-receive-app and peer-receive-service refuse "GRANT_EXPIRED: …"
+#        before they write anything when no live ticket matches. peer-delete and
+#        peer-clear-in-flight stay ticketless (a peer's own partial copy only). The gate now maps
+#        receive-app, receive-service and ensure-dirs to the peer-* verbs (with the peer id).
+#        peer-receive-app / peer-receive-service never delete and never overwrite an existing file
+#        (rrsync -no-del -no-overwrite, or --ignore-existing added here when rrsync lacks the
+#        flags); the one exception is an app bundle this Engine is fetching itself (its
+#        apps/<appId>/.idea-fetching names the ticket's op), so a --partial resume can finish.
+#        Service tars are received with symlinks munged.
 #        No new subcommands. CROSS_RESUME_HELPER_MIN stays 23; SWAP_QUARANTINE_HELPER_MIN stays 24.
 #
 # Tokens (none can start with '-' or hold '..'; only trailing borg-create
@@ -288,7 +312,7 @@
 set -u
 set -o pipefail
 
-readonly IDEA_APP_DATA_VERSION=25
+readonly IDEA_APP_DATA_VERSION=26
 
 PATH=/usr/sbin:/usr/bin:/sbin:/bin
 export PATH
@@ -336,6 +360,7 @@ DOCKER=/usr/bin/docker
 TAR=/usr/bin/tar
 SHA256SUM=/usr/bin/sha256sum
 PYTHON3=/usr/bin/python3
+GREP=/usr/bin/grep
 
 # ── Fixed locations ──────────────────────────────────────────────────────────
 DISKS_DIR=/disks
@@ -374,6 +399,13 @@ SNAP_EXCLUDE_MAX_LEN=256
 EXIT_NO_SPACE=3
 VOLUMES_DIR=/var/lib/docker/volumes
 PEER_MAX=256
+# v26 (engine#595): peer transfer tickets (root-only tmpfs; see v26 above)
+TICKET_DIR=/run/idea-app-data/peer-tickets
+TICKET_MAX=256
+TICKET_MAX_PER_PEER=64
+TICKET_MAX_SECONDS=21600
+UPTIME_FILE=/proc/uptime
+BOOT_ID_FILE=/proc/sys/kernel/random/boot_id
 # v24 (engine#506): swap-quarantine reads at most this many paths, each at most this long
 SWAP_PATHS_MAX=4096
 SWAP_PATH_MAX_LEN=1024
@@ -395,6 +427,7 @@ RE_ENGINE='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
 RE_VOL='^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$'
 RE_APP='^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$'
 RE_KEY64='AAAAC3NzaC1lZDI1NTE5AAAAI[A-Za-z0-9+/]{43}'
+RE_GRANT_ID='^[A-Za-z0-9_-]{16}$'
 RE_STORE_DOC='^[1-9A-HJ-NP-Za-km-z]{16,64}$'
 RE_PEER_LINE="^([A-Za-z0-9][A-Za-z0-9_.-]{0,127}) ssh-ed25519 ($RE_KEY64) ssh-ed25519 ($RE_KEY64)\$"
 
@@ -1198,6 +1231,90 @@ ledger_rewrite() {   # ledger_rewrite <drop root> <drop id> [<add line>]: prune 
     $CHMOD 0600 -- "$LEDGER_FILE" || true
 }
 
+# ── v26 (engine#595): peer transfer tickets ──────────────────────────────────
+# One file per ticket in $TICKET_DIR (root 0700, tmpfs), one line:
+#   v1 <peer> <root> <kind> <id|-> <opId|-> <grantId> <bootId> <deadline (uptime s)>
+uptime_s() { local u=""; read -r u _ < "$UPTIME_FILE" 2>/dev/null; u="${u%%.*}"; [[ "$u" =~ ^[0-9]+$ ]] || refuse "cannot read $UPTIME_FILE"; echo "$u"; }
+boot_id() { local b=""; read -r b < "$BOOT_ID_FILE" 2>/dev/null; [[ "$b" =~ ^[A-Za-z0-9-]{8,64}$ ]] || refuse "cannot read $BOOT_ID_FILE"; echo "$b"; }
+ticket_ready() {
+    root_dir "${TICKET_DIR%/*}" 0755 "ticket parent folder"
+    root_dir "$TICKET_DIR" 0700 "ticket folder"
+}
+# Is the ticket folder there and trustworthy (root-owned, 0700, no symlink)? A missing folder means no tickets.
+ticket_dir_ok() {
+    [[ -e "$TICKET_DIR" || -L "$TICKET_DIR" ]] || return 1
+    [[ -d "$TICKET_DIR" && ! -L "$TICKET_DIR" ]] || refuse "ticket folder $TICKET_DIR is not a real folder"
+    local uid mode
+    read -r uid _ mode <<<"$(stat_fields "$TICKET_DIR")"
+    [[ "$uid" == "$ROOT_UID" && "$mode" == 700 ]] || refuse "ticket folder $TICKET_DIR must be root-owned 0700 (got uid $uid mode 0$mode)"
+}
+ticket_files() {   # fills TICKET_FILES
+    TICKET_FILES=()
+    ticket_dir_ok || return 0
+    shopt -s nullglob
+    TICKET_FILES=("$TICKET_DIR"/*.ticket)
+    shopt -u nullglob
+}
+# need_ticket <peer> <root> <instance|app|services|any> <id|-> [<opId>]: a live ticket of this Engine
+# for that peer and target, or refuse GRANT_EXPIRED before anything is written. Sets TICKET_OP.
+need_ticket() {
+    local peer="$1" root="$2" kind="$3" id="$4" op="${5:-}" f v p r k i o g b d now boot
+    TICKET_OP=""
+    now=$(uptime_s) || exit 2
+    boot=$(boot_id) || exit 2
+    ticket_files
+    for f in "${TICKET_FILES[@]}"; do
+        [[ -f "$f" && ! -L "$f" ]] || continue
+        v=""; read -r v p r k i o g b d _ < "$f" 2>/dev/null || [[ -n "$v" ]] || continue
+        [[ "$v" == v1 && "$p" == "$peer" && "$r" == "$root" && "$b" == "$boot" && "$d" =~ ^[0-9]+$ ]] || continue
+        (( d > now )) || continue
+        if [[ "$kind" != any ]]; then [[ "$k" == "$kind" && "$i" == "$id" ]] || continue; fi
+        if [[ -n "$op" && "$o" != - && "$o" != "$op" ]]; then continue; fi
+        TICKET_OP="$o"
+        return 0
+    done
+    local what="$kind $id"
+    [[ "$kind" == any ]] && what="anything"
+    [[ "$kind" == services ]] && what="service images"
+    # One clear line for every sender: a current Engine maps it to GRANT_EXPIRED; an Engine from before
+    # engine-03 (no grants, e.g. adfd9d3) shows it as its failed op's error (zx: stderr + exit code 2)
+    refuse "GRANT_EXPIRED: Engine $peer has no live permission from this Engine to write $what on $root (it expired, this Engine restarted, or Engine $peer is too old to ask for one and must be updated first). Nothing was written; start the operation again from the Console"
+}
+# The rsync server arguments of a receive into a SHARED folder (apps/<appId>, services/): no delete,
+# remove, backup, partial-dir, delay-updates, log-file or temp-dir options, and no -b in the flags.
+check_shared_server_args() {
+    local a opts
+    for a in "$@"; do
+        case "$a" in
+            --del|--delete*|--remove*|--backup*|--suffix*|--partial-dir*|--delay-updates|--log-file*|--temp-dir*|--max-delete*)
+                refuse "$SUB never deletes, moves or backs up files: rsync option $(printf '%q' "$a") is not allowed" ;;
+        esac
+        if [[ "$a" == -[!-]* ]]; then
+            opts="${a#-}"; opts="${opts%%e[0-9]*}"; opts="${opts%%e.*}"
+            [[ "$opts" != *b* ]] || refuse "$SUB never backs up files: rsync flag -b is not allowed"
+        fi
+    done
+}
+rrsync_has() { $GREP -qF -- "'$1'" "$RRSYNC" 2>/dev/null; }
+# shared_receive <dir> <overwrite yes|no> <munge yes|no> <server args…>: rrsync -wo as the Engine user,
+# never deleting; without overwrite, existing files are kept. Uses rrsync's own flags when it has
+# them, else adds --ignore-existing / --munge-links to the server arguments (rrsync allows both).
+shared_receive() {
+    local dir="$1" overwrite="$2" munge="$3"; shift 3
+    local flags=() inject=()
+    if rrsync_has -no-del; then flags+=(-no-del); fi
+    if [[ "$overwrite" == no ]]; then
+        if rrsync_has -no-overwrite; then flags+=(-no-overwrite); else inject+=(--ignore-existing); fi
+    fi
+    if [[ "$munge" == yes ]]; then
+        if rrsync_has -munge; then flags+=(-munge); else inject+=(--munge-links); fi
+    fi
+    local srv=("$1" "${inject[@]}" "${@:2}")
+    export SSH_ORIGINAL_COMMAND="rsync ${srv[*]}"
+    run_child $RUNUSER -u "$ENGINE_USER" -- $RRSYNC -wo "${flags[@]}" "$dir"
+    exit $?
+}
+
 # ── Root only ────────────────────────────────────────────────────────────────
 [[ "$EUID" -eq "$ROOT_UID" ]] || refuse "must run as root (through sudo)"
 
@@ -1387,6 +1504,7 @@ case "$SUB" in
         check_engine_id "$2"; check_id "$4"
         PEER="$2"; DST_ROOT_TOKEN="$3"; DST_ID="$4"
         resolve_root "$DST_ROOT_TOKEN" instances; D_DIR="$R_DIR"
+        need_ticket "$PEER" "$DST_ROOT_TOKEN" instance "$DST_ID"
         existing_dir "$D_DIR/instances" "destination instances folder"
         DST=$(inst_dir "$D_DIR" "$DST_ID")
         shift 4
@@ -1411,6 +1529,7 @@ case "$SUB" in
         check_engine_id "$2"; check_id "$4"
         PEER="$2"; ROOT_TOKEN="$3"; INST_ID="$4"
         resolve_root "$ROOT_TOKEN" instances
+        need_ticket "$PEER" "$ROOT_TOKEN" instance "$INST_ID"
         DST=$(inst_dir "$R_DIR" "$INST_ID")
         shift 4
         check_server_args "$@"
@@ -1436,6 +1555,7 @@ case "$SUB" in
         check_engine_id "$2"; check_id "$4"; check_opid "$5"
         PEER="$2"
         resolve_root "$3" instances
+        need_ticket "$PEER" "$3" instance "$4" "$5"
         PARENT="$R_DIR/instances"
         existing_dir "$PARENT" "instances folder"
         M=$(marker_path "$R_DIR" "$4")
@@ -1483,6 +1603,7 @@ case "$SUB" in
         check_engine_id "$2"; check_id "$4"; check_opid "$5"
         PEER="$2"; DST_ROOT_TOKEN="$3"; DST_ID="$4"; DST_OP="$5"
         resolve_root "$DST_ROOT_TOKEN" instances; D_DIR="$R_DIR"
+        need_ticket "$PEER" "$DST_ROOT_TOKEN" instance "$DST_ID" "$DST_OP"
         existing_dir "$D_DIR/instances" "destination instances folder"
         DST=$(inst_dir "$D_DIR" "$DST_ID")
         shift 5
@@ -1506,6 +1627,7 @@ case "$SUB" in
         check_engine_id "$2"; check_id "$4"; check_opid "$5"
         PEER="$2"; ROOT_TOKEN="$3"; INST_ID="$4"; V_OP="$5"
         resolve_root "$ROOT_TOKEN" instances
+        need_ticket "$PEER" "$ROOT_TOKEN" instance "$INST_ID" "$V_OP"
         DST=$(inst_dir "$R_DIR" "$INST_ID")
         shift 5
         [[ "${1:-}" == --server ]] || refuse "$SUB only runs an rsync server (first server argument must be --server)"
@@ -1553,6 +1675,125 @@ case "$SUB" in
         export SSH_ORIGINAL_COMMAND="rsync $*"
         run_child $RUNUSER -u "$ENGINE_USER" -- $RRSYNC -wo "$DST"
         exit $?
+        ;;
+
+    peer-receive-app)
+        # v26 (engine#595): receive-app for a peer, under a live ticket; never deletes, and keeps
+        # existing files unless apps/<appId>/.idea-fetching names the ticket's op (this Engine's own Fetch)
+        (( $# >= 5 )) || refuse "peer-receive-app takes <peerEngineId> <root> <appId> and the rsync server arguments, got $(($# - 1)) argument(s)"
+        check_engine_id "$2"; check_app "$4"
+        PEER="$2"; APP_ROOT_TOKEN="$3"; APP_ID="$4"
+        resolve_root "$APP_ROOT_TOKEN" instances
+        need_ticket "$PEER" "$APP_ROOT_TOKEN" app "$APP_ID"
+        existing_dir "$R_DIR/apps" "apps folder"
+        DST="$R_DIR/apps/$APP_ID"
+        shift 4
+        check_server_args "$@"
+        check_shared_server_args "$@"
+        free_floor "$R_DIR/apps"
+        take_locks "app.$APP_ROOT_TOKEN.$APP_ID"
+        engine_user_dir "$DST" "app master folder"
+        OVERWRITE=no
+        FM="$DST/.idea-fetching"
+        if [[ "$TICKET_OP" != - && -f "$FM" && ! -L "$FM" ]]; then
+            FM_ID=""; read -r FM_ID < "$FM" 2>/dev/null || true
+            [[ -n "$FM_ID" && "$FM_ID" == "$TICKET_OP" ]] && OVERWRITE=yes
+        fi
+        journal "peer-receive-app: $DST for Engine $PEER (overwrite=$OVERWRITE)"
+        shared_receive "$DST" "$OVERWRITE" no "$@"
+        ;;
+
+    peer-receive-service)
+        # v26 (engine#595): receive-service for a peer, under a live ticket; never deletes or
+        # overwrites a tar, symlinks munged
+        (( $# >= 4 )) || refuse "peer-receive-service takes <peerEngineId> <root> and the rsync server arguments, got $(($# - 1)) argument(s)"
+        check_engine_id "$2"
+        PEER="$2"; SVC_ROOT_TOKEN="$3"
+        resolve_root "$SVC_ROOT_TOKEN" instances
+        need_ticket "$PEER" "$SVC_ROOT_TOKEN" services -
+        DST="$R_DIR/services"
+        shift 3
+        check_server_args "$@"
+        check_shared_server_args "$@"
+        existing_dir "$DST" "services folder"
+        free_floor "$DST"
+        take_locks "svc.$SVC_ROOT_TOKEN"
+        journal "peer-receive-service: $DST for Engine $PEER"
+        shared_receive "$DST" no yes "$@"
+        ;;
+
+    peer-ensure-dirs)
+        need 2 $(($# - 1)) "<peerEngineId> <root>"
+        check_engine_id "$2"
+        resolve_root "$3" instances
+        need_ticket "$2" "$3" any -
+        for d in apps instances services; do
+            engine_user_dir "$R_DIR/$d" "$d folder"
+        done
+        ;;
+
+    peer-ticket-add)
+        # v26: the Engine registers a ticket when it accepts a peer's grant for a transfer
+        need 7 $(($# - 1)) "<peerEngineId> <root> <instance|app|services> <id|-> <opId|-> <grantId> <seconds>"
+        check_engine_id "$2"
+        T_PEER="$2"; T_ROOT="$3"; T_KIND="$4"; T_ID="$5"; T_OP="$6"; T_GRANT="$7"; T_SECS="$8"
+        resolve_root "$T_ROOT" instances
+        case "$T_KIND" in
+            instance) check_id "$T_ID" ;;
+            app) check_app "$T_ID" ;;
+            services) [[ "$T_ID" == - ]] || refuse "a services ticket takes '-' as its id" ;;
+            *) refuse "ticket kind '$(printf '%q' "$T_KIND")' is not instance, app or services" ;;
+        esac
+        [[ "$T_OP" == - ]] || check_opid "$T_OP"
+        [[ "$T_GRANT" =~ $RE_GRANT_ID ]] || refuse "grant id '$(printf '%q' "${T_GRANT:0:40}")' does not match $RE_GRANT_ID"
+        [[ "$T_SECS" =~ ^[1-9][0-9]{0,5}$ ]] && (( T_SECS <= TICKET_MAX_SECONDS )) || refuse "ticket seconds '$(printf '%q' "${T_SECS:0:20}")' must be 1..$TICKET_MAX_SECONDS"
+        ticket_ready
+        take_locks tickets
+        NOW=$(uptime_s) || exit 2
+        BOOT=$(boot_id) || exit 2
+        T_NAME="$T_GRANT.$T_KIND.$T_ID.ticket"
+        ticket_files
+        N_ALL=0; N_PEER=0
+        for f in "${TICKET_FILES[@]}"; do
+            v=""; read -r v p _ _ _ _ _ b d _ < "$f" 2>/dev/null || [[ -n "$v" ]] || true
+            if [[ "$v" != v1 || "$b" != "$BOOT" || ! "$d" =~ ^[0-9]+$ ]] || (( d <= NOW )); then
+                $RM -f -- "$f"; continue   # dead: another boot, expired or unreadable
+            fi
+            [[ "${f##*/}" == "$T_NAME" ]] && continue
+            N_ALL=$((N_ALL + 1)); [[ "$p" == "$T_PEER" ]] && N_PEER=$((N_PEER + 1))
+        done
+        (( N_ALL < TICKET_MAX )) || refuse "TICKETS_FULL: $TICKET_MAX live tickets already"
+        (( N_PEER < TICKET_MAX_PER_PEER )) || refuse "TICKETS_FULL: Engine $T_PEER already has $TICKET_MAX_PER_PEER live tickets"
+        swap_file "$TICKET_DIR/$T_NAME" "v1 $T_PEER $T_ROOT $T_KIND $T_ID $T_OP $T_GRANT $BOOT $((NOW + T_SECS))"$'\n' >/dev/null
+        $CHMOD 0600 -- "$TICKET_DIR/$T_NAME" || true
+        journal "peer-ticket-add: Engine $T_PEER may write $T_KIND $T_ID on $T_ROOT (op $T_OP, grant $T_GRANT) for ${T_SECS}s"
+        echo "ok: ticket $T_NAME for ${T_SECS}s"
+        ;;
+
+    peer-ticket-drop)
+        need 1 $(($# - 1)) "<grantId>"
+        [[ "$2" =~ $RE_GRANT_ID ]] || refuse "grant id '$(printf '%q' "${2:0:40}")' does not match $RE_GRANT_ID"
+        N=0
+        if ticket_dir_ok; then
+            take_locks tickets
+            shopt -s nullglob
+            for f in "$TICKET_DIR/$2".*.ticket; do $RM -f -- "$f" && N=$((N + 1)); done
+            shopt -u nullglob
+        fi
+        journal "peer-ticket-drop: grant $2, $N ticket(s)"
+        echo "ok: dropped $N ticket(s)"
+        ;;
+
+    peer-tickets-reset)
+        need 0 $(($# - 1)) "none"
+        N=0
+        if ticket_dir_ok; then
+            take_locks tickets
+            ticket_files
+            for f in "${TICKET_FILES[@]}"; do $RM -f -- "$f" && N=$((N + 1)); done
+        fi
+        journal "peer-tickets-reset: $N ticket(s) dropped"
+        echo "ok: dropped $N ticket(s)"
         ;;
 
     ensure-dirs)
@@ -2953,7 +3194,7 @@ print("previousId="+str(row[0])); print("morangoId="+new_id)'
         ;;
 
     "")
-        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, temp-backup-estimate, temp-backup-create, temp-backup-delete, temp-backup-restore, temp-backups, peer-receive, peer-receive-files, peer-delete, peer-mark-in-flight, peer-clear-in-flight, peer-resume-receive, peer-verify-receive, verify-send, receive-app, receive-service, ensure-dirs, erase-slot, put-files, kolibri-rebind, swap-quarantine, sync-peers, clear-peers, install-usage-key)"
+        refuse "no subcommand (version, size, copy, send, receive, delete, quarantine, snapshot, restore-snapshot, snapshots, estimate, quarantine-snapshot, borg-init, borg-info, borg-create, borg-extract, borg-list, borg-extract-verify, borg-delete, borg-compact, quarantine-backups, clean-verify, temp-backup-estimate, temp-backup-create, temp-backup-delete, temp-backup-restore, temp-backups, peer-receive, peer-receive-files, peer-delete, peer-mark-in-flight, peer-clear-in-flight, peer-resume-receive, peer-verify-receive, verify-send, receive-app, receive-service, ensure-dirs, peer-receive-app, peer-receive-service, peer-ensure-dirs, peer-ticket-add, peer-ticket-drop, peer-tickets-reset, erase-slot, put-files, kolibri-rebind, swap-quarantine, sync-peers, clear-peers, install-usage-key)"
         ;;
     *)
         refuse "unknown subcommand '$(printf '%q' "$SUB")'"

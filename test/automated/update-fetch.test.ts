@@ -94,6 +94,36 @@ describe('fetchBundle (target side, #263)', () => {
     })
 })
 
+describe('fetchBundle transfer ticket (engine#595, helper v26)', () => {
+    const ticketLog = () => {
+        const log: string[] = []
+        return { log, tickets: {
+            add: async (peer: string, root: string, appId: string, requestId: string, ticketId: string, seconds: number) => { log.push(`add ${peer} ${root} ${appId} ${requestId} ${ticketId.length} ${seconds}`); return { ok: true as const, registered: 1 } },
+            drop: async (ticketId: string) => { log.push(`drop ${ticketId.length}`) },
+        } }
+    }
+    it('registers the ticket for this request before asking for the push and drops it when the answer is in', async () => {
+        const t = ticketLog()
+        const { d, sent } = targetDeps({ 'compose.yaml': 'good', SHA256SUMS: 'x' }, 'ok', { tickets: t.tickets })
+        await fetchBundle(req, d)
+        expect(t.log).toEqual(['add eng-b sda1 kolibri-1.1 req-1 16 5', 'drop 16'])
+        expect(sent).toHaveLength(1)
+    })
+    it('drops the ticket also when the source never answers', async () => {
+        const silent = ticketLog()
+        expect(await code(fetchBundle(req, targetDeps({}, 'ok', { send: () => {}, timeoutMs: 20, now: () => 3, tickets: silent.tickets }).d))).toMatch(/^TRANSFER_FAILED: no answer/)
+        expect(silent.log).toEqual(['add eng-b sda1 kolibri-1.1 req-1 16 1', 'drop 16'])
+    })
+    it('when the ticket cannot be registered it does not ask the source at all', async () => {
+        const { d, sent } = targetDeps({ 'compose.yaml': 'good' }, 'ok', { tickets: {
+            add: async () => ({ ok: false as const, error: 'could not register the transfer permission for Engine eng-b: TICKETS_FULL' }),
+            drop: async () => { throw new Error('not registered, nothing to drop') },
+        } })
+        expect(await code(fetchBundle(req, d))).toMatch(/^TRANSFER_FAILED: could not register the transfer permission for Engine eng-b: TICKETS_FULL/)
+        expect(sent).toEqual([])
+    })
+})
+
 describe('pushAppBundle (source side, #263)', () => {
     const store = { diskDB: { r1: src } } as any
     const preq = { sourceDiskId: 'r1', appId: 'kolibri-1.1', targetEngineId: 'eng-a', targetRoot: 'sda1', requestId: 'req-1', instanceId: 'i1' }

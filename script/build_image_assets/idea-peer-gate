@@ -13,12 +13,14 @@
 # Pi's app-data helper:  [/usr/bin/]sudo -n /usr/local/sbin/idea-app-data <sub> <args…>
 # Allowed, and run as argv (never through a shell):
 #   version                                → idea-app-data version
-#   ensure-dirs <root>                     → idea-app-data ensure-dirs <root>
+#   ensure-dirs <root>                     → idea-app-data peer-ensure-dirs <peer> <root>   (v26)
+#   size <root> <id>                       → idea-app-data size <root> <id>
+#                                            (read-only: whether instances/<id> exists, and its size; no ticket)
 #   receive <root> <id> --server …         → idea-app-data peer-receive <peer> <root> <id> --server …
 #                                            (a NEW instance folder, recorded in the ledger)
 #   receive-files <root> <id> --server …   → idea-app-data peer-receive-files <peer> <root> <id> --server …
-#   receive-app <root> <appId> --server …  → idea-app-data receive-app <root> <appId> --server …
-#   receive-service <root> --server …      → idea-app-data receive-service <root> --server …
+#   receive-app <root> <appId> --server …  → idea-app-data peer-receive-app <peer> <root> <appId> --server …   (v26)
+#   receive-service <root> --server …      → idea-app-data peer-receive-service <peer> <root> --server …     (v26)
 #   delete <root> <id>                     → idea-app-data peer-delete <peer> <root> <id>
 #                                            (only a folder that peer's receive created)
 # engine#497 stage 3 (a), helper v23 (Koen 2026-11-17, Q1 option A: the source Engine resumes and
@@ -31,6 +33,10 @@
 #   verify-receive <root> <id> <opId> --server … → idea-app-data peer-verify-receive <peer> …
 #                                            (dry run only; the one place the exact token
 #                                            --log-format=%i is accepted, for rsync's itemized list)
+# engine#595 (helper v26): every write verb above except delete and clear-in-flight needs a live
+# transfer ticket that this Engine registered when it accepted the peer's grant; the helper checks
+# it (this gate runs as pi and cannot read the root-only tickets), so the gate passes the peer id
+# to every verb that writes.
 # Everything else — a shell, scp/sftp, any other program or subcommand, --sender,
 # a character outside [A-Za-z0-9._=,:+@/-] and space — is refused (exit 2,
 # "refused: …"). The helper checks every token again. Every call is logged with
@@ -101,7 +107,10 @@ case "$SUBCMD" in
         allow version ;;
     ensure-dirs)
         (( N == 1 )) || refuse "ensure-dirs takes exactly <root>"
-        allow ensure-dirs "${ARGS[0]}" ;;
+        allow peer-ensure-dirs "$PEER" "${ARGS[0]}" ;;
+    size)
+        (( N == 2 )) || refuse "size takes exactly <root> <id>"
+        allow size "${ARGS[0]}" "${ARGS[1]}" ;;
     receive)
         (( N >= 3 )) || refuse "receive takes <root> <id> [<opId>] and the rsync server arguments"
         if [[ "${ARGS[2]}" == --server ]]; then
@@ -128,11 +137,11 @@ case "$SUBCMD" in
     receive-app)
         (( N >= 3 )) || refuse "receive-app takes <root> <appId> and the rsync server arguments"
         server_args 2
-        allow receive-app "${ARGS[@]}" ;;
+        allow peer-receive-app "$PEER" "${ARGS[@]}" ;;
     receive-service)
         (( N >= 2 )) || refuse "receive-service takes <root> and the rsync server arguments"
         server_args 1
-        allow receive-service "${ARGS[@]}" ;;
+        allow peer-receive-service "$PEER" "${ARGS[@]}" ;;
     delete)
         (( N == 2 )) || refuse "delete takes exactly <root> <id>"
         allow peer-delete "$PEER" "${ARGS[@]}" ;;

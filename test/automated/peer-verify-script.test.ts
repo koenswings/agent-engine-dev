@@ -188,7 +188,8 @@ describe('peer-verify.sh check 4: the exact gate calls on the system root', () =
         expect(existing.stderr).toMatch(/did not create/)
         const recv = await sb.runGate([PEER], `sudo -n ${H} receive system ${tmpid} --server -logDtpre.iLsfxCIvu . .`)
         expect(recv.exitCode).toBe(2)
-        expect(recv.stderr).toMatch(/already exists/)
+        // helper v26 (engine#595): refused before the folder check, for lack of a transfer ticket
+        expect(recv.stderr).toMatch(/already exists|GRANT_EXPIRED/)
         expect(await fs.readdir(path.join(sb.sys, 'instances', tmpid))).toEqual([])
         expect(await sb.calls('rrsync')).toEqual([])
         const version = await sb.runGate([PEER], `sudo -n ${H} version`)

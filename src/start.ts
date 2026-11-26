@@ -12,8 +12,11 @@ import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
 import { warnIfTestFailUpdateRestartIgnored } from './data/UpdateAppTestHook.js'
 import { takeStartupFailure, publishStartupFailure } from './data/StartupFailure.js'
 import { StoreSelfHeal, publishStoreSelfHeal } from './data/StoreHealth.js'
-import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkCrossEngineResumeCapability, checkDemoAppsCapability } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkCrossEngineResumeCapability, checkPeerTicketsCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
+import { syncEngineAuth, watchStoreAccounts } from './data/EngineAuth.js'
+import { commandKey } from './data/CommandKey.js'
+import { publishRelayPublicKey } from './data/RelayKey.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
 import { DocumentId, Repo } from '@automerge/automerge-repo'
@@ -174,7 +177,10 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         onStoreMapsArrived: () => storeMapsArrived.handler(),
     })
     storeMapsArrived.handler = () => {
+        // engine#582: the one-time account import waits for the store maps
+        try { syncEngineAuth(storeHandle) } catch (e) { log(`[auth] account import after peer sync failed: ${e}`) }
         createOrUpdateEngine(storeHandle, localEngineId)
+            .then(() => { try { publishRelayPublicKey(storeHandle, String(localEngineId)) } catch (e) { log(`[auth] relay key could not be published: ${e}`) } })
             .then(() => { if (storeSelfHeal.value) publishStoreSelfHeal(storeHandle, String(localEngineId), { ...storeSelfHeal.value, reason: `${storeSelfHeal.value.reason}; maps arrived by peer sync at ${new Date().toISOString()}` }) })
             .catch(e => log(`[store-health] writing this Engine's entry after peer sync failed: ${e}`))
     }
@@ -185,6 +191,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await checkBackupCleanupCapability()
     await checkPreUpdateQuarantineCapability()
     await checkCrossEngineResumeCapability()
+    await checkPeerTicketsCapability()
     checkDemoAppsCapability()
 
     // Create or update the local engine object
@@ -193,6 +200,14 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await storeHandle.whenReady()
     await import('./data/DemoApps.js').then(m => m.refreshDemoHb(storeHandle, String(localEngineId))).catch(e => log(`demo hb: ${e}`))
     const store = storeHandle.doc()
+
+    // engine#582: Engine-local operator accounts (one-time import from the store), setup code
+    try { syncEngineAuth(storeHandle) } catch (e) { log(`[auth] sign-in setup failed: ${e}`) }
+    watchStoreAccounts(storeHandle)
+    // engine#582: this Engine's command key (signs its own queue entries); created on first start
+    try { commandKey() } catch (e) { log(`[auth] command key could not be created: ${e}`) }
+    // engine#582: relay key; the public half goes into this Engine's engineDB entry
+    try { publishRelayPublicKey(storeHandle, String(localEngineId)) } catch (e) { log(`[auth] relay key could not be published: ${e}`) }
 
     // Remove any phantom engine entries and orphan disks that accumulated
     // from previous boots (e.g. before the sudo-hdparm fix). Runs before any
@@ -211,6 +226,10 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // engine#376: the host peer files only for a known fleet store, never in testMode / IDEA_WATCH_DIR
         storeDocId, testMode: config.settings.testMode, watchDirSet: !!process.env.IDEA_WATCH_DIR,
     })
+    // engine#595: a restart forgets every grant, so drop the peer transfer tickets of the previous
+    // run (helper v26). Only the Engine that owns this Pi's host peer files (mode 'on'): a second
+    // Engine on the same Pi must not drop the first one's tickets.
+    if (peerAccess.mode === 'on') await import('./data/PeerTickets.js').then(m => m.resetPeerTickets())
 
     // Clear unmount errors (idea#126) this Engine recorded for disks whose mount
     // point is no longer mounted, or now holds another filesystem (fsUuid).
@@ -253,7 +272,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
     // idea#203: http://idea.local (port 80) must reach this Engine's Console even when httpPort is not 80
-    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle, config.settings.ideaLocalHttpPort ?? 80, { engineId: String(localEngineId) })
+    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle, config.settings.ideaLocalHttpPort ?? 80, { engineId: String(localEngineId), auth: { engineId: String(localEngineId), storeHandle } })
     live.httpServer = httpServer
 
     // Start the instances monitor (engine#428: heal late PORT_NOT_READY starts)

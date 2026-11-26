@@ -7,7 +7,7 @@
  *   - the startup version check (match / mismatch / missing; isDev skips)
  *   - rsyncInstanceData: argv, progress, errors, and cancel through cancelOperation
  *     (fake sudo execs the sandboxed helper, whose rsync sleeps)
- *   - the peer ssh argv (remote delete, remote ensure-dirs) with this Engine's own key
+ *   - the peer ssh argv (remote delete, remote size, remote ensure-dirs) with this Engine's own key
  *     and the peer's pinned host key (per-Pi Engine keys)
  *   - runAppDataWithInput (sync-peers): the peer set goes over stdin
  *
@@ -19,7 +19,7 @@ import { fs, os, path } from 'zx'
 import { Repo, DocHandle } from '@automerge/automerge-repo'
 import {
     APP_DATA_HELPER, APP_DATA_HELPER_VERSION, sizeArgs, copyArgs, sendArgs, deleteArgs, eraseSlotArgs,
-    borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgListArgs, borgExtractVerifyArgs, borgDeleteArgs, borgCompactArgs, quarantineBackupsArgs, verifyStampNow, checkStamp, appDataSudoArgv, remoteDeleteSshArgs,
+    borgInitArgs, borgInfoArgs, borgCreateArgs, borgExtractArgs, borgListArgs, borgExtractVerifyArgs, borgDeleteArgs, borgCompactArgs, quarantineBackupsArgs, verifyStampNow, checkStamp, appDataSudoArgv, remoteDeleteSshArgs, remoteSizeSshArgs,
     runAppData, appDataErrorMessage, appDataHelperProblem, assertAppDataHelper,
     instanceDataBytes, deleteInstanceData, deleteRemoteInstanceData,
     remoteEnsureDirsSshArgs, ensureDirsArgs, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, putFilesArgs,
@@ -135,7 +135,7 @@ describe('helper argv builders', () => {
 
     it('refuse paths, option-looking tokens and bad archives/strips before anything runs', () => {
         for (const d of ['sdb3', 'sdb4', 'sdz9']) expect(sizeArgs(d, 'inst-1')).toEqual(['size', d, 'inst-1'])
-        expect(APP_DATA_HELPER_VERSION).toBe('25')
+        expect(APP_DATA_HELPER_VERSION).toBe('26')
         for (const d of ['sdb3', 'sdb9']) expect(() => eraseSlotArgs(d, '/tmp/x')).toThrow(/not a test slot name/)
         expect(() => sizeArgs('/disks/sdb1', 'x')).toThrow(/not a disk root/)
         expect(() => sizeArgs('..', 'x')).toThrow(/not a disk root/)
@@ -184,6 +184,16 @@ describe('helper argv builders', () => {
         expect(() => remoteDeleteSshArgs('idea04', 'ENGINE_idea04', '$(id)', 'x')).toThrow(/not a disk root/)
         expect(() => remoteDeleteSshArgs('idea04', 'ENGINE;id', 'sdb1', 'x')).toThrow(/not an Engine id/)
         expect(() => remoteDeleteSshArgs('-oProxyCommand=x', 'ENGINE_idea04', 'sdb1', 'x')).toThrow(/not a peer address/)
+    })
+
+    it('remoteSizeSshArgs: ssh of the existing read-only size verb (the gate allows it)', () => {
+        expect(remoteSizeSshArgs('idea04.local', 'ENGINE_idea04', 'idea-test-3', 'abc')).toEqual([
+            'ssh', '-i', '/home/pi/.ssh/idea_engine_ed25519', '-o', 'IdentitiesOnly=yes', '-o', 'BatchMode=yes',
+            '-o', 'StrictHostKeyChecking=yes', '-o', 'UserKnownHostsFile=/etc/idea/peer_known_hosts',
+            '-o', 'HostKeyAlias=ENGINE_idea04', '-o', 'ConnectTimeout=10', 'pi@idea04.local', '--',
+            'sudo -n /usr/local/sbin/idea-app-data size idea-test-3 abc',
+        ])
+        expect(() => remoteSizeSshArgs('idea04', 'ENGINE_idea04', 'sdb1', 'x;reboot')).toThrow(/not an instance id/)
     })
 
     it('remoteEnsureDirsSshArgs: the peer helper\'s ensure-dirs <root>, never a plain mkdir/chown', () => {

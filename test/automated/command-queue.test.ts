@@ -40,6 +40,7 @@ import { verifyMoveTarget } from '../../src/data/MoveAppRemote.js'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { enableStoreMonitor } from '../../src/monitors/storeMonitor.js'
 import { commandLogText } from '../../src/data/CommandLogStore.js'
+import { signEntry } from '../../src/data/CommandKey.js'
 
 const newStore = async (): Promise<DocHandle<Store>> => {
     const h = new Repo({ network: [], storage: undefined }).create<Store>({
@@ -53,8 +54,9 @@ const newLog = (): DocHandle<CommandLogStore> =>
     new Repo({ network: [], storage: undefined }).create<CommandLogStore>({ traces: {}, recentTraceIds: [] })
 const traces = (h: DocHandle<CommandLogStore>): CommandTrace[] => h.doc()!.recentTraceIds.map(id => h.doc()!.traces[id])
 const queue = (h: DocHandle<Store>): string[] => [...((h.doc()!.engineDB[localEngineId].commands as any[]) ?? [])].map(String)
+// engine#582: the queue runs only entries signed by this Engine
 const push = (h: DocHandle<Store>, ...cmds: string[]) =>
-    h.change(doc => { for (const c of cmds) (doc.engineDB[localEngineId].commands as any[]).push(c) })
+    h.change(doc => { for (const c of cmds) (doc.engineDB[localEngineId].commands as any[]).push(signEntry(c, 'cli', String(localEngineId)).entry) })
 
 describe('engine command queue (idea#168)', () => {
     let h: DocHandle<Store>

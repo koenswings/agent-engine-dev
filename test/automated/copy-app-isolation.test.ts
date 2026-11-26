@@ -36,6 +36,21 @@ const sshCalls = vi.hoisted(() => [] as string[])
 const instanceTransfers = vi.hoisted(() => [] as any[])
 const helperDeletes = vi.hoisted(() => [] as string[][])
 
+// engine#582: follow-ups to another Engine go through PeerCommands (POST /api/command with a grant);
+// here the "delivery" is simulated by appending the command to the target's queue row.
+vi.mock('../../src/data/PeerCommands.js', async (importOriginal) => {
+    const actual = await importOriginal<any>()
+    return {
+        ...actual,
+        dispatchToPeer: vi.fn(async (sh: any, engineId: string, command: string) => {
+            sh.change((d: any) => { d.engineDB[engineId].commands.push(command) })
+            return { ok: true, seq: 1, issuerEngineId: engineId }
+        }),
+        // engine#582: the target accepts this Engine's grant unless a test says otherwise
+        preflightPeerGrant: vi.fn(async (_sh: any, engineId: string) => ({ ok: true, issuerEngineId: engineId })),
+    }
+})
+
 vi.mock('../../src/utils/rsync.js', () => ({
     rsyncDirectory: vi.fn(async (src: string, dest: string, onProgress?: (p: { progressPercent: number }) => void) => {
         const { fs } = await import('zx')
@@ -167,6 +182,7 @@ import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
 import { disksRoot } from '../../src/data/Config.js'
 import { setRootDeviceForTests } from '../../src/data/Disk.js'
 import { network } from '../../src/data/Network.js'
+import { dispatchToPeer, preflightPeerGrant, PeerGrantRefusal } from '../../src/data/PeerCommands.js'
 import { copyApp, moveApp } from '../../src/data/CopyMoveApp.js'
 import { installAppFromDisk } from '../../src/data/InstallApp.js'
 import { findExternalLinks, uniqueCopyName, clearEnginePort, setComposeInstanceName } from '../../src/data/InstanceCopy.js'
@@ -176,6 +192,8 @@ import { AppID, DiskID, DiskName, EngineID, InstanceID, Timestamp } from '../../
 import { authorizedEntry } from '../../src/data/PeerAccess.js'
 import { peerSshOptions } from '../../src/utils/peerSsh.js'
 import { testKey } from '../harness/peerKeys.js'
+import { issueGrant, checkGrant, rememberGrant, grantFrom, forgetGrant, clearGrantsForTests, GrantError, GRANT_TTL_MS } from '../../src/data/PeerGrants.js'
+import { monoNow } from '../../src/utils/monoClock.js'
 
 /** Per-Pi Engine keys: the local Engine and REMOTE have published and accepted each other's keys. */
 const peersExchanged = (doc: Store, remote: EngineID, opts: { remoteAccepts?: boolean } = {}) => {
@@ -466,6 +484,7 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
             expect(overlay.files['.env']).not.toMatch(/^port=/m)
             expect(toCopy[1].files['.idea-rebind-morango']).toBe('r40\n')
             expect(h.doc().engineDB[REMOTE].commands).toEqual([`startInstance ${newRow.id} ${TGT} --cause cross-engine-cmd`])
+            expect(vi.mocked(dispatchToPeer)).toHaveBeenCalledWith(h, String(REMOTE), `startInstance ${newRow.id} ${TGT} --cause cross-engine-cmd`)
             expect(order).toEqual([`stop:${ORIG}`, `start:${ORIG}`])
         } finally {
             delete network.connections['10.0.0.35:4321' as any]
@@ -631,5 +650,214 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         await fs.remove(`${tgtRoot()}/instances`)
         await expect(copyApp(h, ORIG as any, SRC, 'DISK_nope' as DiskID)).rejects.toThrow()
         expect(await copyDirs()).toEqual([])
+    })
+
+    // ── engine#582: a stale grant never lets work for the other Engine start ──
+
+    const STALE = (engineId: string) => ({ ok: false, code: 'GRANT_EXPIRED', message: 'This permission expired (or this Engine restarted). Start again.', issuerEngineId: engineId })
+    const crossSetup = async (remote: EngineID, addr: string, status = 'Running') => {
+        h = await makeHandle(status)
+        h.change(doc => {
+            doc.diskDB[TGT].dockedTo = remote
+            ;(doc.engineDB as any)[remote] = { id: remote, commands: [], lastRun: Date.now(), capabilities: [CROSS_ENGINE_RESUME_CAPABILITY] }
+            peersExchanged(doc, remote)
+        })
+        network.connections[`${addr}:4321` as any] = { adapter: {} as any, missedDiscoveryCount: 0, hostname: 'idea-stale' as any, engineId: remote }
+    }
+
+    it('engine#582: a stale grant: nothing stopped, no ensure-dirs, no marker, no rsync, nothing registered; op Failed GRANT_EXPIRED with issuerEngineId', async () => {
+        const REMOTE = 'ENGINE_remote-g1' as EngineID
+        await crossSetup(REMOTE, '10.0.0.41')
+        vi.mocked(preflightPeerGrant).mockClear()
+        vi.mocked(dispatchToPeer).mockClear()
+        vi.mocked(preflightPeerGrant).mockResolvedValueOnce(STALE(REMOTE))
+        try {
+            const err = await copyApp(h, ORIG as any, SRC, TGT).then(() => null, (e) => e)
+            expect(err).toBeInstanceOf(PeerGrantRefusal)
+            expect(err).toMatchObject({ code: 'GRANT_EXPIRED', issuerEngineId: REMOTE, traceResult: { code: 'GRANT_EXPIRED', issuerEngineId: REMOTE, dispatchedTo: REMOTE, step: 'start' } })
+            expect(vi.mocked(preflightPeerGrant).mock.calls.map(c => c[1])).toEqual([REMOTE])
+            expect(order).toEqual([])                       // the source was never stopped
+            expect(h.doc().instanceDB[ORIG].status).toBe('Running')
+            expect(sshCalls).toEqual([])                    // no ensure-dirs (mkdir) on the peer
+            expect(peerInFlightCalls).toEqual([])           // no marker
+            expect(instanceTransfers).toEqual([])           // no rsync of instance data
+            expect(remoteOverlays).toEqual([])              // no app master / overlay / image push
+            expect(helperDeletes).toEqual([])
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])   // nothing registered
+            expect(vi.mocked(dispatchToPeer)).not.toHaveBeenCalled()
+            const op = Object.values(h.doc().operationDB)[0] as any
+            expect(op.status).toBe('Failed')
+            expect(op.error).toMatch(/^GRANT_EXPIRED: /)
+            expect(op.args).toMatchObject({ errorCode: 'GRANT_EXPIRED', issuerEngineId: REMOTE })
+        } finally {
+            delete network.connections['10.0.0.41:4321' as any]
+        }
+    })
+
+    it('engine#582: via handleCommand the copyApp trace ends as error with errorCode GRANT_EXPIRED and issuerEngineId in its result', async () => {
+        const REMOTE = 'ENGINE_remote-g5' as EngineID
+        await crossSetup(REMOTE, '10.0.0.45')
+        vi.mocked(preflightPeerGrant).mockResolvedValueOnce(STALE(REMOTE))
+        const { commands } = await import('../../src/data/Commands.js')
+        const { handleCommand } = await import('../../src/utils/commandUtils.js')
+        const { commandLogText } = await import('../../src/data/CommandLogStore.js')
+        const log = new Repo({ network: [], storage: undefined }).create<any>({ traces: {}, recentTraceIds: [] })
+        try {
+            await handleCommand(commands, h, 'engine', `copyApp ${ORIG} ${SRC} ${TGT}`, log)
+            const ids = log.doc().recentTraceIds
+            const t = log.doc().traces[ids[ids.length - 1]]
+            expect(t).toMatchObject({ command: 'copyApp', status: 'error', errorCode: 'GRANT_EXPIRED' })
+            expect(JSON.parse(commandLogText(t.result) ?? '{}')).toMatchObject({ code: 'GRANT_EXPIRED', issuerEngineId: REMOTE, dispatchedTo: REMOTE })
+            expect(order).toEqual([])
+            expect(instanceTransfers).toEqual([])
+            expect(h.doc().instanceDB[ORIG].status).toBe('Running')
+        } finally {
+            delete network.connections['10.0.0.45:4321' as any]
+        }
+    })
+
+    it('engine#582: the grant goes stale during the copy: checked again before registering; no row, marker kept, no startInstance', async () => {
+        const REMOTE = 'ENGINE_remote-g2' as EngineID
+        await crossSetup(REMOTE, '10.0.0.42', 'Stopped')
+        vi.mocked(preflightPeerGrant).mockClear()
+        vi.mocked(dispatchToPeer).mockClear()
+        vi.mocked(preflightPeerGrant)
+            .mockResolvedValueOnce({ ok: true, issuerEngineId: REMOTE })
+            .mockResolvedValueOnce(STALE(REMOTE))
+        try {
+            await expect(copyApp(h, ORIG as any, SRC, TGT)).rejects.toMatchObject({ code: 'GRANT_EXPIRED', traceResult: { step: 'register', issuerEngineId: REMOTE } })
+            expect(vi.mocked(preflightPeerGrant).mock.calls.map(c => c[1])).toEqual([REMOTE, REMOTE])
+            const newId = instanceTransfers[0].dstId
+            expect(peerInFlightCalls.map(c => c[0])).toEqual(['mark', 'verify'])   // never cleared: the copy stays marked there
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])               // not registered for the peer's disk
+            expect(vi.mocked(dispatchToPeer)).not.toHaveBeenCalled()
+            expect(h.doc().engineDB[REMOTE].commands).toEqual([])
+            expect(sshCalls.filter(c => / rm -rf |delete-instance/.test(c))).toEqual([])   // nothing deleted there either
+            expect(helperDeletes).toEqual([])
+            const op = Object.values(h.doc().operationDB)[0] as any
+            expect(op).toMatchObject({ status: 'Failed', args: { errorCode: 'GRANT_EXPIRED', issuerEngineId: REMOTE, targetInstanceId: newId } })
+        } finally {
+            delete network.connections['10.0.0.42:4321' as any]
+        }
+    })
+
+    it('engine#582: a resumed cross copy after a restart of this Engine (no grant kept): refused before the marker is touched or anything is pushed', async () => {
+        const REMOTE = 'ENGINE_remote-g3' as EngineID
+        await crossSetup(REMOTE, '10.0.0.43', 'Stopped')
+        try {
+            failure.rsync = R36_RSYNC
+            await copyApp(h, ORIG as any, SRC, TGT)
+            const op = Object.values(h.doc().operationDB)[0] as any
+            expect(op.status).toBe('Pending')
+            failure.rsync = null
+            instanceTransfers.length = 0
+            peerInFlightCalls.length = 0
+            sshCalls.length = 0
+            remoteOverlays.length = 0
+            vi.mocked(preflightPeerGrant).mockClear()
+            vi.mocked(preflightPeerGrant).mockResolvedValueOnce(STALE(REMOTE))
+            await expect(copyApp(h, ORIG as any, SRC, TGT, 'console-command', { recoveredOpId: op.id })).rejects.toMatchObject({ code: 'GRANT_EXPIRED' })
+            expect(peerInFlightCalls).toEqual([])
+            expect(instanceTransfers).toEqual([])
+            expect(sshCalls).toEqual([])
+            expect(remoteOverlays).toEqual([])
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
+            expect(h.doc().operationDB[op.id]).toMatchObject({ status: 'Failed', args: { errorCode: 'GRANT_EXPIRED', issuerEngineId: REMOTE } })
+        } finally {
+            delete network.connections['10.0.0.43:4321' as any]
+        }
+    })
+
+    it('engine#595: the grant check names the transfer; a helper ticket refusal mid-copy (the target restarted) fails the op GRANT_EXPIRED, never parks it', async () => {
+        const REMOTE = 'ENGINE_remote-t1' as EngineID
+        await crossSetup(REMOTE, '10.0.0.46', 'Stopped')
+        vi.mocked(preflightPeerGrant).mockClear()
+        try {
+            failure.rsync = `idea-app-data send exited with code 12: refused: GRANT_EXPIRED: Engine ${String(localEngineId)} has no live permission from this Engine to write instance x on sdz1 (it expired, this Engine restarted, or …). Nothing was written; start the operation again from the Console\nrsync: connection unexpectedly closed`
+            const err = await copyApp(h, ORIG as any, SRC, TGT).then(() => null, (e) => e)
+            expect(err).toBeInstanceOf(PeerGrantRefusal)
+            expect(err).toMatchObject({ code: 'GRANT_EXPIRED', issuerEngineId: REMOTE, traceResult: { step: 'transfer' } })
+            const [call] = vi.mocked(preflightPeerGrant).mock.calls
+            const op = Object.values(h.doc().operationDB)[0] as any
+            expect(call[1]).toBe(REMOTE)
+            expect(call[2]).toEqual({ targetDiskId: String(TGT), dstId: op.args.targetInstanceId, appId: expect.any(String), opId: op.id, services: expect.any(Boolean) })
+            expect(op.status).toBe('Failed')
+            expect(op.error).toMatch(new RegExp(`^GRANT_EXPIRED: Engine ${REMOTE} refused the transfer: Engine .* has no live permission`))
+            expect(op.args).toMatchObject({ errorCode: 'GRANT_EXPIRED', issuerEngineId: REMOTE })
+            expect(peerInFlightCalls.map(c => c[0])).toEqual(['mark'])        // the partial stays marked there
+            expect(helperDeletes).toEqual([])                                  // nothing deleted there
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
+        } finally {
+            failure.rsync = null
+            delete network.connections['10.0.0.46:4321' as any]
+        }
+    })
+
+    it('engine#582: with a good grant the copy asks the target twice (start, before registering) and then dispatches startInstance', async () => {
+        const REMOTE = 'ENGINE_remote-g4' as EngineID
+        await crossSetup(REMOTE, '10.0.0.44', 'Stopped')
+        vi.mocked(preflightPeerGrant).mockClear()
+        vi.mocked(dispatchToPeer).mockClear()
+        try {
+            const id = await copyApp(h, ORIG as any, SRC, TGT)
+            expect(id).toBeTruthy()
+            expect(vi.mocked(preflightPeerGrant).mock.calls.map(c => c[1])).toEqual([REMOTE, REMOTE])
+            expect(vi.mocked(dispatchToPeer)).toHaveBeenCalledWith(h, String(REMOTE), `startInstance ${id} ${TGT} --cause cross-engine-cmd`)
+        } finally {
+            delete network.connections['10.0.0.44:4321' as any]
+        }
+    })
+
+    it('engine#582: GRANT_EXPIRED, then a fresh grant from the same issuer: the same copy runs to Done', async () => {
+        const REMOTE = 'ENGINE_remote-g6' as EngineID
+        await crossSetup(REMOTE, '10.0.0.47', 'Stopped')
+        // the target's grant check, with the real grant code: its issued grants and key, this Engine's received grant
+        const keyDir = await fs.mkdtemp(path.join(os.tmpdir(), 'grant-retry-'))
+        clearGrantsForTests()
+        vi.mocked(preflightPeerGrant).mockClear()
+        vi.mocked(dispatchToPeer).mockClear()
+        vi.mocked(preflightPeerGrant).mockImplementation(async (_sh: any, engineId: string) => {
+            const g = grantFrom(engineId)
+            if (!g) return STALE(engineId)
+            try { checkGrant(g, engineId, String(localEngineId), undefined, keyDir); return { ok: true, issuerEngineId: engineId } } catch (e) {
+                if (!(e instanceof GrantError)) throw e
+                forgetGrant(engineId)
+                return { ok: false, code: e.code, message: e.message, issuerEngineId: engineId }
+            }
+        })
+        try {
+            // a grant the issuer no longer knows (its 6 h ran out): refused at the start, nothing done
+            rememberGrant(issueGrant(REMOTE, String(localEngineId), 'admin', monoNow() - GRANT_TTL_MS - 1, keyDir).grant, String(localEngineId))
+            await expect(copyApp(h, ORIG as any, SRC, TGT)).rejects.toMatchObject({ code: 'GRANT_EXPIRED', issuerEngineId: REMOTE, traceResult: { step: 'start' } })
+            const failed = Object.values(h.doc().operationDB)[0] as any
+            expect(failed).toMatchObject({ status: 'Failed', args: { errorCode: 'GRANT_EXPIRED', issuerEngineId: REMOTE } })
+            expect(grantFrom(REMOTE)).toBeNull()                       // the refused grant is dropped
+            expect(instanceTransfers).toEqual([])
+            expect(peerInFlightCalls).toEqual([])
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
+
+            // the Console takes a new grant from the same issuer; the same copy now runs to Done
+            rememberGrant(issueGrant(REMOTE, String(localEngineId), 'admin', undefined, keyDir).grant, String(localEngineId))
+            const id = await copyApp(h, ORIG as any, SRC, TGT)
+            expect(id).toBeTruthy()
+            expect(vi.mocked(preflightPeerGrant).mock.calls.map(c => c[1])).toEqual([REMOTE, REMOTE, REMOTE])   // refused start; start + before registering
+            const done = Object.values(h.doc().operationDB).find((o: any) => o.id !== failed.id) as any
+            expect(done.status).toBe('Done')
+            expect(instanceTransfers).toHaveLength(1)
+            expect(Object.keys(h.doc().instanceDB).sort()).toEqual([ORIG, id].sort())
+            expect(vi.mocked(dispatchToPeer)).toHaveBeenCalledWith(h, String(REMOTE), `startInstance ${id} ${TGT} --cause cross-engine-cmd`)
+        } finally {
+            vi.mocked(preflightPeerGrant).mockImplementation(async (_sh: any, engineId: string) => ({ ok: true, issuerEngineId: engineId }))
+            clearGrantsForTests()
+            await fs.remove(keyDir)
+            delete network.connections['10.0.0.47:4321' as any]
+        }
+    })
+
+    it('engine#582: a local copy never asks for a grant', async () => {
+        h = await makeHandle('Stopped')
+        vi.mocked(preflightPeerGrant).mockClear()
+        await copyApp(h, ORIG as any, SRC, TGT)
+        expect(vi.mocked(preflightPeerGrant)).not.toHaveBeenCalled()
     })
 })

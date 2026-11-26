@@ -31,6 +31,7 @@ vi.mock('../../src/data/Instance.js', async (importOriginal) => {
 
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
+import { signEntry } from '../../src/data/CommandKey.js'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { enableStoreMonitor } from '../../src/monitors/storeMonitor.js'
 
@@ -62,7 +63,7 @@ describe('stopInstance is awaited (#239)', () => {
 
     it('a startInstance queued right after stopInstance runs only after the stop finished', async () => {
         enableStoreMonitor(h, log)
-        h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(`stopInstance ${INST} ${DISK}`, `startInstance ${INST} ${DISK}`) })
+        h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(signEntry(`stopInstance ${INST} ${DISK}`, 'cli', String(localEngineId)).entry, signEntry(`startInstance ${INST} ${DISK}`, 'cli', String(localEngineId)).entry) })
         await vi.waitFor(() => expect(events).toContain('stop:begin'))
         await new Promise(r => setTimeout(r, 200))
         expect(events).toEqual(['stop:begin'])
@@ -76,7 +77,7 @@ describe('stopInstance is awaited (#239)', () => {
     it('a stopInstance queued right after startInstance runs only after the start finished', async () => {
         releaseStart = () => {}
         enableStoreMonitor(h, log)
-        h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(`startInstance ${INST} ${DISK}`, `stopInstance ${INST} ${DISK}`) })
+        h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(signEntry(`startInstance ${INST} ${DISK}`, 'cli', String(localEngineId)).entry, signEntry(`stopInstance ${INST} ${DISK}`, 'cli', String(localEngineId)).entry) })
         await vi.waitFor(() => expect(events).toContain('start:begin'))
         await new Promise(r => setTimeout(r, 200))
         expect(events).toEqual(['start:begin'])

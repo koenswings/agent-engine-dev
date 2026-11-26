@@ -26,6 +26,10 @@
  *   GET http://<engine-hostname>/api/store-url
  *   → { "url": "automerge:<hash>", "wsPort": 4321 }
  *
+ * CORS (engine#582): /api/* answers carry Access-Control-Allow-Origin only for this
+ * Engine's own Console origins and settings.devConsoleOrigins (consoleOrigins.ts);
+ * OPTIONS on /api/* is answered for preflights.
+ *
  * `wsPort` is the Engine's effective WebSocket port (config.yaml settings.port,
  * after the IDEA_ENGINE_PORT override in Config.ts), so the Console does not
  * have to assume the default. `url` is unchanged for backward compatibility.
@@ -39,6 +43,10 @@ import { log } from '../utils/utils.js'
 import { config } from '../data/Config.js'
 import type { DocHandle } from '@automerge/automerge-repo'
 import type { CommandLogStore } from '../data/CommandLogStore.js'
+import { corsHeadersFor, CORS_PREFLIGHT_HEADERS } from './consoleOrigins.js'
+import { handleAuthApi, AuthContext } from './authApi.js'
+import { handleCommandApi } from './commandApi.js'
+import { handleRelay, relayRoute } from './relayApi.js'
 
 const STORE_URL_FILE = path.join(
     config.settings.storeIdentityFolder,
@@ -145,7 +153,7 @@ export const enableHttpMonitor = (
     consolePath: string = config.settings.consolePath,
     _commandLogHandle?: DocHandle<CommandLogStore> | null,  // unused at runtime — URL comes from disk
     alsoPort?: number,     // idea#203: also serve on this port (idea.local, :80) when it differs from `port`
-    opts: { engineId?: string, wsPort?: number } = {},  // engineId for /api/store-url; wsPort = Engine WebSocket port for Upgrade pass-through
+    opts: { engineId?: string, wsPort?: number, auth?: AuthContext } = {},  // engineId for /api/store-url; wsPort = Engine WebSocket port for Upgrade pass-through; auth = /api/auth/* (engine#582)
 ): http.Server => {
 
     // agent-engine-dev#264: the Console is not settled at startup. A build that lands after
@@ -165,20 +173,34 @@ export const enableHttpMonitor = (
     consoleState()
 
     const handler: http.RequestListener = async (req, res) => {
-        const url = req.url ?? '/'
+        let url = req.url ?? '/'
+        // engine#582: CORS only for this Engine's own Console origins (consoleOrigins.ts)
+        const cors = corsHeadersFor(req, [port, alsoPort, config.settings.httpPort, config.settings.ideaLocalHttpPort ?? 80])
+        let apiPathOnly = (url.split('?')[0] ?? '/')
+        if (req.method === 'OPTIONS' && (apiPathOnly === '/api' || apiPathOnly.startsWith('/api/'))) {
+            res.writeHead(204, cors['Access-Control-Allow-Origin'] ? { ...cors, ...CORS_PREFLIGHT_HEADERS } : cors)
+            res.end()
+            return
+        }
+
+        // engine#582 step 4: /api/engines/<id>/<path> — another Engine through this one (relayApi.ts);
+        // this Engine's own id is answered here as /api/<path>.
+        if (opts.auth && apiPathOnly.startsWith('/api/engines/')) {
+            const route = relayRoute(apiPathOnly, opts.auth.engineId)
+            const query = url.includes('?') ? url.slice(url.indexOf('?')) : ''
+            if (route.kind === 'remote') { await handleRelay(req, res, route.engineId, route.path, query, cors, opts.auth); return }
+            if (route.kind === 'local') { apiPathOnly = route.path; url = route.path + query }
+        }
 
         // ── API routes ──────────────────────────────────────────────────────
         if (url === '/api/store-url' || url === '/api/store-url/') {
             try {
                 const storeUrl = (await fs.readFile(STORE_URL_FILE, 'utf-8')).trim()
-                res.writeHead(200, {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',  // Console may be on a different origin during dev
-                })
+                res.writeHead(200, { 'Content-Type': 'application/json', ...cors })
                 res.end(JSON.stringify(buildStoreUrlPayload(storeUrl, undefined, opts.engineId)))
             } catch (e) {
                 log(`[http] /api/store-url: failed to read store URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
+                res.writeHead(503, { 'Content-Type': 'application/json', ...cors })
                 res.end(JSON.stringify({ error: 'Store URL not available yet' }))
             }
             return
@@ -187,25 +209,31 @@ export const enableHttpMonitor = (
         if (url === '/api/command-log-url' || url === '/api/command-log-url/') {
             try {
                 const logUrl = (await fs.readFile(COMMAND_LOG_URL_FILE, 'utf-8')).trim()
-                res.writeHead(200, {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                })
+                res.writeHead(200, { 'Content-Type': 'application/json', ...cors })
                 res.end(JSON.stringify({ url: logUrl }))
             } catch (e) {
                 log(`[http] /api/command-log-url: failed to read URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
+                res.writeHead(503, { 'Content-Type': 'application/json', ...cors })
                 res.end(JSON.stringify({ error: 'Command log URL not available yet' }))
             }
             return
         }
 
+        // engine#582: Engine sign-in (authApi.ts). Without an auth context (older callers) these are 404s.
+        if (opts.auth && (apiPathOnly === '/api/auth' || apiPathOnly.startsWith('/api/auth/'))) {
+            if (await handleAuthApi(req, res, apiPathOnly, cors, opts.auth)) return
+        }
+        // engine#582: signed commands (commandApi.ts) — operator token or peer grant.
+        if (opts.auth && (apiPathOnly === '/api/command' || apiPathOnly === '/api/command/')) {
+            if (await handleCommandApi(req, res, apiPathOnly, cors, opts.auth)) return
+        }
+
         // engine#357: unknown /api/* is a JSON 404, never the Console SPA fallback.
-        // Same error shape and CORS header as the 503s above ({ error: string }).
+        // engine#582: contract error shape { error: 'NOT_FOUND', message }; CORS headers as the 503s above.
         const apiPath = (url.split('?')[0] ?? '/')
         if (apiPath === '/api' || apiPath.startsWith('/api/')) {
-            res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
-            res.end(JSON.stringify({ error: 'Not found' }))
+            res.writeHead(404, { 'Content-Type': 'application/json', ...cors })
+            res.end(JSON.stringify({ error: 'NOT_FOUND', message: `No API route ${apiPath} on this Engine.` }))
             return
         }
 
