@@ -225,6 +225,10 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         // engine#376: the host peer files only for a known fleet store, never in testMode / IDEA_WATCH_DIR
         storeDocId, testMode: config.settings.testMode, watchDirSet: !!process.env.IDEA_WATCH_DIR,
     })
+    // engine#595: a restart forgets every grant, so drop the peer transfer tickets of the previous
+    // run (helper v26). Only the Engine that owns this Pi's host peer files (mode 'on'): a second
+    // Engine on the same Pi must not drop the first one's tickets.
+    if (peerAccess.mode === 'on') await import('./data/PeerTickets.js').then(m => m.resetPeerTickets())
 
     // Clear unmount errors (idea#126) this Engine recorded for disks whose mount
     // point is no longer mounted, or now holds another filesystem (fsUuid).

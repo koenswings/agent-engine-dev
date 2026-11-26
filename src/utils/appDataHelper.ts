@@ -39,7 +39,7 @@ export const APP_DATA_HELPER = '/usr/local/sbin/idea-app-data'
  * script/build_image_assets/idea-app-data (a test checks this). Bump both when the
  * subcommands or their arguments change.
  */
-export const APP_DATA_HELPER_VERSION = '25'
+export const APP_DATA_HELPER_VERSION = '26'
 
 export const APP_DATA_HELPER_UPDATE =
     'ask Ops to update the Engine\'s root helper: run ./install-root-helpers in the Engine checkout (it installs borgbackup, rsync, ' +
@@ -235,6 +235,33 @@ export const remoteClearInFlightArgs = (root: string, id: string, opId: string):
     ['clear-in-flight', checkRoot(root), checkId(id), checkOpId(opId)]
 /** On a peer (through its gate): create apps/, instances/, services/ on <root>, owned by pi. */
 export const ensureDirsArgs = (root: string): string[] => ['ensure-dirs', checkRoot(root)]
+
+// ── engine#595 (helper v26): peer transfer tickets ─────────────────────────
+/** The helper version with peer transfer tickets (peer-ticket-add / -drop / peer-tickets-reset). */
+export const PEER_TICKETS_HELPER_MIN = 26
+/** The longest ticket the helper accepts (TICKET_MAX_SECONDS; the grant TTL, 6 h). */
+export const PEER_TICKET_MAX_SECONDS = 21600
+export type PeerTicketKind = 'instance' | 'app' | 'services'
+const GRANT_ID_TOKEN = /^[A-Za-z0-9_-]{16}$/
+const checkGrantId = (grantId: string): string => {
+    if (!GRANT_ID_TOKEN.test(grantId)) throw new Error(`'${grantId}' is not a grant id the app-data helper accepts`)
+    return grantId
+}
+/**
+ * peer-ticket-add <peer> <root> <kind> <id|-> <opId|-> <grantId> <seconds>: let Engine `peer` write
+ * this target on this Engine for `seconds` (whole seconds, 1..PEER_TICKET_MAX_SECONDS).
+ */
+export const peerTicketAddArgs = (peer: string, root: string, kind: PeerTicketKind, id: string | null, opId: string | null, grantId: string, seconds: number): string[] => {
+    const target = kind === 'instance' ? checkId(String(id ?? '')) : kind === 'app' ? checkApp(String(id ?? '')) : '-'
+    if (kind === 'services' && id && id !== '-') throw new Error('a services ticket has no id')
+    const secs = Math.floor(seconds)
+    if (!Number.isFinite(secs) || secs < 1 || secs > PEER_TICKET_MAX_SECONDS) throw new Error(`ticket seconds ${seconds} must be 1..${PEER_TICKET_MAX_SECONDS}`)
+    return ['peer-ticket-add', checkEngineId(peer), checkRoot(root), kind, target, opId ? checkOpId(opId) : '-', checkGrantId(grantId), String(secs)]
+}
+export const peerTicketDropArgs = (grantId: string): string[] => ['peer-ticket-drop', checkGrantId(grantId)]
+export const peerTicketsResetArgs = (): string[] => ['peer-tickets-reset']
+/** The helper's refusal when a peer write has no live ticket (the issuer of the missing grant is this Engine). */
+export const isTicketRefusal = (message: string): boolean => /refused: GRANT_EXPIRED: /.test(message)
 /**
  * TEST-ONLY: erase a loop-backed duration slot (idea-test-N) to an empty IDEA disk.
  * umount + mkfs.ext4 + remount via the helper; production USB erase stays on idea-erase-disk.

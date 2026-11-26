@@ -17,7 +17,7 @@
 #               authorize the golden Pi (role golden in fleet-state); store matches
 #   3 copy      real Engine copyApp both ways between Atlas-provided scratch disks
 #   4 refusals  plain ssh → exit 2 + journal; peer delete → "did not create";
-#               receive into an existing folder → "already exists".
+#               receive into an existing folder → "already exists" (helper v26: "GRANT_EXPIRED", no ticket).
 #               Engine-to-Engine ssh over Tailscale 100.x is EXPECTED-BLOCKED
 #               under the tag:idea ACL (tag:idea→nothing); refusals are checked
 #               over Engine.lanAddress instead.
@@ -578,7 +578,7 @@ declare -A WANT_STAT=(
 for i in "${!NAMES[@]}"; do
     out=$(rsh "$i" bash -s <<<"$INSTALL_PROBE" 2>&1); echo "$out" > "$EVID/1-install-${NAMES[$i]}.txt"
     bad=()
-    [[ "$(sed -n 's/^VERSION=//p' <<<"$out")" == "idea-app-data 25" ]] || bad+=("helper version: $(sed -n 's/^VERSION=//p' <<<"$out")")
+    [[ "$(sed -n 's/^VERSION=//p' <<<"$out")" == "idea-app-data 26" ]] || bad+=("helper version: $(sed -n 's/^VERSION=//p' <<<"$out")")
     [[ "$(sed -n 's/^SSHD_T=//p' <<<"$out")" == ok ]] || bad+=("sshd -t: $(sed -n 's/^SSHD_T=//p' <<<"$out")")
     grep -q '/etc/ssh/idea_authorized_keys/%u' <<<"$(sed -n 's/^AKF=//p' <<<"$out")" || bad+=("AuthorizedKeysFile is '$(sed -n 's/^AKF=//p' <<<"$out")'")
     for p in "${!WANT_STAT[@]}"; do
@@ -818,7 +818,7 @@ refusals() {  # refusals <fromIdx> <toIdx>
         out=$(peer_ssh_to "$a" "$b" "$check_host" "sudo -n $HELPER version" 2>&1); rc=$?
         echo "== LAN $check_host version rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
     fi
-    [[ $rc == 0 && "$out" == *"idea-app-data 25"* ]] || bad+=("control 'version' through the gate on $check_host failed (rc $rc: ${out:0:120})")
+    [[ $rc == 0 && "$out" == *"idea-app-data 26"* ]] || bad+=("control 'version' through the gate on $check_host failed (rc $rc: ${out:0:120})")
     # a) plain command → gate refusal, exit 2, journal
     out=$(peer_ssh_to "$a" "$b" "$check_host" "id" 2>&1); rc=$?
     echo "== id rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
@@ -840,7 +840,8 @@ refusals() {  # refusals <fromIdx> <toIdx>
         rsh "$b" "test -d $tmp" || bad+=("the existing folder $tmp is GONE after a refused delete")
         out=$(peer_ssh_to "$a" "$b" "$check_host" "sudo -n $HELPER receive system $tmpid --server -logDtpre.iLsfxCIvu . ." 2>&1 </dev/null); rc=$?
         echo "== receive system $tmpid (exists) rc=$rc"$'\n'"$out" >> "$EVID/4-refusals-${NAMES[$a]}-${NAMES[$b]}.txt"
-        [[ $rc == 2 && "$out" == *"already exists"* ]] || bad+=("receive into an existing folder gave rc $rc: ${out:0:160}")
+        # helper v26 (engine#595) refuses earlier: no transfer ticket (GRANT_EXPIRED)
+        [[ $rc == 2 && ( "$out" == *"already exists"* || "$out" == *"GRANT_EXPIRED"* ) ]] || bad+=("receive into an existing folder gave rc $rc: ${out:0:160}")
         [[ -z "$(rsh "$b" "ls -A $tmp")" ]] || bad+=("$tmp is no longer empty")
         rsh "$b" "sudo -n rmdir -- $tmp && rm -f $STATE/tempdir.$tmpid && rmdir $STATE 2>/dev/null; true"
         rsh "$b" "test ! -e $tmp" || bad+=("cannot remove $tmp")
