@@ -41,6 +41,7 @@ import { diskFsRoot } from './data/Disk.js'
 import { bootRetryHandlers } from './data/RecoveryRetry.js'
 import { clearStaleUnmountErrors } from './monitors/mounts.js'
 import { createCommandLogStore, getCommandLogHandle, shutdownRepo, startCommandLogRotation } from './data/CommandLogStore.js'
+import { startPeerCommandLogRelease } from './data/PeerCommandLogRelease.js'
 import { startMemoryMonitor } from './monitors/memoryMonitor.js'
 import { initCommandLogger } from './utils/CommandLogger.js'
 import { assertAppDataHelper, reportBorgAtStartup } from './utils/appDataHelper.js'
@@ -253,6 +254,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     startCommandLogRotation(repo)
     // engine#471: hourly [memory] line (rss, heap, external = mostly Automerge wasm, loaded docs / command logs)
     startMemoryMonitor(repo, { ownCommandLogId: () => getCommandLogHandle()?.documentId ?? null })
+    // engine#581: other Engines' command logs leave the Repo cache when no Console has read them for 10 min
+    startPeerCommandLogRelease(repo)
 
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
