@@ -75,10 +75,61 @@ describe('idea-engine-firewall.sh --dry-run', () => {
     })
 
     it.skipIf(process.getuid?.() === 0)('apply, confirm and remove refuse without root', () => {
-        for (const c of ['apply', 'confirm', 'remove']) {
+        for (const c of ['confirm', 'remove']) {
             const r = run(c)
             expect(r.code).toBe(1)
             expect(r.err).toContain('needs root')
         }
+        const r = run('apply')
+        // apply checks eth0 before root: a box whose eth0 LAN is not allowed exits 2
+        // asking for --allow; otherwise it still refuses without root.
+        if (r.code === 2) expect(r.err).toContain('--allow')
+        else {
+            expect(r.code).toBe(1)
+            expect(r.err).toContain('needs root')
+        }
+    })
+
+    it('eth0 LAN outside 10.42: dry-run warns, apply refuses, --allow clears it', () => {
+        const ip = path.join(etc, 'ip-addr')
+        fs.writeFileSync(ip, '2: eth0    inet 192.168.0.113/24 brd 192.168.0.255 scope global eth0\n')
+        const envRun = (...args: string[]) => {
+            const r = spawnSync('bash', [SCRIPT, ...args], {
+                encoding: 'utf8',
+                env: { ...process.env, IDEA_FW_ETC: etc, IDEA_FW_NFT_DIR: path.join(etc, 'nft'), IDEA_FW_RUN: path.join(etc, 'run'), IDEA_FW_UNIT_DIR: path.join(etc, 'unit'), IDEA_FW_IP_ADDR_FILE: ip },
+            })
+            return { code: r.status, out: r.stdout, err: r.stderr }
+        }
+        const dry = envRun('--dry-run')
+        expect(dry.code).toBe(0)
+        expect(dry.out).toContain('elements = { 10.42.0.0/16 }')
+        expect(dry.out).not.toContain('192.168.0.0/24')
+        expect(dry.err).toMatch(/WARNING:.*eth0 is 192\.168\.0\.0\/24.*--allow 192\.168\.0\.0\/24/)
+        const apply = envRun('apply')
+        expect(apply.code).toBe(2)
+        expect(apply.err).toContain('eth0 is 192.168.0.0/24')
+        expect(apply.err).toContain('--allow 192.168.0.0/24')
+        expect(apply.out).toBe('')
+        const allowed = envRun('--dry-run', '--allow', '192.168.0.0/24')
+        expect(allowed.code).toBe(0)
+        expect(allowed.out).toContain('192.168.0.0/24')
+        expect(allowed.err).not.toMatch(/WARNING:.*eth0/)
+        const applyAllowed = envRun('apply', '--allow', '192.168.0.0/24')
+        // LAN is allowed; without root we stop at need_root (or skip if we are root)
+        if (process.getuid?.() !== 0) {
+            expect(applyAllowed.code).toBe(1)
+            expect(applyAllowed.err).toContain('needs root')
+        }
+    })
+
+    it('eth0 already in 10.42: no warning', () => {
+        const ip = path.join(etc, 'ip-addr')
+        fs.writeFileSync(ip, '2: eth0    inet 10.42.0.1/16 brd 10.42.255.255 scope global eth0\n')
+        const r = spawnSync('bash', [SCRIPT, '--dry-run'], {
+            encoding: 'utf8',
+            env: { ...process.env, IDEA_FW_ETC: etc, IDEA_FW_NFT_DIR: path.join(etc, 'nft'), IDEA_FW_RUN: path.join(etc, 'run'), IDEA_FW_UNIT_DIR: path.join(etc, 'unit'), IDEA_FW_IP_ADDR_FILE: ip },
+        })
+        expect(r.status).toBe(0)
+        expect(r.stderr).not.toMatch(/WARNING:.*eth0/)
     })
 })

@@ -14,6 +14,12 @@
 # Options:
 #   --allow <cidr>           also accept this IPv4/IPv6 range (repeatable); added to
 #                            /etc/idea/firewall-allow (one CIDR per line, # comments)
+#
+# eth0: the script detects eth0's IPv4 subnet. If that subnet is not already
+# allowed (10.42.0.0/16, the allow file, or --allow), --dry-run still prints the
+# ruleset and warns on stderr; apply refuses (exit 2) and tells you to pass
+# --allow <cidr>. Pool LANs such as 192.168.0.0/24 need that, or Console and
+# Engine-to-Engine traffic on httpPort would be dropped.
 #   --ports <p,p,...>        Engine ports to filter (default 80,8080,4321)
 #   --rollback-seconds <n>   apply: seconds before the automatic rollback (default 120)
 #
@@ -106,6 +112,77 @@ split_family() {   # $1 = 4|6, rest = cidrs → comma list of that family
     local IFS=,; printf '%s' "${out[*]-}" | sed 's/,/, /g'
 }
 
+# --- eth0 LAN detection (IDEA_FW_IP_ADDR_FILE: fake `ip -4 -o addr` lines for tests)
+ipv4_to_int() {
+    local IFS=.
+    set -- $1
+    echo $(( (10#$1 << 24) + (10#$2 << 16) + (10#$3 << 8) + 10#$4 ))
+}
+int_to_ipv4() {
+    local n=$1
+    echo $(( (n >> 24) & 255 )).$(( (n >> 16) & 255 )).$(( (n >> 8) & 255 )).$(( n & 255 ))
+}
+ipv4_prefix() {  # 10.0.0.7 or 10.0.0.7/24 → prefix (bare address = /32)
+    local p=${1#*/}
+    [[ "$p" == "$1" ]] && p=32
+    echo "$p"
+}
+ipv4_network() {  # 192.168.0.113/24 → 192.168.0.0/24
+    local spec=$1 ip=${1%/*} pfx
+    pfx=$(ipv4_prefix "$spec")
+    local addr mask
+    addr=$(ipv4_to_int "$ip")
+    if (( pfx == 0 )); then mask=0
+    elif (( pfx >= 32 )); then mask=4294967295
+    else mask=$(( (0xFFFFFFFF << (32 - pfx)) & 0xFFFFFFFF ))
+    fi
+    echo "$(int_to_ipv4 $(( addr & mask )))/$pfx"
+}
+# true if allow CIDR (IPv4) contains lan CIDR
+cidr4_contains() {
+    is_v4 "$1" && is_v4 "$2" || return 1
+    local a_net l_net a_pfx l_pfx a_addr l_addr a_mask
+    a_net=$(ipv4_network "$1"); l_net=$(ipv4_network "$2")
+    a_pfx=$(ipv4_prefix "$a_net"); l_pfx=$(ipv4_prefix "$l_net")
+    (( a_pfx <= l_pfx )) || return 1
+    a_addr=$(ipv4_to_int "${a_net%/*}")
+    l_addr=$(ipv4_to_int "${l_net%/*}")
+    if (( a_pfx == 0 )); then a_mask=0
+    elif (( a_pfx >= 32 )); then a_mask=4294967295
+    else a_mask=$(( (0xFFFFFFFF << (32 - a_pfx)) & 0xFFFFFFFF ))
+    fi
+    (( (l_addr & a_mask) == (a_addr & a_mask) ))
+}
+detect_eth0_cidr() {
+    local line
+    if [[ -n "${IDEA_FW_IP_ADDR_FILE:-}" && -f "$IDEA_FW_IP_ADDR_FILE" ]]; then
+        line=$(grep -E '(^|[[:space:]])eth0[[:space:]]' "$IDEA_FW_IP_ADDR_FILE" | head -1 || true)
+    else
+        line=$(ip -4 -o addr show dev eth0 2>/dev/null | head -1 || true)
+    fi
+    [[ -n "$line" ]] || return 1
+    if [[ $line =~ inet[[:space:]]+([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+/[0-9]+) ]]; then
+        ipv4_network "${BASH_REMATCH[1]}"
+        return 0
+    fi
+    return 1
+}
+# Warn (dry-run) or refuse apply when eth0's subnet would be dropped.
+check_eth0_lan() {
+    local lan covered=0 c
+    lan=$(detect_eth0_cidr || true)
+    [[ -n "$lan" ]] || return 0
+    for c in "$HOTSPOT" "${FILE_ALLOW[@]+"${FILE_ALLOW[@]}"}" "${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}"; do
+        if cidr4_contains "$c" "$lan"; then covered=1; break; fi
+    done
+    (( covered == 1 )) && return 0
+    local msg="eth0 is $lan, which this ruleset would drop. Re-run with --allow $lan so the Console and other Engines on this LAN can still reach this Engine's httpPort (relay and store sync)."
+    if [[ "$CMD" == apply ]]; then
+        die "$msg" 2
+    fi
+    echo "WARNING: $msg" >&2
+}
+
 ruleset() {
     local allow=("$HOTSPOT" "${FILE_ALLOW[@]+"${FILE_ALLOW[@]}"}" "${EXTRA_ALLOW[@]+"${EXTRA_ALLOW[@]}"}")
     local a4 a6 adm4 adm6 ports
@@ -158,8 +235,10 @@ remember_allow() {   # --allow ranges are kept in the allow file for the next ru
 case "$CMD" in
 dry-run)
     ruleset
+    check_eth0_lan
     ;;
 apply)
+    check_eth0_lan
     need_root
     [[ ! -f "$PENDING" ]] || die "an earlier apply is still waiting for confirm or rollback; run 'confirm' or wait"
     tmp=$(mktemp)

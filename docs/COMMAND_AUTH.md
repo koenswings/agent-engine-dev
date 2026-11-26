@@ -404,7 +404,10 @@ sudo script/ops/idea-engine-firewall.sh confirm | status | remove
 - Exit codes: 0 ok, 1 failed, 2 usage or bad input.
 
 Pool and kit Engines must allow each other on `httpPort` (relay and peer follow-ups):
-add the pool LAN or Tailscale ranges with `--allow` or the allow file.
+add the pool LAN or Tailscale ranges with `--allow` or the allow file. The script
+detects eth0's IPv4 subnet: `--dry-run` warns, and `apply` refuses, when that subnet
+is not already allowed, and tells you to pass `--allow <cidr>` (for example a pool
+LAN of `192.168.0.0/24`, which the default `10.42.0.0/16` list does not cover).
 
 ## Cleanup (step 5)
 
