@@ -2449,7 +2449,7 @@ export class RealFleetOps implements FleetOps {
      * Never calls storeHandle.change().
      */
     async listOperations(engineId: string): Promise<
-        { id: string; kind: string; status: string; startedAt: number | null; completedAt: number | null; error: string | null; args: Record<string, string> }[]
+        { id: string; kind: string; status: string; startedAt: number | null; completedAt: number | null; error: string | null; args: Record<string, string>; engineId: string | null }[]
     > {
         this.assertNotExcluded(engineId, 'listOperations')
         let conn = await this.connect(engineId)
@@ -2478,6 +2478,7 @@ export class RealFleetOps implements FleetOps {
                 args: Object.fromEntries(
                     Object.entries((o.args ?? {}) as Record<string, unknown>).map(([k, v]) => [k, String(v)]),
                 ),
+                engineId: o.engineId == null ? null : String(o.engineId),
             }
         })
     }

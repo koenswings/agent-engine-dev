@@ -4124,5 +4124,33 @@ describe('v26↔v26 copy pair filter + mixed-fleet refusal (engine#595 / PR #599
 
             expect(await verifyOldToNewCopyRefusal(ctxOf({ readStore: async () => ({ engineId: 'x', instanceDB: {}, diskDB: {}, engineDB: {} }) }), since, { ...expectPair, diskEntriesAfter: [] })).toBeNull()
         })
+
+        it('shared store: the source Failed op with the source engineId in both lists is not a target op (mixed-fleet run3)', async () => {
+            const SRC_ID = 'ENGINE_AA000000000000055000', TGT_ID = 'ENGINE_gge6zxyl6ftmnri4qx6'
+            const srcOp = { ...failedRow, id: 'p4ne7mouipgadwmfo2m', engineId: SRC_ID }
+            const view = { engineId: 'idea03', liveEngineId: TGT_ID, instanceDB: { [INST]: { id: INST, status: 'Running', diskId: KOLIBRI }, [NC_INST]: { id: NC_INST, status: 'Running', diskId: NC } }, diskDB: {}, engineDB: {} }
+            const shared = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async () => [srcOp],
+                readStore: async () => view,
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST] })
+            expect(shared).toMatchObject({ ok: true, reason: 'ok' })
+
+            // No engineId on the row and no live id: the source op id alone is still excluded.
+            const noIds = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async () => [failedRow],
+                readStore: async () => ({ ...view, liveEngineId: undefined }),
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST] })
+            expect(noIds).toMatchObject({ ok: true, reason: 'ok' })
+
+            // A copyApp run by the target Engine still fails, even next to the source op.
+            const tgtOp = { id: 't2', kind: 'copyApp', status: 'Failed', startedAt: since, error: 'x', args: { instanceId: INST }, engineId: TGT_ID }
+            const real = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async () => [srcOp, tgtOp],
+                readStore: async () => view,
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST] })
+            expect(real).toMatchObject({ ok: false, reason: 'target_op' })
+            expect(real?.note).toMatch(/t2=Failed/)
+            expect(real?.note).not.toMatch(/p4ne7mouipgadwmfo2m/)
+        })
     })
 })

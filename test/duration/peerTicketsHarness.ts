@@ -36,6 +36,8 @@ type DurationOperationRow = {
     completedAt?: number | null
     error?: string | null
     args?: Record<string, string>
+    /** operationDB row's own engineId (the Engine that runs the op), when the reader returns it. */
+    engineId?: string | null
 }
 
 /** Capability advertised by a helper-v26 Engine (PR6). Keep as a literal so this PR does not import PR6. */
@@ -427,10 +429,21 @@ export const verifyOldToNewCopyRefusal = async (
     let sourceRows: DurationOperationRow[] = []
     let targetRows: DurationOperationRow[] = []
     let readErrors: string[] = []
+    // listOperations returns every operationDB row of the shared store, so the source Engine's own
+    // copyApp shows up in the target's list too. Count only rows the target Engine runs (its live
+    // ENGINE_ id). When the row has no engineId or the target id is unknown, drop only the source op ids.
+    let targetLiveId: string | null = null
+    try {
+        const v = await ctx.opts.ops.readStore(expect.targetEngine)
+        targetLiveId = v.liveEngineId
+            ?? Object.values(v.engineDB ?? {}).find(e => e?.hostname === expect.targetEngine)?.id
+            ?? null
+    } catch { /* unknown target id: count every non-source row */ }
     const scan = async () => {
         sourceRows = []
         targetRows = []
         readErrors = []
+        const sourceIds = new Set<string>()
         for (const [eng, bucket] of [
             [expect.sourceEngine, 'source'] as const,
             [expect.targetEngine, 'target'] as const,
@@ -441,8 +454,12 @@ export const verifyOldToNewCopyRefusal = async (
                     if (typeof r.startedAt !== 'number' || r.startedAt < sinceMs - slackMs) continue
                     if (bucket === 'source') {
                         if (expect.instanceId && r.args?.instanceId && r.args.instanceId !== expect.instanceId) continue
+                        sourceIds.add(r.id)
                         sourceRows.push(r)
                     } else {
+                        if (targetLiveId && r.engineId) {
+                            if (r.engineId !== targetLiveId) continue
+                        } else if (sourceIds.has(r.id)) continue
                         targetRows.push(r)
                     }
                 }
