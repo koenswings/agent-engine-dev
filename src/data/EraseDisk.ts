@@ -39,6 +39,29 @@ export const isSlotEraseDevice = (device: string | null | undefined): boolean =>
     !!device && SLOT_ERASE_DEVICE_PATTERN.test(device)
 
 export const ERASE_SCRIPT = '/usr/local/sbin/idea-erase-disk'
+
+/** Trace / throw text when the root helper is not on the Pi. No stack frames. */
+export const ERASE_HELPER_MISSING =
+    'The erase helper /usr/local/sbin/idea-erase-disk is missing on this Pi, so nothing was erased.'
+
+const eraseErrorText = (err: unknown): string => {
+    if (err == null) return ''
+    if (typeof err === 'string') return err
+    const e = err as { message?: string, stderr?: string, stdout?: string, shortMessage?: string }
+    return [e.message, e.stderr, e.stdout, e.shortMessage].filter(Boolean).join('\n')
+}
+
+/** True when `err` is sudo/zx failing because idea-erase-disk is not installed. */
+export const isEraseHelperMissing = (err: unknown): boolean => {
+    const text = eraseErrorText(err)
+    if (!text.includes('idea-erase-disk') && (err as { code?: string })?.code !== 'ENOENT') return false
+    if ((err as { code?: string })?.code === 'ENOENT') return true
+    return /command not found|No such file or directory|ENOENT/i.test(text)
+}
+
+/** Plain sentence for a missing helper; otherwise null (caller keeps its own wording). */
+export const eraseHelperErrorMessage = (err: unknown): string | null =>
+    isEraseHelperMissing(err) ? ERASE_HELPER_MISSING : null
 export const ERASE_STAGING_ROOT = path.join(ENGINE_STATE_DIR, 'erase-staging')
 export const IDEA_DISK_LABEL = 'IDEA Disk'
 /** How long eraseDisk waits for the erased disk to be republished as empty after the add. */
@@ -117,8 +140,14 @@ export const hiddenPartitionsMessage = (label: string, whole: string, hidden: Hi
 
 const defaultOps: EraseOps = {
     runScript: async (a) => {
-        const out = await $`sudo -n ${ERASE_SCRIPT} ${a.device} ${a.serial} ${String(a.sizeBytes)} ${a.label} ${a.stagingDir}`
-        return { stdout: out.stdout }
+        try {
+            const out = await $`sudo -n ${ERASE_SCRIPT} ${a.device} ${a.serial} ${String(a.sizeBytes)} ${a.label} ${a.stagingDir}`
+            return { stdout: out.stdout }
+        } catch (e) {
+            const plain = eraseHelperErrorMessage(e)
+            if (plain) throw new Error(plain)
+            throw e
+        }
     },
     runSlotErase: async (a) => {
         const argv = eraseSlotArgs(a.slot, a.stagingDir)
@@ -151,7 +180,9 @@ const defaultOps: EraseOps = {
     hiddenTablePartitions: async (whole) => {
         const out = await $`sudo -n ${ERASE_SCRIPT} --check-table /dev/${whole}`.nothrow()
         if (out.exitCode !== 0) {
-            throw new Error((out.stderr || out.stdout).trim() || `exit ${out.exitCode}`)
+            const failed = { message: (out.stderr || out.stdout).trim() || `exit ${out.exitCode}`, stderr: out.stderr, stdout: out.stdout, code: out.exitCode === 127 ? 'ENOENT' : undefined }
+            const plain = eraseHelperErrorMessage(failed)
+            throw new Error(plain ?? failed.message)
         }
         return parseHiddenPartitions(out.stdout)
     },
@@ -424,6 +455,8 @@ export const eraseDisk = async (
         try {
             hidden = await ops.hiddenTablePartitions(whole)
         } catch (e: any) {
+            const plain = eraseHelperErrorMessage(e)
+            if (plain) throw new Error(plain)
             throw new Error(`Could not check the partition table of /dev/${whole} (${e.message ?? e}), so nothing was erased.`)
         }
         if (hidden.length > 0) throw new Error(hiddenPartitionsMessage(summary.label, whole, hidden))
@@ -631,7 +664,8 @@ export const eraseDisk = async (
                 log(`Erase of ${summary.label} failed after unmounting and ${devicePartition} could not be mounted again: ${re?.message ?? re}`)
             }
         }
-        throw e
+        const plain = eraseHelperErrorMessage(e)
+        throw plain ? new Error(plain) : e
     } finally {
         lockedDevices.delete(whole)
         clearEraseProgress(storeHandle)
