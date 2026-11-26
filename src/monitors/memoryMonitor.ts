@@ -14,6 +14,7 @@
  * calls into Automerge (no save, no getAllChanges), so it allocates nothing in
  * wasm memory itself.
  */
+import os from 'os'
 import { log } from '../utils/utils.js'
 
 /** Once an hour (plus one line at start). */
@@ -74,6 +75,12 @@ export const memorySnapshot = (
     }
 }
 
+/**
+ * engine#581: the [memory] line ends with a WARN when the Engine's RSS reaches this
+ * share of the Pi's RAM (4 GB Pis: ~1.9 GiB), so 4 GB Pis can be watched with one grep.
+ */
+export const MEMORY_WARN_FRACTION = 0.5
+
 const mib = (n: number): string => `${Math.round(n / MIB)}MiB`
 
 /**
@@ -81,9 +88,13 @@ const mib = (n: number): string => `${Math.round(n / MIB)}MiB`
  * `[memory] rss=1706MiB heapUsed=121MiB heapTotal=158MiB external=1480MiB arrayBuffers=3MiB docs=6 ready=6 commandLogs=4 ownCommandLog=yes uptime=8.0h`
  * external minus arrayBuffers is mostly Automerge's wasm memory.
  */
-export const formatMemoryLine = (s: MemorySnapshot, uptimeSec: number): string =>
+export const formatMemoryLine = (s: MemorySnapshot, uptimeSec: number, totalMem?: number, warnFraction: number = MEMORY_WARN_FRACTION): string =>
     `[memory] rss=${mib(s.rss)} heapUsed=${mib(s.heapUsed)} heapTotal=${mib(s.heapTotal)} external=${mib(s.external)} arrayBuffers=${mib(s.arrayBuffers)}` +
-    ` docs=${s.docs} ready=${s.docsReady} commandLogs=${s.commandLogs} ownCommandLog=${s.ownCommandLogLoaded ? 'yes' : 'no'} uptime=${(uptimeSec / 3600).toFixed(1)}h`
+    ` docs=${s.docs} ready=${s.docsReady} commandLogs=${s.commandLogs} ownCommandLog=${s.ownCommandLogLoaded ? 'yes' : 'no'} uptime=${(uptimeSec / 3600).toFixed(1)}h` +
+    (totalMem && totalMem > 0 && s.rss >= warnFraction * totalMem
+        ? ` WARN rss=${Math.round(100 * s.rss / totalMem)}% of RAM (${mib(totalMem)}, threshold ${Math.round(100 * warnFraction)}%)`
+        : '')
+
 
 export interface MemoryMonitorOptions {
     intervalMs?: number
@@ -92,6 +103,9 @@ export interface MemoryMonitorOptions {
     sink?: (line: string) => void
     usage?: () => NodeJS.MemoryUsage
     uptime?: () => number
+    /** Total RAM for the WARN threshold. Default: os.totalmem(). */
+    totalMem?: () => number
+    warnFraction?: number
 }
 
 /** Log one line now and then every intervalMs. Returns a stop function. The timer does not keep the process alive. */
@@ -100,7 +114,7 @@ export const startMemoryMonitor = (repo: HandleCacheView, opts: MemoryMonitorOpt
     const uptime = opts.uptime ?? (() => process.uptime())
     const tick = () => {
         try {
-            sink(formatMemoryLine(memorySnapshot(repo, opts.ownCommandLogId?.() ?? null, opts.usage), uptime()))
+            sink(formatMemoryLine(memorySnapshot(repo, opts.ownCommandLogId?.() ?? null, opts.usage), uptime(), (opts.totalMem ?? (() => os.totalmem()))(), opts.warnFraction))
         } catch (e) {
             sink(`[memory] snapshot failed: ${e instanceof Error ? e.message : e}`)
         }
