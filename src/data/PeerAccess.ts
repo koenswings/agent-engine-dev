@@ -19,10 +19,13 @@
  * 3. Every key change of a peer (added, removed, ssh key or host key changed) is
  *    logged loudly.
  *
- * Trust: anything that can write the store can already make an Engine run
- * commands (engineDB[x].commands), so taking keys from the store opens no new
- * door; the gate limits what a peer key can do (receive into a new folder,
- * ensure-dirs, version, delete only of folders that peer's receive created).
+ * Trust: a key from the store only opens the gate; it does not let a peer write.
+ * Since engine#595 (helper v26) every write through the gate (receive, ensure-dirs,
+ * in-flight markers, app masters, service images) also needs a live transfer
+ * ticket that THIS Engine registered when it accepted that peer's signed grant
+ * (PeerTickets.ts); a restart drops them. Without one the helper refuses before it
+ * writes anything. Ticketless: version, delete of folders that peer's receive
+ * created (the ledger) and clearing that peer's own in-flight marker.
  *
  * Fail closed: when store-url.txt was missing and the Engine wrote back the fleet
  * store URL (StoreIdentity), this Engine does not know it is in the right store:

@@ -494,6 +494,21 @@ describe('POST /api/command and POST /api/auth/grant', () => {
         expect(queue(h)).toEqual([])
     })
 
+    it('engine#595: grantCheck naming a transfer: 200 for a disk docked here (its helper lets the transfer through); a disk not docked here or bad words refused, nothing queued', async () => {
+        h.change(d => { (d.diskDB as any)['disk-self'] = { id: 'disk-self', name: 'self-disk', device: 'sdz9', dockedTo: SELF } })
+        const g = issueGrant(SELF, PEER).grant
+        const ok = await post('/api/command', { command: `${GRANT_CHECK_COMMAND} disk-self new1 kolibri-1.0 - 1`, fromEngineId: PEER }, `Grant ${g}`)
+        expect(ok.status).toBe(200)
+        expect(await ok.json()).toMatchObject({ engineId: SELF, issuerEngineId: SELF, ok: true })
+        const away = await post('/api/command', { command: `${GRANT_CHECK_COMMAND} disk-peer new1 - - 0`, fromEngineId: PEER }, `Grant ${g}`)
+        expect(away.status).toBe(409)
+        expect(await away.json()).toMatchObject({ error: 'TARGET_NOT_DOCKED', issuerEngineId: SELF })
+        const bad = await post('/api/command', { command: `${GRANT_CHECK_COMMAND} disk-self ../x - - 0`, fromEngineId: PEER }, `Grant ${g}`)
+        expect(bad.status).toBe(400)
+        expect(await bad.json()).toMatchObject({ error: 'BAD_REQUEST', issuerEngineId: SELF })
+        expect(queue(h)).toEqual([])
+    })
+
     it('POST /api/auth/grant: a grant for a known Engine; every error carries issuerEngineId', async () => {
         const r = await post('/api/auth/grant', { toEngineId: PEER }, `Bearer ${token}`)
         expect(r.status).toBe(200)

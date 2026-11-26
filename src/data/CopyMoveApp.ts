@@ -36,7 +36,7 @@ import {
     engineCanResume, peerInFlight, markPeerInFlight, clearPeerInFlight, verifyPeerCopyOrThrow,
 } from './InFlight.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
-import { dispatchToPeer, preflightPeerGrant, grantRefusal, PeerGrantRefusal } from './PeerCommands.js'
+import { dispatchToPeer, preflightPeerGrant, grantRefusal, PeerGrantRefusal, ticketRefusal } from './PeerCommands.js'
 import { getEngineAddress, getLiveEngineAddress, getLiveEngineEndpoint } from './Network.js'
 import { peerLiveSeen, PEER_CLOCK_STALE_MS } from './Liveness.js'
 import { serviceImageTarName } from './ImageRef.js'
@@ -297,7 +297,7 @@ peerResumeProbe.reachable = (engineId: string) => probePeerEngineReachable(engin
 export const parkCrossCopyMove = async (
     storeHandle: DocHandle<Store>, opId: string, sourceDiskId: string, targetDiskId: string, targetEngineId: string, e: unknown,
 ): Promise<void> => {
-    const reason = (e as any)?.message ?? String(e)
+    const reason = e instanceof PeerGrantRefusal ? `${e.code}: ${e.message}` : (e as any)?.message ?? String(e)
     const gone = await copyInterruption(storeHandle, [sourceDiskId]) ?? peerInterruption(storeHandle.doc(), targetDiskId, targetEngineId, reason)
     parkResumableOp(storeHandle, opId, gone ? `${gone}: ${reason}` : reason, { interrupted: !!gone })
 }
@@ -442,7 +442,10 @@ export const copyApp = async (
         // engine#582: the target Engine checks this Engine's permission (grant) before
         // anything is stopped, written or registered for it; a stale grant ends the op here
         if (isCrossEngine) {
-            const refusal = grantRefusal(await preflightPeerGrant(storeHandle, String(targetDisk.dockedTo)), 'start')
+            // engine#595: the same check lets this transfer through the target's helper (tickets)
+            const refusal = grantRefusal(await preflightPeerGrant(storeHandle, String(targetDisk.dockedTo), {
+                targetDiskId: String(targetDisk.id), dstId: String(newInstanceId), appId, opId, services: !!instance.serviceImages?.length,
+            }), 'start')
             if (refusal) throw refusal
         }
         if (resumable) {
@@ -762,7 +765,10 @@ export const copyApp = async (
         })
         log(chalk.green(`copyApp: done — new instance ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id})`))
 
-    } catch (e: any) {
+    } catch (caught: any) {
+        // engine#595: the target's helper refused the transfer (no live ticket: that Engine
+        // restarted, or the permission ran out): the same as a refused grant, never a link failure
+        const e: any = (isCrossEngine && !(caught instanceof PeerGrantRefusal) && ticketRefusal(caught, String(targetDisk.dockedTo), 'transfer')) || caught
         // Don't overwrite Cancelled status (set by cancelOperation before SIGTERM completes)
         copyError = e instanceof Error ? e : new Error(String(e))
         const currentStatus = storeHandle.doc()?.operationDB?.[opId]?.status

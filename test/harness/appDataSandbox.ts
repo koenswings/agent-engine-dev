@@ -65,6 +65,13 @@ export interface AppDataSandbox {
     /** /var/lib/docker/volumes: the fake docker reports <volumesDir>/<v>/_data */
     volumesDir: string
     gateScript: string
+    /** v26 (engine#595): the peer ticket folder (stands in for /run/idea-app-data/peer-tickets) */
+    ticketDir: string
+    /** the stand-ins for /proc/uptime and the boot id the helper reads */
+    setUptime: (seconds: number) => Promise<void>
+    setBootId: (id: string) => Promise<void>
+    /** register a peer transfer ticket the way the Engine does (peer-ticket-add); throws on refusal */
+    addTicket: (peer: string, root: string, kind: 'instance' | 'app' | 'services', id?: string, opId?: string, seconds?: number, grantId?: string) => Promise<void>
     run: (args: string[], env?: Record<string, string>) => Promise<RunResult>
     /** the gate as sshd runs it: argv [peerEngineId], SSH_ORIGINAL_COMMAND = cmd */
     runGate: (gateArgs: string[], cmd: string | undefined, env?: Record<string, string>) => Promise<RunResult>
@@ -283,6 +290,14 @@ exit \${FAKE_SYSTEMCTL_EXIT:-0}`)
     setConst('PEER_OWNER', peerOwner)
     setConst('PEER_QUARANTINE_DIR', peerQuarantineDir)
     setConst('LEDGER_DIR', ledgerDir)
+    const ticketDir = path.join(tmp, 'run-idea-app-data', 'peer-tickets')
+    const uptimeFile = path.join(tmp, 'proc-uptime')
+    const bootIdFile = path.join(tmp, 'proc-boot_id')
+    await fs.writeFile(uptimeFile, '1000.25 3000.50\n')
+    await fs.writeFile(bootIdFile, '0b1d2c3e-aaaa-bbbb-cccc-000000000001\n')
+    setConst('TICKET_DIR', ticketDir)
+    setConst('UPTIME_FILE', uptimeFile)
+    setConst('BOOT_ID_FILE', bootIdFile)
     setConst('USAGE_AUTH_DIR', usageAuthDir)
     setConst('USAGE_EXPORT', usageExport)
     setConst('USAGE_EXPORT_SRC', path.resolve('script/build_image_assets/idea-usage-export'))
@@ -380,12 +395,19 @@ SUDO_USER=pi exec ${script} "$@"`)
         await fs.symlink('sessions/s1', path.join(inst, 'data', 'link-inside'))
         return inst
     }
+    const setUptime = async (seconds: number) => { await fs.writeFile(uptimeFile, `${seconds}.10 ${seconds * 3}.00\n`) }
+    const setBootId = async (id: string) => { await fs.writeFile(bootIdFile, `${id}\n`) }
+    const addTicket = async (peer: string, root: string, kind: 'instance' | 'app' | 'services', id = '-', opId = '-', seconds = 600, grantId = 'GrantId0123456789'.slice(0, 16)) => {
+        const r = await run(['peer-ticket-add', peer, root, kind, id, opId, grantId, String(seconds)])
+        if (r.exitCode !== 0) throw new Error(`peer-ticket-add ${peer} ${root} ${kind} ${id}: ${r.stderr}`)
+    }
     const journalText = async () => (await fs.pathExists(journal)) ? fs.readFile(journal, 'utf8') : ''
     return {
         tmp, bin, script, disks, sys, rootsFile, lockDir: path.join(lockParent, 'idea-app-data'), mounts, hosts, journal,
         peerAuthDir, peerAuthFile: path.join(peerAuthDir, 'pi'),
         usageAuthDir, usageAuthFile: path.join(usageAuthDir, 'pi'), usageExport, peerSshdDropin,
         peerKnownHosts, peerOwner, peerQuarantineDir, ledgerDir, gateScript, volumesDir: path.join(tmp, 'volumes'),
+        ticketDir, setUptime, setBootId, addTicket,
         run, runGate, calls, fake, addDisk, addInstance, journalText,
     }
 }

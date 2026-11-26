@@ -77,6 +77,12 @@ describe('idea-app-data ensure-dirs (idea#80)', () => {
 
     it('through the gate: a peer key may run ensure-dirs (and nothing like mkdir)', async () => {
         await sb.addDisk('sdc1')
+        // helper v26 (engine#595): only under a live transfer ticket of that peer for that disk
+        const none = await sb.runGate(['ENGINE_peer2'], 'sudo -n /usr/local/sbin/idea-app-data ensure-dirs sdc1')
+        expect(none.exitCode).toBe(2)
+        expect(none.stderr).toMatch(/GRANT_EXPIRED/)
+        expect(await fs.pathExists(path.join(sb.disks, 'sdc1', 'services'))).toBe(false)
+        await sb.addTicket('ENGINE_peer2', 'sdc1', 'instance', 'new1')
         const ok = await sb.runGate(['ENGINE_peer2'], 'sudo -n /usr/local/sbin/idea-app-data ensure-dirs sdc1')
         expect(ok.exitCode, ok.stderr).toBe(0)
         expect(await fs.pathExists(path.join(sb.disks, 'sdc1', 'services'))).toBe(true)

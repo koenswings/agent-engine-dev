@@ -28,6 +28,7 @@ import type { UpdateProgress, FetchPaused } from './UpdateApp.js'
 const UPDATE_PROGRESS_TYPE = 'idea/updateProgress' as const   // = UpdateApp.UPDATE_PROGRESS_TYPE (no import cycle)
 import type { PeerEngine } from '../utils/rsync.js'
 import { killRegisteredProcess } from './Operations.js'
+import { newTicketId, registerFetchTicket, dropTickets, type TicketResult } from './PeerTickets.js'
 
 export const FETCHING_MARKER = '.idea-fetching'
 export const FETCHED_MARKER = '.idea-fetched'
@@ -67,6 +68,15 @@ export interface FetchTargetDeps {
     newId: () => string
     now: () => number
     timeoutMs: number
+    /**
+     * engine#595 (helper v26): the transfer ticket that lets the source Engine push apps/<newAppId>
+     * here for this request (registered before pushAppBundle, dropped when the fetch ends).
+     * Omitted in tests that do not exercise it.
+     */
+    tickets?: {
+        add: (peer: string, root: string, appId: string, requestId: string, ticketId: string, seconds: number) => Promise<TicketResult>
+        drop: (ticketId: string) => Promise<void>
+    }
 }
 
 export interface FetchRequest {
@@ -115,13 +125,20 @@ export const fetchBundle = async (req: FetchRequest, d: FetchTargetDeps): Promis
         ;(t as any).unref?.()
     })
     const token = await d.rootToken(req.targetDisk)
-    log(`updateApp Fetch: asking Engine ${sourceEngine} to push ${req.newAppId} from ${req.sourceDisk.id} (request ${requestId})`)
-    d.send(sourceEngine as EngineID, `pushAppBundle ${req.sourceDisk.id} ${req.newAppId} ${req.localEngineId} ${token} ${requestId} ${req.instanceId}`)
-    const a = await answer
     const fail = async (why: string): Promise<never> => {
         const aside = await setFetchAside(dir, d.now()).catch(() => null)
         throw new UpdateAppError('TRANSFER_FAILED', `${why}${aside ? `; the partial folder was moved aside to ${aside}` : ''}`)
     }
+    // engine#595: the source may push into apps/<newAppId> only under this request's ticket
+    const ticketId = newTicketId()
+    if (d.tickets) {
+        const t = await d.tickets.add(sourceEngine, token, req.newAppId, requestId, ticketId, Math.ceil(d.timeoutMs / 1000))
+        if (!t.ok) { pending.delete(requestId); return fail(t.error) }
+    }
+    log(`updateApp Fetch: asking Engine ${sourceEngine} to push ${req.newAppId} from ${req.sourceDisk.id} (request ${requestId})`)
+    d.send(sourceEngine as EngineID, `pushAppBundle ${req.sourceDisk.id} ${req.newAppId} ${req.localEngineId} ${token} ${requestId} ${req.instanceId}`)
+    let a: Awaited<typeof answer>
+    try { a = await answer } finally { if (d.tickets) await d.tickets.drop(ticketId).catch(() => undefined) }
     if (!a.ok) return fail(a.why)
     const pushed = await pushedIdeaEntries(dir)
     if (pushed.length) return fail(`the source pushed bundle-root ${pushed.join(', ')}; refused`)
@@ -141,6 +158,7 @@ export const defaultFetchTargetDeps = (storeHandle: DocHandle<Store>, verifySums
     newId: () => uuid(),
     now: () => Date.now(),
     timeoutMs: FETCH_TIMEOUT_MS,
+    tickets: { add: (peer, root, appId, requestId, ticketId, seconds) => registerFetchTicket(peer, root, appId, requestId, ticketId, seconds), drop: (id) => dropTickets(id) },
 })
 
 // ── Source side ─────────────────────────────────────────────────────────────

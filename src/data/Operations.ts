@@ -470,7 +470,34 @@ const stripResumePrefixes = (reason: string): string => {
     }
 }
 
-export type ParkOutcome = 'left' | 'waiting' | 'pending' | 'gaveUp'
+export type ParkOutcome = 'left' | 'waiting' | 'pending' | 'gaveUp' | 'refused'
+
+/**
+ * engine#582 / engine#595: the target Engine no longer accepts this Engine's permission: a
+ * grantCheck refusal (GRANT_EXPIRED / GRANT_INVALID) or its helper's transfer-ticket refusal
+ * ("refused: GRANT_EXPIRED: …", e.g. after that Engine restarted). Never an interruption and
+ * never resumed: a new permission is needed, so the op ends.
+ */
+export const grantRefusalCode = (reason: string): 'GRANT_EXPIRED' | 'GRANT_INVALID' | null => {
+    const r = String(reason ?? '')
+    if (/\bGRANT_INVALID\b/.test(r)) return 'GRANT_INVALID'
+    return /\bGRANT_EXPIRED\b/.test(r) ? 'GRANT_EXPIRED' : null
+}
+
+/**
+ * End a resumable op the target Engine refused (grantRefusalCode): Failed `<code>: <reason>`,
+ * args.errorCode, and the kind's gave-up hook (a move starts its source again). The partial
+ * copy stays on the target under its in-flight marker (deleting it there needs a permission too).
+ */
+export const failRefusedResumableOp = (storeHandle: DocHandle<Store>, id: string, code: string, reason: string): void => {
+    const op = storeHandle.doc()?.operationDB?.[id]
+    if (!op) return
+    const why = stripResumePrefixes(reason).replace(/^(GRANT_EXPIRED|GRANT_INVALID):\s*/, '')
+    setOperationArgs(storeHandle, id, { errorCode: code })
+    updateOperation(storeHandle, id, { status: 'Failed', error: `${code}: ${why}`, completedAt: Date.now() as Timestamp })
+    log(chalk.red(`resume: ${id.slice(0, 8)} ${op.kind}: the target Engine refused this Engine's permission (${code}): ${why}; not resumed`))
+    runGaveUpHook(storeHandle, id)
+}
 
 /**
  * engine#497 stage 3 (c): what a kind does once its op gave up (RESUME_GAVE_UP). moveApp
@@ -502,6 +529,11 @@ export const parkResumableOp = (
     const op = storeHandle.doc()?.operationDB?.[id]
     if (!op || op.status === 'Cancelled' || op.status === 'Done' || engineStopping) return 'left'
     const why = stripResumePrefixes(reason)
+    const refused = grantRefusalCode(why)
+    if (refused) {
+        failRefusedResumableOp(storeHandle, id, refused, why)
+        return 'refused'
+    }
     if (opts.interrupted) {
         updateOperation(storeHandle, id, { status: 'Pending', error: `${RESUME_WAITING}: ${why}`, completedAt: null })
         log(chalk.yellow(`resume: ${id.slice(0, 8)} ${op.kind} interrupted (${why}); it resumes when its disks are docked (not counted)`))
@@ -867,6 +899,14 @@ export const recoverInterruptedOperations = async (
     log(`recoverInterruptedOperations: ${interrupted.length} interrupted operation(s) found`)
 
     for (const op of interrupted) {
+        // engine#595: parked by an earlier run after the target Engine refused this Engine's
+        // permission (it restarted): never resumed, a new permission is needed
+        const refusedCode = isParkedOp(op) ? grantRefusalCode(String(op.error ?? '')) : null
+        if (refusedCode) {
+            dropInterruptedCommand(storeHandle, op)
+            failRefusedResumableOp(storeHandle, op.id, refusedCode, String(op.error ?? ''))
+            continue
+        }
         // idea#79: an interrupted cross-Engine move is never retried and never
         // removes the source; only a recorded verify means the copy is good.
         if (op.kind === 'moveApp' && op.move && !isResumableOp(op)) {

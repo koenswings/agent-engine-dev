@@ -47,11 +47,11 @@ const swap = (sb: AppDataSandbox, dev: string, id: string, paths: string[], env:
     sb.run(['swap-quarantine', dev, id], { FAKE_STDIN: paths.map(p => `${p}\n`).join(''), ...env })
 
 describe('idea-app-data v24: swap-quarantine (engine#506)', () => {
-    it('is version 25, and the Engine needs v24 to quarantine at Swap', async () => {
+    it('is version 26, and the Engine needs v24 to quarantine at Swap', async () => {
         const sb = await sandbox()
-        expect(APP_DATA_HELPER_VERSION).toBe('25')
+        expect(APP_DATA_HELPER_VERSION).toBe('26')
         expect(SWAP_QUARANTINE_HELPER_MIN).toBe(24)
-        expect((await sb.run(['version'])).stdout.trim()).toBe('idea-app-data 25')
+        expect((await sb.run(['version'])).stdout.trim()).toBe('idea-app-data 26')
     })
 
     it('moves each listed file into .idea-quarantine/<id>-swap-dropped-<stamp>/ keeping its relative path; deletes nothing; data/ untouched', async () => {

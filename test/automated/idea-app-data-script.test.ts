@@ -79,7 +79,7 @@ describe('idea-app-data: the source script (idea#168)', () => {
         for (const m of text.matchAll(/^([A-Z_]+)=(\/\S+)$/gm)) {
             if (['PATH', 'DISKS_DIR', 'ROOTS_FILE', 'LOCK_DIR', 'ROOT_HOME', 'HELPER_PATH',
                 'PEER_KEY', 'PEER_KNOWN_HOSTS', 'PEER_AUTH_DIR', 'PEER_OWNER', 'PEER_QUARANTINE_DIR', 'PEER_GATE', 'LEDGER_DIR', 'VOLUMES_DIR',
-                'USAGE_AUTH_DIR', 'USAGE_EXPORT', 'USAGE_EXPORT_CMD', 'USAGE_EXPORT_SRC', 'PEER_SSHD_DROPIN'].includes(m[1])) continue
+                'USAGE_AUTH_DIR', 'USAGE_EXPORT', 'USAGE_EXPORT_CMD', 'USAGE_EXPORT_SRC', 'PEER_SSHD_DROPIN', 'TICKET_DIR', 'UPTIME_FILE', 'BOOT_ID_FILE'].includes(m[1])) continue
             expect(m[2], m[1]).toMatch(/^\/usr\/(s?bin)\/[a-z0-9.]+$/)
         }
     })
@@ -1773,10 +1773,10 @@ describe('idea-app-data v14: snapshot excludes in estimate and snapshot (idea#39
     }
     const lockFile = (dev: string, id: string) => path.join(sb.lockDir, `inst.${dev}.${id}.lock`)
 
-    it('helper and Engine speak v25 (v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine; v20 the engine#497 in-flight marker; v21 the engine#503 kolibri-rebind; v23 the engine#497 (a) cross-Engine resume verbs; v24 the engine#506 swap-quarantine)', async () => {
-        expect(APP_DATA_HELPER_VERSION).toBe('25')
+    it('helper and Engine speak v26 (v26 the engine#595 peer transfer tickets; v15 peer-file guards, v16 archive-mode suffix and v17 clean-verify unchanged; v18 adds the engine#469 temp-backup verbs; v19 adds the engine#468 replaced-folder quarantine; v20 the engine#497 in-flight marker; v21 the engine#503 kolibri-rebind; v23 the engine#497 (a) cross-Engine resume verbs; v24 the engine#506 swap-quarantine)', async () => {
+        expect(APP_DATA_HELPER_VERSION).toBe('26')
         const r = await sb.run(['version'])
-        expect(r.stdout.trim()).toBe('idea-app-data 25')
+        expect(r.stdout.trim()).toBe('idea-app-data 26')
     })
 
     it('estimate: the two-argument call is unchanged; with excludes the folder kb is net of them, still one line', async () => {

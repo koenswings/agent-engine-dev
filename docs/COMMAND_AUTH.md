@@ -272,6 +272,7 @@ the Engine user sign with `script/cli-queue-entry.ts` (`src cli`).
 | `Bearer <token>` | `{ command, confirmId?, confirmText?, grants?: { <engineId>: <grant> } }` | `202 { engineId, seq }` |
 | `Grant <grant>` (another Engine) | `{ command, fromEngineId, replyGrant? }` | `202 { engineId, seq }` |
 | `Grant <grant>` (another Engine) | `{ command: "grantCheck", fromEngineId }` | `200 { engineId, issuerEngineId, ok: true }`, nothing queued |
+| `Grant <grant>` (another Engine) | `{ command: "grantCheck <targetDiskId> <dstId> <appId\|-> <opId\|-> <0\|1>", fromEngineId }` (engine#595) | `200 { engineId, issuerEngineId, ok: true, tickets? }`, nothing queued; B's helper lets that transfer through (see below). `409 TARGET_NOT_DOCKED`, `400 BAD_REQUEST`, `503 TRANSFER_PERMISSION_FAILED` |
 
 Errors: `413 PAYLOAD_TOO_LARGE` (before the token), `400 BAD_REQUEST` (not one line of text),
 `503 STORE_NOT_READY` (the Engine has not loaded its store yet; try again), `401` token codes, `422 COMMAND_REFUSED`
@@ -331,8 +332,36 @@ The Console asks B for a new grant and starts again. A later follow-up refused b
 example `cleanupMoveTarget` after B restarted mid-move) is traced the same way; a refused
 cleanup is reported at once (`targetCleanup: failed`) instead of after the cleanup timeout.
 
-The ssh data path (B's `idea-peer-gate`) is authorised by the Engine keys (`PeerAccess.ts`),
-not by grants; the preflight makes sure A uses it only after B accepted the grant.
+### Transfer tickets: the ssh data path follows the grant (engine#595, helper v26)
+
+The ssh data path (B's `idea-peer-gate`) is opened by the Engine keys (`PeerAccess.ts`). Since
+helper v26 a WRITE through it also needs a live transfer ticket on B, and only B's Engine
+registers tickets, when it accepts a grant:
+
+- `copyApp` / `moveApp`: A's first `grantCheck` names the transfer (target disk, new instance
+  id, app, op, whether service images follow). B checks that the disk is docked to B, takes
+  the root token from its own store (never from A), and registers tickets for
+  `instances/<dstId>`, `apps/<appId>` and `services/` for as long as the grant still has
+  (`grantRemainingMs`, at most 6 h). A resumed copy registers them again under the same op.
+- updateApp Fetch: B (the Engine that fetches) registers a ticket for `apps/<newAppId>` with
+  the request id as op before it sends `pushAppBundle`, and drops it when the answer is in.
+
+Tickets live in a root-only tmpfs list (`/run/idea-app-data/peer-tickets`), expire on the
+helper's monotonic clock (`/proc/uptime` plus the boot id) and are dropped when B's Engine
+starts (`peer-tickets-reset`, with `peerAccess` on). So when B restarts, A loses both the grant
+check and the data path: a write after that is refused by B's helper with exit 2 and
+`refused: GRANT_EXPIRED: …` before it creates a folder, marker or ledger line. Deleting a copy
+B's ledger says A made, and clearing A's own in-flight marker, need no ticket.
+
+On A, that refusal is the same as a refused grant check: `PeerCommands.ticketRefusal` turns it
+into `GRANT_EXPIRED` (`step: transfer`), never a link interruption (`InFlight.isPeerLinkFailure`
+is false for it), so the op never parks `RESUME_WAITING`:
+
+- a copy is `Failed` `GRANT_EXPIRED: Engine B refused the transfer: …` (`args.errorCode`);
+- a move whose target was marked ends `Failed` `GRANT_EXPIRED: …` (move code `RESUME_GAVE_UP`)
+  and its source starts again if it ran; the partial copy stays on B under its marker;
+- at Engine start, an op an earlier run parked with such a refusal is ended the same way
+  (`recoverInterruptedOperations`), and never resumed.
 
 A B on an earlier engine#582 build (no `grantCheck`) answers `422 COMMAND_REFUSED`
 `not-a-follow-up` after a good grant check; A counts that as accepted. An Engine without
@@ -354,6 +383,11 @@ B's `GET /api/auth/info` reports B's engine id. Connect timeout 3 s → `ENGINE_
 | Peer answers `404` on `/api/auth/info` | `ENGINE_VERSION_MISMATCH` |
 | Copy or move after B restarted | Refused by B at the `grantCheck`, before anything runs: `GRANT_EXPIRED` with `issuerEngineId: B`; start the operation again |
 | Follow-up after B restarted mid-operation | `GRANT_EXPIRED` with `issuerEngineId: B` on the follow-up trace |
+| Transfer after B restarted mid-copy (helper v26 on B) | B's helper refuses the write (`refused: GRANT_EXPIRED`); A ends the op `GRANT_EXPIRED` (not parked); the partial stays on B under its marker |
+| A before engine#582 (no `grantCheck`, e.g. adfd9d3) → B with helper v26 | B's helper refuses A's first remote step (`ensure-dirs`) with exit 2 and one line `refused: GRANT_EXPIRED: … too old to ask for one and must be updated first`; A's copy ends `Failed` with that text, nothing written on either Engine. Update A |
+| Which Engines need tickets | B advertises capability `peerTickets1` (in `Engine.capabilities` with `capabilitiesBootedAt`, and in `GET /api/auth/info`) when its own helper is v26 or later, checked once at startup, never fatal. With `capabilitiesBootedAt === lastBooted`, writes into B need engine#595 on the sender |
+| A with engine#595 → B with helper below v26 | B registers no tickets (`HELPER_OUTDATED` skipped) and its gate needs none: works as before |
+| A with engine#582 but not engine#595 → B with helper v26 | A's `grantCheck` names no transfer, so B registers no ticket and its helper refuses the transfer (`GRANT_EXPIRED`). Update A |
 
 ## Relay: /api/engines/<id>/… (step 4)
 

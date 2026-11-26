@@ -112,12 +112,33 @@ export const grantRefusal = (r: DispatchResult, step: string): PeerGrantRefusal 
     : new PeerGrantRefusal(r.code ?? 'GRANT_EXPIRED', r.message ?? `Engine ${r.issuerEngineId} did not accept this Engine's permission.`, r.issuerEngineId, step)
 
 /**
+ * engine#595: what a copy or move is about to write on the issuer. With it, the grantCheck also
+ * asks the issuer to let this Engine's transfer through its helper (transfer tickets, helper v26)
+ * for as long as the grant lives: `grantCheck <targetDiskId> <dstId> <appId|-> <opId|-> <0|1>`.
+ * An issuer without engine#595 ignores the words (its helper needs no ticket).
+ */
+export interface GrantCheckTransfer { targetDiskId: string, dstId: string, appId?: string | null, opId?: string | null, services: boolean }
+
+export const grantCheckCommand = (t?: GrantCheckTransfer): string => t
+    ? `${GRANT_CHECK_COMMAND} ${t.targetDiskId} ${t.dstId} ${t.appId || '-'} ${t.opId || '-'} ${t.services ? 1 : 0}`
+    : GRANT_CHECK_COMMAND
+
+/**
+ * engine#595: the peer helper refused a transfer for want of a ticket ("refused: GRANT_EXPIRED: …",
+ * e.g. the issuer restarted after the grantCheck). The same refusal as a failed preflight, or null.
+ */
+export const ticketRefusal = (e: unknown, issuerEngineId: string, step: string): PeerGrantRefusal | null => {
+    const m = /refused: GRANT_EXPIRED: ([^\n]*)/.exec(String((e as any)?.message ?? e ?? ''))
+    return m ? new PeerGrantRefusal('GRANT_EXPIRED', `Engine ${issuerEngineId} refused the transfer: ${m[1].trim()}`, issuerEngineId, step) : null
+}
+
+/**
  * Ask Engine `engineId` (the issuer) whether it still accepts the grant this Engine holds
  * from it. Read-only on both sides: B checks the grant and answers 200 without queueing.
  * A B on an earlier engine#582 build (no grantCheck) answers 422 not-a-follow-up AFTER a
  * good grant check; that counts as accepted. Never throws; a refusal is traced.
  */
-export const preflightPeerGrant = async (storeHandle: DocHandle<Store>, engineId: string): Promise<DispatchResult> => {
+export const preflightPeerGrant = async (storeHandle: DocHandle<Store>, engineId: string, transfer?: GrantCheckTransfer): Promise<DispatchResult> => {
     const self = String(localEngineId)
     if (engineId === self) return { ok: true, issuerEngineId: self }
     const store = storeHandle.doc()
@@ -132,7 +153,7 @@ export const preflightPeerGrant = async (storeHandle: DocHandle<Store>, engineId
         } else {
             try {
                 const res = await peerJson(store, engineId, 'POST', '/api/command',
-                    { command: GRANT_CHECK_COMMAND, fromEngineId: self }, { Authorization: `Grant ${grant}` }, PEER_COMMAND_TIMEOUT_MS)
+                    { command: grantCheckCommand(transfer), fromEngineId: self }, { Authorization: `Grant ${grant}` }, PEER_COMMAND_TIMEOUT_MS)
                 if (res.status === 200 && res.json?.ok === true) r = { ok: true, issuerEngineId: engineId }
                 else if (res.status === 422 && res.json?.reason === 'not-a-follow-up') r = { ok: true, issuerEngineId: engineId }
                 else {

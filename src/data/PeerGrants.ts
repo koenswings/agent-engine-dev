@@ -104,3 +104,12 @@ export const forgetGrant = (issuer: string): void => { received.delete(issuer) }
 
 /** Tests only. */
 export const clearGrantsForTests = (): void => { issued.clear(); received.clear() }
+
+/**
+ * engine#595: milliseconds a grant this Engine issued still has, or 0 when it is unknown or
+ * expired. Transfer tickets (PeerTickets.ts) never outlive their grant.
+ */
+export const grantRemainingMs = (grantId: string, now: number = monoNow()): number => {
+    const g = issued.get(grantId)
+    return g && g.expiresAt > now ? g.expiresAt - now : 0
+}
