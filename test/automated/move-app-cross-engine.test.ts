@@ -20,6 +20,7 @@ import { recoverInterruptedOperations, setOperationArgs, peerResumeProbe } from 
 import { CROSS_ENGINE_RESUME_CAPABILITY } from '../../src/data/InFlight.js'
 import { RemoveError } from '../../src/data/RemoveInstance.js'
 import { commandLogText } from '../../src/data/CommandLogStore.js'
+import { PeerGrantRefusal } from '../../src/data/PeerCommands.js'
 
 const SRC = String(localEngineId)
 const TGT = 'ENGINE_idea04' as EngineID
@@ -106,6 +107,7 @@ const twoEngines = (h: DocHandle<Store>, o: { targetStatus?: string, targetBytes
             void verifyMoveTarget(sh, opId, id, bytes, running, { localEngineId: async () => String(TGT), targetBytes: async () => o.targetBytes ?? BYTES, timeoutMs: 50, pollMs: 5 })
         },
         requestCleanup: requestCleanup as any,
+        preflight: async (_sh, engineId) => ({ ok: true, issuerEngineId: String(engineId) }),
         startSource: startSource as any,
         removeSource: removeSource as any,
         verifyTimeoutMs: 300,
@@ -977,5 +979,52 @@ describe('Copying idea/progress byte updates (engine#387)', () => {
         expect(seen[3]).toEqual({ bytesDone: 10_000, bytesTotal: 10_000 })
         expect(seen[4]).toEqual({ bytesDone: 10_000, bytesTotal: 10_000 })
     })
+
 })
 
+describe('moveApp across Engines: grant preflight (engine#582)', () => {
+    afterEach(() => { resetPortReadyProgressForTests() })
+    peerResumeProbe.address = (id: string) => id === String(TGT) ? '10.0.0.4' : undefined
+    it('engine#582: a stale grant refuses the move before anything starts: no op, no copy, source untouched; code and issuerEngineId on the error', async () => {
+        const h = makeStore()
+        const { deps, removeSource, requestCleanup, requestStart, startSource } = twoEngines(h)
+        const copy = vi.fn(deps.copy!)
+        const requestVerify = vi.fn(deps.requestVerify!)
+        const preflight = vi.fn(async () => ({ ok: false, code: 'GRANT_EXPIRED', message: 'This permission expired (or this Engine restarted). Start again.', issuerEngineId: String(TGT) }))
+        const err = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', { ...deps, copy, requestVerify, preflight }).then(() => null, e => e)
+        expect(err).toBeInstanceOf(PeerGrantRefusal)
+        expect(err).toMatchObject({ code: 'GRANT_EXPIRED', traceResult: { code: 'GRANT_EXPIRED', issuerEngineId: String(TGT), dispatchedTo: String(TGT), step: 'start' } })
+        expect(preflight).toHaveBeenCalledWith(h, String(TGT))
+        expect(Object.keys(h.doc().operationDB)).toEqual([])
+        expect(copy).not.toHaveBeenCalled()
+        expect(requestVerify).not.toHaveBeenCalled()
+        expect(requestCleanup).not.toHaveBeenCalled()
+        expect(requestStart).not.toHaveBeenCalled()
+        expect(removeSource).not.toHaveBeenCalled()
+        expect(startSource).not.toHaveBeenCalled()
+        expect(h.doc().instanceDB[INST]).toMatchObject({ status: 'Running', storedOn: SRC_DISK })
+    })
+
+    it('engine#582: a good grant: the move asks once at the start, then runs as before', async () => {
+        const h = makeStore()
+        const { deps } = twoEngines(h)
+        const preflight = vi.fn(async (_sh: any, id: string) => ({ ok: true, issuerEngineId: String(id) }))
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', { ...deps, preflight })
+        expect(r.code).toBe('MOVED')
+        expect(preflight).toHaveBeenCalledTimes(1)
+    })
+
+    it('engine#582: the target refuses the cleanup request (stale grant, it restarted): targetCleanup failed at once, without waiting for the timeout', async () => {
+        const h = makeStore()
+        const { deps, stopAndQuarantine } = twoEngines(h, { duringVerify: sh => sh.change(d => { const i = (d.instanceDB as any)[INST]; i.status = 'Running'; i.lastStarted = 999 }) })
+        const requestCleanup = vi.fn(async () => ({ ok: false, code: 'GRANT_EXPIRED', message: 'expired', issuerEngineId: String(TGT) }))
+        const started = Date.now()
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', { ...deps, requestCleanup: requestCleanup as any, cleanupTimeoutMs: 5_000 })
+        expect(Date.now() - started).toBeLessThan(4_000)
+        expect(r.code).toBe('SOURCE_CHANGED')
+        expect(requestCleanup).toHaveBeenCalledTimes(1)
+        expect(stopAndQuarantine).not.toHaveBeenCalled()
+        expect(theOp(h).move).toMatchObject({ targetCleanup: 'failed' })
+        expect(String(theOp(h).move.targetCleanupDetail)).toMatch(/did not accept this Engine's permission \(GRANT_EXPIRED\)/)
+    })
+})

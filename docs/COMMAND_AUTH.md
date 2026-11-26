@@ -271,6 +271,7 @@ the Engine user sign with `script/cli-queue-entry.ts` (`src cli`).
 |---|---|---|
 | `Bearer <token>` | `{ command, confirmId?, confirmText?, grants?: { <engineId>: <grant> } }` | `202 { engineId, seq }` |
 | `Grant <grant>` (another Engine) | `{ command, fromEngineId, replyGrant? }` | `202 { engineId, seq }` |
+| `Grant <grant>` (another Engine) | `{ command: "grantCheck", fromEngineId }` | `200 { engineId, issuerEngineId, ok: true }`, nothing queued |
 
 Errors: `413 PAYLOAD_TOO_LARGE` (before the token), `400 BAD_REQUEST` (not one line of text),
 `503 STORE_NOT_READY` (the Engine has not loaded its store yet; try again), `401` token codes, `422 COMMAND_REFUSED`
@@ -305,14 +306,37 @@ A keeps one trace per follow-up it sent: `ok` with B's seq, or `error` with the 
 `issuerEngineId` in the result. Grant errors from B always name B as `issuerEngineId`;
 errors from `/api/auth/grant` also carry it.
 
-**A grant is checked by B, at the follow-up.** A only checks that a grant names B as issuer
-and A as receiver; it cannot tell whether B still knows it. A grant that went stale (6 h
-passed, or B restarted) is therefore accepted by A (`202`), and the operation starts. When A
-sends the follow-up, B answers `403 GRANT_EXPIRED`; A drops the grant and the follow-up's
-trace on A is `status: error`, `errorCode: GRANT_EXPIRED`, with `issuerEngineId: B` and
-`dispatchedTo: B` in its result. The operation then fails at that step like any other
-follow-up error; the Console asks B for a new grant and starts again. This is intended: the
-grant check happens where the grant was issued.
+**B checks the grant before anything happens for B.** A only checks that a grant names B
+as issuer and A as receiver; it cannot tell whether B still knows it, so a stale grant (6 h
+passed, or B restarted) is still accepted by A: `202` means only "queued". Before a
+cross-Engine copy or move stops, writes or registers anything, A asks B with
+`grantCheck` (`PeerCommands.preflightPeerGrant`; read-only on both Engines):
+
+- `copyApp`: first thing in the operation (before the resume step, the source stop, the
+  directories, the in-flight marker and any rsync), and again just before the copy is
+  registered for B's disk (B may have restarted during the copy).
+- `moveApp`: before the move operation is created.
+
+When B answers `403 GRANT_EXPIRED` (or `GRANT_INVALID`), A drops the grant and:
+
+- the copy operation is `Failed` with `error: GRANT_EXPIRED: …` and `args.errorCode` /
+  `args.issuerEngineId`; a move is refused with no operation;
+- the command trace is `status: error`, `errorCode: GRANT_EXPIRED`, with `issuerEngineId: B`,
+  `dispatchedTo: B` and `step` (`start` or `register`) in its result; a `grantCheck` trace
+  records the refused check;
+- nothing ran for B. After a refusal at `register`, the copied folder stays on B under its
+  in-flight marker (deleting it would also need B's permission) and is never registered.
+
+The Console asks B for a new grant and starts again. A later follow-up refused by B (for
+example `cleanupMoveTarget` after B restarted mid-move) is traced the same way; a refused
+cleanup is reported at once (`targetCleanup: failed`) instead of after the cleanup timeout.
+
+The ssh data path (B's `idea-peer-gate`) is authorised by the Engine keys (`PeerAccess.ts`),
+not by grants; the preflight makes sure A uses it only after B accepted the grant.
+
+A B on an earlier engine#582 build (no `grantCheck`) answers `422 COMMAND_REFUSED`
+`not-a-follow-up` after a good grant check; A counts that as accepted. An Engine without
+`signedCommands1` is never asked (`ENGINE_VERSION_MISMATCH`, no request).
 
 Peer addresses come from B's `engineDB` row (`lanAddress`, `lanAddresses`, then
 `<hostname>.local`; private ranges only) on `httpPort`. Before the first request A checks
@@ -328,7 +352,8 @@ B's `GET /api/auth/info` reports B's engine id. Connect timeout 3 s → `ENGINE_
 | Older Console writes a command into the store queue of a new Engine | Refused `COMMAND_UNSIGNED` (trace + audit), never run |
 | New Engine needs a follow-up on an Engine without `signedCommands1` | Refused before anything starts: `409 ENGINE_VERSION_MISMATCH { engineId, version }` |
 | Peer answers `404` on `/api/auth/info` | `ENGINE_VERSION_MISMATCH` |
-| Follow-up after B restarted | `GRANT_EXPIRED` with `issuerEngineId: B`; start the operation again |
+| Copy or move after B restarted | Refused by B at the `grantCheck`, before anything runs: `GRANT_EXPIRED` with `issuerEngineId: B`; start the operation again |
+| Follow-up after B restarted mid-operation | `GRANT_EXPIRED` with `issuerEngineId: B` on the follow-up trace |
 
 ## Relay: /api/engines/<id>/… (step 4)
 

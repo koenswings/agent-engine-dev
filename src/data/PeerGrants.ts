@@ -69,6 +69,12 @@ export const checkGrant = (grant: unknown, self: string, from: string, now: numb
     return p
 }
 
+/**
+ * A read-only grant check (engine#582): another Engine asks "do you still know this grant?"
+ * before it stops, writes or registers anything for this Engine. Never queued.
+ */
+export const GRANT_CHECK_COMMAND = 'grantCheck'
+
 /** Is `command` one a peer may queue with a grant? */
 export const isPeerFollowUp = (command: string): boolean => PEER_FOLLOW_UP_COMMANDS.includes(String(command).trim().split(/\s+/)[0])
 
