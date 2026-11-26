@@ -9,6 +9,7 @@
  * --scenario cover-registered-intents → Pixel-registered + infra walk (walks/cover-registered-intents.yaml); live --ui demo
  * --scenario cover-all-skip-copy → SHAKE-OUT variant of cover-all (no copy_app / open_copied_instance);
  *   reported shakeOut:true + notCovered (cover-all numbering). NOT a cover-all attempt.
+ * --scenario mixed-fleet-copy-refusal → Atlas-only old→new refusal proof (requires DURATION_MIXED_FLEET_PROOF=1).
  * Deprecated aliases (minimal, stress, school-day, …) resolve to unified — not separate graphs.
  * --live: RealFleetOps over Tailscale/SSH (requires --hosts or DURATION_FLEET_HOSTS).
  * --ui: PlaywrightUiDriver → Pixel e2e/intents (DURATION_CONSOLE_URL / idea01 :8080).
@@ -43,6 +44,7 @@ import { DEFAULT_PREFLIGHT_TIMEOUT_MS } from './realFleetOps.js'
 import { EXIT_STORE_PREFLIGHT, formatStoreMismatch, runStorePreflight } from './storePreflight.js'
 import { EXIT_SLOT_PREFLIGHT } from './slotLayout.js'
 import { describeStage2Windows, EXIT_STAGE2_PREFLIGHT, resolveDurationStage, stage2Preflight, stage2HomeOf, stage2SummaryFields, STAGE2_FIXTURES, STAGE2_GAP_SHORT } from './stage2.js'
+import { assertMixedFleetWalkAllowed } from './peerTicketsHarness.js'
 import { resolveStage2StoreFixMode, runStage2StoreFix } from './stage2StoreFix.js'
 import { Stage2FleetOps } from './stage2FleetOps.js'
 import { EXIT_FIXTURE_PREFLIGHT, fixtureDiskPreflight } from './fixtureDisks.js'
@@ -71,6 +73,7 @@ const usage = () => {
   --scenario <name>     Markov: random|unified (default) → scenarios/unified.yaml
                         Walk:   cover-all → walks/cover-all.yaml (strict full graph)
                         Walk:   cover-registered-intents → walks/cover-registered-intents.yaml (registered-intents walk; alias cover-hardpass)
+                        Walk:   mixed-fleet-copy-refusal → old→new copy refusal (DURATION_MIXED_FLEET_PROOF=1, Atlas only)
                         Walk:   cover-all-skip-copy → SHAKE-OUT variant of cover-all (skips copy_app @43/@116,
                                 open_copied_instance @117); duration_done says shakeOut:true + notCovered
                         Walk:   kolibri-*-smoke / nextcloud-*-smoke / wikipedia-smoke → short Prefer A smokes
@@ -290,6 +293,13 @@ const main = async () => {
 
     const walkMode = isWalkScenario(args.scenario)
     const walk = walkMode ? loadWalk(args.scenario) : null
+    if (walk) {
+        try { assertMixedFleetWalkAllowed(walk.name) }
+        catch (e) {
+            console.error(e instanceof Error ? e.message : String(e))
+            process.exit(2)
+        }
+    }
     // idea#168: shake-out variants (walk file has shake_out:) are labelled everywhere.
     const shakeOut = shakeOutSummary(walk)
     const scenario = walk ? walk.scenario : loadScenario(args.scenario)
