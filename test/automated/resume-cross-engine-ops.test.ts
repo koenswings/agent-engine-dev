@@ -48,6 +48,8 @@ vi.mock('../../src/data/PeerCommands.js', async (importOriginal) => {
             sh.change((d: any) => { d.engineDB[engineId].commands.push(command) })
             return { ok: true, seq: 1, issuerEngineId: engineId }
         }),
+        // engine#582: the target accepts this Engine's grant unless a test says otherwise
+        preflightPeerGrant: vi.fn(async (_sh: any, engineId: string) => ({ ok: true, issuerEngineId: engineId })),
     }
 })
 
@@ -151,6 +153,7 @@ const wire = (h: DocHandle<Store>) => {
             })
         },
         requestCleanup: vi.fn() as any,
+        preflight: async (_sh, engineId) => ({ ok: true, issuerEngineId: String(engineId) }),
         clearTargetMarker: clearTargetMarker as any,
         startSource: startSource as any,
         removeSource: removeSource as any,
