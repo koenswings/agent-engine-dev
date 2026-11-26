@@ -12,7 +12,6 @@ settings:
 defaults:
   user: pi
   machine: raspberrypi.local
-  password: raspberry
   engine: 127.0.0.1
   network: appnet
   language: en_ZW.UTF-8
