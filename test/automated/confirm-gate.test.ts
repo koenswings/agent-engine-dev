@@ -112,11 +112,11 @@ describe('prepareConfirm: strict checks and summaries', () => {
 
     it('flashCard: present card with the shown size → sizeBytes confirmation', async () => {
         const deps = {
-            findCard: async (_h: any, id: string) => id === 'c1' ? { candidateId: 'c1', sizeBytes: 32000, model: 'SD', refusal: null } as any : null,
+            findCard: async (_h: any, id: string) => id === 'c1' ? { candidateId: 'c1', sizeBytes: 32000, model: 'SD', refusal: null, contents: { kind: 'idea-client', imageName: 'idea-client-2026.10.img', version: '2026.10' } } as any : null,
             resolveImage: async (_h: any, v: string) => { if (v !== 'current') throw new Error(`Unknown client image '${v}'`); return { version: '2026.11' } },
         }
         const p = await prepareConfirm(h, 'flashCard c1 current 32000', deps)
-        expect(p).toMatchObject({ confirmField: 'sizeBytes', expected: '32000', summary: { version: '2026.11', sizeBytes: 32000 } })
+        expect(p).toMatchObject({ confirmField: 'sizeBytes', expected: '32000', summary: { version: '2026.11', sizeBytes: 32000, contents: { kind: 'idea-client', imageName: 'idea-client-2026.10.img', version: '2026.10' } } })
         await expect(prepareConfirm(h, 'flashCard c2 current 32000', deps)).rejects.toThrow(/not present/)
         await expect(prepareConfirm(h, 'flashCard c1 current 31999', deps)).rejects.toThrow(/Card size/)
         await expect(prepareConfirm(h, 'flashCard c1 9.9 32000', deps)).rejects.toThrow(/Unknown client image/)

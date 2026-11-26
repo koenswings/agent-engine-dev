@@ -172,7 +172,11 @@ export const prepareConfirm = async (
         // confirmText is the card size in bytes as a decimal string (the Console echoes
         // summary.sizeBytes once the operator confirms the Engine-built summary)
         return {
-            summary: { command: 'flashCard', candidateId, sizeBytes: card.sizeBytes, model: card.model, version: image.version },
+            summary: {
+                command: 'flashCard', candidateId, sizeBytes: card.sizeBytes, model: card.model, version: image.version,
+                // what is on the card now (the same classification as Engine.clientCards[].contents)
+                contents: card.contents ? JSON.parse(JSON.stringify(card.contents)) : { kind: 'unknown' },
+            },
             confirmField: 'sizeBytes',
             expected: String(card.sizeBytes),
         }

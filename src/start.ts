@@ -14,6 +14,7 @@ import { takeStartupFailure, publishStartupFailure } from './data/StartupFailure
 import { StoreSelfHeal, publishStoreSelfHeal } from './data/StoreHealth.js'
 import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkCrossEngineResumeCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
+import { syncEngineAuth, watchStoreAccounts } from './data/EngineAuth.js'
 import { enableHttpMonitor } from './monitors/httpMonitor.js'
 import { enableIdeaLocalPublisher, IdeaLocalPublisher } from './monitors/ideaLocal.js'
 import { DocumentId, Repo } from '@automerge/automerge-repo'
@@ -174,6 +175,8 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
         onStoreMapsArrived: () => storeMapsArrived.handler(),
     })
     storeMapsArrived.handler = () => {
+        // engine#582: the one-time account import waits for the store maps
+        try { syncEngineAuth(storeHandle) } catch (e) { log(`[auth] account import after peer sync failed: ${e}`) }
         createOrUpdateEngine(storeHandle, localEngineId)
             .then(() => { if (storeSelfHeal.value) publishStoreSelfHeal(storeHandle, String(localEngineId), { ...storeSelfHeal.value, reason: `${storeSelfHeal.value.reason}; maps arrived by peer sync at ${new Date().toISOString()}` }) })
             .catch(e => log(`[store-health] writing this Engine's entry after peer sync failed: ${e}`))
@@ -193,6 +196,10 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await storeHandle.whenReady()
     await import('./data/DemoApps.js').then(m => m.refreshDemoHb(storeHandle, String(localEngineId))).catch(e => log(`demo hb: ${e}`))
     const store = storeHandle.doc()
+
+    // engine#582: Engine-local operator accounts (one-time import from the store), setup code
+    try { syncEngineAuth(storeHandle) } catch (e) { log(`[auth] sign-in setup failed: ${e}`) }
+    watchStoreAccounts(storeHandle)
 
     // Remove any phantom engine entries and orphan disks that accumulated
     // from previous boots (e.g. before the sudo-hdparm fix). Runs before any
@@ -253,7 +260,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     // Start the HTTP server (serves Console UI + /api/store-url)
     log(chalk.bgMagenta('STARTING HTTP SERVER'))
     // idea#203: http://idea.local (port 80) must reach this Engine's Console even when httpPort is not 80
-    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle, config.settings.ideaLocalHttpPort ?? 80, { engineId: String(localEngineId) })
+    const httpServer = enableHttpMonitor(undefined, undefined, commandLogHandle, config.settings.ideaLocalHttpPort ?? 80, { engineId: String(localEngineId), auth: { engineId: String(localEngineId), storeHandle } })
     live.httpServer = httpServer
 
     // Start the instances monitor (engine#428: heal late PORT_NOT_READY starts)

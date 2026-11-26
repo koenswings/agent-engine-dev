@@ -10,7 +10,7 @@ Design record: [engine#582](https://github.com/koenswings/agent-engine-dev/issue
 | Step | What | State |
 |---|---|---|
 | 1 | CORS and store WebSocket Origin check for own Console origins, second confirmation gate (module), `createInstance` local-only, git account pin, command source on traces, local audit log | this page |
-| 2 | Engine-local operator accounts, setup code, challenge sign-in, sessions | later |
+| 2 | Engine-local operator accounts, setup code, challenge sign-in, sessions, rate limits, `/api/auth/*`, `idea-engine-auth` CLI | this page |
 | 3 | Command key, signed queue entries, `POST /api/command`, peer grants, mixed-version refusal | later |
 | 4 | `/api/engines/<id>/…` relay | later |
 | 5 | Firewall script for Ops | later |
@@ -23,7 +23,8 @@ it. Created 0700 on first use; files in it are 0600. It is never synced, never p
 disk backup or a kit image, and must never be copied between Pis. In `testMode`, without a
 setting or env, it is a per-process folder under the OS temp dir.
 
-Step 1 writes only `command-audit.log` there.
+Files: `command-audit.log` (step 1); `operators.json`, `auth-secret`, `setup-code.txt`
+while setup is open (step 2).
 
 ## CORS: own Console origins only
 
@@ -68,7 +69,10 @@ from outside this Pi; `summariseDisk` and other read-only commands need no confi
     Summary `{ command, targetId, label, sizeBytes, device, apps: ["<name> <version>"] }`.
     Confirm field `label`; the confirm text is the label exactly as in the summary.
   - `flashCard`: the card is present here with no refusal and the size shown; the version
-    is a known client image. Summary `{ command, candidateId, sizeBytes, model, version }`.
+    is a known client image. Summary `{ command, candidateId, sizeBytes, model, version, contents }`,
+    where `contents` is what is on the card now, as in `Engine.clientCards[].contents`
+    (`{ kind: 'idea-client', imageName, version }`, `raspios`, `ubuntu`, `empty`, `{ kind: 'other', summary }`, `unknown`).
+    This summary is the single flash confirmation.
     Confirm field `sizeBytes`; the confirm text is the size in bytes as a decimal string.
 - `issueConfirm` returns `{ confirmId, summary, confirmField, expiresInMs: 60000 }`.
 - `checkConfirm` accepts a confirmation once: same session, same command text, confirm text
@@ -112,3 +116,113 @@ same source and a stable `errorCode` where there is one.
 `{ t, engineId, seq, command, args, source, result: ok|error|refused, errorCode }`. Args are
 redacted like the command log. It rotates at 10 MB and keeps 5 older files
 (`command-audit.log.1` … `.5`). A write failure is logged once and never fails the command.
+
+## Engine-local operator accounts (step 2)
+
+`src/data/Operators.ts`. `<authFolder>/operators.json` (0600, atomic writes):
+
+```json
+{ "version": 1, "importedFromStore": { "at": 1795600000000, "count": 2 },
+  "operators": [{ "id": "user-…", "username": "admin", "passwordHash": "$2b$10$…", "role": "operator", "created": 1795600000000 }] }
+```
+
+- **One-time import.** The Engine imports the store `userDB` entries with a well-formed
+  bcrypt hash (`$2a$`/`$2b$`/`$2y$`, any cost; the cost is kept until the next password
+  change) once, recorded in `importedFromStore`. Later `userDB` changes are never imported.
+  The log shows the count and the usernames, never hashes. The store `userDB` itself is
+  not changed.
+  - **Merge rule.** When operators.json already has operators (setup or the CLI ran before
+    the store synced), this Engine's accounts win: a store account with a username that
+    already exists here is skipped; the others are added.
+  - **Waiting for the store.** When the store maps have not arrived yet (a fresh store
+    waiting for peer sync), the import waits for them; setup stays open meanwhile.
+  - **No userDB.** A loaded store without `userDB` (made from `store-template.json`) has
+    nothing to import: the log says so and the Engine stops waiting
+    (`importedFromStore.none`). If a `userDB` arrives later by peer sync, it is imported
+    once by the same rule.
+- New hashes (setup, add operator, password change) must be bcrypt cost 10–12; the
+  Console makes them at cost 10.
+- Usernames are 1–64 characters without control characters; across Engines the Console
+  matches operators by username. The last operator cannot be removed (`409 LAST_OPERATOR`).
+
+## Setup code (step 2)
+
+`src/data/SetupCode.ts`. With no operators, the Engine makes a code of 8 Crockford base32
+characters, `XXXX-XXXX`, shown in the Engine log at start and every 10 minutes, on the Pi
+console (`/dev/tty1`, best effort, not in testMode) and in `<authFolder>/setup-code.txt`.
+`POST /api/auth/setup` with the code creates the first operator and signs in. Single use;
+expires after 24 h of Engine uptime; a restart makes a new code; after 5 wrong codes setup
+is locked for 15 minutes (`429 LOGIN_RATE_LIMITED`). Each Engine has its own code.
+
+Ops can skip setup on the Pi with the local CLI (run as the Engine user, `pi`):
+
+```
+node dist/script/idea-engine-auth.js set-password <username>   # asks twice, no echo; or one line on stdin
+node dist/script/idea-engine-auth.js list
+```
+
+It hashes with bcrypt cost 10 and writes only the hash. Run on an Engine that never ran
+this build, it creates `operators.json` and so skips the one-time store import.
+
+## Challenge sign-in (step 2)
+
+`src/data/LoginChallenge.ts`. The password never leaves the browser.
+
+1. `POST /api/auth/challenge { username }` → `{ challengeId, salt, nonce, expiresInMs: 60000 }`.
+   `salt` is the 29-character salt prefix of the operator's hash. An unknown username gets
+   a stable fake salt in the same `$2b$` format, with the cost of the newest operator hash
+   (HMAC of the username with `<authFolder>/auth-secret`).
+2. The Console computes `h = bcrypt(password, salt)` and
+   `proof = hex(HMAC-SHA256(key = utf8(h), "idea-login-v1|" + engineId + "|" + challengeId + "|" + nonce))`.
+3. `POST /api/auth/login { challengeId, username, proof }`: the Engine recomputes it with the
+   stored hash and compares in constant time. A challenge is used up by the first try.
+
+Reference vector (unit test): password `idea-test`, salt `$2b$10$abcdefghijklmnopqrstuu` →
+`h = $2b$10$abcdefghijklmnopqrstuuTz0XgmRlzyslBgX7qxsZ1WQYR9WyyzG`; engineId `eng-test`,
+challengeId `ch1`, nonce `n1` → proof `cd1abc0204f9362e41dfe9733db7e9206385588aece117f80ab3e6ea2e94d538`.
+
+## Sessions and rate limits (step 2)
+
+`src/data/Sessions.ts`: 32 random bytes as a Bearer token; the Engine keeps only its
+SHA-256, in memory (a restart signs everyone out). 15 minutes idle, renewed by every
+accepted call and `POST /api/auth/renew`; hard cap 8 hours; at most 32 sessions (least
+recently used dropped). Monotonic clock. Removing an operator or changing a password ends
+that operator's other sessions.
+
+`src/data/LoginRateLimit.ts`, failed proofs only: per client address 5 in 5 minutes →
+locked 60 s, doubling per further lock to 15 minutes, cleared by a success; per username 20
+in 15 minutes from any client → that username locked 15 minutes; globally 30 per minute.
+Answer `429 LOGIN_RATE_LIMITED` with `Retry-After` and `retryAfterSeconds`. The client
+address is the socket address; step 4 adds the address vouched for by a relaying Engine.
+
+## HTTP API (step 2)
+
+`src/monitors/authApi.ts`. JSON bodies up to 16 KB; answers carry `Cache-Control: no-store`
+and the CORS rule above. Errors are `{ error, message, … }`.
+
+| Route | Auth | Body | Answer |
+|---|---|---|---|
+| `GET /api/auth/info` | none | | `200 { engineId, engineName, version, authVersion: 1, setupRequired, capabilities }` |
+| `POST /api/auth/setup` | none | `{ setupCode, username, passwordHash }` | `201 { token, expiresInMs, operator: { id, username } }`; `403 SETUP_CODE_INVALID`, `409 SETUP_DONE` |
+| `POST /api/auth/challenge` | none | `{ username }` | `200 { challengeId, salt, nonce, expiresInMs }`; `403 SETUP_REQUIRED` |
+| `POST /api/auth/login` | none | `{ challengeId, username, proof }` | `200 { token, expiresInMs, operator }`; `401 LOGIN_FAILED`, `429` |
+| `POST /api/auth/renew` | Bearer | `{}` | `200 { expiresInMs }` |
+| `POST /api/auth/logout` | Bearer | `{}` | `204` |
+| `POST /api/auth/password` | Bearer | `{ challengeId, proof, newPasswordHash }` | `204`; `401 LOGIN_FAILED` |
+| `GET /api/auth/operators` | Bearer | | `200 { operators: [{ id, username, created }] }` |
+| `POST /api/auth/operators` | Bearer | `{ username, passwordHash }` | `201 { operator: { id, username, created } }`; `409 OPERATOR_EXISTS` |
+| `DELETE /api/auth/operators/<id>` | Bearer | | `204`; `404 OPERATOR_UNKNOWN`, `409 LAST_OPERATOR` |
+
+Tokens: no `Authorization` header → `401 AUTH_REQUIRED`; a malformed or unknown token →
+`401 TOKEN_INVALID`; a known session past its expiry → `401 TOKEN_EXPIRED` (once; after
+that the token is unknown, `TOKEN_INVALID`). A body over 16 KB → `413 PAYLOAD_TOO_LARGE`; the
+size is checked before the token, so this holds with or without a (valid) token.
+An unknown `/api/*` route → `404 { error: "NOT_FOUND", message }`. An older Engine
+answers `404` on `/api/auth/info`. Sign-in events go to `command-audit.log` as
+`auth:<event>` lines (username, client address; never hashes, proofs or tokens).
+
+`engineName` is the Engine's `engineDB` hostname; `version` its `engineDB` version.
+
+**Capability `engineSignIn1`.** Step 2 advertises it so a Console can use sign-in before
+commands move to `POST /api/command` (`signedCommands1`, step 3). In step 2 commands still
+go through the store queue as before; nothing about them changes.
