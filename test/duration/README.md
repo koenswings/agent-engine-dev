@@ -99,6 +99,7 @@ across filesystems). The harness never downloads, builds or deletes a staged tar
 - `cover-all` → **deterministic walk** (`walks/cover-all.yaml`) covering every graph action once — strict full-graph regression (under `--ui`, Pixel-missing still **failLoud** abort; live retry requires Console@`6e359bd` or newer)
 - `cover-registered-intents` (chat: **registered-intents walk**; alias `cover-hardpass`) → **deterministic walk** (`walks/cover-registered-intents.yaml`) covering the current Pixel-registered demo subset + Engine infra FleetOps — **live `--ui` demo now** (coaching Intents are registered but walk expansion is deferred; excludes DEFERRED + PIXEL_MISSING)
 - `kolibri-learn-smoke` / `kolibri-teacher-preview-smoke` → short Prefer A walks to `finish_exercise` (6 / 7 steps; skips coaching 3–7)
+- `mixed-fleet-copy-refusal` → Atlas-only old→new copy refusal (requires `DURATION_MIXED_FLEET_PROOF=1`). idea01 stays on pre-ticket code; idea03 is on helper v26 / PR6. The walk's `copy_app` is judged by `verifyOldToNewCopyRefusal`, not `verifyCopyOperation`. Never run this env on cover-all, cover-registered-intents, or Markov.
 - `--start-from <N|action>` (walks only): slice from 1-based step or first matching action; seeds `walker.current` to that step's `from`. With `--iterations`, start-from applies first then remaining are truncated.
 - Do **not** invent alternate Markov graphs
 
@@ -118,6 +119,16 @@ Canonical Fake pool: **idea01 + idea03 + idea04** (never idea02). Live `--hosts`
 | **Live UI (preferred; Console@`cdcfdb1`)** | `--live --ui --start-instances --hosts idea01=…,idea03=…,idea04=… --console-url http://idea01:8080` |
 | Path A start instances | `--start-instances` → RealFleetOps `startInstances:true` + preserve dock on return |
 | Record walk (real PNGs) | add `--record-walk /tmp/dur-walk` (pair with `--ui`) |
+
+## v26↔v26 copy pairs (engine#595 / PR #599)
+
+When **at least one** pool Engine advertises live `peerTickets1` (`capabilities` includes `peerTickets1` **and** `capabilitiesBootedAt === lastBooted`; a missing stamp does not count), `copy_app` in `predictCopyMovePair` accepts only pairs where **both** Engines count. The harness pins `DURATION_COPY_INSTANCE_ID` / `_SOURCE_DISK` / `_TARGET_DISK` before the preflight and the Intent so the Console follows. An operator override must still pass the filter; if no legal pair exists the step fails loud (no fallback). On main, with no Engine advertising the cap, the filter is inactive and default Kolibri→Nextcloud behaviour is unchanged.
+
+All-v26 pool (the normal Stage 2 walk after the kit candidate is deployed): the default pair stays Kolibri on idea01 → Nextcloud on idea03; `@102` / registered `@74` still move that copy onto `duration-empty-001` on idea03.
+
+Mixed pool (idea01 old, idea03/idea04 v26): that default pair is illegal. There is no Stage 2-safe remapping that leaves the Files/Backup/Erase/move-only disks empty, so cover-all / cover-registered-intents fail loud. Use `mixed-fleet-copy-refusal` with `DURATION_MIXED_FLEET_PROOF=1` for the idea01→idea03 refusal proof (Atlas sets the env; the walker refuses to start this walk without it).
+
+`move_app` is not filtered (same-Pi move does not use transfer tickets).
 
 ## Run (no Pis — FakeFleetOps)
 
