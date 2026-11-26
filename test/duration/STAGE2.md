@@ -235,3 +235,9 @@ disk on timeout. It runs at three points:
   cancel_eject 107, notice_usb_dock 55, confirm_erase 105.
 
 It only reads the store. No user action is retried.
+
+## v26↔v26 copy pairs and the mixed-fleet proof
+
+After the kit candidate (Engine PR6 / helper v26) is on every pool Pi, cover-all `@43` / `@116` and cover-registered-intents `@30` / `@90` keep the default Kolibri (idea01) → Nextcloud (idea03) pair: both Engines advertise live `peerTickets1`, and `@102` / `@74` still move that copy onto empty-001 on idea03.
+
+idea01 stays on old code only for the mixed-fleet proof. Do **not** run cover-all on that mixed pool: the default pair is illegal and no remapping leaves the Files / Backup / Erase / move-only disks empty. Atlas sets `DURATION_MIXED_FLEET_PROOF=1` and runs `--scenario mixed-fleet-copy-refusal` (Kolibri on idea01 → Nextcloud on idea03 must end Failed on the source, with nothing written on idea03).

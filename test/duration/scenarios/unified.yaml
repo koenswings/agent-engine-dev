@@ -357,6 +357,8 @@ states:
       - to: op_instance
         weight: 18
         action: open_instance_controls
+      # copy_app: when any pool Engine has live peerTickets1, the walker only
+      # draws / accepts v26↔v26 pairs (see test/duration/peerTicketsHarness.ts).
       - to: op_copy_move
         weight: 5
         action: copy_app
@@ -407,6 +409,7 @@ states:
       - to: op_instance
         weight: 6
         action: rename_instance
+      # copy_app: same v26↔v26 filter as the op_disk edge when peerTickets1 is live.
       - to: op_copy_move
         weight: 10
         action: copy_app

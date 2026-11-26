@@ -5,6 +5,15 @@
 
 import { describe, it, expect } from 'vitest'
 import { FakeFleetOps, dispatchAction, addFilesAppDiskId, ensureAppOnlyDiskOnConsoleEngine, redockEmpty002AfterErase, redockEmpty002BeforeSecondInstall, redockEmpty001BeforeMakeFiles, resolveConsoleEngineHost, filesDiskTargetId, preflightFilesDiskTarget, syncKolibriSidecarUrlForEngine, syncNextcloudSidecarUrlForEngine, resyncFixtureSidecarUrlsFromStore, locateInstanceEngine, verifyRestoreOperation, SIDECAR_SETTLE_ACTIONS, verifyBackupOperation, verifyCopyOperation, diagnoseBackupTrace, traceArgTokens, ensureBackupDiskForInstance, backupYamlLastBackup, predictCopyMovePair, preflightCopyMoveSamePi, resolveRebootTarget, verifyRebootEngine, REBOOT_CONFIRM_DEFAULT_MS, nextcloudLoginFormLooksReady, nextcloudInitialState, nextcloudReadyTimeoutMs, waitNextcloudSidecarReadyForEngine, fixtureSetHasNextcloud } from '../duration/actions.js'
+
+import {
+    assertMixedFleetWalkAllowed,
+    engineHasLivePeerTickets,
+    MIXED_FLEET_COPY_REFUSAL_WALK,
+    MIXED_FLEET_PROOF_ENV,
+    PEER_TICKETS_CAPABILITY,
+    verifyOldToNewCopyRefusal,
+} from '../duration/peerTicketsHarness.js'
 import { semanticStoresEqual, waitForConvergence } from '../duration/convergence.js'
 import { evaluateInvariants, DEFAULT_INFRA_INVARIANTS, listInvariantTypes } from '../duration/invariants.js'
 import {
@@ -3825,5 +3834,295 @@ describe('idea#168 run summary: shake-out labelling + keep_editing recovery coun
         expect(c.snapshot()).toEqual({ total: 3, failed: 0, byKind: { reopen_files: 1, reconnect: 1, reload: 1 } })
         expect(written.join('')).toContain('"kind":"reopen_files"')
         expect(written).toHaveLength(5)
+    })
+})
+
+describe('v26↔v26 copy pair filter + mixed-fleet refusal (engine#595 / PR #599)', () => {
+    const POOL = ['idea01', 'idea03', 'idea04']
+    const KOLIBRI = 'duration-kolibri-grade5a-001'
+    const NC = 'duration-nextcloud-grade5a-001'
+    const EMPTY = 'duration-empty-001'
+    const INST = 'kolibri-grade5a-001'
+    const NC_INST = 'nextcloud-grade5a-001'
+    const ENV_KEYS = [
+        'DURATION_COPY_TARGET_DISK', 'DURATION_COPY_SOURCE_DISK', 'DURATION_COPY_INSTANCE_ID',
+        MIXED_FLEET_PROOF_ENV, 'DURATION_STAGE',
+    ] as const
+    const withEnv = async (vars: Partial<Record<(typeof ENV_KEYS)[number], string>>, fn: () => Promise<void>) => {
+        const prev: Record<string, string | undefined> = {}
+        for (const k of ENV_KEYS) {
+            prev[k] = process.env[k]
+            if (vars[k] === undefined) delete process.env[k]
+            else process.env[k] = vars[k]
+        }
+        try { await fn() } finally {
+            for (const k of ENV_KEYS) {
+                if (prev[k] === undefined) delete process.env[k]
+                else process.env[k] = prev[k]
+            }
+        }
+    }
+    const ctxFor = (ops: unknown, action = 'copy_app') => ({
+        opts: { ops, rng: () => 0, settleTimeoutMs: 500, fast: true, stubUi: true },
+        walker: { current: 'op_instance', layer: 'operator' as const, dockedEngine: 'idea01', step: 43 },
+        from: 'op_instance',
+        to: 'op_copy_move',
+        action,
+        excludeEngines: ['idea02'],
+        poolEngines: POOL,
+        fixtureDisk: KOLIBRI,
+        fixtureInstance: INST,
+        fixtureDisks: [KOLIBRI, NC, EMPTY],
+        fixtureInstances: { ...KID_FIXTURES },
+    })
+    const liveCap = (boot = 100): { capabilities: string[]; capabilitiesBootedAt: number; lastBooted: number } => ({
+        capabilities: [PEER_TICKETS_CAPABILITY],
+        capabilitiesBootedAt: boot,
+        lastBooted: boot,
+    })
+    /** Stage 2 READY layout at walk start: Kolibri@idea01, Nextcloud+empty-001@idea03, empty-002/003@idea04. */
+    const stage2StartFleet = async (caps: { idea01?: boolean | 'stale'; idea03?: boolean | 'stale'; idea04?: boolean | 'stale' }) => {
+        const ops = fakeOps({
+            poolEngines: POOL,
+            excludeEngines: ['idea02'],
+            storeMode: 'shared',
+            fixtureInstances: { ...KID_FIXTURES },
+        })
+        await ops.dockFixture('idea01', KOLIBRI)
+        await ops.dockFixture('idea01', 'duration-add-files-001')
+        await ops.dockFixture('idea03', NC)
+        await ops.dockFixture('idea03', EMPTY)
+        await ops.dockFixture('idea04', 'duration-empty-002')
+        await ops.dockFixture('idea04', 'duration-empty-003')
+        const apply = (id: string, how: boolean | 'stale' | undefined) => {
+            if (how === true) ops.setEngineCaps(id, liveCap(100))
+            else if (how === 'stale') ops.setEngineCaps(id, { capabilities: [PEER_TICKETS_CAPABILITY], capabilitiesBootedAt: 50, lastBooted: 100 })
+            else if (how === false) ops.setEngineCaps(id, { capabilities: ['diskIdArgs'], capabilitiesBootedAt: 100, lastBooted: 100 })
+        }
+        apply('idea01', caps.idea01)
+        apply('idea03', caps.idea03)
+        apply('idea04', caps.idea04)
+        return ops
+    }
+
+    it('live-cap helper: both cap and matching boot stamp required; missing stamp is not live', () => {
+        expect(engineHasLivePeerTickets(undefined)).toBe(false)
+        expect(engineHasLivePeerTickets({ id: 'idea03' })).toBe(false)
+        expect(engineHasLivePeerTickets({ id: 'idea03', capabilities: [PEER_TICKETS_CAPABILITY] })).toBe(false)
+        expect(engineHasLivePeerTickets({ id: 'idea03', capabilities: [PEER_TICKETS_CAPABILITY], lastBooted: 10 })).toBe(false)
+        expect(engineHasLivePeerTickets({ id: 'idea03', capabilities: [PEER_TICKETS_CAPABILITY], capabilitiesBootedAt: 10 })).toBe(false)
+        expect(engineHasLivePeerTickets({ id: 'idea03', capabilities: ['diskIdArgs'], capabilitiesBootedAt: 10, lastBooted: 10 })).toBe(false)
+        expect(engineHasLivePeerTickets({ id: 'idea03', capabilities: [PEER_TICKETS_CAPABILITY], capabilitiesBootedAt: 10, lastBooted: 11 })).toBe(false)
+        expect(engineHasLivePeerTickets({ id: 'idea03', capabilities: [PEER_TICKETS_CAPABILITY], capabilitiesBootedAt: 10, lastBooted: 10 })).toBe(true)
+    })
+
+    it('filter inactive on main: no live peerTickets1 keeps the default Kolibri→Nextcloud pair', async () => {
+        await withEnv({}, async () => {
+            const ops = await stage2StartFleet({})
+            const pair = await predictCopyMovePair(ctxFor(ops) as any, { instanceId: INST, diskId: KOLIBRI })
+            expect(pair).toMatchObject({
+                instanceId: INST,
+                sourceDiskId: KOLIBRI,
+                sourceEngine: 'idea01',
+                targetDiskId: NC,
+                targetEngine: 'idea03',
+            })
+        })
+    })
+
+    it('a stale boot or a missing cap is rejected; a both-live pair is accepted', async () => {
+        await withEnv({}, async () => {
+            const stale = await stage2StartFleet({ idea01: 'stale', idea03: 'stale', idea04: 'stale' })
+            // no Engine is live → filter still inactive, default pair stands
+            const inactive = await predictCopyMovePair(ctxFor(stale) as any, { instanceId: INST, diskId: KOLIBRI })
+            expect(inactive).toMatchObject({ sourceEngine: 'idea01', targetEngine: 'idea03', targetDiskId: NC })
+
+            const allLive = await stage2StartFleet({ idea01: true, idea03: true, idea04: true })
+            const ok = await predictCopyMovePair(ctxFor(allLive) as any, { instanceId: INST, diskId: KOLIBRI })
+            expect(ok).toMatchObject({
+                instanceId: INST,
+                sourceDiskId: KOLIBRI,
+                sourceEngine: 'idea01',
+                targetDiskId: NC,
+                targetEngine: 'idea03',
+            })
+        })
+    })
+
+    it('all-v26 Stage 2 start layout keeps Kolibri@idea01 → Nextcloud@idea03 (move target empty-001 stays free)', async () => {
+        await withEnv({}, async () => {
+            const ops = await stage2StartFleet({ idea01: true, idea03: true, idea04: true })
+            Object.assign(ops, { stage: 2 })
+            const pair = await predictCopyMovePair(ctxFor(ops) as any, { instanceId: INST, diskId: KOLIBRI })
+            expect(pair).toMatchObject({
+                instanceId: INST, sourceEngine: 'idea01', sourceDiskId: KOLIBRI,
+                targetEngine: 'idea03', targetDiskId: NC,
+            })
+        })
+    })
+
+    it('mixed idea01+idea03 pair is rejected and a legal pair is picked', async () => {
+        await withEnv({}, async () => {
+            const ops = await stage2StartFleet({ idea01: false, idea03: true, idea04: true })
+            const pair = await predictCopyMovePair(ctxFor(ops) as any, { instanceId: INST, diskId: KOLIBRI })
+            expect(pair.sourceEngine).not.toBe('idea01')
+            expect(pair.sourceEngine).toBeTruthy()
+            expect(pair.targetEngine).toBeTruthy()
+            expect(pair.sourceEngine === 'idea03' || pair.sourceEngine === 'idea04').toBe(true)
+            expect(pair.targetEngine === 'idea03' || pair.targetEngine === 'idea04').toBe(true)
+            // Natural pick: Nextcloud on idea03 → empty-001 on idea03
+            expect(pair).toMatchObject({
+                instanceId: NC_INST,
+                sourceDiskId: NC,
+                sourceEngine: 'idea03',
+                targetDiskId: EMPTY,
+                targetEngine: 'idea03',
+            })
+        })
+    })
+
+    it('Stage 2 mixed pool fails loud (no remapping onto role / move-only disks)', async () => {
+        await withEnv({}, async () => {
+            const ops = await stage2StartFleet({ idea01: false, idea03: true, idea04: true })
+            Object.assign(ops, { stage: 2 })
+            await expect(predictCopyMovePair(ctxFor(ops) as any, { instanceId: INST, diskId: KOLIBRI }))
+                .rejects.toThrow(/no legal v26↔v26 pair that preserves Stage 2 role disks/)
+        })
+    })
+
+    it('no legal pair fails loud; an illegal operator override is not remapped', async () => {
+        await withEnv({}, async () => {
+            const ops = fakeOps({ poolEngines: POOL, excludeEngines: ['idea02'], storeMode: 'shared' })
+            await ops.dockFixture('idea01', KOLIBRI)
+            await ops.dockFixture('idea03', NC)
+            ops.setEngineCaps('idea01', { capabilities: ['diskIdArgs'], capabilitiesBootedAt: 1, lastBooted: 1 })
+            ops.setEngineCaps('idea03', liveCap(1))
+            await expect(predictCopyMovePair(ctxFor(ops) as any, { instanceId: INST, diskId: KOLIBRI }))
+                .rejects.toThrow(/no legal v26↔v26 pair/)
+        })
+        await withEnv({
+            DURATION_COPY_INSTANCE_ID: INST,
+            DURATION_COPY_SOURCE_DISK: KOLIBRI,
+            DURATION_COPY_TARGET_DISK: NC,
+        }, async () => {
+            const ops = await stage2StartFleet({ idea01: false, idea03: true, idea04: true })
+            await expect(predictCopyMovePair(ctxFor(ops) as any, { instanceId: INST, diskId: KOLIBRI }))
+                .rejects.toThrow(/operator DURATION_COPY_\* override pair.*must still pass the filter/)
+        })
+    })
+
+    it('move_app is not filtered (same-Pi move does not use transfer tickets)', async () => {
+        await withEnv({}, async () => {
+            const ops = await stage2StartFleet({ idea01: false, idea03: true, idea04: true })
+            const pair = await predictCopyMovePair(ctxFor(ops, 'move_app') as any, { instanceId: INST, diskId: KOLIBRI })
+            expect(pair).toMatchObject({ sourceEngine: 'idea01', targetEngine: 'idea03', targetDiskId: NC })
+        })
+    })
+
+    it('mixed-fleet-copy-refusal walk loads and refuses to run without DURATION_MIXED_FLEET_PROOF=1', async () => {
+        const walk = loadWalk(MIXED_FLEET_COPY_REFUSAL_WALK)
+        expect(walk.name).toBe(MIXED_FLEET_COPY_REFUSAL_WALK)
+        expect(walk.steps.map(s => s.action)).toEqual([
+            'open_console_as_operator', 'sign_in', 'open_disk_inventory', 'open_instance_controls', 'copy_app',
+        ])
+        expect(isWalkScenario(MIXED_FLEET_COPY_REFUSAL_WALK)).toBe(true)
+        await withEnv({}, async () => {
+            expect(() => assertMixedFleetWalkAllowed(walk.name)).toThrow(/requires DURATION_MIXED_FLEET_PROOF=1/)
+            const ops = fakeOps({ poolEngines: [...DEFAULT_POOL], excludeEngines: ['idea02'], storeMode: 'shared', settleDelayMs: 0 })
+            await expect(runDeterministicWalk(walk, { fast: true, ops, stubUi: true, skipStability: true }))
+                .rejects.toThrow(/requires DURATION_MIXED_FLEET_PROOF=1/)
+        })
+    })
+
+    it('cover-all / cover-registered-intents copy step numbers are unchanged', () => {
+        expect(loadWalk('cover-all').steps.map((s, i) => s.action === 'copy_app' ? i + 1 : 0).filter(Boolean)).toEqual([43, 116])
+        expect(loadWalk('cover-registered-intents').steps.map((s, i) => s.action === 'copy_app' ? i + 1 : 0).filter(Boolean)).toEqual([30, 90])
+        expect(loadWalk('cover-all').steps.map((s, i) => s.action === 'move_app' ? i + 1 : 0).filter(Boolean)).toEqual([102])
+        expect(loadWalk('cover-registered-intents').steps.map((s, i) => s.action === 'move_app' ? i + 1 : 0).filter(Boolean)).toEqual([74])
+    })
+
+    it('Fake mixed-fleet refusal walk completes when the env is set (verifier skipped without listOperations)', async () => {
+        await withEnv({ [MIXED_FLEET_PROOF_ENV]: '1' }, async () => {
+            const walk = loadWalk(MIXED_FLEET_COPY_REFUSAL_WALK)
+            const ops = fakeOps({ poolEngines: [...DEFAULT_POOL], excludeEngines: ['idea02'], storeMode: 'shared', settleDelayMs: 0 })
+            const result = await runDeterministicWalk(walk, { fast: true, ops, stubUi: true, skipStability: true })
+            expect(result.failures, result.logs.map(l => l.message).join(' | ')).toBe(0)
+            expect(result.aborted).toBe(false)
+            expect(result.steps).toBe(5)
+        })
+    })
+
+    describe('verifyOldToNewCopyRefusal', () => {
+        const baseline = { instanceIds: new Set([INST, NC_INST]), diskEntries: [NC_INST] }
+        const since = 1_000
+        const ctxOf = (ops: object) => ({
+            opts: { ops, fast: true },
+            poolEngines: POOL,
+            excludeEngines: ['idea02'],
+        }) as any
+        const failedRow = {
+            id: 'op1', kind: 'copyApp', status: 'Failed', startedAt: since,
+            completedAt: since + 10,
+            error: 'refused: GRANT_EXPIRED: Engine idea01 is too old to ask for one and must be updated first. Nothing was written; start the operation again from the Console',
+            args: { instanceId: INST, targetDiskId: NC },
+        }
+        const expectPair = {
+            sourceEngine: 'idea01',
+            targetEngine: 'idea03',
+            instanceId: INST,
+            targetDiskId: NC,
+            baseline,
+        }
+
+        it('passes on Failed plus the substring and an empty target', async () => {
+            const r = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async (eng: string) => eng === 'idea01' ? [failedRow] : [],
+                readStore: async () => ({ engineId: 'x', instanceDB: { [INST]: { id: INST, status: 'Running', diskId: KOLIBRI }, [NC_INST]: { id: NC_INST, status: 'Running', diskId: NC } }, diskDB: {}, engineDB: {} }),
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST] })
+            expect(r).toMatchObject({ ok: true, reason: 'ok' })
+            expect(r?.note).toMatch(/too old/)
+        })
+
+        it('fails on Done, the wrong error, a new folder, or a marker', async () => {
+            const done = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async (eng: string) => eng === 'idea01' ? [{ ...failedRow, status: 'Done', error: null }] : [],
+                readStore: async () => ({ engineId: 'x', instanceDB: {}, diskDB: {}, engineDB: {} }),
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST] })
+            expect(done).toMatchObject({ ok: false, reason: 'not_failed' })
+
+            const wrong = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async (eng: string) => eng === 'idea01' ? [{ ...failedRow, error: 'rsync exited with code 23' }] : [],
+                readStore: async () => ({ engineId: 'x', instanceDB: { [INST]: { id: INST, status: 'Running', diskId: KOLIBRI }, [NC_INST]: { id: NC_INST, status: 'Running', diskId: NC } }, diskDB: {}, engineDB: {} }),
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST] })
+            expect(wrong).toMatchObject({ ok: false, reason: 'wrong_error' })
+
+            const folder = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async (eng: string) => eng === 'idea01' ? [failedRow] : [],
+                readStore: async () => ({ engineId: 'x', instanceDB: { [INST]: { id: INST, status: 'Running', diskId: KOLIBRI }, [NC_INST]: { id: NC_INST, status: 'Running', diskId: NC } }, diskDB: {}, engineDB: {} }),
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST, 'kolibri-copy-xyz'] })
+            expect(folder).toMatchObject({ ok: false, reason: 'target_folder' })
+
+            const marker = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async (eng: string) => eng === 'idea01' ? [failedRow] : [],
+                readStore: async () => ({ engineId: 'x', instanceDB: { [INST]: { id: INST, status: 'Running', diskId: KOLIBRI }, [NC_INST]: { id: NC_INST, status: 'Running', diskId: NC } }, diskDB: {}, engineDB: {} }),
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST, 'kolibri-copy-xyz.idea-op-in-flight'] })
+            expect(marker).toMatchObject({ ok: false, reason: 'target_marker' })
+        })
+
+        it('fails on a new instanceDB row or a target-side op; returns null without listOperations', async () => {
+            const inst = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async (eng: string) => eng === 'idea01' ? [failedRow] : [],
+                readStore: async () => ({ engineId: 'x', instanceDB: { [INST]: { id: INST, status: 'Running', diskId: KOLIBRI }, [NC_INST]: { id: NC_INST, status: 'Running', diskId: NC }, 'new-copy': { id: 'new-copy', status: 'Starting', diskId: NC } }, diskDB: {}, engineDB: {} }),
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST] })
+            expect(inst).toMatchObject({ ok: false, reason: 'target_instance' })
+
+            const tgt = await verifyOldToNewCopyRefusal(ctxOf({
+                listOperations: async (eng: string) => eng === 'idea01' ? [failedRow] : [{ id: 't1', kind: 'copyApp', status: 'Failed', startedAt: since, error: 'x', args: {} }],
+                readStore: async () => ({ engineId: 'x', instanceDB: { [INST]: { id: INST, status: 'Running', diskId: KOLIBRI }, [NC_INST]: { id: NC_INST, status: 'Running', diskId: NC } }, diskDB: {}, engineDB: {} }),
+            }), since, { ...expectPair, diskEntriesAfter: [NC_INST] })
+            expect(tgt).toMatchObject({ ok: false, reason: 'target_op' })
+
+            expect(await verifyOldToNewCopyRefusal(ctxOf({ readStore: async () => ({ engineId: 'x', instanceDB: {}, diskDB: {}, engineDB: {} }) }), since, { ...expectPair, diskEntriesAfter: [] })).toBeNull()
+        })
     })
 })

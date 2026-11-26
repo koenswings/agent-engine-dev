@@ -655,6 +655,14 @@ export class Stage2FleetOps extends RealFleetOps {
         return { dest: m.dest, entries: String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean) }
     }
 
+    override async listDiskInstanceEntries(engineId: string, diskId: string): Promise<string[]> {
+        const m = await this.stage2MountOf(engineId, diskId)
+        if (!m) throw new Error(`Stage2FleetOps.listDiskInstanceEntries: ${diskId} is not mounted on ${engineId}`)
+        const dest = `${m.dest}/instances`
+        const out = await this.sshRead(this.s2host(engineId), `if [ -d '${dest}' ]; then ls -1A '${dest}'; fi`)
+        return String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean)
+    }
+
     /**
      * Per-Pi HTTP identity (READY §4.2): the port a sidecar check uses must belong to THIS
      * instance's container on THIS Pi. idea04 also answers :18080 (native kolibri-0.15.5), so a bare
