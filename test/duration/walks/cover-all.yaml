@@ -133,6 +133,10 @@ steps:
   - from: op_disk
     to: op_instance
     action: open_instance_controls
+  # @43 copy_app: when any pool Engine advertises live peerTickets1, the harness
+  # picks only a v26↔v26 pair (default all-v26: Kolibri@idea01 → Nextcloud@idea03).
+  # A mixed pool (idea01 old) has no Stage 2-safe legal pair — fail loud and use
+  # mixed-fleet-copy-refusal + DURATION_MIXED_FLEET_PROOF=1 instead.
   - from: op_instance
     to: op_copy_move
     action: copy_app
@@ -358,6 +362,8 @@ steps:
   - from: op_install
     to: op_instance
     action: start_after_install
+  # @116 copy_app: same v26↔v26 filter as @43 (inactive on main until a pool Engine
+  # advertises live peerTickets1).
   - from: op_instance
     to: op_copy_move
     action: copy_app

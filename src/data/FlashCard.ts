@@ -184,6 +184,22 @@ export interface FlashResult {
 // ── flashCard ────────────────────────────────────────────────────────────────
 
 /**
+ * engine#582: the client card `candidateId` as this Engine sees it now, or null.
+ * Used to build the confirmation summary before a flash.
+ */
+export const findClientCard = async (storeHandle: DocHandle<Store>, candidateId: string): Promise<ScannedCard | null> => {
+    const scan = await ops.scan(storeHandle)
+    return scan.clientCards.find(c => c.candidateId === candidateId) ?? null
+}
+
+/** engine#582: the client image `versionArg` resolves to on this Engine; throws CardError when unknown. */
+export const resolveFlashImage = async (storeHandle: DocHandle<Store>, versionArg: string): Promise<{ version: string, imageSizeBytes?: number | null }> => {
+    const r = resolveImage(await ops.images(storeHandle), versionArg)
+    if (!r.ok) throw new CardError(r.code, r.text)
+    return r.image
+}
+
+/**
  * Checks, then starts the flash and returns { operationId, done }. Refusals throw CardError
  * before any Operation is created. `done` settles when the helper exits (never rejects).
  */

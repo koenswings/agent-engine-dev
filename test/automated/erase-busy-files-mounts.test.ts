@@ -4,6 +4,7 @@
  * volume (wh 2026-10-13: wipefs "Device or resource busy").
  */
 import { describe, it, beforeEach, afterEach, expect } from 'vitest'
+import { rememberOwnSummaryTrace } from '../../src/data/SummariseDisk.js'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { fs, path, YAML } from 'zx'
 import { Store } from '../../src/data/Store.js'
@@ -45,6 +46,7 @@ describe('eraseDisk refuses a disk held by another instance (filesMounts / volum
                 usedBytes: null, readable: true, apps: [], instances: [], backups: [], files: null, other: null,
                 otherPartitions: [], computedAt: Date.now() }),
         } as any)
+        rememberOwnSummaryTrace('sum-busy')
         return 'sum-busy'
     }
 

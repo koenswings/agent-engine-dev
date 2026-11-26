@@ -6,7 +6,7 @@
  * Phase 1: same-engine — source and target on local engine.
  * Phase 2: cross-engine — source on local engine, target on remote engine;
  *   rsync over ssh with this Engine's own key (per-Pi Engine keys,
- *   data/PeerAccess.ts, utils/peerSsh.ts), remote start via sendCommand. Every
+ *   data/PeerAccess.ts, utils/peerSsh.ts), remote start via PeerCommands.dispatchToPeer (peer grant). Every
  *   remote step runs the peer's helper through its gate (ensure-dirs, receive-app,
  *   receive / receive-files, receive-service, delete); none is a plain ssh command.
  */
@@ -36,7 +36,7 @@ import {
     engineCanResume, peerInFlight, markPeerInFlight, clearPeerInFlight, verifyPeerCopyOrThrow,
 } from './InFlight.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
-import { sendCommand } from '../utils/commandUtils.js'
+import { dispatchToPeer, preflightPeerGrant, grantRefusal, PeerGrantRefusal, ticketRefusal } from './PeerCommands.js'
 import { getEngineAddress, getLiveEngineAddress, getLiveEngineEndpoint } from './Network.js'
 import { peerLiveSeen, PEER_CLOCK_STALE_MS } from './Liveness.js'
 import { serviceImageTarName } from './ImageRef.js'
@@ -297,7 +297,7 @@ peerResumeProbe.reachable = (engineId: string) => probePeerEngineReachable(engin
 export const parkCrossCopyMove = async (
     storeHandle: DocHandle<Store>, opId: string, sourceDiskId: string, targetDiskId: string, targetEngineId: string, e: unknown,
 ): Promise<void> => {
-    const reason = (e as any)?.message ?? String(e)
+    const reason = e instanceof PeerGrantRefusal ? `${e.code}: ${e.message}` : (e as any)?.message ?? String(e)
     const gone = await copyInterruption(storeHandle, [sourceDiskId]) ?? peerInterruption(storeHandle.doc(), targetDiskId, targetEngineId, reason)
     parkResumableOp(storeHandle, opId, gone ? `${gone}: ${reason}` : reason, { interrupted: !!gone })
 }
@@ -439,6 +439,15 @@ export const copyApp = async (
         updateOperation(storeHandle, opId, { currentStep: step, totalSteps: COPY_STEPS.length, stepLabel: COPY_STEPS[step] })
 
     try {
+        // engine#582: the target Engine checks this Engine's permission (grant) before
+        // anything is stopped, written or registered for it; a stale grant ends the op here
+        if (isCrossEngine) {
+            // engine#595: the same check lets this transfer through the target's helper (tickets)
+            const refusal = grantRefusal(await preflightPeerGrant(storeHandle, String(targetDisk.dockedTo), {
+                targetDiskId: String(targetDisk.id), dstId: String(newInstanceId), appId, opId, services: !!instance.serviceImages?.length,
+            }), 'start')
+            if (refusal) throw refusal
+        }
         if (resumable) {
             const helperIssue = await resumeHelperProblem('copyApp on this Engine (resumable copy, engine#497)')
             if (helperIssue) throw new Error(`HELPER_OUTDATED: ${helperIssue}`)
@@ -461,7 +470,7 @@ export const copyApp = async (
             (resumedArgs.phase === 'registered' || String(storeHandle.doc()?.instanceDB?.[newInstanceId]?.storedOn ?? '') === String(targetDisk.id))) {
             await clearPeerInFlight(peer.host, peer.engineId, targetRoot, newInstanceId, opId)
             setOperationArgs(storeHandle, opId, { phase: 'done' })
-            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd` as any)
+            void dispatchToPeer(storeHandle, String(targetDisk.dockedTo), `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd`)
             updateOperation(storeHandle, opId, { status: 'Done', progressPercent: 100, error: null, completedAt: Date.now() as Timestamp })
             log(chalk.green(`copyApp: done — instance ${newInstanceId} was already registered on '${targetDisk.name}' (Engine ${peer.engineId}); cleared its in-flight marker there`))
             return newInstanceId
@@ -689,8 +698,12 @@ export const copyApp = async (
             // here (the move starts it on the target disk during Checking).
             log(`copyApp: kept instance id ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id}); storedOn is unchanged until verify`)
         } else if (isCrossEngine) {
+            // engine#582: checked again before the copy is registered for the other Engine's disk
+            // (it may have restarted during the copy); the copied folder stays under its marker there
+            const again = grantRefusal(await preflightPeerGrant(storeHandle, String(targetDisk.dockedTo)), 'register')
+            if (again) throw again
             // Cross-engine: create instance record in shared store (as Docked),
-            // then tell the remote engine to start it via sendCommand.
+            // then tell the remote engine to start it (dispatchToPeer, peer grant).
             log(`copyApp: registering new instance ${newInstanceId} on remote disk '${targetDisk.name}' (${targetDisk.id})`)
             const composeContent = (await $`cat ${instanceSrc}/compose.yaml`).stdout
             const { parse: parseYAML } = await import('yaml')
@@ -728,7 +741,7 @@ export const copyApp = async (
             }
             // Tell the remote engine to start this instance, by id (idea#168)
             log(`copyApp: sending startInstance command to remote engine '${targetDisk.dockedTo}'`)
-            sendCommand(storeHandle, targetDisk.dockedTo as any, `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd` as any)
+            void dispatchToPeer(storeHandle, String(targetDisk.dockedTo), `startInstance ${newInstanceId} ${targetDisk.id} --cause cross-engine-cmd`)
         } else {
             // Local: use existing processInstance flow
             log(`copyApp: registering new instance ${newInstanceId} on disk '${targetDisk.name}' (${targetDisk.id})`)
@@ -752,11 +765,23 @@ export const copyApp = async (
         })
         log(chalk.green(`copyApp: done — new instance ${newInstanceId} on '${targetDisk.name}' (${targetDisk.id})`))
 
-    } catch (e: any) {
+    } catch (caught: any) {
+        // engine#595: the target's helper refused the transfer (no live ticket: that Engine
+        // restarted, or the permission ran out): the same as a refused grant, never a link failure
+        const e: any = (isCrossEngine && !(caught instanceof PeerGrantRefusal) && ticketRefusal(caught, String(targetDisk.dockedTo), 'transfer')) || caught
         // Don't overwrite Cancelled status (set by cancelOperation before SIGTERM completes)
         copyError = e instanceof Error ? e : new Error(String(e))
         const currentStatus = storeHandle.doc()?.operationDB?.[opId]?.status
-        if (markerWritten && journal) {
+        if (e instanceof PeerGrantRefusal && !journal) {
+            // engine#582: the other Engine did not accept the permission. Not retried (a new grant
+            // is needed); nothing is deleted on that Engine (that would need its permission too).
+            if (currentStatus !== 'Cancelled') {
+                setOperationArgs(storeHandle, opId, { errorCode: e.code, issuerEngineId: e.issuerEngineId })
+                updateOperation(storeHandle, opId, { status: 'Failed', error: `${e.code}: ${e.message}`, completedAt: Date.now() as Timestamp })
+            }
+            markerWritten = false
+            createdInstanceDest = null
+        } else if (markerWritten && journal) {
             // engine#497 (a): the copy step of a cross-Engine move; the move parks its own op
         } else if (markerWritten && crossResumable) {
             // engine#497 (a): the partial copy stays on the peer under its marker; this Engine
@@ -795,7 +820,8 @@ export const copyApp = async (
         // engine#497 stage 3 (c), Koen Q2: a cross-Engine move's source stays stopped once its target is marked
         if (wasRunning && !sourceRestarted && ((copyError && !(journal && markerWritten)) || !opts.keepSourceStopped)) await restartSource('after a failed copy')
     }
-    if (copyError && opts.rethrow) throw copyError
+    // engine#582: a grant refusal always reaches the command trace (errorCode, issuerEngineId)
+    if (copyError && (opts.rethrow || copyError instanceof PeerGrantRefusal)) throw copyError
     return copyError ? null : newInstanceId
 }
 

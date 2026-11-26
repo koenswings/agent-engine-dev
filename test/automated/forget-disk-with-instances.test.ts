@@ -12,6 +12,7 @@ import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId, ENGINE_CAPABILITIES } from '../../src/data/Engine.js'
+import { signEntry } from '../../src/data/CommandKey.js'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { enableStoreMonitor } from '../../src/monitors/storeMonitor.js'
 import {
@@ -224,7 +225,7 @@ describe('forgetDisk --with-instances command trace (idea#466)', () => {
     it('via the Engine command queue: removed and trace ok', async () => {
         const log = newLog()
         enableStoreMonitor(h, log)
-        h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(`forgetDisk ${GONE} --with-instances`) })
+        h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(signEntry(`forgetDisk ${GONE} --with-instances`, 'cli', String(localEngineId)).entry) })
         await vi.waitFor(() => expect(traces(log).filter(t => t.command === 'forgetDisk' && t.status !== 'running').length).toBe(1))
         expect(traces(log).find(t => t.command === 'forgetDisk')!.status).toBe('ok')
         expect(h.doc()!.diskDB[GONE as any]).toBeUndefined()

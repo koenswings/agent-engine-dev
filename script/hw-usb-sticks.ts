@@ -42,6 +42,7 @@ import { $, fs, sleep } from 'zx'
 import os from 'os'
 import path from 'path'
 import { fileURLToPath } from 'url'
+import { cliQueueEntry } from './cli-queue-entry.js'
 import { collectBlockFacts, resolveStick, StickExpectation, diskHasExt4, unformattedExpectation } from './hw-roundtrip-guard.js'
 
 $.verbose = false
@@ -189,7 +190,7 @@ for (const s of sticks) {
                 check(builder()?.status === 'Running', `${s.name}: builder Running`)
                 check(usbSticks().find(x => x.stickId === stickId)?.builderAutoStart === 'started', `${s.name}: builderAutoStart started`)
             } else info(`builder ${b.id} is ${b.status}, not Docked: auto-start-from-Docked check needs a fresh dock of the builder disk`)
-            h.change((doc: any) => { doc.engineDB[ENGINE_ID].commands.push(`stopInstance ${builder().name} ${builder().storedOn}`) })
+            h.change((doc: any) => { doc.engineDB[ENGINE_ID].commands.push(cliQueueEntry(`stopInstance ${builder().name} ${builder().storedOn}`, ENGINE_ID)) })
             await waitFor('builder Stopped', () => builder()?.status === 'Stopped', 120000)
             await unplug(r.usbId, dev); await waitFor('gone', () => !usbSticks().some(x => x.stickId === stickId)); await sleep(2000); await plug(r.usbId, dev)
             await waitFor('back', () => usbSticks().some(x => x.stickId === stickId)); await sleep(5000)

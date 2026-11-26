@@ -22,7 +22,7 @@ import { appIdentity } from "./AppIdParse.js";
 import { healthTimeoutSeconds, DEFAULT_HEALTH_TIMEOUT_S } from "./AppHealthTimeout.js";
 import { Docker } from "node-docker-api";
 import { createMeta } from '../data/Meta.js'
-import { config, disksRoot, skipImageLoad } from '../data/Config.js'
+import { config, disksRoot, skipImageLoad, allowedGitAccounts } from '../data/Config.js'
 import { DocHandle } from "@automerge/automerge-repo";
 import { CommandLogStore, LogEntry, getCommandLogHandle, liveCommandLogHandle, addTrace, closeTrace, flushLogs } from './CommandLogStore.js'
 import { getActiveTrace, flushTrace } from '../utils/CommandLogger.js'
@@ -377,6 +377,10 @@ export const buildInstance = async (instanceName: InstanceName, appName: AppName
   // name, and keep the scratch clone strictly inside APPS_TMP_ROOT.
   assertAppName(appName)
   assertGitAccount(gitAccount)
+  // engine#582: only the configured accounts (default koenswings) may supply app code
+  if (!allowedGitAccounts().includes(gitAccount)) {
+    throw Object.assign(new Error(`Git account '${gitAccount}' is not allowed on this Engine (settings.allowedGitAccounts: ${allowedGitAccounts().join(', ')})`), { code: 'GIT_ACCOUNT_NOT_ALLOWED' })
+  }
   const tmpApp = childPathInside(APPS_TMP_ROOT, String(appName))
 
   // CODING STYLE: only use absolute pathnames !

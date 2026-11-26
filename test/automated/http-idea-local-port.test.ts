@@ -100,9 +100,13 @@ describe('idea.local port: API, command log, engineId and WebSocket (idea#203, C
                 const j = await r.json()
                 expect(j.engineId).toBe('e-123'); expect(typeof j.url).toBe('string'); expect(typeof j.wsPort).toBe('number')
             } else expect(r.status).toBe(503)
-            const c = await fetch(`http://127.0.0.1:${p}/api/command-log-url`)
+            // engine#582: the Console page on the other port of the same Engine is an own origin
+            const other = p === main ? extra : main
+            const c = await fetch(`http://127.0.0.1:${p}/api/command-log-url`, { headers: { Origin: `http://127.0.0.1:${other}` } })
             expect([200, 503]).toContain(c.status)
-            expect(c.headers.get('access-control-allow-origin')).toBe('*')
+            expect(c.headers.get('access-control-allow-origin')).toBe(`http://127.0.0.1:${other}`)
+            const f = await fetch(`http://127.0.0.1:${p}/api/command-log-url`, { headers: { Origin: 'http://brave-otter.local' } })
+            expect(f.headers.get('access-control-allow-origin')).toBeNull()
         }
     })
 

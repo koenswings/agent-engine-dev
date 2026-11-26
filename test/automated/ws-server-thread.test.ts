@@ -4,6 +4,7 @@
  *   - a Repo on the threaded server syncs a doc to a client and back
  *   - a client disconnect reaches the server Repo as a peer disconnect
  *   - a port already in use: 'listening' rejects (and the error is logged as before)
+ *   - engine#582: a browser Origin must be this Engine's Console; no Origin (peers) and extensions pass
  */
 
 import { describe, it, expect, afterEach } from 'vitest'
@@ -11,6 +12,8 @@ import net from 'net'
 import { Repo, PeerId } from '@automerge/automerge-repo'
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
 import { ThreadedWebSocketServerAdapter } from '../../src/wsServerThread.js'
+import WebSocket from 'ws'
+import { config } from '../../src/data/Config.js'
 
 const freePort = (): Promise<number> => new Promise((resolve, reject) => {
     const s = net.createServer()
@@ -60,5 +63,26 @@ describe('ThreadedWebSocketServerAdapter', () => {
         cleanups.push(() => adapter.close())
         new Repo({ network: [adapter] })
         await expect(adapter.listening).rejects.toThrow(/EADDRINUSE/)
+    }, 30_000)
+
+    it('engine#582: Origin check on the store WebSocket', async () => {
+        const port = await freePort()
+        const adapter = new ThreadedWebSocketServerAdapter(port, 30_000)
+        cleanups.push(() => adapter.close())
+        new Repo({ network: [adapter] })
+        await adapter.listening
+        const httpPort = config.settings.httpPort
+        const own = httpPort === 80 ? 'http://127.0.0.1' : `http://127.0.0.1:${httpPort}`
+        const tryOpen = (origin?: string): Promise<'open' | number> => new Promise((resolve) => {
+            const ws = new WebSocket(`ws://127.0.0.1:${port}`, origin ? { origin } : {})
+            ws.on('open', () => { ws.close(); resolve('open') })
+            ws.on('unexpected-response', (_req, res) => { resolve(res.statusCode ?? 0); ws.terminate() })
+            ws.on('error', () => { /* reported through unexpected-response */ })
+        })
+        expect(await tryOpen()).toBe('open')
+        expect(await tryOpen(own)).toBe('open')
+        expect(await tryOpen('chrome-extension://abcdefghijklmnopabcdefghijklmnop')).toBe('open')
+        expect(await tryOpen('http://evil.example')).toBe(401)
+        expect(await tryOpen('http://idea04.local')).toBe(401)
     }, 30_000)
 })

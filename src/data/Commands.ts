@@ -29,7 +29,7 @@ import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { pickLocalBackupDisk, localBackupDisks, localEngineName, noLocalBackupDiskMessage } from './LocalBackupDisk.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
-import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
+import { summariseDisk, attachTraceResult, rememberOwnSummaryTrace } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
 import { makeBackupDisk, assertBackupDiskMinSize } from './MakeBackupDisk.js';
 import { ForgetDiskError, WITH_INSTANCES_FLAG, forgetDisk, forgetDiskWithInstances } from './ForgetDisk.js';
@@ -309,6 +309,8 @@ const sendWrapper = (storeHandle: DocHandle<Store> | null, args: string) => {
     const engineId = args.substring(0, firstSpaceIndex);
     const command = args.substring(firstSpaceIndex + 1);
     if (!storeHandle.doc()?.engineDB[engineId as EngineID]) throw new Error(`Cannot send command: Engine ${engineId} not found in store.`)
+    // engine#582: only this Engine's own queue; another Engine signs its own queue (sign in to it)
+    if (engineId !== String(localEngineId)) throw Object.assign(new Error(`send only queues commands on this Engine (${localEngineId}). To command Engine ${engineId}, sign in to it.`), { code: 'COMMAND_REFUSED' })
     sendCommand(storeHandle, engineId as EngineID, command as Command);
 }
 
@@ -555,6 +557,7 @@ const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, target
     if (!storeHandle) throw new Error('Store is not available.')
     const summary = await summariseDisk(storeHandle, targetId)
     attachTraceResult(summary)
+    rememberOwnSummaryTrace()
     const partial = !!(summary.files?.partial || summary.other?.partial)
     print(chalk.green(`Summary for ${summary.label}: readable=${summary.readable} partial=${partial}`))
 }

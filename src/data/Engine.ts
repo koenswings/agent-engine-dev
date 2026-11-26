@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
-import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH, helperAtLeast, BACKUP_CLEANUP_HELPER_MIN, CROSS_RESUME_HELPER_MIN, type AppDataRunner } from '../utils/appDataHelper.js';
+import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH, helperAtLeast, BACKUP_CLEANUP_HELPER_MIN, CROSS_RESUME_HELPER_MIN, PEER_TICKETS_HELPER_MIN, type AppDataRunner } from '../utils/appDataHelper.js';
 import { PEER_GATE, PEER_AUTHORIZED_KEYS, PEER_KNOWN_HOSTS } from '../utils/peerSsh.js';
 import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js';
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
@@ -30,6 +30,8 @@ export interface Engine {
   capabilities?: string[];
   /** The lastBooted of the startup that wrote `capabilities` (idea#128) */
   capabilitiesBootedAt?: Timestamp;
+  /** engine#582: public half of this Engine's relay key (Ed25519, raw 32 bytes, base64url); see RelayKey.ts */
+  relayPublicKey?: string;
   /** Set by eraseDisk for its whole run (Files Disk step 3, not built yet); createFilesDisk refuses that disk meanwhile (idea#131) */
   eraseInProgress?: EraseInProgress | null;
   /** Whole non-system disks without ext4 (idea#134); rebuilt on dock/undock and at startup */
@@ -215,13 +217,20 @@ export interface EraseInProgress {
  *               verify-receive), so a source Engine may resume a copy or move into it.
  *               Advertised only when the app-data helper is at v23 or newer, checked once
  *               at startup. A source refuses a target without it (TARGET_OUTDATED).
+ * engineSignIn1 (engine#582): /api/auth/* (Engine-local operators, challenge sign-in,
+ *               setup code). Commands still use the store queue until signedCommands1.
+ * signedCommands1 (engine#582): POST /api/command and /api/auth/grant; the queue runs
+ *               only entries signed by this Engine (unsigned → COMMAND_UNSIGNED); peer
+ *               follow-ups need a grant from the target Engine.
+ * engineRelay1 (engine#582): /api/engines/<id>/… forwards auth, command, store-url and
+ *               command-log-url to another Engine; relayPublicKey in the engineDB entry.
  * Written at every startup as a whole new list, with capabilitiesBootedAt set
  * to that startup's lastBooted. A Console counts a capability only when
  * capabilities includes it AND capabilitiesBootedAt === lastBooted of the same
  * Engine record: an older (rolled-back) Engine rewrites lastBooted but not the
  * stamp, so it is treated as old at once.
  */
-export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'traceInstanceId', 'makeBackupDisk']
+export const ENGINE_CAPABILITIES: readonly string[] = ['diskIdArgs', 'filesDisk', 'filesMount', 'eraseDisk', 'instanceIdArgs', 'usbSticks', 'unknownDiskReadOnly', 'clientCards', 'clientImages', 'forgetDisk', 'ideaIgnoreMarker', 'diskCandidates', 'removeInstance', 'updateApp', 'updateAppFetch', 'renameInstance', 'moveAppCrossEngine', 'usageSummaries', 'backupVerify', 'forgetDiskWithInstances', 'backupLinks', 'scheduledBackups', 'traceInstanceId', 'makeBackupDisk', 'engineSignIn1', 'signedCommands1', 'engineRelay1']
 /** idea#201 §10: advertised only when the flash helper is installed (HELPER_MISSING otherwise) */
 export const FLASH_CARD_CAPABILITY = 'flashCard'
 export const FLASH_HELPER_PATH = '/usr/local/sbin/idea-flash-card'
@@ -362,6 +371,29 @@ export const checkCrossEngineResumeCapability = async (
 /** Test seam: drop the cached startup check. */
 export const resetCrossEngineResumeCapabilityForTests = (): void => { crossEngineResumeHelperOk = null }
 
+/** engine#595: advertised only when the app-data helper (and its gate) is v26 or newer: writes into this Engine need a transfer ticket */
+import { PEER_TICKETS_CAPABILITY } from './PeerTickets.js'
+export { PEER_TICKETS_CAPABILITY }
+let peerTicketsHelperOk: boolean | null = null
+
+/** Once at startup, decide whether to advertise `peerTickets1`. Never throws. */
+export const checkPeerTicketsCapability = async (
+  run?: AppDataRunner,
+  timeoutMs: number = PRE_UPDATE_QUARANTINE_HELPER_CHECK_MS,
+): Promise<boolean> => {
+  try {
+    const outdated = await withTimeout(helperAtLeast(PEER_TICKETS_HELPER_MIN, 'peerTickets1', run), timeoutMs)
+    peerTicketsHelperOk = outdated === null
+  } catch {
+    peerTicketsHelperOk = false
+  }
+  log(`peerTickets1 capability ${peerTicketsHelperOk ? 'advertised' : 'omitted'} (app-data helper ${peerTicketsHelperOk ? '' : 'older than '}v${PEER_TICKETS_HELPER_MIN}${peerTicketsHelperOk ? '+' : ', missing, error or timeout'})`)
+  return peerTicketsHelperOk
+}
+
+/** Test seam: drop the cached startup check. */
+export const resetPeerTicketsCapabilityForTests = (): void => { peerTicketsHelperOk = null }
+
 /** The capability list written at this startup */
 let demoAppsPythonOk: boolean | null = null
 
@@ -391,6 +423,7 @@ export const engineCapabilities = (
   quarantineHelperOk: boolean = preUpdateQuarantineHelperOk === true,
   demoAppsOk: boolean = demoAppsPythonOk === true,
   crossResumeOk: boolean = crossEngineResumeHelperOk === true,
+  peerTicketsOk: boolean = peerTicketsHelperOk === true,
 ): string[] => {
   const caps = [...ENGINE_CAPABILITIES]
   if (helperInstalled) caps.push(FLASH_CARD_CAPABILITY)
@@ -398,6 +431,7 @@ export const engineCapabilities = (
   if (quarantineHelperOk) caps.push(PRE_UPDATE_QUARANTINE_CAPABILITY)
   if (demoAppsOk) caps.push(DEMO_APPS_CAPABILITY)
   if (crossResumeOk) caps.push(CROSS_ENGINE_RESUME_CAPABILITY)
+  if (peerTicketsOk) caps.push(PEER_TICKETS_CAPABILITY)
   return caps
 }
 
@@ -1502,7 +1536,6 @@ export const tailscaleDownloadScript = (version = TAILSCALE_VERSION, sha256 = TA
 /** Where installTailscale stores the auth key on the Pi (root-only, 0600). */
 export const TAILSCALE_AUTHKEY_PATH = '/etc/tailscale/debug-authkey'
 const TAILSCALE_AUTHKEY_DIR = '/etc/tailscale'
-const TAILSCALE_AUTHKEY_SECRETS_FILE = '/home/pi/openclaw/secrets/tailscale_authkey.txt'
 
 /**
  * Removes TAILSCALE_AUTHKEY from this process's environment (and zx's $.env, which
@@ -1513,14 +1546,11 @@ export const scrubTailscaleAuthKeyEnv = () => {
   if ($.env && $.env !== process.env) delete $.env.TAILSCALE_AUTHKEY
 }
 
-/** TAILSCALE_AUTHKEY env var first, then the secrets file on the management Pi. */
-export const resolveTailscaleAuthKey = (): string | null => {
-  const fromEnv = process.env.TAILSCALE_AUTHKEY?.trim()
-  if (fromEnv) return fromEnv
-  return fs.existsSync(TAILSCALE_AUTHKEY_SECRETS_FILE)
-    ? fs.readFileSync(TAILSCALE_AUTHKEY_SECRETS_FILE, 'utf-8').trim() || null
-    : null
-}
+/**
+ * The key from the TAILSCALE_AUTHKEY env var only (provision-fleet.sh sets it from
+ * --authkey-file or ~/.config/idea/fleet-authkey). No other file is read.
+ */
+export const resolveTailscaleAuthKey = (): string | null => process.env.TAILSCALE_AUTHKEY?.trim() || null
 
 /**
  * Store the Tailscale auth key on the Pi without it ever being a command-line
@@ -1556,9 +1586,8 @@ export const storeTailscaleAuthKey = async (exec: any, authKey: string): Promise
  * The Pi remains fully offline during normal operation.
  * A coordinator activates debug mode by running the activation script over SSH.
  *
- * Auth key source (in priority order), see resolveTailscaleAuthKey:
- *   1. TAILSCALE_AUTHKEY env var (set on the management Pi running buildEngine)
- *   2. /home/pi/openclaw/secrets/tailscale_authkey.txt (Atlas's secrets dir on this Pi)
+ * Auth key source, see resolveTailscaleAuthKey: the TAILSCALE_AUTHKEY env var on the
+ * machine running buildEngine (provision-fleet.sh sets it from --authkey-file).
  * Use a short-lived, single-use key (docs/PI_FLEET.md). The key is never logged
  * and never passed as a command argument (idea#115).
  */
@@ -1571,7 +1600,7 @@ export const installTailscale = async (exec: any, enginePath: string) => {
   scrubTailscaleAuthKeyEnv()
 
   if (!authKey) {
-    console.error(chalk.red(`installTailscale: no auth key found. Set TAILSCALE_AUTHKEY env var or ensure ${TAILSCALE_AUTHKEY_SECRETS_FILE} exists.`))
+    console.error(chalk.red('installTailscale: no auth key found. Set the TAILSCALE_AUTHKEY env var (provision-fleet.sh: --authkey-file).'))
     process.exit(1)
   }
 
