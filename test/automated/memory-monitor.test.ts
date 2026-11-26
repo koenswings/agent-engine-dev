@@ -5,7 +5,7 @@
 import { describe, it, expect, vi, afterEach } from 'vitest'
 import { Repo } from '@automerge/automerge-repo'
 import {
-    MEMORY_LOG_INTERVAL_MS, formatMemoryLine, isCommandLogShape, memorySnapshot, startMemoryMonitor,
+    MEMORY_LOG_INTERVAL_MS, MEMORY_WARN_FRACTION, formatMemoryLine, isCommandLogShape, memorySnapshot, startMemoryMonitor,
 } from '../../src/monitors/memoryMonitor.js'
 
 const MIB = 1024 * 1024
@@ -48,6 +48,19 @@ describe('memoryMonitor (engine#471)', () => {
         const s = memorySnapshot({ handles: { a: fakeHandle({ traces: {}, recentTraceIds: [] }) } }, 'a', usage)
         expect(formatMemoryLine(s, 8 * 3600)).toBe(
             '[memory] rss=1706MiB heapUsed=121MiB heapTotal=158MiB external=1480MiB arrayBuffers=3MiB docs=1 ready=1 commandLogs=1 ownCommandLog=yes uptime=8.0h')
+    })
+
+    it('engine#581: WARN suffix when rss reaches the share of RAM (default 50%), none below or without a total', () => {
+        expect(MEMORY_WARN_FRACTION).toBe(0.5)
+        const s = memorySnapshot({ handles: {} }, null, usage)          // rss 1706 MiB
+        expect(formatMemoryLine(s, 0, 3796 * MIB)).toBe(
+            '[memory] rss=1706MiB heapUsed=121MiB heapTotal=158MiB external=1480MiB arrayBuffers=3MiB docs=0 ready=0 commandLogs=0 ownCommandLog=no uptime=0.0h')
+        expect(formatMemoryLine(s, 0, 3000 * MIB)).toMatch(/ uptime=0\.0h WARN rss=57% of RAM \(3000MiB, threshold 50%\)$/)
+        expect(formatMemoryLine(s, 0, 3796 * MIB, 0.4)).toMatch(/ WARN rss=45% of RAM \(3796MiB, threshold 40%\)$/)
+        expect(formatMemoryLine(s, 0)).not.toContain('WARN')
+        const lines: string[] = []
+        startMemoryMonitor({ handles: {} }, { sink: l => lines.push(l), usage, uptime: () => 0, totalMem: () => 2048 * MIB })()
+        expect(lines[0]).toContain('WARN rss=83% of RAM (2048MiB, threshold 50%)')
     })
 
     it('works on a real Repo: store doc + command log, own log id read on every tick', async () => {
