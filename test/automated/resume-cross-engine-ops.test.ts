@@ -36,6 +36,7 @@ import {
 import { CROSS_ENGINE_RESUME_CAPABILITY, peerInFlight, isPeerLinkFailure, engineCanResume } from '../../src/data/InFlight.js'
 import { engineCapabilities } from '../../src/data/Engine.js'
 import { shouldAutoStart, moveInFlightFromSource } from '../../src/data/AutoStart.js'
+import { PeerGrantRefusal } from '../../src/data/PeerCommands.js'
 
 const { startInstanceMock } = vi.hoisted(() => ({ startInstanceMock: vi.fn(async (..._a: any[]) => undefined) }))
 // engine#582: follow-ups to another Engine go through PeerCommands (POST /api/command with a grant);
@@ -97,11 +98,13 @@ const peer = {
     markers: new Map<string, string>(),
     folders: new Map<string, 'partial' | 'complete'>(),
     pushes: [] as { opId: string, resumedInto: boolean }[],
-    copyScript: [] as ('ok' | 'link' | 'cut' | 'fail')[],
+    copyScript: [] as ('ok' | 'link' | 'cut' | 'fail' | 'restarted' | 'grant')[],
     verifyScript: [] as ('ok' | 'bad')[],
 }
 const LINK_ERR = 'rsync (idea-app-data send exited with code 12: rsync: connection unexpectedly closed)'
 const REAL_ERR = 'rsync (idea-app-data send exited with code 23: some files vanished)'
+/** engine#595: the target Engine restarted mid-push; its helper (v26) refuses the rest of the push for want of a ticket */
+const TICKET_ERR = `rsync (idea-app-data send exited with code 12: refused: GRANT_EXPIRED: Engine ${String(localEngineId)} has no live permission from this Engine to write instance ${'inst-src'} on sdy497a (it expired, this Engine restarted, or Engine ${String(localEngineId)} is too old to ask for one and must be updated first). Nothing was written; start the operation again from the Console\nrsync: connection unexpectedly closed (0 bytes received so far) [sender])`
 
 const wire = (h: DocHandle<Store>) => {
     const removeSource = vi.fn(async (_sh: DocHandle<Store>, id: InstanceID) => ({ quarantinePath: `/disks/${SRC_DEV}/.idea-quarantine/${id}` }))
@@ -112,6 +115,11 @@ const wire = (h: DocHandle<Store>) => {
         if (peer.markers.get(id) === opId) peer.markers.delete(id)
     })
     const copy = vi.fn(async (sh: DocHandle<Store>, id: InstanceID, _s: DiskID, _t: DiskID, _c: any, opId: string) => {
+        // what copyApp throws when its grantCheck preflight (its first step) is refused: the target forgot the grant
+        if (peer.copyScript[0] === 'grant') {
+            peer.copyScript.shift()
+            throw new PeerGrantRefusal('GRANT_EXPIRED', `No valid permission from Engine ${String(TGT)} (expired, or this Engine restarted). Start the operation again.`, String(TGT), 'start')
+        }
         // copyApp (keepSourceStopped, same id) on the source Engine
         sh.change(d => { (d.instanceDB as any)[INST].status = 'Stopped' })
         const key = String(id)
@@ -129,6 +137,7 @@ const wire = (h: DocHandle<Store>) => {
         if (step === 'link') { peer.folders.set(key, 'partial'); peer.up = false; throw new Error(LINK_ERR) }
         if (step === 'cut') { peer.folders.set(key, 'partial'); markEngineStopping(); throw new Error('rsync (idea-app-data send stopped by SIGKILL)') }
         if (step === 'fail') { peer.folders.set(key, 'partial'); throw new Error(REAL_ERR) }
+        if (step === 'restarted') { peer.folders.set(key, 'partial'); throw new Error(TICKET_ERR) }
         peer.folders.set(key, 'complete')
         return id
     })
@@ -273,6 +282,80 @@ describe('engine#497 stage 3 (a): cross-Engine resume (the source owns the resum
             `startInstance ${INST} ${TGT_DISK} --cause cross-engine-cmd --op ${op.id}`,
             `startInstance ${INST} ${TGT_DISK} --cause post-move`,
         ])
+    })
+
+    // engine#595 resume split: a link that drops (the target Engine is still up and still has this
+    // op's transfer ticket) parks RESUME_WAITING and resumes (above). A target Engine that RESTARTED
+    // forgot the grant and its tickets: its helper refuses, and that ends the op GRANT_EXPIRED; it
+    // never parks, never loops, and the partial copy stays there under its marker.
+    it('the target Engine restarts mid-push: its helper refuses the rest (no ticket) → Failed GRANT_EXPIRED, not parked, no resume; partial kept; the source starts again', async () => {
+        const h = makeStore({ status: 'Running' })
+        const w = wire(h)
+        await recoverInterruptedOperations(h, w.handlers)
+        noteDiskDocked(h, SRC_DISK)
+        peer.copyScript.push('restarted')
+        const r = await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
+        expect(r.code).toBe('RESUME_GAVE_UP')
+        const op = theOp(h)
+        expect(op.status).toBe('Failed')
+        expect(op.error).toMatch(/^GRANT_EXPIRED: rsync \(idea-app-data send exited with code 12: refused: GRANT_EXPIRED: Engine .* has no live permission/)
+        expect(op.args.errorCode).toBe('GRANT_EXPIRED')
+        expect(op.args.resumeFailures).toBeUndefined()
+        expect(isParkedOp(op)).toBe(false)
+        // the target is back (and rebooted): nothing resumes, now or later
+        h.change(d => { (d.engineDB as any)[TGT].lastBooted = 3; (d.engineDB as any)[TGT].capabilitiesBootedAt = 3 })
+        expect(await resumePeerParkedOps(h)).toEqual([])
+        expect(await resumePeerParkedOps(h, Date.now() + PEER_RESUME_RETRY_MS + 1)).toEqual([])
+        expect(w.copy).toHaveBeenCalledTimes(1)
+        // nothing is deleted there (that needs a permission too): partial and marker stay for the operator
+        expect(peer.markers.get(INST)).toBe(op.id)
+        expect(peer.folders.get(INST)).toBe('partial')
+        expect((h.doc().engineDB as any)[TGT].commands ?? []).toEqual([])
+        // it was running: it starts again on its own disk
+        await until(() => startInstanceMock.mock.calls.length === 1, 'the source restart')
+        expect(String(startInstanceMock.mock.calls[0][2].id)).toBe(SRC_DISK)
+        expect(h.doc().instanceDB[INST]?.storedOn).toBe(SRC_DISK)
+        expect(w.removeSource).not.toHaveBeenCalled()
+    })
+
+    it('the link drops, then the target Engine restarts while the op is parked: the resume is refused at the grant check → Failed GRANT_EXPIRED (no second push)', async () => {
+        const h = makeStore({ status: 'Stopped' })
+        const w = wire(h)
+        await recoverInterruptedOperations(h, w.handlers)
+        noteDiskDocked(h, SRC_DISK)
+        peer.copyScript.push('link', 'grant')
+        await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
+        const op = theOp(h)
+        expect(op.error).toMatch(/^RESUME_WAITING: /)
+        peer.up = true
+        h.change(d => { (d.engineDB as any)[TGT].lastBooted = 3; (d.engineDB as any)[TGT].capabilitiesBootedAt = 3 })
+        expect(await resumePeerParkedOps(h)).toEqual([op.id])
+        await until(() => theOp(h).status === 'Failed', 'the refused resume')
+        expect(theOp(h).error).toMatch(/^GRANT_EXPIRED: No valid permission from Engine ENGINE_idea04/)
+        expect(theOp(h).args.errorCode).toBe('GRANT_EXPIRED')
+        expect(peer.pushes).toEqual([{ opId: op.id, resumedInto: false }])
+        expect(await resumePeerParkedOps(h, Date.now() + PEER_RESUME_RETRY_MS + 1)).toEqual([])
+        expect(peer.markers.get(INST)).toBe(op.id)
+        expect(startInstanceMock).not.toHaveBeenCalled()                   // wasRunning '0'
+    })
+
+    it('Engine start: an op an earlier run parked after a ticket refusal is ended GRANT_EXPIRED, not resumed', async () => {
+        const h = makeStore({ status: 'Stopped' })
+        const w = wire(h)
+        await recoverInterruptedOperations(h, w.handlers)
+        noteDiskDocked(h, SRC_DISK)
+        peer.copyScript.push('link')
+        await moveAppCrossEngine(h, INST as any, SRC_DISK, TGT_DISK, 'console-command', w.deps)
+        const op = theOp(h)
+        // as an Engine before engine#595 parked it (it counted the refusal as a real failure)
+        h.change(d => { (d.operationDB as any)[op.id].error = `RESUME_PENDING (1/3): ${TICKET_ERR}` })
+        resetResumeStateForTests()
+        await recoverInterruptedOperations(h, w.handlers)
+        expect(theOp(h).status).toBe('Failed')
+        expect(theOp(h).error).toMatch(/^GRANT_EXPIRED: rsync \(idea-app-data send exited with code 12: refused: GRANT_EXPIRED: /)
+        expect(noteDiskDocked(h, SRC_DISK)).toEqual([])
+        expect(await resumePeerParkedOps(h, Date.now() + PEER_RESUME_RETRY_MS + 1)).toEqual([])
+        expect(w.copy).toHaveBeenCalledTimes(1)
     })
 
     it('a power cut on the source mid-push: the op stays Running; after the reboot it waits for its source dock pass, then pushes again into the same folder → Done', async () => {

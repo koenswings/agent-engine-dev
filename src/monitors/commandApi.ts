@@ -20,7 +20,7 @@ import type { DocHandle } from '@automerge/automerge-repo'
 import type { Store } from '../data/Store.js'
 import { authenticate, clientOf, readJsonBody, HttpError } from './authApi.js'
 import { sessionShortId } from '../data/Sessions.js'
-import { checkGrant, GrantError, GRANT_CHECK_COMMAND, isPeerFollowUp, parseGrant, rememberGrant } from '../data/PeerGrants.js'
+import { checkGrant, GrantError, GRANT_CHECK_COMMAND, grantRemainingMs, isPeerFollowUp, parseGrant, rememberGrant, type ParsedGrant } from '../data/PeerGrants.js'
 import { hasSignedCommands } from '../data/PeerCommands.js'
 import { commandNeedsConfirm, issueConfirm, checkConfirm, prepareConfirm, ConfirmRefusal } from '../data/ConfirmGate.js'
 import { enqueueSigned } from '../data/SignedQueue.js'
@@ -102,12 +102,19 @@ export const routeCommand = async (req: http.IncomingMessage, pathname: string, 
         if (isPeer) {
             const from = typeof b.fromEngineId === 'string' ? b.fromEngineId : ''
             const source: CommandSource = { kind: 'peer', peerEngineId: from || undefined, remoteAddr, ...via }
-            try { checkGrant(auth.slice(6).trim(), self, from, undefined, ctx.dir ?? authFolder()) } catch (e) {
+            let grant: ParsedGrant
+            try { grant = checkGrant(auth.slice(6).trim(), self, from, undefined, ctx.dir ?? authFolder()) } catch (e) {
                 if (e instanceof GrantError) await refuse(source, command, new HttpError(403, e.code, e.message))
                 throw e
             }
-            // engine#582: the grant check a peer runs before any work for this Engine; nothing is queued
-            if (name === GRANT_CHECK_COMMAND) return { status: 200, body: { engineId: self, issuerEngineId: self, ok: true } }
+            // engine#582: the grant check a peer runs before any work for this Engine; nothing is queued.
+            // engine#595: with the transfer it names, this Engine's helper lets that transfer through.
+            if (name === GRANT_CHECK_COMMAND) {
+                const { acceptGrantCheck } = await import('../data/PeerTickets.js')
+                const a = await acceptGrantCheck(store, self, from, grant.grantId, grantRemainingMs(grant.grantId), command)
+                if (!a.ok) await refuse(source, command, new HttpError(a.status, a.code, a.message))
+                return { status: 200, body: { engineId: self, issuerEngineId: self, ok: true, ...(a.ok && a.registered ? { tickets: a.registered } : {}) } }
+            }
             if (!isPeerFollowUp(command) || !commands.some(c => c.name === name)) {
                 await refuse(source, command, new HttpError(422, 'COMMAND_REFUSED', `'${name}' cannot be sent by another Engine.`, { reason: 'not-a-follow-up' }))
             }

@@ -17,6 +17,9 @@ import {
 } from '../../src/data/PeerTickets.js'
 import { peerTicketAddArgs, PEER_TICKET_MAX_SECONDS, isTicketRefusal } from '../../src/utils/appDataHelper.js'
 import { isPeerLinkFailure } from '../../src/data/InFlight.js'
+import { acceptGrantCheck } from '../../src/data/PeerTickets.js'
+import { grantCheckCommand, ticketRefusal, PeerGrantRefusal } from '../../src/data/PeerCommands.js'
+import { grantRefusalCode } from '../../src/data/Operations.js'
 import { makeAppDataSandbox, AppDataSandbox } from '../harness/appDataSandbox.js'
 
 const G = 'GrantAaaaaaaaaaa'
@@ -88,7 +91,59 @@ describe('PeerTickets (Engine side)', () => {
     })
 })
 
+describe('grantCheck with a transfer (engine#595)', () => {
+    const store = { diskDB: {
+        'disk-b': { id: 'disk-b', device: 'sdc1', dockedTo: 'ENGINE_b' },
+        'disk-away': { id: 'disk-away', device: 'sdd1', dockedTo: 'ENGINE_c' },
+    } }
+    const rootOf = async (d: any) => String(d.device)
+    it('the source names what it will write; an issuer without engine#595 sees only extra words', () => {
+        expect(grantCheckCommand()).toBe('grantCheck')
+        expect(grantCheckCommand({ targetDiskId: 'disk-b', dstId: 'new1', appId: 'kolibri-1.0', opId: 'Op1', services: true })).toBe('grantCheck disk-b new1 kolibri-1.0 Op1 1')
+        expect(grantCheckCommand({ targetDiskId: 'disk-b', dstId: 'new1', appId: null, opId: null, services: false })).toBe('grantCheck disk-b new1 - - 0')
+    })
+    it('the issuer registers tickets on ITS root for the disk docked to it, for what the grant still has', async () => {
+        const { d, calls } = fakeDeps()
+        const a = await acceptGrantCheck(store, 'ENGINE_b', 'ENGINE_a', G, 3_600_000, 'grantCheck disk-b new1 kolibri-1.0 Op1 0', d, rootOf)
+        expect(a).toEqual({ ok: true, registered: 2 })
+        expect(calls).toEqual([
+            ['peer-ticket-add', 'ENGINE_a', 'sdc1', 'instance', 'new1', 'Op1', G, '3600'],
+            ['peer-ticket-add', 'ENGINE_a', 'sdc1', 'app', 'kolibri-1.0', 'Op1', G, '3600'],
+        ])
+        const plain = fakeDeps()
+        expect(await acceptGrantCheck(store, 'ENGINE_b', 'ENGINE_a', G, 3_600_000, 'grantCheck', plain.d, rootOf)).toEqual({ ok: true, registered: 0 })
+        expect(plain.calls).toEqual([])
+    })
+    it('refuses, before anything runs as root: a disk not docked here, bad words, an expired grant, a failed registration', async () => {
+        const none = fakeDeps()
+        const r = (cmd: string, ms = 60_000, d = none.d) => acceptGrantCheck(store, 'ENGINE_b', 'ENGINE_a', G, ms, cmd, d, rootOf)
+        expect(await r('grantCheck disk-away new1 - - 0')).toMatchObject({ ok: false, status: 409, code: 'TARGET_NOT_DOCKED' })
+        expect(await r('grantCheck nope new1 - - 0')).toMatchObject({ ok: false, status: 409, code: 'TARGET_NOT_DOCKED' })
+        expect(await r('grantCheck disk-b new1 - -')).toMatchObject({ ok: false, status: 400, code: 'BAD_REQUEST' })
+        expect(await r('grantCheck disk-b ../x - - 0')).toMatchObject({ ok: false, status: 400, code: 'BAD_REQUEST' })
+        expect(await r('grantCheck disk-b new1 a..b - 0')).toMatchObject({ ok: false, status: 400, code: 'BAD_REQUEST' })
+        expect(await r('grantCheck disk-b new1 - - 2')).toMatchObject({ ok: false, status: 400, code: 'BAD_REQUEST' })
+        expect(await r('grantCheck disk-b new1 - - 0', 0)).toMatchObject({ ok: false, status: 403, code: 'GRANT_EXPIRED' })
+        expect(none.calls).toEqual([])
+        const full = fakeDeps({ fail: () => true })
+        expect(await r('grantCheck disk-b new1 - - 0', 60_000, full.d)).toMatchObject({ ok: false, status: 503, code: 'TRANSFER_PERMISSION_FAILED' })
+    })
+})
+
 describe('a ticket refusal is never a link interruption (InFlight, engine#595)', () => {
+    it('the source maps the helper refusal to GRANT_EXPIRED (the same as a refused grant check)', () => {
+        const e = new Error('rsync to Engine ENGINE_b exited with code 12: refused: GRANT_EXPIRED: Engine ENGINE_a has no live permission from this Engine to write app k-1 on sdc1 (…)\nrsync: connection unexpectedly closed')
+        const r = ticketRefusal(e, 'ENGINE_b', 'transfer')
+        expect(r).toBeInstanceOf(PeerGrantRefusal)
+        expect(r!.code).toBe('GRANT_EXPIRED')
+        expect(r!.message).toBe('Engine ENGINE_b refused the transfer: Engine ENGINE_a has no live permission from this Engine to write app k-1 on sdc1 (…)')
+        expect(r!.traceResult).toEqual({ code: 'GRANT_EXPIRED', issuerEngineId: 'ENGINE_b', dispatchedTo: 'ENGINE_b', step: 'transfer' })
+        expect(ticketRefusal(new Error('rsync exited with code 12: connection unexpectedly closed'), 'ENGINE_b', 'transfer')).toBeNull()
+        expect(grantRefusalCode(`RESUME_PENDING (1/3): ${e.message}`)).toBe('GRANT_EXPIRED')
+        expect(grantRefusalCode('GRANT_INVALID: bad mac')).toBe('GRANT_INVALID')
+        expect(grantRefusalCode('rsync exited with code 23')).toBeNull()
+    })
+
     it('rsync reports exit 12 when the remote helper refuses; with GRANT_EXPIRED that is a refusal, not RESUME_WAITING', () => {
         const refused = 'rsync to Engine ENGINE_b (10.0.0.2, receive-app) exited with code 12: refused: GRANT_EXPIRED: Engine ENGINE_a has no live permission from this Engine to write app k-1 on sdc1 (…)\nrsync: connection unexpectedly closed (0 bytes received so far) [sender]'
         expect(isPeerLinkFailure(refused)).toBe(false)

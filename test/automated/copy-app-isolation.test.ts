@@ -766,6 +766,31 @@ describe('copyApp / moveApp / installApp: instance isolation (idea#168 r35)', ()
         }
     })
 
+    it('engine#595: the grant check names the transfer; a helper ticket refusal mid-copy (the target restarted) fails the op GRANT_EXPIRED, never parks it', async () => {
+        const REMOTE = 'ENGINE_remote-t1' as EngineID
+        await crossSetup(REMOTE, '10.0.0.46', 'Stopped')
+        vi.mocked(preflightPeerGrant).mockClear()
+        try {
+            failure.rsync = `idea-app-data send exited with code 12: refused: GRANT_EXPIRED: Engine ${String(localEngineId)} has no live permission from this Engine to write instance x on sdz1 (it expired, this Engine restarted, or …). Nothing was written; start the operation again from the Console\nrsync: connection unexpectedly closed`
+            const err = await copyApp(h, ORIG as any, SRC, TGT).then(() => null, (e) => e)
+            expect(err).toBeInstanceOf(PeerGrantRefusal)
+            expect(err).toMatchObject({ code: 'GRANT_EXPIRED', issuerEngineId: REMOTE, traceResult: { step: 'transfer' } })
+            const [call] = vi.mocked(preflightPeerGrant).mock.calls
+            const op = Object.values(h.doc().operationDB)[0] as any
+            expect(call[1]).toBe(REMOTE)
+            expect(call[2]).toEqual({ targetDiskId: String(TGT), dstId: op.args.targetInstanceId, appId: expect.any(String), opId: op.id, services: expect.any(Boolean) })
+            expect(op.status).toBe('Failed')
+            expect(op.error).toMatch(new RegExp(`^GRANT_EXPIRED: Engine ${REMOTE} refused the transfer: Engine .* has no live permission`))
+            expect(op.args).toMatchObject({ errorCode: 'GRANT_EXPIRED', issuerEngineId: REMOTE })
+            expect(peerInFlightCalls.map(c => c[0])).toEqual(['mark'])        // the partial stays marked there
+            expect(helperDeletes).toEqual([])                                  // nothing deleted there
+            expect(Object.keys(h.doc().instanceDB)).toEqual([ORIG])
+        } finally {
+            failure.rsync = null
+            delete network.connections['10.0.0.46:4321' as any]
+        }
+    })
+
     it('engine#582: with a good grant the copy asks the target twice (start, before registering) and then dispatches startInstance', async () => {
         const REMOTE = 'ENGINE_remote-g4' as EngineID
         await crossSetup(REMOTE, '10.0.0.44', 'Stopped')

@@ -125,3 +125,43 @@ export const resetPeerTickets = async (d: TicketDeps = defaultTicketDeps): Promi
     log(problem)
     return problem
 }
+
+// ── grantCheck on this (the issuing) Engine ──────────────────────────────────
+
+export type GrantCheckAnswer =
+    | { ok: true, registered: number, skipped?: string }
+    | { ok: false, status: number, code: string, message: string }
+
+const DISK_ID_RE = /^[A-Za-z0-9._:-]{1,128}$/
+
+/**
+ * engine#595: the grantCheck words after the command name (PeerCommands.grantCheckCommand):
+ * none → only the grant check (nothing registered); else `<targetDiskId> <dstId> <appId|-> <opId|-> <0|1>`.
+ * The target disk must be docked HERE; its root token is this Engine's own (appDataRoot), never
+ * one the peer names. The tickets live as long as the grant (`grantId`, issued here) still has.
+ */
+export const acceptGrantCheck = async (
+    store: { diskDB?: Record<string, any> } | undefined, self: string, peer: string, grantId: string, remainingMs: number, command: string,
+    d: TicketDeps = defaultTicketDeps,
+    rootOf: (disk: any) => Promise<string> = async (disk) => (await import('./Disk.js')).appDataRoot(disk),
+): Promise<GrantCheckAnswer> => {
+    const words = String(command).trim().split(/\s+/).slice(1)
+    if (words.length === 0) return { ok: true, registered: 0 }
+    const bad = (message: string): GrantCheckAnswer => ({ ok: false, status: 400, code: 'BAD_REQUEST', message })
+    if (words.length !== 5) return bad(`grantCheck takes no words or <targetDiskId> <dstId> <appId|-> <opId|-> <0|1>.`)
+    const [diskId, dstId, appWord, opWord, servicesWord] = words
+    if (!DISK_ID_RE.test(diskId) || !/^[01]$/.test(servicesWord)) return bad('grantCheck: bad target disk id or services flag.')
+    const disk = store?.diskDB?.[diskId]
+    if (!disk || !disk.device || String(disk.dockedTo ?? '') !== String(self)) {
+        return { ok: false, status: 409, code: 'TARGET_NOT_DOCKED', message: `Disk ${diskId} is not docked to Engine ${self}.` }
+    }
+    const t: TransferTarget = { root: await rootOf(disk), dstId, appId: appWord === '-' ? null : appWord, opId: opWord === '-' ? null : opWord, services: servicesWord === '1' }
+    try {
+        // the same checks the helper makes, before anything runs as root
+        peerTicketAddArgs(peer, t.root, 'instance', t.dstId, t.opId ?? null, grantId, 1)
+        if (t.appId) peerTicketAddArgs(peer, t.root, 'app', t.appId, t.opId ?? null, grantId, 1)
+    } catch (e: any) { return bad(`grantCheck: ${e?.message ?? e}`) }
+    if (remainingMs <= 0) return { ok: false, status: 403, code: 'GRANT_EXPIRED', message: `No valid permission for Engine ${peer} (expired, or this Engine restarted). Start the operation again.` }
+    const r = await registerTransferTickets(peer, grantId, remainingMs, t, d)
+    return r.ok ? r : { ok: false, status: 503, code: 'TRANSFER_PERMISSION_FAILED', message: r.error }
+}
