@@ -6,12 +6,12 @@ import { tmpdir } from 'os'
 import path from 'path'
 
 /**
- * The 503 replies of GET /api/store-url and /api/command-log-url carry
- * Access-Control-Allow-Origin: * like the 200s, so a Console opened from
- * another Pi's page can read the "not available yet" answer instead of a CORS
- * error. The store identity folder points at an empty temp dir, so both URL
- * files are missing. Must be set before httpMonitor is imported (paths are
- * computed at load time).
+ * The 503 replies of GET /api/store-url and /api/command-log-url carry the same
+ * CORS headers as the 200s. Since engine#582 that is: the Engine's own Console
+ * origins get Access-Control-Allow-Origin (echoed), any other origin gets none.
+ * The store identity folder points at an empty temp dir, so both URL files are
+ * missing. Must be set before httpMonitor is imported (paths are computed at
+ * load time).
  */
 const emptyDir = mkdtempSync(path.join(tmpdir(), 'idea-503-cors-'))
 const { config } = await import('../../src/data/Config.js')
@@ -37,11 +37,15 @@ describe('503 replies send CORS header', () => {
     })
 
     for (const route of ['/api/store-url', '/api/store-url/', '/api/command-log-url', '/api/command-log-url/']) {
-        it(`${route} -> 503 with Access-Control-Allow-Origin: *`, async () => {
-            const res = await fetch(`${baseUrl}${route}`, { headers: { Origin: 'http://brave-otter.local' } })
+        it(`${route} -> 503; own origin echoed, another origin gets no CORS header`, async () => {
+            const res = await fetch(`${baseUrl}${route}`, { headers: { Origin: baseUrl } })
             expect(res.status).toBe(503)
-            expect(res.headers.get('access-control-allow-origin')).toBe('*')
+            expect(res.headers.get('access-control-allow-origin')).toBe(baseUrl)
+            expect(res.headers.get('vary')).toBe('Origin')
             expect((await res.json()).error).toMatch(/not available yet/)
+            const other = await fetch(`${baseUrl}${route}`, { headers: { Origin: 'http://brave-otter.local' } })
+            expect(other.status).toBe(503)
+            expect(other.headers.get('access-control-allow-origin')).toBeNull()
         })
     }
 })

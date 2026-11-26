@@ -17,6 +17,7 @@ import { config, commandLogArchiveMaxBytes } from './Config.js'
 import { stopPeriodicFlush } from '../repo.js'
 import { isCommandLogContent, markOwnArchivedCommandLog, markOwnCommandLog } from './StoreScope.js'
 import { quarantineBadChunks } from './StoreHealth.js'
+import type { CommandSource } from './CommandSource.js'
 
 // ── Types (also exported for use in CommonTypes consumers) ───────────────────
 
@@ -79,6 +80,10 @@ export interface CommandTrace {
   error?: LogText | null
   /** JSON result text for commands that return data (summariseDisk, idea#134); null otherwise. Never an object. */
   result?: LogText | null
+  /** engine#582: who asked for the command (CommandSource.ts); absent on traces written before it. */
+  source?: CommandSource
+  /** engine#582: sequence number of the signed queue entry; absent when the command had none. */
+  seq?: number
   logs: LogEntry[]          // Automerge list — appended in batches via flushLogs
 }
 
@@ -531,6 +536,10 @@ export const addTrace = (
 ): void => {
   liveCommandLogHandle(handle).change(doc => {
     const t: CommandTrace = { ...trace, args: logStr(trace.args ?? ''), errorMessage: logStrOrNull(trace.errorMessage), logs: [] }
+    // Automerge refuses undefined values: optional fields are left out when not set (engine#582)
+    if (t.source === undefined) delete t.source
+    else t.source = { ...t.source }
+    if (t.seq === undefined || t.seq === null) delete t.seq
     if (trace.error !== undefined) t.error = logStrOrNull(trace.error)
     if (trace.result !== undefined) t.result = logStrOrNull(trace.result)
     doc.traces[trace.traceId] = t

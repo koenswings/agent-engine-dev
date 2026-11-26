@@ -286,7 +286,7 @@ export const makeBackupDisk = async (
             ? readSummaryFromTrace(storeHandle.doc()!, summaryTraceId, targetId)
             : null
         if (erase) {
-            if (!summary) fail(storeHandle, opId, 'SUMMARY_STALE', 'The summary is missing, for another disk, or older than 10 minutes. Check the disk again.')
+            if (!summary) fail(storeHandle, opId, 'SUMMARY_STALE', 'The summary is missing, for another disk, older than 10 minutes, or not made by this Engine. Check the disk again.')
             if (summary!.label !== confirmName) {
                 fail(storeHandle, opId, 'CONFIRM_MISMATCH', `Typed name does not match the disk label '${summary!.label}'.`)
             }

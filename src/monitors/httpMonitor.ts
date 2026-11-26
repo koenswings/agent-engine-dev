@@ -26,6 +26,10 @@
  *   GET http://<engine-hostname>/api/store-url
  *   → { "url": "automerge:<hash>", "wsPort": 4321 }
  *
+ * CORS (engine#582): /api/* answers carry Access-Control-Allow-Origin only for this
+ * Engine's own Console origins and settings.devConsoleOrigins (consoleOrigins.ts);
+ * OPTIONS on /api/* is answered for preflights.
+ *
  * `wsPort` is the Engine's effective WebSocket port (config.yaml settings.port,
  * after the IDEA_ENGINE_PORT override in Config.ts), so the Console does not
  * have to assume the default. `url` is unchanged for backward compatibility.
@@ -39,6 +43,7 @@ import { log } from '../utils/utils.js'
 import { config } from '../data/Config.js'
 import type { DocHandle } from '@automerge/automerge-repo'
 import type { CommandLogStore } from '../data/CommandLogStore.js'
+import { corsHeadersFor, CORS_PREFLIGHT_HEADERS } from './consoleOrigins.js'
 
 const STORE_URL_FILE = path.join(
     config.settings.storeIdentityFolder,
@@ -166,19 +171,24 @@ export const enableHttpMonitor = (
 
     const handler: http.RequestListener = async (req, res) => {
         const url = req.url ?? '/'
+        // engine#582: CORS only for this Engine's own Console origins (consoleOrigins.ts)
+        const cors = corsHeadersFor(req, [port, alsoPort, config.settings.httpPort, config.settings.ideaLocalHttpPort ?? 80])
+        const apiPathOnly = (url.split('?')[0] ?? '/')
+        if (req.method === 'OPTIONS' && (apiPathOnly === '/api' || apiPathOnly.startsWith('/api/'))) {
+            res.writeHead(204, cors['Access-Control-Allow-Origin'] ? { ...cors, ...CORS_PREFLIGHT_HEADERS } : cors)
+            res.end()
+            return
+        }
 
         // ── API routes ──────────────────────────────────────────────────────
         if (url === '/api/store-url' || url === '/api/store-url/') {
             try {
                 const storeUrl = (await fs.readFile(STORE_URL_FILE, 'utf-8')).trim()
-                res.writeHead(200, {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',  // Console may be on a different origin during dev
-                })
+                res.writeHead(200, { 'Content-Type': 'application/json', ...cors })
                 res.end(JSON.stringify(buildStoreUrlPayload(storeUrl, undefined, opts.engineId)))
             } catch (e) {
                 log(`[http] /api/store-url: failed to read store URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
+                res.writeHead(503, { 'Content-Type': 'application/json', ...cors })
                 res.end(JSON.stringify({ error: 'Store URL not available yet' }))
             }
             return
@@ -187,24 +197,21 @@ export const enableHttpMonitor = (
         if (url === '/api/command-log-url' || url === '/api/command-log-url/') {
             try {
                 const logUrl = (await fs.readFile(COMMAND_LOG_URL_FILE, 'utf-8')).trim()
-                res.writeHead(200, {
-                    'Content-Type': 'application/json',
-                    'Access-Control-Allow-Origin': '*',
-                })
+                res.writeHead(200, { 'Content-Type': 'application/json', ...cors })
                 res.end(JSON.stringify({ url: logUrl }))
             } catch (e) {
                 log(`[http] /api/command-log-url: failed to read URL — ${e}`)
-                res.writeHead(503, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })  // Console on another Pi must see the 503 too
+                res.writeHead(503, { 'Content-Type': 'application/json', ...cors })
                 res.end(JSON.stringify({ error: 'Command log URL not available yet' }))
             }
             return
         }
 
         // engine#357: unknown /api/* is a JSON 404, never the Console SPA fallback.
-        // Same error shape and CORS header as the 503s above ({ error: string }).
+        // Same error shape and CORS headers as the 503s above ({ error: string }).
         const apiPath = (url.split('?')[0] ?? '/')
         if (apiPath === '/api' || apiPath.startsWith('/api/')) {
-            res.writeHead(404, { 'Content-Type': 'application/json', 'Access-Control-Allow-Origin': '*' })
+            res.writeHead(404, { 'Content-Type': 'application/json', ...cors })
             res.end(JSON.stringify({ error: 'Not found' }))
             return
         }

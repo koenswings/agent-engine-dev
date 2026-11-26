@@ -6,6 +6,10 @@ import { handleCommand } from '../utils/commandUtils.js'
 import { commands } from '../data/Commands.js';
 import { localEngineId } from '../data/Engine.js';
 import { CommandLogStore } from '../data/CommandLogStore.js';
+import type { CommandSource } from '../data/CommandSource.js';
+
+/** engine#582: entries from the store queue; the writer is not known on this path. */
+const QUEUE_SOURCE: CommandSource = { kind: 'queue' }
 
 
 
@@ -70,7 +74,7 @@ const drainReadOnlyCommands = (storeHandle: DocHandle<Store>, engineId: EngineID
         log(`Processing read-only command for engine ${engineId} (parallel): ${command}`)
         // Same #262 setImmediate: do not run inside the store 'change' event.
         new Promise<void>(resolve => setImmediate(resolve))
-            .then(() => handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null))
+            .then(() => handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null, { source: QUEUE_SOURCE }))
             .catch(e => log(`Command '${command}' failed outside its trace: ${e?.message ?? e}`))
             .finally(() => {
                 running!.delete(command)
@@ -98,7 +102,7 @@ export const processCommandQueue = (storeHandle: DocHandle<Store>, engineId: Eng
     // returns, so a command that changes the store and then checks the result (forgetDisk)
     // saw its own change as not done. setImmediate runs it on a clean stack.
     new Promise<void>(resolve => setImmediate(resolve))
-        .then(() => handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null))
+        .then(() => handleCommand(commands, storeHandle, 'engine', command, cmdLogHandle ?? null, { source: QUEUE_SOURCE }))
         .catch(e => log(`Command '${command}' failed outside its trace: ${e?.message ?? e}`))
         .finally(() => {
             busy!.delete(String(engineId))

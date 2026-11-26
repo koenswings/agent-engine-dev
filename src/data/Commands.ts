@@ -29,7 +29,7 @@ import { cancelOperation } from './Operations.js';
 import { DiskArgResult, lookupDiskArg, resolveDiskArg } from './DiskArg.js';
 import { pickLocalBackupDisk, localBackupDisks, localEngineName, noLocalBackupDiskMessage } from './LocalBackupDisk.js';
 import { createFilesDisk } from './CreateFilesDisk.js';
-import { summariseDisk, attachTraceResult } from './SummariseDisk.js';
+import { summariseDisk, attachTraceResult, rememberOwnSummaryTrace } from './SummariseDisk.js';
 import { eraseDisk } from './EraseDisk.js';
 import { makeBackupDisk, assertBackupDiskMinSize } from './MakeBackupDisk.js';
 import { ForgetDiskError, WITH_INSTANCES_FLAG, forgetDisk, forgetDiskWithInstances } from './ForgetDisk.js';
@@ -555,6 +555,7 @@ const summariseDiskWrapper = async (storeHandle: DocHandle<Store> | null, target
     if (!storeHandle) throw new Error('Store is not available.')
     const summary = await summariseDisk(storeHandle, targetId)
     attachTraceResult(summary)
+    rememberOwnSummaryTrace()
     const partial = !!(summary.files?.partial || summary.other?.partial)
     print(chalk.green(`Summary for ${summary.label}: readable=${summary.readable} partial=${partial}`))
 }

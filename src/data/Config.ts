@@ -2,6 +2,7 @@ import { $, YAML, chalk, fs } from "zx";
 import { log } from "../utils/utils.js";
 import { fileURLToPath } from 'url';
 import { dirname, join } from 'path';
+import os from 'os';
 
 // ##################################################################################################
 // Type Definitions
@@ -35,6 +36,9 @@ export interface Settings {
     ideaLocal?: boolean;          // Publish the shared name idea.local via avahi D-Bus when mdns is on (idea#203; default true). See monitors/ideaLocal.ts.
     lanPreferCidrs?: string[];    // IPv4 CIDRs whose addresses win the Engine.lanAddress choice over the default route (default ['10.42.0.0/16'], the school/kit LAN; [] = default-route order only). See lanPreferCidrs() and LanAddress.ts.
     quarantineAfterMs?: number;   // idea#396: shorten the 24 h pre-update snapshot quarantine window (honoured only when isDev or testMode; ignored in production).
+    authFolder?: string;          // engine#582: Engine-local folder for operator accounts, the command key and the audit log; never synced (default ~/.idea-engine/auth; IDEA_AUTH_DIR wins). See authFolder().
+    devConsoleOrigins?: string[]; // engine#582: extra origins (e.g. 'http://localhost:5173') that get CORS answers next to the Engine's own Console origins (default []). See devConsoleOrigins().
+    allowedGitAccounts?: string[]; // engine#582: GitHub accounts buildInstance may clone apps from (default ['koenswings']). See allowedGitAccounts().
 }
 
 export interface Defaults {
@@ -120,6 +124,9 @@ function validate<T>(obj: any, validator: (obj: any, path: string) => string[]):
     return validator(obj, '');
 }
 
+/** An origin: scheme, host and optional port, nothing else (devConsoleOrigins). */
+const ORIGIN_RE = /^https?:\/\/[A-Za-z0-9.\-\[\]:]+$/
+
 export function validateSettings(obj: any, path: string): string[] {
     const errors: string[] = [];
     if (typeof obj.mdns !== 'boolean') errors.push(`'${path}mdns' must be a boolean.`);
@@ -143,6 +150,9 @@ export function validateSettings(obj: any, path: string): string[] {
     if (obj.commandLogArchiveMaxBytes !== undefined && (typeof obj.commandLogArchiveMaxBytes !== 'number' || !(obj.commandLogArchiveMaxBytes > 0))) errors.push(`'${path}commandLogArchiveMaxBytes' must be a positive number.`);
     if (obj.peerStaleHours !== undefined && (typeof obj.peerStaleHours !== 'number' || !(obj.peerStaleHours > 0))) errors.push(`'${path}peerStaleHours' must be a positive number.`);
     if (obj.autoStartChannelBuilder !== undefined && typeof obj.autoStartChannelBuilder !== 'boolean') errors.push(`'${path}autoStartChannelBuilder' must be a boolean.`);
+    if (obj.authFolder !== undefined && (typeof obj.authFolder !== 'string' || obj.authFolder === '')) errors.push(`'${path}authFolder' must be a non-empty string.`);
+    if (obj.devConsoleOrigins !== undefined && (!Array.isArray(obj.devConsoleOrigins) || obj.devConsoleOrigins.some((o: unknown) => typeof o !== 'string' || !ORIGIN_RE.test(o)))) errors.push(`'${path}devConsoleOrigins' must be a list of origins such as 'http://localhost:5173'.`);
+    if (obj.allowedGitAccounts !== undefined && (!Array.isArray(obj.allowedGitAccounts) || obj.allowedGitAccounts.some((a: unknown) => typeof a !== 'string' || a === ''))) errors.push(`'${path}allowedGitAccounts' must be a list of account names.`);
     if (obj.lanPreferCidrs !== undefined && (!Array.isArray(obj.lanPreferCidrs) || obj.lanPreferCidrs.some((c: unknown) => typeof c !== 'string' || !LAN_CIDR.test(c)))) errors.push(`'${path}lanPreferCidrs' must be a list of IPv4 CIDRs such as '10.42.0.0/16'.`);
     if (obj.quarantineAfterMs !== undefined && (typeof obj.quarantineAfterMs !== 'number' || !Number.isFinite(obj.quarantineAfterMs) || obj.quarantineAfterMs <= 0)) errors.push(`'${path}quarantineAfterMs' must be a positive number.`);
     if (obj.ideaLocalHttpPort !== undefined && (typeof obj.ideaLocalHttpPort !== 'number' || !Number.isInteger(obj.ideaLocalHttpPort) || obj.ideaLocalHttpPort < 1 || obj.ideaLocalHttpPort > 65535)) errors.push(`'${path}ideaLocalHttpPort' must be a port number.`);
@@ -450,3 +460,26 @@ export const skipMetaUpdate = (): boolean => config.settings.skipMetaUpdate ?? (
 /** #185: size cap of the CommandLog archive folder (bytes, default 1 GB). No age-based deletion. */
 export const COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES = 1_000_000_000
 export const commandLogArchiveMaxBytes = (): number => config.settings.commandLogArchiveMaxBytes ?? COMMAND_LOG_ARCHIVE_DEFAULT_MAX_BYTES
+
+
+/**
+ * engine#582: Engine-local folder for operator accounts, the command key, sessions'
+ * on-disk helpers and the command audit log. Never synced, never in a backup or a kit
+ * image. IDEA_AUTH_DIR wins, then settings.authFolder, then ~/.idea-engine/auth (on a Pi,
+ * pm2 runs as pi: /home/pi/.idea-engine/auth, outside the checkout so a redeploy keeps it).
+ * In testMode without either, a per-process folder under the OS temp dir, so tests never
+ * touch a real account file. Read at call time.
+ */
+export const authFolder = (): string => {
+    if (process.env.IDEA_AUTH_DIR) return process.env.IDEA_AUTH_DIR
+    if (config.settings.authFolder) return config.settings.authFolder
+    if (config.settings.testMode) return join(os.tmpdir(), `idea-engine-auth-test-${process.pid}`)
+    return join(os.homedir(), '.idea-engine', 'auth')
+}
+
+/** engine#582: extra CORS origins next to the Engine's own Console origins (default none). */
+export const devConsoleOrigins = (): string[] => [...(config.settings.devConsoleOrigins ?? [])]
+
+/** engine#582: GitHub accounts buildInstance may clone from (default ['koenswings']). */
+export const ALLOWED_GIT_ACCOUNTS_DEFAULT: readonly string[] = ['koenswings']
+export const allowedGitAccounts = (): string[] => [...(config.settings.allowedGitAccounts ?? ALLOWED_GIT_ACCOUNTS_DEFAULT)]

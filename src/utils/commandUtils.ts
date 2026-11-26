@@ -8,6 +8,9 @@ import { print } from './utils.js';
 import { redactString } from './redact.js';
 import { setupDemoTraceApps } from '../data/DemoApps.js';
 import { lookupInstanceArg } from '../data/InstanceArg.js';
+import { CommandSource, cleanCommandSource, isRemoteSource } from '../data/CommandSource.js';
+import { appendAudit } from '../data/CommandAudit.js';
+import { localEngineId } from '../data/Engine.js';
 
 
 /**
@@ -19,8 +22,16 @@ const recordErrorTrace = (
     commandLogHandle: DocHandle<CommandLogStore> | null | undefined,
     commandName: string,
     argsJson: string,
-    message: string
+    message: string,
+    opts: HandleCommandOptions = {},
+    errorCode: string | null = null,
 ): void => {
+    const source = cleanCommandSource(opts.source)
+    appendAudit({
+        t: Date.now(), engineId: String(localEngineId), seq: opts.seq ?? null,
+        command: commandName || '(empty)', args: argsJson, source: source ?? null,
+        result: 'refused', errorCode,
+    })
     if (!commandLogHandle) return;
     const traceId = crypto.randomUUID();
     addTrace(commandLogHandle, {
@@ -31,9 +42,31 @@ const recordErrorTrace = (
         completedAt: null,
         status: 'running',
         errorMessage: null,
+        ...(source ? { source } : {}),
+        ...(typeof opts.seq === 'number' ? { seq: opts.seq } : {}),
     });
-    closeTrace(commandLogHandle, traceId, 'error', redactString(message));
+    closeTrace(commandLogHandle, traceId, 'error', redactString(message), undefined, errorCode);
 }
+
+/**
+ * engine#582: options for handleCommand. `source` says who asked (recorded on the
+ * trace and in the audit log); `seq` is the signed queue entry's sequence number.
+ * Callers that pass no source are in-process (tests, the Engine itself).
+ */
+export interface HandleCommandOptions {
+    source?: CommandSource
+    seq?: number
+}
+
+/**
+ * engine#582: commands that never run when they come from outside this Pi
+ * (an operator, a peer, or an unknown queue writer). createInstance clones an app
+ * from a GitHub account given as an argument; installApp replaces it.
+ */
+export const LOCAL_ONLY_COMMANDS: readonly string[] = ['createInstance']
+
+/** Stable refusal code for a local-only command sent from outside (engine#582). */
+export const COMMAND_REFUSED = 'COMMAND_REFUSED'
 
 
 /**
@@ -77,8 +110,10 @@ export const handleCommand = async (
     storeHandle: DocHandle<Store> | null,
     context: 'console' | 'engine',
     input: string,
-    commandLogHandle?: DocHandle<CommandLogStore> | null
+    commandLogHandle?: DocHandle<CommandLogStore> | null,
+    opts: HandleCommandOptions = {},
 ): Promise<void> => {
+    const source = cleanCommandSource(opts.source)
     const trimmedInput = input.trim();
     const commandName = trimmedInput.split(' ')[0];
     const command = commands.find(cmd => cmd.name === commandName);
@@ -90,7 +125,8 @@ export const handleCommand = async (
             commandLogHandle,
             commandName || '(empty)',
             JSON.stringify({ input: trimmedInput }),
-            message
+            message,
+            opts
         );
         return;
     }
@@ -114,14 +150,21 @@ export const handleCommand = async (
     if (context === 'console' && command.scope === 'engine') {
         const message = `Error: Command '${commandName}' can only be executed on an engine. Use 'send <engineId> ${commandName} ...' to execute it remotely.`;
         print(message);
-        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message, opts);
         return;
     }
 
     if (context === 'engine' && command.scope === 'console') {
         const message = `Error: Command '${commandName}' can only be executed on a console.`;
         print(message);
-        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message, opts);
+        return;
+    }
+
+    if (LOCAL_ONLY_COMMANDS.includes(commandName) && isRemoteSource(source)) {
+        const message = `Error: '${commandName}' only runs from the command line on this Engine. Use installApp instead.`;
+        print(message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message, opts, COMMAND_REFUSED);
         return;
     }
 
@@ -138,7 +181,7 @@ export const handleCommand = async (
     } catch (error: any) {
         const message = `Error: ${error.message}`;
         console.error(message);
-        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message);
+        recordErrorTrace(commandLogHandle, commandName, JSON.stringify(stringArgs), message, opts);
         return;
     }
 
@@ -172,8 +215,14 @@ export const handleCommand = async (
             completedAt: null,
             status: 'running',
             errorMessage: null,
+            ...(source ? { source } : {}),
+            ...(typeof opts.seq === 'number' ? { seq: opts.seq } : {}),
         });
     }
+    const audit = (result: 'ok' | 'error', errorCode: string | null = null) => appendAudit({
+        t: Date.now(), engineId: String(localEngineId), seq: opts.seq ?? null,
+        command: commandName, args: argsJson, source: source ?? null, result, errorCode,
+    })
 
     // ── Execute inside trace context ─────────────────────────────────────────
     try {
@@ -182,6 +231,7 @@ export const handleCommand = async (
             await flushTrace(traceId);
             closeTrace(commandLogHandle, traceId, 'ok', takePendingTraceCloseMessage(traceId));
         }
+        audit('ok')
     } catch (error: any) {
         console.error(`Error: ${error.message}`);
         if (commandLogHandle) {
@@ -193,6 +243,7 @@ export const handleCommand = async (
             const errorResult = error?.traceResult !== undefined ? JSON.stringify(error.traceResult) : null
             closeTrace(commandLogHandle, traceId, 'error', error.message, errorResult, errorCode);
         }
+        audit('error', typeof error?.code === 'string' && /^[A-Z][A-Z0-9_]*$/.test(error.code) ? error.code : null)
     }
 }
 
