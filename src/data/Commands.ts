@@ -309,6 +309,8 @@ const sendWrapper = (storeHandle: DocHandle<Store> | null, args: string) => {
     const engineId = args.substring(0, firstSpaceIndex);
     const command = args.substring(firstSpaceIndex + 1);
     if (!storeHandle.doc()?.engineDB[engineId as EngineID]) throw new Error(`Cannot send command: Engine ${engineId} not found in store.`)
+    // engine#582: only this Engine's own queue; another Engine signs its own queue (sign in to it)
+    if (engineId !== String(localEngineId)) throw Object.assign(new Error(`send only queues commands on this Engine (${localEngineId}). To command Engine ${engineId}, sign in to it.`), { code: 'COMMAND_REFUSED' })
     sendCommand(storeHandle, engineId as EngineID, command as Command);
 }
 

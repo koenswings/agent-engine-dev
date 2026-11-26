@@ -2,7 +2,7 @@
  * UpdateFetch.ts — cross-Engine Fetch for updateApp (agent-engine-dev#263, builds on #230).
  *
  * Push model, no gate or helper change: the instance's Engine (target) asks the Engine where
- * the source disk is docked (`pushAppBundle`, sent with sendCommand) to push apps/<appId>/ with
+ * the source disk is docked (`pushAppBundle`, sent with PeerCommands.dispatchToPeer) to push apps/<appId>/ with
  * rsyncToPeer through the existing receive-app path into <target disk>/apps/<appId>/. The source
  * answers with `appFetchResult <requestId> ok|TRANSFER_FAILED <why>`.
  *
@@ -136,7 +136,7 @@ export const fetchBundle = async (req: FetchRequest, d: FetchTargetDeps): Promis
 export const defaultFetchTargetDeps = (storeHandle: DocHandle<Store>, verifySums: (dir: string) => Promise<boolean>): FetchTargetDeps => ({
     mountRoot: (disk) => diskMountRoot(disk),
     rootToken: (disk) => appDataRoot(disk),
-    send: (engineId, command) => { void import('../utils/commandUtils.js').then(m => m.sendCommand(storeHandle, engineId, command as Command)) },
+    send: (engineId, command) => { void import('./PeerCommands.js').then(m => m.dispatchToPeer(storeHandle, String(engineId), command)) },
     verifySums,
     newId: () => uuid(),
     now: () => Date.now(),
@@ -234,7 +234,7 @@ export const defaultPushDeps = (storeHandle: DocHandle<Store>): PushDeps => ({
     stop: (opId) => killRegisteredProcess(opId),
     dirBytes: async (dir) => (await import('./CopyMoveApp.js')).directoryBytes(dir),
     temperatureC: readCpuTemperatureC,
-    reply: (engineId, command) => { void import('../utils/commandUtils.js').then(m => m.sendCommand(storeHandle, engineId, command as Command)) },
+    reply: (engineId, command) => { void import('./PeerCommands.js').then(m => m.dispatchToPeer(storeHandle, String(engineId), command)) },
     broadcast: (msg) => { try { storeHandle.broadcast(msg) } catch { /* no peers */ } },
     now: () => Date.now(),
     sleep: (ms) => new Promise(r => setTimeout(r, ms)),

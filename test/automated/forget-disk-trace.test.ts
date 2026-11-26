@@ -7,6 +7,7 @@ import { describe, it, beforeEach, afterEach, expect, vi } from 'vitest'
 import { DocHandle, Repo } from '@automerge/automerge-repo'
 import { Store } from '../../src/data/Store.js'
 import { createOrUpdateEngine, localEngineId } from '../../src/data/Engine.js'
+import { signEntry } from '../../src/data/CommandKey.js'
 import { CommandLogStore, CommandTrace } from '../../src/data/CommandLogStore.js'
 import { enableStoreMonitor } from '../../src/monitors/storeMonitor.js'
 import { forgetDisk } from '../../src/data/ForgetDisk.js'
@@ -47,7 +48,7 @@ describe('forgetDisk reports what it did (#262)', () => {
 
     it('via the command queue: both records removed and both traces ok', async () => {
         enableStoreMonitor(h, log)
-        h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(`forgetDisk ${DISK}`, 'forgetDisk 1so47cqrv6kor7anvxm') })
+        h.change(d => { (d.engineDB[localEngineId].commands as any[]).push(signEntry(`forgetDisk ${DISK}`, 'cli', String(localEngineId)).entry, signEntry('forgetDisk 1so47cqrv6kor7anvxm', 'cli', String(localEngineId)).entry) })
         await vi.waitFor(() => expect(queue(h)).toEqual([]))
         await vi.waitFor(() => expect(traces(log).filter(t => t.command?.startsWith('forgetDisk') && t.status !== 'running').length).toBe(2))
         expect(h.doc()!.diskDB[DISK as any]).toBeUndefined()

@@ -11,6 +11,7 @@ import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websoc
 import { $, fs, sleep, argv } from 'zx'
 import os from 'os'
 import path from 'path'
+import { cliQueueEntry } from './cli-queue-entry.js'
 
 const host = os.hostname()
 if (['idea02', 'wizardly-hugle'].includes(host)) { console.error(`refusing on ${host}`); process.exit(2) }
@@ -39,7 +40,7 @@ out('card', card)
 const since = Date.now() - 5000
 const cmd = `flashCard ${card.candidateId} ${v} ${card.sizeBytes}`
 out('send', cmd)
-h.change((d: any) => { d.engineDB[E.id].commands.push(cmd) })
+h.change((d: any) => { d.engineDB[E.id].commands.push(cliQueueEntry(cmd, E.id)) })
 let opId: string | null = null, last = ''
 for (let i = 0; i < 7200; i++) {
     await sleep(1000)

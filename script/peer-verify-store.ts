@@ -12,7 +12,8 @@
  *   tsx script/peer-verify-store.ts <host> purge [--instances a,b] [--disks c,d]
  *
  * Output: one JSON object on stdout. Exit 0 ok, 1 error (message on stderr).
- * Env: PV_HTTP_PORT (80), PV_STORE_TIMEOUT_MS (45000), PV_STORE_URL / PV_WS_PORT (skip HTTP).
+ * Env: PV_HTTP_PORT (80), PV_STORE_TIMEOUT_MS (45000), PV_STORE_URL / PV_WS_PORT (skip HTTP),
+ *      PV_TOKEN (operator session token; push-command on an Engine with signedCommands1).
  */
 import { Repo, type DocHandle, type DocumentId, type PeerId } from '@automerge/automerge-repo'
 import { WebSocketClientAdapter } from '@automerge/automerge-repo-network-websocket'
@@ -85,9 +86,22 @@ const main = async () => {
         const command = words.join(' ')
         if (!engineId || !command) die('push-command <engineId> <command…>')
         if (!doc.engineDB?.[engineId]) die(`Engine ${engineId} is not in the store on ${host}`)
-        handle.change((d: any) => { d.engineDB[engineId].commands.push(command) })
-        await sleep(3000)   // let the change reach the Engine before the socket closes
-        out = { pushed: command, engineId }
+        // engine#582: an Engine with signedCommands1 runs only signed entries; send through
+        // its POST /api/command with an operator token (PV_TOKEN) instead of the store.
+        if ((doc.engineDB[engineId].capabilities ?? []).includes('signedCommands1')) {
+            const token = process.env.PV_TOKEN
+            if (!token) die(`Engine ${engineId} takes commands only from a signed-in operator; set PV_TOKEN to a session token`)
+            const r = await fetch(`http://${host}:${process.env.PV_HTTP_PORT ?? 80}/api/command`, {
+                method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` }, body: JSON.stringify({ command }),
+            })
+            const body = await r.json().catch(() => ({}))
+            if (r.status !== 202) die(`POST /api/command answered ${r.status}: ${JSON.stringify(body)}`)
+            out = { pushed: command, engineId, seq: body.seq }
+        } else {
+            handle.change((d: any) => { d.engineDB[engineId].commands.push(command) })
+            await sleep(3000)   // let the change reach the Engine before the socket closes
+            out = { pushed: command, engineId }
+        }
     } else if (cmd === 'purge') {
         const inst = flag('instances')
         const disks = flag('disks')

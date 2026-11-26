@@ -45,6 +45,7 @@ import type { DocHandle } from '@automerge/automerge-repo'
 import type { CommandLogStore } from '../data/CommandLogStore.js'
 import { corsHeadersFor, CORS_PREFLIGHT_HEADERS } from './consoleOrigins.js'
 import { handleAuthApi, AuthContext } from './authApi.js'
+import { handleCommandApi } from './commandApi.js'
 
 const STORE_URL_FILE = path.join(
     config.settings.storeIdentityFolder,
@@ -211,6 +212,10 @@ export const enableHttpMonitor = (
         // engine#582: Engine sign-in (authApi.ts). Without an auth context (older callers) these are 404s.
         if (opts.auth && (apiPathOnly === '/api/auth' || apiPathOnly.startsWith('/api/auth/'))) {
             if (await handleAuthApi(req, res, apiPathOnly, cors, opts.auth)) return
+        }
+        // engine#582: signed commands (commandApi.ts) — operator token or peer grant.
+        if (opts.auth && (apiPathOnly === '/api/command' || apiPathOnly === '/api/command/')) {
+            if (await handleCommandApi(req, res, apiPathOnly, cors, opts.auth)) return
         }
 
         // engine#357: unknown /api/* is a JSON 404, never the Console SPA fallback.

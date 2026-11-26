@@ -33,6 +33,7 @@ import { loginWaitMs, recordLoginFailure, recordLoginSuccess } from '../data/Log
 import { setupOpen, useSetupCode } from '../data/SetupCode.js'
 import { appendAudit } from '../data/CommandAudit.js'
 import { cleanCommandSource } from '../data/CommandSource.js'
+import { issueGrant } from '../data/PeerGrants.js'
 
 export const AUTH_VERSION = 1
 export const MAX_BODY_BYTES = 16 * 1024
@@ -166,7 +167,12 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
     const dir = dirOf(ctx)
     const client = clientAddressOf(req)
     // The body is read (size-checked) before any token check: an oversized body is 413 for everyone.
-    const raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readRawBody(req)
+    let raw: Buffer
+    try { raw = method === 'GET' || method === 'HEAD' ? Buffer.alloc(0) : await readRawBody(req) } catch (e) {
+        // engine#582: every error of the grant route names this Engine as issuerEngineId
+        if (route === '/api/auth/grant' && e instanceof HttpError) e.extra = { issuerEngineId: ctx.engineId, ...e.extra }
+        throw e
+    }
     const body = (): Record<string, unknown> => parseJsonBody(raw)
 
     if (route === '/api/auth/info' && method === 'GET') return { status: 200, body: buildAuthInfo(ctx) }
@@ -220,6 +226,26 @@ export const routeAuth = async (req: http.IncomingMessage, pathname: string, ctx
     if (route === '/api/auth/renew' && method === 'POST') {
         const s = authenticate(req)
         return { status: 200, body: { expiresInMs: Math.max(0, Math.min(SESSION_IDLE_MS, s.expiresAt - s.lastUsed)) } }
+    }
+
+    if (route === '/api/auth/grant' && method === 'POST') {
+        // engine#582: permission for another Engine to send follow-ups here. Every
+        // error names this Engine as issuerEngineId.
+        const self = ctx.engineId
+        try {
+            const s = authenticate(req)
+            const b = body()
+            const to = str(b.toEngineId, 'toEngineId', 80)
+            if (!/^[A-Za-z0-9_-]{1,80}$/.test(to) || to === self) throw new HttpError(400, 'BAD_REQUEST', "'toEngineId' must be another Engine's id.")
+            const store = ctx.storeHandle?.doc() as Store | undefined
+            if (!store?.engineDB?.[to as any]) throw new HttpError(404, 'ENGINE_UNKNOWN', `Engine ${to} is not known to this Engine.`)
+            const g = issueGrant(self, to, s.username, undefined, dirOf(ctx))
+            auditAuth(ctx, 'grant', { username: to, by: s.username, session: sessionShortId(s) })
+            return { status: 200, body: { grant: g.grant, expiresInMs: g.expiresInMs, issuerEngineId: self } }
+        } catch (e) {
+            if (e instanceof HttpError) e.extra = { issuerEngineId: self, ...e.extra }
+            throw e
+        }
     }
 
     if (route === '/api/auth/logout' && method === 'POST') {

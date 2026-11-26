@@ -43,7 +43,7 @@ import { InstanceID, InstanceName, DiskID, EngineID, OperationCause, Timestamp, 
 import { createOperation, updateOperation, setOperationArgs, peerResumeProbe } from './Operations.js'
 import { engineCanResume, peerInFlight } from './InFlight.js'
 import { attachTraceResult } from './SummariseDisk.js'
-import { sendCommand } from '../utils/commandUtils.js'
+import { dispatchToPeer, preflightPeerGrant, grantRefusal, DispatchResult } from './PeerCommands.js'
 import { resourceLock, instanceKey, diskKey } from '../utils/ResourceLock.js'
 import { instanceDataBytes, helperAtLeast, deleteInstanceData, deleteRemoteInstanceData, remoteInstanceFolderExists } from '../utils/appDataHelper.js'
 import { REMOVE_HELPER_MIN, RemoveError, quarantineInstanceOnDisk } from './RemoveInstance.js'
@@ -63,7 +63,9 @@ export interface MoveDeps {
     requestVerify: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void
     requestStart: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void
     /** Ask the target Engine to stop the Checking container and quarantine the target folder (engine#388). */
-    requestCleanup: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void
+    requestCleanup: (storeHandle: DocHandle<Store>, targetEngineId: string, command: string) => void | Promise<DispatchResult | void>
+    /** engine#582: ask the target Engine whether it still accepts this Engine's grant (read-only). */
+    preflight: (storeHandle: DocHandle<Store>, targetEngineId: string) => Promise<DispatchResult>
     /** True when instances/<id> already exists on the target disk (local folder or remote size). */
     targetFolderExists: (store: Store, disk: Disk, id: InstanceID) => Promise<boolean>
     startSource: (storeHandle: DocHandle<Store>, instance: Instance, disk: Disk) => Promise<void>
@@ -189,9 +191,10 @@ const defaultDeps: MoveDeps = {
         if (!id) throw new Error('the copy did not finish')
         return id
     },
-    requestVerify: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
-    requestStart: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
-    requestCleanup: (storeHandle, engineId, command) => sendCommand(storeHandle, engineId as EngineID, command as Command),
+    requestVerify: (storeHandle, engineId, command) => { void dispatchToPeer(storeHandle, String(engineId), String(command)) },
+    requestStart: (storeHandle, engineId, command) => { void dispatchToPeer(storeHandle, String(engineId), String(command)) },
+    requestCleanup: (storeHandle, engineId, command) => dispatchToPeer(storeHandle, String(engineId), String(command)),
+    preflight: (storeHandle, engineId) => preflightPeerGrant(storeHandle, String(engineId)),
     targetFolderExists: defaultTargetFolderExists,
     startSource: (storeHandle, instance, disk) => startInstance(storeHandle, instance, disk, 'post-move'),
     removeSource: async (storeHandle, instanceId, _engineId, sourceDiskId) => {
@@ -394,6 +397,10 @@ export const moveAppCrossEngine = async (
         if (await d.targetFolderExists(storeHandle.doc(), targetDisk, instance.id)) {
             refuse('TARGET_EXISTS', `instance ${instance.id} already exists on ${targetDisk.name}`)
         }
+        // engine#582: the target Engine checks this Engine's permission before the move starts
+        // (no op, nothing stopped or sent); the trace gets its code and issuerEngineId
+        const refusal = grantRefusal(await d.preflight(storeHandle, targetEngineId), 'start')
+        if (refusal) throw refusal
     }
 
     let opId: string
@@ -487,7 +494,12 @@ export const moveAppCrossEngine = async (
             return record('failed', 'no target copy to clean up')
         }
         try {
-            d.requestCleanup(storeHandle, targetEngineId, `cleanupMoveTarget ${opId} ${targetInstanceId} ${targetDisk.id}`)
+            const sent = await d.requestCleanup(storeHandle, targetEngineId, `cleanupMoveTarget ${opId} ${targetInstanceId} ${targetDisk.id}`)
+            // engine#582: the target no longer accepts this Engine's permission (it restarted):
+            // the cleanup cannot run there, so do not wait for it; the copy stays under its marker
+            if (sent && !sent.ok && (sent.code === 'GRANT_EXPIRED' || sent.code === 'GRANT_INVALID')) {
+                return record('failed', `${targetName} did not accept this Engine's permission (${sent.code}); the copy there was not cleaned up`)
+            }
         } catch (e: any) {
             return record('failed', e?.message ?? String(e))
         }
@@ -670,7 +682,7 @@ export const crossMoveGaveUp = async (storeHandle: DocHandle<Store>, op: { id: s
     try {
         await defaultDeps.clearTargetMarker(host, engine, await appDataRoot(disk), id, opId)
         setOperationArgs(storeHandle, opId, { targetMarked: null })
-        defaultDeps.requestCleanup(storeHandle, engine, `cleanupMoveTarget ${opId} ${id} ${disk.id}`)
+        void defaultDeps.requestCleanup(storeHandle, engine, `cleanupMoveTarget ${opId} ${id} ${disk.id}`)
         log(`moveApp: operation ${opId} gave up while Checking; asked ${engine} to stop and quarantine its copy ${id}`)
     } catch (e: any) {
         log(`moveApp: operation ${opId} gave up while Checking; could not clean up the copy on ${engine}: ${e?.message ?? e}`)

@@ -83,6 +83,7 @@ import os from 'os'
 import path from 'path'
 import { spawn, ChildProcess } from 'child_process'
 import { fileURLToPath } from 'url'
+import { cliQueueEntry } from './cli-queue-entry.js'
 import { collectBlockFacts, loadExpectation, planSystemRecordChecks, resolveStick, systemDiskSkipFromConfig } from './hw-roundtrip-guard.js'
 import { readHardwareId } from '../src/data/Meta.js'
 import { readPartitionFacts, resolveHardwareDiskId } from '../src/data/DiskIdentity.js'
@@ -244,7 +245,7 @@ const dockedOn = (dev: string) => disks().filter(d => d.device === dev && d.dock
 /** Same path as the Console: append a command string to engineDB[<engine>].commands */
 const sendEject = (arg: string): number => {
     const t0 = Date.now()
-    storeHandle.change((doc: any) => { doc.engineDB[ENGINE_ID].commands.push(`ejectDisk ${arg}`) })
+    storeHandle.change((doc: any) => { doc.engineDB[ENGINE_ID].commands.push(cliQueueEntry(`ejectDisk ${arg}`, ENGINE_ID)) })
     return t0
 }
 const waitTrace = async (arg: string, t0: number): Promise<any | null> => {
@@ -514,7 +515,7 @@ const roundTrip = async () => {
 
 const sendCommand = (cmd: string): number => {
     const t0 = Date.now()
-    storeHandle.change((doc: any) => { doc.engineDB[ENGINE_ID].commands.push(cmd) })
+    storeHandle.change((doc: any) => { doc.engineDB[ENGINE_ID].commands.push(cliQueueEntry(cmd, ENGINE_ID)) })
     return t0
 }
 const instanceStatus = (id: string): string | null => store().instanceDB?.[id]?.status ?? null

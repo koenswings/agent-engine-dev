@@ -22,6 +22,7 @@ import { getCommandLogHandle, addTrace, closeTrace } from './CommandLogStore.js'
 import { runWithTrace, flushTrace } from '../utils/CommandLogger.js'
 import { engineCanResume, isPeerLinkFailure } from './InFlight.js'
 import { config } from './Config.js'
+import { entryLogText } from './CommandKey.js'
 
 // ── Recovery strategy per operation kind ─────────────────────────────────────
 
@@ -401,7 +402,7 @@ export const dropInterruptedCommand = (
         removed = String(list[i])
         list.splice(i, 1)
     })
-    if (removed) log(`recovery: ${op.id.slice(0, 8)} ${current.kind} (${current.status}): removed its queued command '${removed}' so the startup replay does not run it again${opts.retryOwned ? ' (boot recovery retries it in this op)' : ''}`)
+    if (removed) log(`recovery: ${op.id.slice(0, 8)} ${current.kind} (${current.status}): removed its queued command '${entryLogText(removed)}' so the startup replay does not run it again${opts.retryOwned ? ' (boot recovery retries it in this op)' : ''}`)
     return removed
 }
 
