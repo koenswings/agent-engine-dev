@@ -29,8 +29,8 @@ import {
     COMMAND_UNSIGNED, COMMAND_SIGNATURE_INVALID, COMMAND_REPLAYED,
 } from '../../src/data/CommandKey.js'
 import { enqueueSigned, clearPendingSourcesForTests } from '../../src/data/SignedQueue.js'
-import { issueGrant, checkGrant, GrantError, GRANT_TTL_MS, isPeerFollowUp, rememberGrant, grantFrom, clearGrantsForTests, parseGrant } from '../../src/data/PeerGrants.js'
-import { dispatchToPeer, hasSignedCommands } from '../../src/data/PeerCommands.js'
+import { issueGrant, checkGrant, GrantError, GRANT_TTL_MS, isPeerFollowUp, rememberGrant, grantFrom, clearGrantsForTests, parseGrant, GRANT_CHECK_COMMAND } from '../../src/data/PeerGrants.js'
+import { dispatchToPeer, hasSignedCommands, preflightPeerGrant, grantRefusal, PeerGrantRefusal } from '../../src/data/PeerCommands.js'
 import { setPeerAddressOverrideForTests, verifiedTarget, PeerError } from '../../src/data/PeerHttp.js'
 import { createSession, clearSessionsForTests } from '../../src/data/Sessions.js'
 import { clearConfirmsForTests, CONFIRM_TTL_MS } from '../../src/data/ConfirmGate.js'
@@ -280,6 +280,67 @@ describe('peer follow-ups (PeerCommands / PeerHttp), mixed versions', () => {
         await expect(verifiedTarget(h.doc(), 'ENGINE_unreachable')).rejects.toMatchObject({ code: 'ENGINE_UNREACHABLE', engineId: 'ENGINE_unreachable' })
     })
 
+    // engine#582: the read-only grant check before a copy or move does anything for the peer
+    it('preflight: POST /api/command grantCheck with Authorization: Grant and no reply grant; 200 ok → accepted', async () => {
+        const g = issueGrant(PEER, SELF).grant
+        rememberGrant(g, SELF)
+        answer = { status: 200, body: { engineId: PEER, issuerEngineId: PEER, ok: true } }
+        expect(await preflightPeerGrant(h, PEER)).toEqual({ ok: true, issuerEngineId: PEER })
+        expect(seen).toHaveLength(1)
+        expect(seen[0]).toMatchObject({ url: '/api/command', auth: `Grant ${g}`, body: { command: GRANT_CHECK_COMMAND, fromEngineId: SELF } })
+        expect(seen[0].body.replyGrant).toBeUndefined()
+        expect(grantFrom(PEER)).toBe(g)
+        expect(traces(log).filter(t => t.command === GRANT_CHECK_COMMAND)).toEqual([])   // no trace on success
+    })
+
+    it('preflight: an earlier engine#582 peer (no grantCheck) answers 422 not-a-follow-up after a good grant check → accepted', async () => {
+        rememberGrant(issueGrant(PEER, SELF).grant, SELF)
+        answer = { status: 422, body: { error: 'COMMAND_REFUSED', reason: 'not-a-follow-up', issuerEngineId: PEER } }
+        expect(await preflightPeerGrant(h, PEER)).toEqual({ ok: true, issuerEngineId: PEER })
+        answer = { status: 422, body: { error: 'COMMAND_REFUSED', reason: 'unknown', issuerEngineId: PEER } }
+        expect(await preflightPeerGrant(h, PEER)).toMatchObject({ ok: false, code: 'COMMAND_REFUSED' })
+    })
+
+    it('preflight: the peer refuses the grant (it restarted) → GRANT_EXPIRED with issuerEngineId, grant dropped, traced; grantRefusal carries both', async () => {
+        rememberGrant(issueGrant(PEER, SELF).grant, SELF)
+        answer = { status: 403, body: { error: 'GRANT_EXPIRED', message: 'This permission expired (or this Engine restarted). Start again.', issuerEngineId: PEER } }
+        const r = await preflightPeerGrant(h, PEER)
+        expect(r).toMatchObject({ ok: false, code: 'GRANT_EXPIRED', issuerEngineId: PEER })
+        expect(grantFrom(PEER)).toBeNull()
+        const t = traces(log).filter(x => x.command === GRANT_CHECK_COMMAND).at(-1)!
+        expect(t).toMatchObject({ status: 'error', errorCode: 'GRANT_EXPIRED' })
+        expect(commandLogText(t.result)).toContain(`"issuerEngineId":"${PEER}"`)
+        const e = grantRefusal(r, 'start')!
+        expect(e).toBeInstanceOf(PeerGrantRefusal)
+        expect(e).toMatchObject({ code: 'GRANT_EXPIRED', issuerEngineId: PEER, traceResult: { code: 'GRANT_EXPIRED', issuerEngineId: PEER, dispatchedTo: PEER, step: 'start' } })
+        expect(grantRefusal({ ok: true, issuerEngineId: PEER }, 'start')).toBeNull()
+    })
+
+    it('preflight: GRANT_INVALID also drops the grant', async () => {
+        rememberGrant(issueGrant(PEER, SELF).grant, SELF)
+        answer = { status: 403, body: { error: 'GRANT_INVALID', message: 'not valid', issuerEngineId: PEER } }
+        expect(await preflightPeerGrant(h, PEER)).toMatchObject({ ok: false, code: 'GRANT_INVALID', issuerEngineId: PEER })
+        expect(grantFrom(PEER)).toBeNull()
+    })
+
+    it('preflight: no grant kept (6 h passed, or this Engine restarted) → GRANT_EXPIRED, nothing sent', async () => {
+        expect(await preflightPeerGrant(h, PEER)).toMatchObject({ ok: false, code: 'GRANT_EXPIRED', issuerEngineId: PEER })
+        expect(seen).toEqual([])
+    })
+
+    it('preflight: an older peer (no signedCommands1) → ENGINE_VERSION_MISMATCH, nothing sent; unreachable → ENGINE_UNREACHABLE', async () => {
+        expect(await preflightPeerGrant(h, OLD)).toMatchObject({ ok: false, code: 'ENGINE_VERSION_MISMATCH', issuerEngineId: OLD })
+        expect(seen).toEqual([])
+        h.change(d => { (d.engineDB as any)['ENGINE_unreachable'] = { id: 'ENGINE_unreachable', commands: [], lastBooted: 5, capabilitiesBootedAt: 5, capabilities: ['signedCommands1'] } })
+        rememberGrant(issueGrant('ENGINE_unreachable', SELF).grant, SELF)
+        expect(await preflightPeerGrant(h, 'ENGINE_unreachable')).toMatchObject({ ok: false, code: 'ENGINE_UNREACHABLE', issuerEngineId: 'ENGINE_unreachable' })
+    })
+
+    it('preflight to this Engine itself: accepted without a request', async () => {
+        expect(await preflightPeerGrant(h, SELF)).toEqual({ ok: true, issuerEngineId: SELF })
+        expect(seen).toEqual([])
+    })
+
     it('to this Engine itself: a signed entry on the own queue', async () => {
         const r = await dispatchToPeer(h, SELF, 'startInstance i1 d1')
         expect(r.ok).toBe(true)
@@ -411,6 +472,26 @@ describe('POST /api/command and POST /api/auth/grant', () => {
         const badBody = await post('/api/command', { fromEngineId: PEER }, `Grant ${g}`)
         expect(badBody.status).toBe(400)
         expect(await badBody.json()).toMatchObject({ error: 'BAD_REQUEST', issuerEngineId: SELF })
+    })
+
+    it('grantCheck from a peer: 200 with a good grant, nothing queued; stale or wrong grants refused with issuerEngineId; never from an operator', async () => {
+        const g = issueGrant(SELF, PEER).grant
+        const ok = await post('/api/command', { command: GRANT_CHECK_COMMAND, fromEngineId: PEER }, `Grant ${g}`)
+        expect(ok.status).toBe(200)
+        expect(await ok.json()).toEqual({ engineId: SELF, issuerEngineId: SELF, ok: true })
+        expect(queue(h)).toEqual([])
+        expect(isPeerFollowUp(GRANT_CHECK_COMMAND)).toBe(false)
+        const otherFrom = await post('/api/command', { command: GRANT_CHECK_COMMAND, fromEngineId: 'ENGINE_x' }, `Grant ${g}`)
+        expect(otherFrom.status).toBe(403)
+        expect(await otherFrom.json()).toMatchObject({ error: 'GRANT_INVALID', issuerEngineId: SELF })
+        clearGrantsForTests()   // = this Engine restarted
+        const stale = await post('/api/command', { command: GRANT_CHECK_COMMAND, fromEngineId: PEER }, `Grant ${g}`)
+        expect(stale.status).toBe(403)
+        expect(await stale.json()).toMatchObject({ error: 'GRANT_EXPIRED', issuerEngineId: SELF })
+        const op = await post('/api/command', { command: GRANT_CHECK_COMMAND }, `Bearer ${token}`)
+        expect(op.status).toBe(422)
+        expect(await op.json()).toMatchObject({ error: 'COMMAND_REFUSED', reason: 'unknown' })
+        expect(queue(h)).toEqual([])
     })
 
     it('POST /api/auth/grant: a grant for a known Engine; every error carries issuerEngineId', async () => {

@@ -20,7 +20,7 @@ import type { DocHandle } from '@automerge/automerge-repo'
 import type { Store } from '../data/Store.js'
 import { authenticate, clientOf, readJsonBody, HttpError } from './authApi.js'
 import { sessionShortId } from '../data/Sessions.js'
-import { checkGrant, GrantError, isPeerFollowUp, parseGrant, rememberGrant } from '../data/PeerGrants.js'
+import { checkGrant, GrantError, GRANT_CHECK_COMMAND, isPeerFollowUp, parseGrant, rememberGrant } from '../data/PeerGrants.js'
 import { hasSignedCommands } from '../data/PeerCommands.js'
 import { commandNeedsConfirm, issueConfirm, checkConfirm, prepareConfirm, ConfirmRefusal } from '../data/ConfirmGate.js'
 import { enqueueSigned } from '../data/SignedQueue.js'
@@ -106,6 +106,8 @@ export const routeCommand = async (req: http.IncomingMessage, pathname: string, 
                 if (e instanceof GrantError) await refuse(source, command, new HttpError(403, e.code, e.message))
                 throw e
             }
+            // engine#582: the grant check a peer runs before any work for this Engine; nothing is queued
+            if (name === GRANT_CHECK_COMMAND) return { status: 200, body: { engineId: self, issuerEngineId: self, ok: true } }
             if (!isPeerFollowUp(command) || !commands.some(c => c.name === name)) {
                 await refuse(source, command, new HttpError(422, 'COMMAND_REFUSED', `'${name}' cannot be sent by another Engine.`, { reason: 'not-a-follow-up' }))
             }
