@@ -12,7 +12,7 @@ import { config, peerAccessEnabled, peerStaleMs } from './data/Config.js'
 import { warnIfTestFailUpdateRestartIgnored } from './data/UpdateAppTestHook.js'
 import { takeStartupFailure, publishStartupFailure } from './data/StartupFailure.js'
 import { StoreSelfHeal, publishStoreSelfHeal } from './data/StoreHealth.js'
-import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkCrossEngineResumeCapability, checkDemoAppsCapability } from './data/Engine.js'
+import { createOrUpdateEngine, cleanupPhantomEngines, localEngineId, checkBackupCleanupCapability, checkPreUpdateQuarantineCapability, checkCrossEngineResumeCapability, checkPeerTicketsCapability, checkDemoAppsCapability } from './data/Engine.js'
 import { PortNumber } from './data/CommonTypes.js'
 import { syncEngineAuth, watchStoreAccounts } from './data/EngineAuth.js'
 import { commandKey } from './data/CommandKey.js'
@@ -191,6 +191,7 @@ export const startEngine = async (disableMDNS?:boolean):Promise<void> => {
     await checkBackupCleanupCapability()
     await checkPreUpdateQuarantineCapability()
     await checkCrossEngineResumeCapability()
+    await checkPeerTicketsCapability()
     checkDemoAppsCapability()
 
     // Create or update the local engine object

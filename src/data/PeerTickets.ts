@@ -26,6 +26,14 @@ import {
     PEER_TICKETS_HELPER_MIN, PEER_TICKET_MAX_SECONDS, PeerTicketKind,
 } from '../utils/appDataHelper.js'
 
+/**
+ * The Engine capability for helper v26 transfer tickets: advertised (Engine.capabilities, with
+ * capabilitiesBootedAt, and /api/auth/info) when this Engine's own helper is v26 or later, checked
+ * once at startup (Engine.checkPeerTicketsCapability). A reader then knows that writes INTO this
+ * Engine through its gate need a ticket, so a sender needs engine#595 (grantCheck naming the transfer).
+ */
+export const PEER_TICKETS_CAPABILITY = 'peerTickets1'
+
 export interface TicketDeps {
     run: AppDataRunner
     /** null when the helper has tickets (v26+), else why not */

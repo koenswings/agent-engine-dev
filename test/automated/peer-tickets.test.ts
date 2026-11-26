@@ -205,3 +205,39 @@ describe('an Engine from before engine-03 (adfd9d3) sending to a v26 Engine', ()
         expect(del.stderr).toMatch(/did not create/)
     })
 })
+
+describe('capability peerTickets1 (engine#595)', () => {
+    afterEach(async () => {
+        const { resetPeerTicketsCapabilityForTests, resetCrossEngineResumeCapabilityForTests } = await import('../../src/data/Engine.js')
+        resetPeerTicketsCapabilityForTests(); resetCrossEngineResumeCapabilityForTests()
+    })
+    it('advertised only with helper v26+, beside crossEngineResume; the constant is the same everywhere', async () => {
+        const { engineCapabilities, PEER_TICKETS_CAPABILITY, CROSS_ENGINE_RESUME_CAPABILITY } = await import('../../src/data/Engine.js')
+        const { PEER_TICKETS_CAPABILITY: fromTickets } = await import('../../src/data/PeerTickets.js')
+        expect(PEER_TICKETS_CAPABILITY).toBe('peerTickets1')
+        expect(fromTickets).toBe(PEER_TICKETS_CAPABILITY)
+        expect(engineCapabilities(false, false, false, false, true, false)).not.toContain(PEER_TICKETS_CAPABILITY)
+        expect(engineCapabilities(false, false, false, false, true, true)).toEqual(expect.arrayContaining([CROSS_ENGINE_RESUME_CAPABILITY, PEER_TICKETS_CAPABILITY]))
+        expect(engineCapabilities(false, false, false, false, false, true)).toContain(PEER_TICKETS_CAPABILITY)
+    })
+    it('one startup check: v26 → advertised; v25, missing, failing or hung → omitted; never throws', async () => {
+        const { checkPeerTicketsCapability, engineCapabilities, PEER_TICKETS_CAPABILITY } = await import('../../src/data/Engine.js')
+        expect(engineCapabilities(false)).not.toContain(PEER_TICKETS_CAPABILITY)          // not checked yet
+        expect(await checkPeerTicketsCapability(async () => 'idea-app-data 26\n', 100)).toBe(true)
+        expect(engineCapabilities(false)).toContain(PEER_TICKETS_CAPABILITY)
+        expect(await checkPeerTicketsCapability(async () => 'idea-app-data 27', 100)).toBe(true)
+        expect(await checkPeerTicketsCapability(async () => 'idea-app-data 25', 100)).toBe(false)
+        expect(engineCapabilities(false)).not.toContain(PEER_TICKETS_CAPABILITY)
+        expect(await checkPeerTicketsCapability(async () => { throw new Error('sudo: a password is required') }, 100)).toBe(false)
+        const started = Date.now()
+        expect(await checkPeerTicketsCapability(() => new Promise(() => { /* never settles */ }), 50)).toBe(false)
+        expect(Date.now() - started).toBeLessThan(2000)
+    })
+    it('a loop stall while the check is in flight still advertises it (engine#521)', async () => {
+        const { checkPeerTicketsCapability, engineCapabilities, PEER_TICKETS_CAPABILITY } = await import('../../src/data/Engine.js')
+        const pending = checkPeerTicketsCapability(() => new Promise<string>((resolve) => { setTimeout(() => resolve('idea-app-data 26'), 150) }), 100)
+        const end = Date.now() + 400; while (Date.now() < end) { /* busy */ }
+        expect(await pending).toBe(true)
+        expect(engineCapabilities(false)).toContain(PEER_TICKETS_CAPABILITY)
+    })
+})

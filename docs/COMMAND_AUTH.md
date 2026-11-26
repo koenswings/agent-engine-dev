@@ -385,6 +385,7 @@ B's `GET /api/auth/info` reports B's engine id. Connect timeout 3 s → `ENGINE_
 | Follow-up after B restarted mid-operation | `GRANT_EXPIRED` with `issuerEngineId: B` on the follow-up trace |
 | Transfer after B restarted mid-copy (helper v26 on B) | B's helper refuses the write (`refused: GRANT_EXPIRED`); A ends the op `GRANT_EXPIRED` (not parked); the partial stays on B under its marker |
 | A before engine#582 (no `grantCheck`, e.g. adfd9d3) → B with helper v26 | B's helper refuses A's first remote step (`ensure-dirs`) with exit 2 and one line `refused: GRANT_EXPIRED: … too old to ask for one and must be updated first`; A's copy ends `Failed` with that text, nothing written on either Engine. Update A |
+| Which Engines need tickets | B advertises capability `peerTickets1` (in `Engine.capabilities` with `capabilitiesBootedAt`, and in `GET /api/auth/info`) when its own helper is v26 or later, checked once at startup, never fatal. With `capabilitiesBootedAt === lastBooted`, writes into B need engine#595 on the sender |
 | A with engine#595 → B with helper below v26 | B registers no tickets (`HELPER_OUTDATED` skipped) and its gate needs none: works as before |
 | A with engine#582 but not engine#595 → B with helper v26 | A's `grantCheck` names no transfer, so B registers no ticket and its helper refuses the transfer (`GRANT_EXPIRED`). Update A |
 

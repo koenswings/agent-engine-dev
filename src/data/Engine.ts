@@ -3,7 +3,7 @@ import { execFileSync } from 'node:child_process';
 
 $.verbose = false;
 import { deepPrint, log, uuid, print } from '../utils/utils.js';
-import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH, helperAtLeast, BACKUP_CLEANUP_HELPER_MIN, CROSS_RESUME_HELPER_MIN, type AppDataRunner } from '../utils/appDataHelper.js';
+import { APP_DATA_HELPER, APP_DATA_HELPER_VERSION, BORG_PATH, helperAtLeast, BACKUP_CLEANUP_HELPER_MIN, CROSS_RESUME_HELPER_MIN, PEER_TICKETS_HELPER_MIN, type AppDataRunner } from '../utils/appDataHelper.js';
 import { PEER_GATE, PEER_AUTHORIZED_KEYS, PEER_KNOWN_HOSTS } from '../utils/peerSsh.js';
 import { readMetaUpdateId, DiskMeta, addMeta, readRemoteDiskId } from './Meta.js';
 import { Version, Command, Hostname, Timestamp, DiskID, EngineID } from './CommonTypes.js';
@@ -371,6 +371,29 @@ export const checkCrossEngineResumeCapability = async (
 /** Test seam: drop the cached startup check. */
 export const resetCrossEngineResumeCapabilityForTests = (): void => { crossEngineResumeHelperOk = null }
 
+/** engine#595: advertised only when the app-data helper (and its gate) is v26 or newer: writes into this Engine need a transfer ticket */
+import { PEER_TICKETS_CAPABILITY } from './PeerTickets.js'
+export { PEER_TICKETS_CAPABILITY }
+let peerTicketsHelperOk: boolean | null = null
+
+/** Once at startup, decide whether to advertise `peerTickets1`. Never throws. */
+export const checkPeerTicketsCapability = async (
+  run?: AppDataRunner,
+  timeoutMs: number = PRE_UPDATE_QUARANTINE_HELPER_CHECK_MS,
+): Promise<boolean> => {
+  try {
+    const outdated = await withTimeout(helperAtLeast(PEER_TICKETS_HELPER_MIN, 'peerTickets1', run), timeoutMs)
+    peerTicketsHelperOk = outdated === null
+  } catch {
+    peerTicketsHelperOk = false
+  }
+  log(`peerTickets1 capability ${peerTicketsHelperOk ? 'advertised' : 'omitted'} (app-data helper ${peerTicketsHelperOk ? '' : 'older than '}v${PEER_TICKETS_HELPER_MIN}${peerTicketsHelperOk ? '+' : ', missing, error or timeout'})`)
+  return peerTicketsHelperOk
+}
+
+/** Test seam: drop the cached startup check. */
+export const resetPeerTicketsCapabilityForTests = (): void => { peerTicketsHelperOk = null }
+
 /** The capability list written at this startup */
 let demoAppsPythonOk: boolean | null = null
 
@@ -400,6 +423,7 @@ export const engineCapabilities = (
   quarantineHelperOk: boolean = preUpdateQuarantineHelperOk === true,
   demoAppsOk: boolean = demoAppsPythonOk === true,
   crossResumeOk: boolean = crossEngineResumeHelperOk === true,
+  peerTicketsOk: boolean = peerTicketsHelperOk === true,
 ): string[] => {
   const caps = [...ENGINE_CAPABILITIES]
   if (helperInstalled) caps.push(FLASH_CARD_CAPABILITY)
@@ -407,6 +431,7 @@ export const engineCapabilities = (
   if (quarantineHelperOk) caps.push(PRE_UPDATE_QUARANTINE_CAPABILITY)
   if (demoAppsOk) caps.push(DEMO_APPS_CAPABILITY)
   if (crossResumeOk) caps.push(CROSS_ENGINE_RESUME_CAPABILITY)
+  if (peerTicketsOk) caps.push(PEER_TICKETS_CAPABILITY)
   return caps
 }
 
