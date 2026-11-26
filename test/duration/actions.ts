@@ -30,6 +30,20 @@ import {
 } from './appUrls.js'
 import { backupDiskTargetId, describeDisk, diskEmptiness, eraseDiskTargetId, filesDiskTargetId, waitDiskEmpty, diskResetVerdict, instanceStoredOn, rowInFlight } from './fixtureDisks.js'
 import { copyDoneBudgetMs, DEFAULT_NEXTCLOUD_READY_MS, envMs, instanceStartBudgetMs, logStartMeasured } from './startBudgets.js'
+import {
+    applyPeerTicketsCopyFilter,
+    captureRefusalBaseline,
+    copyAppPairPins,
+    emptyPeerTicketsScan,
+    isMixedFleetCopyRefusal,
+    mergePeerTicketsScan,
+    mixedFleetRefusalPins,
+    poolHasLivePeerTickets,
+    verifyOldToNewCopyRefusal,
+    type CopyMovePair,
+    type PeerTicketsScan,
+    type RefusalBaseline,
+} from './peerTicketsHarness.js'
 
 export const HUB_ACTIONS = [
     'return_to_start',
@@ -2850,9 +2864,14 @@ export const stage2FixtureAbsent = async (
         const pinEnvFor = action === 'move_app'
             ? { ...env, DURATION_COPY_INSTANCE_ID: acted, DURATION_COPY_TARGET_DISK: env.DURATION_COPY_TARGET_DISK?.trim() || STAGE2_ROLE_MAP.moveApp }
             : env
-        const pair = await predictCopyMovePair(ctx as ActionContext, { instanceId: acted }, pinEnvFor)
-        if (!pair.sourceEngine) return `${action} source disk ${pair.sourceDiskId} of ${acted} not docked on a pool engine`
-        if (!pair.targetDiskId || !pair.targetEngine) return `${action}: no docked target disk ≠ ${pair.sourceDiskId}`
+        try {
+            const pair = await predictCopyMovePair(ctx as ActionContext, { instanceId: acted }, pinEnvFor)
+            if (!pair.sourceEngine) return `${action} source disk ${pair.sourceDiskId} of ${acted} not docked on a pool engine`
+            if (!pair.targetDiskId || !pair.targetEngine) return `${action}: no docked target disk ≠ ${pair.sourceDiskId}`
+        } catch (e) {
+            // v26↔v26 filter fails loud in walks; Markov resamples instead.
+            return e instanceof Error ? e.message : String(e)
+        }
     }
     return null
 }
@@ -3024,6 +3043,16 @@ export const newCopyInstanceId = (baseline: ReadonlySet<string>, after: Readonly
     return fresh.length === 1 ? fresh[0]! : null
 }
 
+export const readPeerTicketsScan = async (
+    ctx: Pick<ActionContext, 'opts' | 'poolEngines' | 'excludeEngines'>,
+): Promise<PeerTicketsScan> => {
+    const scan = emptyPeerTicketsScan()
+    for (const eng of ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))) {
+        try { mergePeerTicketsScan(scan, await ctx.opts.ops.readStore(eng)) } catch { continue }
+    }
+    return scan
+}
+
 export const predictCopyMovePair = async (
     ctx: ActionContext,
     ids: { instanceId?: string; diskId?: string },
@@ -3043,6 +3072,7 @@ export const predictCopyMovePair = async (
     const guessSource = env.DURATION_COPY_SOURCE_DISK?.trim() || ids.diskId || kolibri.diskId
     const defaultTarget = env.DURATION_COPY_TARGET_DISK?.trim() || (guessSource === nc ? kolibri.diskId : nc)
     const docked = new Map<string, string>() // diskId → engine, insertion = store order
+    const scan: PeerTicketsScan = emptyPeerTicketsScan()
     let storedOn: string | null = null
     for (const eng of ctx.poolEngines.filter(e => !ctx.excludeEngines.includes(e))) {
         let view: SemanticStoreView
@@ -3051,6 +3081,7 @@ export const predictCopyMovePair = async (
         } catch {
             continue
         }
+        mergePeerTicketsScan(scan, view)
         for (const d of Object.values(view.diskDB)) {
             if (d.dockedTo && !docked.has(d.id)) docked.set(d.id, d.dockedTo)
         }
@@ -3064,7 +3095,7 @@ export const predictCopyMovePair = async (
     if (!targetDiskId) {
         targetDiskId = COPY_MOVE_TARGET_PREFERENCE.find(id => others.includes(id)) ?? others[0] ?? null
     }
-    return {
+    const pair: CopyMovePair = {
         instanceId,
         sourceDiskId,
         sourceEngine: docked.get(sourceDiskId) ?? null,
@@ -3072,6 +3103,15 @@ export const predictCopyMovePair = async (
         targetEngine: targetDiskId ? (docked.get(targetDiskId) ?? null) : null,
         sameEngineOthers: others.filter(id => docked.get(id) === docked.get(sourceDiskId)),
     }
+    return applyPeerTicketsCopyFilter({
+        action: ctx.action,
+        pair,
+        scan,
+        excludeEngines: ctx.excludeEngines,
+        env,
+        mixedFleetProof: isMixedFleetCopyRefusal(ctx, env),
+        stage2: isStage2(ctx),
+    })
 }
 
 /**
@@ -4104,7 +4144,60 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
     // r86f (A): Stage 2 move_app → the step-43 copy onto empty-001 (env overrides win). Pinned for
     // the preflight and the Intent; restored after the Intent (or on an early abort).
     let restoreMovePins: (() => void) | null = null
+    let restoreCopyPins: (() => void) | null = null
+    const restoreAllPins = (): void => { restoreMovePins?.(); restoreCopyPins?.() }
     let movePinnedInstance: string | null = null
+    let refusalBaseline: RefusalBaseline | undefined
+    let refusalExpect: { sourceEngine: string; targetEngine: string; instanceId?: string; targetDiskId: string } | undefined
+    let pinnedCopyInstance: string | undefined
+    if (ctx.action === 'copy_app') {
+        try {
+            if (isMixedFleetCopyRefusal(ctx)) {
+                const pins = copyAppPairPins({
+                    action: 'copy_app',
+                    pair: { instanceId: '', sourceDiskId: '', sourceEngine: null, targetDiskId: null, targetEngine: null, sameEngineOthers: [] },
+                    mixedFleetProof: true,
+                    filterActive: false,
+                })
+                if (pins) {
+                    restoreCopyPins = pinEnv(pins.set)
+                    preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${pins.note}` : pins.note
+                }
+            }
+            const pair = await predictCopyMovePair(ctx, { instanceId, diskId })
+            if (!isMixedFleetCopyRefusal(ctx)) {
+                const scan = await readPeerTicketsScan(ctx)
+                const pins = copyAppPairPins({
+                    action: 'copy_app',
+                    pair,
+                    mixedFleetProof: false,
+                    filterActive: poolHasLivePeerTickets(scan.engines.values()),
+                })
+                if (pins) {
+                    restoreCopyPins = pinEnv(pins.set)
+                    preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${pins.note}` : pins.note
+                }
+            }
+            if (isMixedFleetCopyRefusal(ctx) && pair.targetDiskId && pair.targetEngine && pair.sourceEngine) {
+                refusalExpect = {
+                    sourceEngine: pair.sourceEngine,
+                    targetEngine: pair.targetEngine,
+                    instanceId: pair.instanceId,
+                    targetDiskId: pair.targetDiskId,
+                }
+                refusalBaseline = await captureRefusalBaseline(ctx.opts.ops, {
+                    poolEngines: ctx.poolEngines,
+                    excludeEngines: ctx.excludeEngines,
+                    targetEngine: pair.targetEngine,
+                    targetDiskId: pair.targetDiskId,
+                })
+            }
+            pinnedCopyInstance = process.env.DURATION_COPY_INSTANCE_ID?.trim() || pair.instanceId
+        } catch (e) {
+            restoreCopyPins?.()
+            return { ok: false, message: `copy_app aborted before Intent: ${e instanceof Error ? e.message : String(e)}`, layer }
+        }
+    }
     try {
         const pins = stage2MoveAppPins(ctx)
         if (pins) {
@@ -4127,7 +4220,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${note}` : note
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e)
-            restoreMovePins?.()
+            restoreAllPins()
             return {
                 ok: false,
                 message: `${ctx.action} aborted before Intent: ${err}`,
@@ -4159,7 +4252,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         } catch (e) {
             const err = e instanceof Error ? e.message : String(e)
             // Stage 2: the sidecar must be proven on its own Pi (no soft-pass).
-            if (isStage2(ctx)) { restoreMovePins?.(); return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer } }
+            if (isStage2(ctx)) { restoreAllPins(); return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer } }
             preStartSettleNote = `${preStartSettleNote ? `${preStartSettleNote}; ` : ''}sidecar URL resync failed: ${err}`
         }
     }
@@ -4174,7 +4267,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         try {
             appUses = stage2AppUsesForStep(ctx, instanceId)
         } catch (e) {
-            restoreMovePins?.()
+            restoreAllPins()
             return { ok: false, message: `${ctx.action} aborted before Intent: ${e instanceof Error ? e.message : String(e)}`, layer }
         }
         if (appUses.length) {
@@ -4184,7 +4277,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
                 if (r.note) preStartSettleNote = preStartSettleNote ? `${preStartSettleNote}; ${r.note}` : r.note
             } catch (e) {
                 const err = e instanceof Error ? e.message : String(e)
-                restoreMovePins?.()
+                restoreAllPins()
                 return { ok: false, message: `${ctx.action} aborted before Intent: ${err}`, layer }
             }
             const d = driver as typeof driver & { tabSeq?: () => number }
@@ -4223,7 +4316,7 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
             ...(waitOp ? { waitOperation: waitOp } : {}),
         })
     } finally {
-        restoreMovePins?.()
+        restoreAllPins()
         if (ctx.action === 'add_files_role') {
             if (prevFilesPin === undefined) delete process.env.DURATION_FILES_DISK_ID
             else process.env.DURATION_FILES_DISK_ID = prevFilesPin
@@ -4317,10 +4410,25 @@ const runUiIntent = async (ctx: ActionContext, layerHint: Layer): Promise<Action
         }
         if (check) message = `${message}; ${check.note}`
     }
-    // copy_app: "Intent ok" is not enough — the copyApp Operation must end Done (live only).
-    if (ctx.action === 'copy_app' && result.ok) {
+    // Mixed-fleet proof: the old→new copy must end Failed on the source and write nothing
+    // on the target. The Console Intent may itself report not-ok; a correct refusal still PASSES.
+    if (ctx.action === 'copy_app' && isMixedFleetCopyRefusal(ctx) && refusalExpect && refusalBaseline) {
+        const check = await verifyOldToNewCopyRefusal(ctx, confirmAtMs ?? intentStartedAt, {
+            ...refusalExpect,
+            baseline: refusalBaseline,
+        }, process.env)
+        if (check && !check.ok) {
+            return { ok: false, message: `copy_app: ${check.note}`, layer }
+        }
+        if (check) {
+            message = `${message}; ${check.note}`
+            return { ok: true, message, layer }
+        }
+        // Fake ops (no listOperations): do not treat "Intent ok" as proof; still don't fail the Fake walk.
+    } else if (ctx.action === 'copy_app' && result.ok) {
+        // copy_app: "Intent ok" is not enough — the copyApp Operation must end Done (live only).
         const check = await verifyCopyOperation(ctx, confirmAtMs ?? intentStartedAt, {
-            instanceId: process.env.DURATION_COPY_INSTANCE_ID?.trim() || instanceId || ctx.fixtureInstance,
+            instanceId: pinnedCopyInstance || instanceId || ctx.fixtureInstance,
         }, { startClockMs: confirmAtMs })
         if (check && !check.ok) {
             return { ok: false, message: `copy_app: ${check.note} (Console Intent reported ok)`, layer }
@@ -4761,6 +4869,18 @@ export class FakeFleetOps implements FleetOps {
             }
         })
         if (this.settleDelayMs) await sleep(this.settleDelayMs)
+    }
+
+    /** Test seam: set capability / boot-stamp fields on an engineDB row. */
+    setEngineCaps(engineId: string, rec: {
+        capabilities?: string[]
+        capabilitiesBootedAt?: number | null
+        lastBooted?: number | null
+    }): void {
+        this.mutate(doc => {
+            const cur = doc.engineDB[engineId] ?? { id: engineId }
+            doc.engineDB[engineId] = { ...cur, ...rec }
+        })
     }
 
     async readStore(engineId: string): Promise<SemanticStoreView> {

@@ -31,7 +31,10 @@
 # EmptyDiskPanel. Engine tip: after stay_on_disk, redockEmpty002BeforeErase mirrors
 # BeforeSecondInstall (fresh dock + store purge).
 # Optional DURATION_COPY_SOURCE_DISK / DURATION_COPY_TARGET_DISK /
-# DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud).
+# DURATION_COPY_INSTANCE_ID (default kolibri→nextcloud). When any pool Engine
+# advertises live peerTickets1, @30/@90 copy_app accept only v26↔v26 pairs
+# (an operator override must still pass). Mixed-pool proof: mixed-fleet-copy-refusal
+# with DURATION_MIXED_FLEET_PROOF=1, not this walk.
 # Wait for Atlas :8080 GO + Path A re-dock layout (kolibri/:18080, empties) before
 # live --ui --record-walk.
 kind: walk

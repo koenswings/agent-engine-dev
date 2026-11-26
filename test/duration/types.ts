@@ -101,6 +101,29 @@ export interface SemanticEngine {
     hostname?: string
     /** Engine PR #166: school-LAN IPv4 (absent on older Engines). Console #139 Open uses it. */
     lanAddress?: string | null
+    /** Advertised capability names from the Engine record (idea#128). */
+    capabilities?: string[]
+    /**
+     * Timestamp when `capabilities` was last written. Live iff it equals `lastBooted`
+     * (a rollback leaves the stamp behind). A missing stamp does not count as live.
+     */
+    capabilitiesBootedAt?: number | null
+    lastBooted?: number | null
+}
+
+/** Project a raw store engineDB row onto the harness SemanticEngine view. */
+export const semanticEngineFromRaw = (id: string, eng: Record<string, unknown> | null | undefined): SemanticEngine => {
+    const capabilities = Array.isArray(eng?.capabilities) ? (eng!.capabilities as unknown[]).map(String) : undefined
+    const capAt = eng != null && Number.isFinite(Number(eng.capabilitiesBootedAt)) ? Number(eng.capabilitiesBootedAt) : undefined
+    const booted = eng != null && Number.isFinite(Number(eng.lastBooted)) ? Number(eng.lastBooted) : undefined
+    return {
+        id,
+        hostname: eng?.hostname != null ? String(eng.hostname) : undefined,
+        ...(typeof eng?.lanAddress === 'string' ? { lanAddress: String(eng.lanAddress) } : {}),
+        ...(capabilities ? { capabilities } : {}),
+        ...(capAt !== undefined ? { capabilitiesBootedAt: capAt } : {}),
+        ...(booted !== undefined ? { lastBooted: booted } : {}),
+    }
 }
 
 export interface SettleReady {
@@ -230,6 +253,12 @@ export interface DurationOptions {
      * Default false — Fake Markov hygiene still undocks on return_to_start.
      */
     preserveDockedOnReturn?: boolean
+    /**
+     * Atlas-only mixed-fleet proof (`DURATION_MIXED_FLEET_PROOF=1` + the
+     * mixed-fleet-copy-refusal walk): copy_app pins idea01 Kolibri → v26 idea03
+     * and expects the source op to end Failed with nothing written on the target.
+     */
+    mixedFleetProof?: boolean
     settleTimeoutMs?: number
     rng?: () => number
     onLog?: (entry: StructuredLogEntry) => void

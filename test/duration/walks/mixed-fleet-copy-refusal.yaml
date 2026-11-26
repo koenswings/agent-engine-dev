@@ -1,0 +1,36 @@
+# Mixed-fleet old→new copy refusal (engine#595 / PR #599).
+#
+# Atlas-only: run with DURATION_MIXED_FLEET_PROOF=1, never as part of cover-all,
+# cover-registered-intents, or a normal Markov walk. idea01 stays on pre-ticket
+# code; idea03 (and any other pool Pi in the kit) is on helper v26 / PR6.
+#
+# The walk pins Kolibri on idea01 → the Nextcloud disk on idea03, runs copy_app,
+# and the harness verifier (NOT verifyCopyOperation, which requires Done) checks:
+#   - source operationDB only: kind copyApp, status Failed, error contains
+#     'too old' or 'updated first'
+#   - no command-log assert (idea01 may have none)
+#   - no target-side op, no new instanceDB row
+#   - on the idea03 target disk: no new instances/<id> and no
+#     instances/<id>.idea-op-in-flight
+#
+# Uses existing unified.yaml edges only (open operator console → sign in →
+# inventory → instance controls → copy_app).
+kind: walk
+name: mixed-fleet-copy-refusal
+graph: unified
+steps:
+  - from: start
+    to: op_entry
+    action: open_console_as_operator
+  - from: op_entry
+    to: op_overview
+    action: sign_in
+  - from: op_overview
+    to: op_disk
+    action: open_disk_inventory
+  - from: op_disk
+    to: op_instance
+    action: open_instance_controls
+  - from: op_instance
+    to: op_copy_move
+    action: copy_app

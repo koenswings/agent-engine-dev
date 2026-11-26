@@ -63,12 +63,13 @@ import {
     trackRepo,
     trackWorkerLink,
 } from './automergeTimeoutGuard.js'
-import type {
-    DiskInstanceRow,
-    FleetOps,
-    SemanticStoreView,
-    SettleReady,
-    StoreMode,
+import {
+    semanticEngineFromRaw,
+    type DiskInstanceRow,
+    type FleetOps,
+    type SemanticStoreView,
+    type SettleReady,
+    type StoreMode,
 } from './types.js'
 
 $.verbose = false
@@ -2053,18 +2054,13 @@ export class RealFleetOps implements FleetOps {
         for (const [id, eng] of Object.entries(store.engineDB ?? {})) {
             if (!eng) continue
             const logical = resolveLogical(id) ?? id
-            engineDB[logical] = {
-                id: logical,
-                hostname: eng.hostname != null ? String(eng.hostname) : undefined,
-                ...(typeof (eng as { lanAddress?: unknown }).lanAddress === 'string'
-                    ? { lanAddress: String((eng as { lanAddress?: unknown }).lanAddress) }
-                    : {}),
-            }
+            engineDB[logical] = semanticEngineFromRaw(logical, eng as unknown as Record<string, unknown>)
         }
         // Ensure the queried logical engine appears even if live key differed
         if (!engineDB[logicalId] && liveId && store.engineDB[liveId as keyof typeof store.engineDB]) {
-            const eng = store.engineDB[liveId as keyof typeof store.engineDB] as { hostname?: string }
-            engineDB[logicalId] = { id: logicalId, hostname: eng.hostname ? String(eng.hostname) : logicalId }
+            const eng = store.engineDB[liveId as keyof typeof store.engineDB] as unknown as Record<string, unknown>
+            engineDB[logicalId] = semanticEngineFromRaw(logicalId, eng)
+            if (!engineDB[logicalId].hostname) engineDB[logicalId].hostname = logicalId
         }
 
         return { engineId: logicalId, ...(liveId ? { liveEngineId: liveId } : {}), instanceDB, diskDB, engineDB }
@@ -3204,6 +3200,22 @@ export class RealFleetOps implements FleetOps {
         const out = await this.sshRead(this.hostOf(engineId), `ls -1A '${dest}' 2>/dev/null || true`)
         const entries = String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean)
         return { dest, entries }
+    }
+
+    /**
+     * Read-only listing of instances/ on a docked fixture (folders and
+     * sibling *.idea-op-in-flight markers). Used by the mixed-fleet refusal verifier.
+     */
+    async listDiskInstanceEntries(engineId: string, diskId: string): Promise<string[]> {
+        this.assertNotExcluded(engineId, 'listDiskInstanceEntries')
+        const device = this.deviceMap(engineId).get(diskId)
+            ?? (await this.hasHealthyFixtureTree(engineId, diskId, { requireInstanceData: false, refuseExternalLinks: false }))
+        if (!device || !/^idea-test-[0-9]+$/.test(device)) {
+            throw new Error(`RealFleetOps.listDiskInstanceEntries: no idea-test slot for ${diskId} on ${engineId}`)
+        }
+        const dest = `${this.disksRoot}/${device}/instances`
+        const out = await this.sshRead(this.hostOf(engineId), `if [ -d '${dest}' ]; then ls -1A '${dest}'; fi`)
+        return String(out ?? '').split('\n').map(l => l.trim()).filter(Boolean)
     }
 
     protected async sshRemoveSentinel(engineId: string, device: string): Promise<void> {
