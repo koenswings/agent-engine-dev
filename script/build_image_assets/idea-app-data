@@ -12,7 +12,8 @@
 # tars are pi-owned and stay plain pi operations. A PEER Engine reaches this helper
 # only through the forced command /usr/local/sbin/idea-peer-gate <peerEngineId>
 # (its key's line in /etc/ssh/idea_authorized_keys/pi, written by sync-peers), which
-# maps receive/delete/receive-files to the peer-* subcommands with the peer's id.
+# maps receive/delete/receive-files to the peer-* subcommands with the peer's id
+# and also allows the read-only size <root> <id> verb (same helper subcommand).
 #
 # Why root: app containers write instance data as root (Kolibri sessions 0600),
 # 999 (MariaDB, 0700 folders) and www-data (Nextcloud 0640/0770). pi cannot read
@@ -65,6 +66,7 @@
 #                                    under that peer's marker of that op; writes nothing)
 #   idea-app-data receive-app        <root> <appId> <rsync server args...>   (as pi)
 #   idea-app-data receive-service    <root> <rsync server args...>           (as pi)
+#   idea-app-data size               <root> <id>   (also through idea-peer-gate; read-only)
 #   idea-app-data ensure-dirs        <root>   (apps/ instances/ services/, owned by pi)
 #   idea-app-data erase-slot       <slot> <stagingDir>   (TEST-ONLY: umount+mkfs+remount a loop-backed slot)
 #   idea-app-data put-files        <root> <id> <stagingDir>  (local Engine: copy basenames from staging into instance as root)

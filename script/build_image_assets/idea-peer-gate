@@ -14,6 +14,8 @@
 # Allowed, and run as argv (never through a shell):
 #   version                                → idea-app-data version
 #   ensure-dirs <root>                     → idea-app-data ensure-dirs <root>
+#   size <root> <id>                       → idea-app-data size <root> <id>
+#                                            (read-only: whether instances/<id> exists, and its size)
 #   receive <root> <id> --server …         → idea-app-data peer-receive <peer> <root> <id> --server …
 #                                            (a NEW instance folder, recorded in the ledger)
 #   receive-files <root> <id> --server …   → idea-app-data peer-receive-files <peer> <root> <id> --server …
@@ -102,6 +104,9 @@ case "$SUBCMD" in
     ensure-dirs)
         (( N == 1 )) || refuse "ensure-dirs takes exactly <root>"
         allow ensure-dirs "${ARGS[0]}" ;;
+    size)
+        (( N == 2 )) || refuse "size takes exactly <root> <id>"
+        allow size "${ARGS[0]}" "${ARGS[1]}" ;;
     receive)
         (( N >= 3 )) || refuse "receive takes <root> <id> [<opId>] and the rsync server arguments"
         if [[ "${ARGS[2]}" == --server ]]; then

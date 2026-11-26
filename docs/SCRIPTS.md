@@ -238,6 +238,10 @@ v9's 2-argument `borg-list <bdev> <id>` ran `borg info --json -- <repo>`. With n
 
 No new verbs. The current helper is v25 so it sits above main's v24 (`swap-quarantine`, engine#506) and still includes v23 (`crossEngineResume` / peer resume verbs, engine#497 stage 3 (a)). `CROSS_RESUME_HELPER_MIN` stays 23; `SWAP_QUARANTINE_HELPER_MIN` stays 24. `sudo -n /usr/local/sbin/idea-app-data version` prints `idea-app-data 25`, and `script/peer-verify.sh` expects 25.
 
+### `idea-peer-gate`: allow read-only `size` (`remoteInstanceFolderExists`)
+
+No helper version bump. The forced command now allows `size <root> <id>`, which `idea-app-data` already implements (`du -sk -x` of the instance folder; a missing folder fails). `remoteInstanceFolderExists` in the Engine uses that call through the gate so a cross-Engine moveApp can see whether `instances/<id>` already exists on the target disk (`TARGET_EXISTS`). The helper stays v25; sudoers is unchanged. Rollout: `./install-root-helpers` (Atlas) installs the new `idea-peer-gate`; confirm `idea-app-data 25`, then deploy/restart the Engine as `pi`. Tests: `test/automated/idea-peer-gate-script.test.ts`, `test/automated/app-data-helper.test.ts`.
+
 ### `idea-app-data` v24: `swap-quarantine` at updateApp's Swap (engine#506)
 
 updateApp's Swap copies the new bundle over `instances/<id>/` and never removed anything, so a file the old bundle had and the new one dropped stayed in the instance folder. Kid's hand-run Nextcloud chain (2026-11-17) hit it: 1.8's `bundled-apps/richdocuments-v8.8.3.tar.gz` stayed next to 2.0's v9.2.3 and the prepare hook refused it (`not listed in SHA256SUMS`); after five hops all five tarballs were there. The instance also kept its install-time `SHA256SUMS`. `<disk>/.idea-quarantine` is root 0700, so the move needs the helper. Steve's decision: Important, a separate PR after #505.

@@ -16,7 +16,7 @@
  *
  * App masters and service tars are Engine-written and pi-owned, so locally they stay
  * plain pi operations. Every call is an argv array (never a shell string). Commands
- * for a PEER Engine (ensure-dirs, receive-app/-service/-files, delete) go over ssh
+ * for a PEER Engine (ensure-dirs, size, receive-app/-service/-files, delete) go over ssh
  * with this Engine's own key (utils/peerSsh.ts) as one remote command built from
  * checked tokens; on the peer the forced command idea-peer-gate parses it and runs
  * that Engine's helper (helper version 2, per-Pi Engine keys).
@@ -424,6 +424,7 @@ export const remoteHelperRsyncPath = (args: string[]): string => remoteHelperCom
 export const remoteDeleteSshArgs = (host: string, peerEngineId: string, root: string, id: string): string[] =>
     peerSshArgv(host, peerEngineId, remoteHelperCommand(deleteArgs(root, id)))
 
+/** The ssh argv for a read-only `size` on a peer (the gate allows this verb). */
 export const remoteSizeSshArgs = (host: string, peerEngineId: string, root: string, id: string): string[] =>
     peerSshArgv(host, peerEngineId, remoteHelperCommand(sizeArgs(root, id)))
 

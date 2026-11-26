@@ -4,7 +4,7 @@
  * sshd runs `idea-peer-gate <peerEngineId>` (the id from the root-owned
  * authorized_keys line) with the peer's request in SSH_ORIGINAL_COMMAND. The gate
  * allows only these calls of this Pi's app-data helper and maps them:
- *   version, ensure-dirs <root>, receive → peer-receive <peer>, receive-files →
+ *   version, ensure-dirs <root>, size <root> <id>, receive → peer-receive <peer>, receive-files →
  *   peer-receive-files <peer>, receive-app, receive-service, delete → peer-delete <peer>
  * and refuses EVERYTHING else (exit 2, sudo never runs). Both `sudo` and
  * `/usr/bin/sudo` are accepted (rsync's --rsync-path and ssh send either).
@@ -16,7 +16,7 @@
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
 import { fs, path } from 'zx'
 import { makeAppDataSandbox, AppDataSandbox } from '../harness/appDataSandbox.js'
-import { remoteHelperCommand, remoteHelperRsyncPath, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, deleteArgs, ensureDirsArgs, APP_DATA_HELPER, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
+import { remoteHelperCommand, remoteHelperRsyncPath, receiveAppArgs, receiveServiceArgs, receiveFilesArgs, deleteArgs, ensureDirsArgs, sizeArgs, APP_DATA_HELPER, APP_DATA_HELPER_VERSION } from '../../src/utils/appDataHelper.js'
 
 let sb: AppDataSandbox
 beforeEach(async () => { sb = await makeAppDataSandbox() })
@@ -34,6 +34,7 @@ describe('idea-peer-gate: the allow-list and its mapping', () => {
     const cases: [string, string[]][] = [
         [`sudo -n ${H} version`, ['version']],
         [`sudo -n ${H} ensure-dirs sdb1`, ['ensure-dirs', 'sdb1']],
+        [`sudo -n ${H} size sdb1 new1`, ['size', 'sdb1', 'new1']],
         [`sudo -n ${H} receive sdb1 new1 ${SRV}`, ['peer-receive', PEER, 'sdb1', 'new1', ...SRV.split(' ')]],
         [`sudo -n ${H} receive-files sdb1 new1 ${SRV}`, ['peer-receive-files', PEER, 'sdb1', 'new1', ...SRV.split(' ')]],
         [`sudo -n ${H} receive-app system kolibri-1.0 ${SRV}`, ['receive-app', 'system', 'kolibri-1.0', ...SRV.split(' ')]],
@@ -58,6 +59,7 @@ describe('idea-peer-gate: the allow-list and its mapping', () => {
     it('accepts exactly what an Engine sends (remoteHelperCommand, --rsync-path and the send of the helper, plus the rsync server args)', async () => {
         const sent = [
             remoteHelperCommand(ensureDirsArgs('sdb1')).join(' '),
+            remoteHelperCommand(sizeArgs('sdb1', 'new1')).join(' '),
             remoteHelperCommand(deleteArgs('sdb1', 'new1')).join(' '),
             `/usr/bin/sudo -n ${H} receive sdb1 new1 ${SRV}`,   // what the helper's send gives rsync as --rsync-path
             `${remoteHelperRsyncPath(receiveFilesArgs('sdb1', 'new1'))} ${SRV}`,
@@ -101,6 +103,8 @@ describe('idea-peer-gate: everything outside the allow-list is refused, sudo nev
         [`sudo -n ${H} version x`, /version takes no arguments/],
         [`sudo -n ${H} ensure-dirs`, /ensure-dirs takes exactly <root>/],
         [`sudo -n ${H} ensure-dirs sdb1 sdc1`, /ensure-dirs takes exactly <root>/],
+        [`sudo -n ${H} size sdb1`, /size takes exactly <root> <id>/],
+        [`sudo -n ${H} size sdb1 new1 extra`, /size takes exactly <root> <id>/],
         [`sudo -n ${H} delete sdb1`, /delete takes exactly <root> <id>/],
         [`sudo -n ${H} delete sdb1 new1 new2`, /delete takes exactly <root> <id>/],
         [`sudo -n ${H} receive sdb1 new1`, /receive takes <root> <id> \[<opId>\] and the rsync server arguments/],
@@ -122,7 +126,7 @@ describe('idea-peer-gate: everything outside the allow-list is refused, sudo nev
         [`sudo -n ${H} receive-service sdb1 --server --sender . .`, /write-only/],
         [`sudo -n ${H} receive-service sdb1`, /receive-service takes <root>/],
         // helper subcommands a peer must never reach directly
-        ...['send', 'verify-send', 'peer-mark-in-flight', 'peer-clear-in-flight', 'peer-resume-receive', 'peer-verify-receive', 'copy', 'size', 'sync-peers', 'clear-peers', 'install-usage-key', 'peer-delete', 'peer-receive', 'peer-receive-files',
+        ...['send', 'verify-send', 'peer-mark-in-flight', 'peer-clear-in-flight', 'peer-resume-receive', 'peer-verify-receive', 'copy', 'sync-peers', 'clear-peers', 'install-usage-key', 'peer-delete', 'peer-receive', 'peer-receive-files',
             'borg-init', 'borg-info', 'borg-create', 'borg-extract', 'unknown'].map(s =>
             [`sudo -n ${H} ${s} sdb1 new1 x y z`, new RegExp(`subcommand '${s}' is not allowed for a peer Engine key`)] as [string, RegExp]),
         [`sudo -n ${H} peer-delete ENGINE_other sdb1 new1`, /subcommand 'peer-delete' is not allowed/],
@@ -245,5 +249,16 @@ describe('idea-peer-gate end to end (gate → sudo → helper)', () => {
         expect(files.exitCode).toBe(2)
         expect(await fs.readFile(path.join(root, 'instances', 'mine', 'compose.yaml'), 'utf8')).toBe('services: {}\n')
         expect(await sb.calls('rrsync')).toEqual([])
+    })
+
+    it('the size command remoteInstanceFolderExists sends is allowed, and answers whether the folder exists', async () => {
+        const root = await sb.addDisk('sdc1')
+        await sb.addInstance(root, 'mine')
+        const present = await sb.runGate([PEER], remoteHelperCommand(sizeArgs('sdc1', 'mine')).join(' '))
+        expect(present.exitCode, present.stderr).toBe(0)
+        expect(present.stdout.trim()).toMatch(/^[0-9]+$/)
+        const missing = await sb.runGate([PEER], remoteHelperCommand(sizeArgs('sdc1', 'gone')).join(' '))
+        expect(missing.exitCode).not.toBe(0)
+        expect(missing.stderr).toMatch(/instance folder/)
     })
 })
